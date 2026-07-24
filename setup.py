@@ -23,9 +23,10 @@ import stat
 import subprocess
 from pathlib import Path
 
-from setuptools import find_namespace_packages, setup
+from setuptools import Distribution, find_namespace_packages, setup
 from setuptools.command.build_py import build_py
 from setuptools.command.egg_info import egg_info
+from setuptools.command.install import install
 from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 
 try:
@@ -257,24 +258,37 @@ class BuildPy(build_py):
     """Build py files."""
 
     def run(self):
-        datasystem_lib_dir = os.path.join(os.path.dirname(__file__), "build")
         super().run()
+        datasystem_lib_dir = os.path.join(self.build_lib, "yr", "datasystem")
         update_permissions(datasystem_lib_dir)
         for service_bin in SERVICE_BINARIES:
-            service_bin_path = os.path.join(
-                datasystem_lib_dir, "lib", "yr", "datasystem", service_bin
-            )
+            service_bin_path = os.path.join(datasystem_lib_dir, service_bin)
             os.chmod(service_bin_path, stat.S_IREAD | stat.S_IWRITE | stat.S_IEXEC)
             os.system(f"strip --strip-all {service_bin_path}")
-        lib_dir = os.path.join(
-            os.path.dirname(__file__), "build", "lib", "yr", "datasystem", "lib"
-        )
+        lib_dir = os.path.join(datasystem_lib_dir, "lib")
         lib_path = Path(lib_dir)
         delete_unuse_so(lib_path)
         check_and_refactor_ucx_lib(lib_dir)
 
 
+class BinaryDistribution(Distribution):
+    def has_ext_modules(self):
+        return True
+
+
+class BinaryInstall(install):
+    """Install binary package modules into the platform library scheme."""
+
+    def finalize_options(self):
+        super().finalize_options()
+        self.install_lib = self.install_platlib
+
+
 class CustomBdistWheel(_bdist_wheel):
+    def finalize_options(self):
+        super().finalize_options()
+        self.root_is_pure = False
+
     def get_tag(self):
         tag = next(tags.sys_tags())
         return tag.interpreter, tag.abi, tag.platform
@@ -295,9 +309,11 @@ setup(
     packages=find_namespace_packages(),
     package_data=package_datas,
     include_package_data=True,
+    distclass=BinaryDistribution,
     cmdclass={
         "egg_info": EggInfo,
         "build_py": BuildPy,
+        "install": BinaryInstall,
         "bdist_wheel": CustomBdistWheel,
     },
     entry_points={

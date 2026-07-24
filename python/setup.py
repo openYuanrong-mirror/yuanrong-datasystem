@@ -21,10 +21,10 @@ import stat
 import subprocess
 
 from pathlib import Path
-from setuptools import find_namespace_packages
-from setuptools import setup
+from setuptools import Distribution, find_namespace_packages, setup
 from setuptools.command.egg_info import egg_info
 from setuptools.command.build_py import build_py
+from setuptools.command.install import install
 from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 
 try:
@@ -142,17 +142,34 @@ class BuildPy(build_py):
     """Build py files."""
 
     def run(self):
-        datasystem_lib_dir = os.path.join(os.path.dirname(__file__), 'build', 'lib', 'yr', 'datasystem')
         super().run()
+        datasystem_lib_dir = os.path.join(self.build_lib, 'yr', 'datasystem')
         update_permissions(datasystem_lib_dir)
-        lib_dir = os.path.join(os.path.dirname(__file__), 'build', 'lib', 'yr', 'datasystem', 'lib')
+        lib_dir = os.path.join(datasystem_lib_dir, 'lib')
         lib_path = Path(lib_dir)
         for item in lib_path.rglob('*'):
             if item.name not in all_dependencies_for_datasystem:
                 item.unlink()
 
 
+class BinaryDistribution(Distribution):
+    def has_ext_modules(self):
+        return True
+
+
+class BinaryInstall(install):
+    """Install binary package modules into the platform library scheme."""
+
+    def finalize_options(self):
+        super().finalize_options()
+        self.install_lib = self.install_platlib
+
+
 class CustomBdistWheel(_bdist_wheel):
+    def finalize_options(self):
+        super().finalize_options()
+        self.root_is_pure = False
+
     def get_tag(self):
         tag = next(tags.sys_tags())
         return tag.interpreter, tag.abi, tag.platform
@@ -164,9 +181,11 @@ setup(
     packages=find_namespace_packages(),
     package_data=package_datas,
     include_package_data=True,
+    distclass=BinaryDistribution,
     cmdclass={
         'egg_info': EggInfo,
         'build_py': BuildPy,
+        'install': BinaryInstall,
         'bdist_wheel': CustomBdistWheel
     },
     install_requires=requires,
