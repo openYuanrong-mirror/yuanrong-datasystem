@@ -137,6 +137,7 @@ struct TopologyControllerDiagnostics {
     uint64_t topologyVersion{ 0 };
     int64_t topologyRevision{ 0 };
     std::optional<ActiveBatch> activeBatch;
+    uint64_t deadlineArmedEpoch{ 0 };
     size_t queuedEvents{ 0 };
     size_t dirtyDerivedOperations{ 0 };
     std::string lastError;
@@ -346,6 +347,9 @@ private:
     Status CommitScaleOutExhaustion(const TopologySnapshot &latest, const std::vector<MemberIdentity> &failedJoining,
                                     const std::vector<MembershipRecord> &memberships);
 
+    Status CommitInterruptedScaleInRecovery(const TopologySnapshot &latest,
+                                            const std::vector<MembershipRecord> &memberships, bool &recovered);
+
     Status CommitExpiredBatch(const TopologySnapshot &latest, const std::vector<MemberIdentity> &failedJoining,
                               const std::vector<MembershipRecord> &memberships);
 
@@ -353,7 +357,7 @@ private:
 
     Status TryStartBatchAfterCollection(const TopologySnapshot &latest, const TopologyState &state,
                                         const std::vector<MemberIdentity> &participants, TopologyChangeType type,
-                                        bool bootstrap);
+                                        bool bootstrap, const std::vector<MembershipRecord> &memberships);
 
     void ClearBatchCollectState(TopologyChangeType type, const char *reason);
 
@@ -362,7 +366,8 @@ private:
                                     std::vector<MemberIdentity> &joining) const;
 
     Status CommitBatchStart(const TopologySnapshot &latest, const TopologyState &state,
-                            const std::vector<MemberIdentity> &participants, TopologyChangeType type, bool bootstrap);
+                            const std::vector<MemberIdentity> &participants,
+                            const std::vector<MembershipRecord> &memberships, TopologyChangeType type, bool bootstrap);
 
     void LogBatchStart(const TopologySnapshot &latest, const TopologySnapshot &committed,
                        const std::vector<MemberIdentity> &participants, const char *action) const;

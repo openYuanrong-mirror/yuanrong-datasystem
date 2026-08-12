@@ -54,7 +54,7 @@ TEST(TopologyRepositoryCodecTest, TopologyRoundTripIsCanonical)
     input.version = 9;
     input.members = { Member{ { std::string(16, 'b'), "127.0.0.1:2" }, MemberState::JOINING, { 30, 40 } },
                       Member{ { std::string(16, 'a'), "127.0.0.1:1" }, MemberState::ACTIVE, { 10, 20 } } };
-    input.activeBatch = ActiveBatch{ TopologyChangeType::SCALE_OUT, 9 };
+    input.activeBatch = ActiveBatch{ TopologyChangeType::SCALE_OUT, 9, { { "127.0.0.1:2", 100 } } };
     std::string first;
     DS_ASSERT_OK(TopologyRepositoryCodec::EncodeTopology(input, first));
     TopologyState decoded;
@@ -63,6 +63,8 @@ TEST(TopologyRepositoryCodecTest, TopologyRoundTripIsCanonical)
     DS_ASSERT_OK(TopologyRepositoryCodec::EncodeTopology(decoded, second));
     EXPECT_EQ(first, second);
     EXPECT_EQ(decoded.members[0].identity.address, "127.0.0.1:1");
+    EXPECT_EQ(decoded.activeBatch->participantTimestampsByAddress,
+              input.activeBatch->participantTimestampsByAddress);
 }
 
 TEST(TopologyRepositoryCodecTest, TaskRoundTripDerivesSingleExecutor)
@@ -99,7 +101,7 @@ TEST(TopologyRepositoryCodecTest, AllowsRestartOnlyNotify)
 TEST(TopologyRepositoryCodecTest, ActiveTaskNotifyRoundTripIsCanonical)
 {
     TopologyTaskNotify input;
-    input.activeBatch = ActiveBatch{ TopologyChangeType::SCALE_OUT, 9 };
+    input.activeBatch = ActiveBatch{ TopologyChangeType::SCALE_OUT, 9, { { "127.0.0.1:2", 100 } } };
     input.taskIds = { "m-e9-0123456789abcdef0123456789abcdef" };
     input.restartTimestampsByAddress.emplace("127.0.0.1:2", 200);
     std::string first;
@@ -110,6 +112,8 @@ TEST(TopologyRepositoryCodecTest, ActiveTaskNotifyRoundTripIsCanonical)
     ASSERT_TRUE(output.activeBatch.has_value());
     EXPECT_EQ(output.activeBatch->type, input.activeBatch->type);
     EXPECT_EQ(output.activeBatch->epoch, input.activeBatch->epoch);
+    EXPECT_EQ(output.activeBatch->participantTimestampsByAddress,
+              input.activeBatch->participantTimestampsByAddress);
     EXPECT_EQ(output.taskIds, input.taskIds);
     EXPECT_EQ(output.restartTimestampsByAddress, input.restartTimestampsByAddress);
 

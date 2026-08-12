@@ -157,6 +157,11 @@
   candidates take priority over pending `PRE_LEAVING` ScaleIn candidates, so a replacement Worker reaches
   `JOINING`/`ACTIVE` before old committed owners enter ScaleIn. Once any batch is active, later ordinary candidates wait
   and never preempt it. Failure remains higher priority.
+- An ordinary ScaleIn records each participant's membership generation in the active batch. For a one-participant
+  batch, a later `RESTARTING`, `RECOVERING`, or `READY` generation proves that the old migration executor is gone: after
+  expiry the Controller rolls the batch back to stable `ACTIVE` ownership without changing identity or tokens. A
+  same-generation record and every multi-participant batch preserve the lossless wait because surviving executors have
+  not completed a distributed abort/drain protocol.
 - Repeated expected backend-access failures while already in `CONTROL_DEGRADED` still refresh the diagnostic
   `lastError`, but the warning log is sampled. State transitions and unexpected runtime failures remain unsampled.
 - Topology observability is carried by structured `CLUSTER_*` logs on the low-frequency control path: watch events and

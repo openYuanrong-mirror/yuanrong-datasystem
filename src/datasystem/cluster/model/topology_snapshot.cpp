@@ -118,6 +118,10 @@ Status ValidateAndCanonicalizeTopologyState(TopologyState &state)
     if (state.activeBatch.has_value()) {
         CHECK_FAIL_RETURN_STATUS(state.activeBatch->epoch > 0 && state.activeBatch->epoch <= state.version, K_INVALID,
                                  "invalid active batch epoch");
+        for (const auto &[address, timestamp] : state.activeBatch->participantTimestampsByAddress) {
+            RETURN_IF_NOT_OK(ValidateAddress(address));
+            CHECK_FAIL_RETURN_STATUS(timestamp > 0, K_INVALID, "invalid batch participant timestamp");
+        }
     }
     RETURN_IF_NOT_OK(ValidateBatchStates(state));
     std::sort(state.members.begin(), state.members.end(),

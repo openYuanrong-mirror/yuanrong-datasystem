@@ -75,6 +75,51 @@ TEST(TopologyPlanBuilderTest, StartsAndFinalizesOneMultiMemberScaleOutBatch)
                             [](const auto &member) { return member.state == MemberState::ACTIVE; }));
 }
 
+TEST(TopologyPlanBuilderTest, InterruptedScaleInRestoresCommittedOwners)
+{
+    HashAlgorithm algorithm;
+    TopologyPlanBuilder builder(algorithm);
+    TopologyState latest;
+    latest.version = 4;
+    latest.clusterHasInit = true;
+    latest.activeBatch = ActiveBatch{ TopologyChangeType::SCALE_IN, 4 };
+    latest.members = { MakeControlMember('a', "127.0.0.1:1", MemberState::LEAVING, { 10, 100 }),
+                       MakeControlMember('b', "127.0.0.1:2", MemberState::ACTIVE, { 50, 150 }),
+                       MakeControlMember('c', "127.0.0.1:3", MemberState::ACTIVE, { 75, 175 }) };
+
+    TopologyState recovered;
+    DS_ASSERT_OK(builder.BuildInterruptedScaleInRecovery(latest, recovered));
+
+    EXPECT_EQ(recovered.version, 5);
+    EXPECT_FALSE(recovered.activeBatch.has_value());
+    ASSERT_EQ(recovered.members.size(), 3);
+    EXPECT_EQ(recovered.members[0].identity, latest.members[0].identity);
+    EXPECT_EQ(recovered.members[0].tokens, latest.members[0].tokens);
+    EXPECT_EQ(recovered.members[0].state, MemberState::ACTIVE);
+    EXPECT_EQ(recovered.members[1].identity, latest.members[1].identity);
+    EXPECT_EQ(recovered.members[1].tokens, latest.members[1].tokens);
+    EXPECT_EQ(recovered.members[1].state, MemberState::ACTIVE);
+    EXPECT_EQ(recovered.members[2].identity, latest.members[2].identity);
+    EXPECT_EQ(recovered.members[2].tokens, latest.members[2].tokens);
+    EXPECT_EQ(recovered.members[2].state, MemberState::ACTIVE);
+}
+
+TEST(TopologyPlanBuilderTest, InterruptedScaleInRejectsMultipleLiveExecutors)
+{
+    HashAlgorithm algorithm;
+    TopologyPlanBuilder builder(algorithm);
+    TopologyState latest;
+    latest.version = 4;
+    latest.clusterHasInit = true;
+    latest.activeBatch = ActiveBatch{ TopologyChangeType::SCALE_IN, 4 };
+    latest.members = { MakeControlMember('a', "127.0.0.1:1", MemberState::LEAVING, { 10, 100 }),
+                       MakeControlMember('b', "127.0.0.1:2", MemberState::LEAVING, { 50, 150 }),
+                       MakeControlMember('c', "127.0.0.1:3", MemberState::ACTIVE, { 75, 175 }) };
+
+    TopologyState recovered;
+    EXPECT_TRUE(builder.BuildInterruptedScaleInRecovery(latest, recovered).IsError());
+}
+
 TEST(TopologyPlanBuilderTest, FailurePreemptsOrdinaryBatchWithoutRollingBackJoiningFacts)
 {
     HashAlgorithm algorithm;

@@ -283,7 +283,7 @@ Status TopologyTaskMaterializer::BuildExpected(const TopologySnapshot &latest, c
         std::visit(
             [&](const auto &value) {
                 auto &notify = built.notifiesByAddress[value.executorAddress];
-                notify.activeBatch = ActiveBatch{ type, epoch };
+                notify.activeBatch = latest.GetActiveBatch();
                 notify.taskIds.push_back(value.taskId);
             },
             task);

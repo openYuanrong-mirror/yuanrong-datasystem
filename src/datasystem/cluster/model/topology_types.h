@@ -82,9 +82,19 @@ struct Member {
 struct ActiveBatch {
     TopologyChangeType type{ TopologyChangeType::SCALE_OUT };
     uint64_t epoch{ 0 };
+    std::map<std::string, int64_t> participantTimestampsByAddress;
+
+    ActiveBatch() = default;
+    ActiveBatch(TopologyChangeType batchType, uint64_t batchEpoch,
+                std::map<std::string, int64_t> timestamps = {})
+        : type(batchType), epoch(batchEpoch), participantTimestampsByAddress(std::move(timestamps))
+    {
+    }
+
     bool operator==(const ActiveBatch &other) const noexcept
     {
-        return type == other.type && epoch == other.epoch;
+        return type == other.type && epoch == other.epoch
+               && participantTimestampsByAddress == other.participantTimestampsByAddress;
     }
     bool operator!=(const ActiveBatch &other) const noexcept
     {

@@ -61,6 +61,7 @@ enum TypePb {
 message ChangeBatchPb {
   TypePb type = 1;
   uint64 epoch = 2;
+  map<string, int64> participant_timestamps_by_address = 3;
 }
 
 message TaskNotifyPb {

@@ -164,19 +164,30 @@ Status ValidateRestartFacts(const std::map<std::string, int64_t> &restartTimesta
 Status EncodeActiveBatch(const ActiveBatch &activeBatch, ::datasystem::ChangeBatchPb &output)
 {
     CHECK_FAIL_RETURN_STATUS(activeBatch.epoch > 0, K_INVALID, "notify batch epoch must be positive");
-    ::datasystem::TypePb typePb;
+    ::datasystem::TypePb typePb{ ::datasystem::SCALE_OUT };
     RETURN_IF_NOT_OK(ToPbType(activeBatch.type, typePb));
     output.set_type(typePb);
     output.set_epoch(activeBatch.epoch);
+    for (const auto &[address, timestamp] : activeBatch.participantTimestampsByAddress) {
+        RETURN_IF_NOT_OK(ValidateMemberAddress(address));
+        CHECK_FAIL_RETURN_STATUS(timestamp > 0, K_INVALID, "batch participant timestamp must be positive");
+        (*output.mutable_participant_timestamps_by_address())[address] = timestamp;
+    }
     return Status::OK();
 }
 
 Status DecodeActiveBatch(const ::datasystem::ChangeBatchPb &input, ActiveBatch &activeBatch)
 {
     CHECK_FAIL_RETURN_STATUS(input.epoch() > 0, K_INVALID, "notify batch epoch must be positive");
-    TopologyChangeType type;
+    TopologyChangeType type{ TopologyChangeType::SCALE_OUT };
     RETURN_IF_NOT_OK(FromPbType(input.type(), type));
-    activeBatch = ActiveBatch{ type, input.epoch() };
+    std::map<std::string, int64_t> timestamps;
+    for (const auto &[address, timestamp] : input.participant_timestamps_by_address()) {
+        RETURN_IF_NOT_OK(ValidateMemberAddress(address));
+        CHECK_FAIL_RETURN_STATUS(timestamp > 0, K_INVALID, "batch participant timestamp must be positive");
+        timestamps.emplace(address, timestamp);
+    }
+    activeBatch = ActiveBatch{ type, input.epoch(), std::move(timestamps) };
     return Status::OK();
 }
 }  // namespace
@@ -198,10 +209,7 @@ Status TopologyRepositoryCodec::EncodeTopology(const TopologyState &state, std::
         }
     }
     if (canonical.activeBatch.has_value()) {
-        ::datasystem::TypePb typePb;
-        RETURN_IF_NOT_OK(ToPbType(canonical.activeBatch->type, typePb));
-        pb.mutable_active_batch()->set_type(typePb);
-        pb.mutable_active_batch()->set_epoch(canonical.activeBatch->epoch);
+        RETURN_IF_NOT_OK(EncodeActiveBatch(*canonical.activeBatch, *pb.mutable_active_batch()));
     }
     return SerializeCanonical(pb, value);
 }
@@ -234,9 +242,9 @@ Status TopologyRepositoryCodec::DecodeTopology(const std::string &value, Topolog
         decoded.members.emplace_back(std::move(member));
     }
     if (pb.has_active_batch()) {
-        TopologyChangeType type;
-        RETURN_IF_NOT_OK(FromPbType(pb.active_batch().type(), type));
-        decoded.activeBatch = ActiveBatch{ type, pb.active_batch().epoch() };
+        ActiveBatch activeBatch;
+        RETURN_IF_NOT_OK(DecodeActiveBatch(pb.active_batch(), activeBatch));
+        decoded.activeBatch = std::move(activeBatch);
     }
     RETURN_IF_NOT_OK(ValidateAndCanonicalizeTopologyState(decoded));
     state = std::move(decoded);

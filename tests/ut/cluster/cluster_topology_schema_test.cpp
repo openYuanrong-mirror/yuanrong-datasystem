@@ -80,9 +80,11 @@ TEST(ClusterTopologySchemaTest, FreezesTaskAndBatchSchema)
     ExpectField(remove, "recovery_ranges", 2);
 
     const auto *batch = ChangeBatchPb::descriptor();
-    ASSERT_EQ(batch->field_count(), 2);
+    ASSERT_EQ(batch->field_count(), 3);
     ExpectField(batch, "type", 1);
     ExpectField(batch, "epoch", 2);
+    ExpectField(batch, "participant_timestamps_by_address", 3);
+    EXPECT_TRUE(batch->FindFieldByName("participant_timestamps_by_address")->is_map());
 
     const auto *type = batch->file()->FindEnumTypeByName("TypePb");
     ASSERT_NE(type, nullptr);

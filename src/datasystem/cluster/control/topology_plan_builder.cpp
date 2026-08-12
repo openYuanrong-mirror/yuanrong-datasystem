@@ -258,6 +258,23 @@ Status TopologyPlanBuilder::BuildScaleInFinal(const TopologyState &latest, Topol
     return Status::OK();
 }
 
+Status TopologyPlanBuilder::BuildInterruptedScaleInRecovery(const TopologyState &latest, TopologyState &next) const
+{
+    RETURN_IF_NOT_OK(ValidateBatch(latest, TopologyChangeType::SCALE_IN));
+    CHECK_FAIL_RETURN_STATUS(MembersInState(latest, MemberState::LEAVING).size() == 1, K_INVALID,
+                             "interrupted ScaleIn recovery requires one leaving member");
+    TopologyState built = latest;
+    for (auto &member : built.members) {
+        if (member.state == MemberState::LEAVING) {
+            member.state = MemberState::ACTIVE;
+        }
+    }
+    built.version = latest.version + 1;
+    built.activeBatch.reset();
+    next = std::move(built);
+    return Status::OK();
+}
+
 Status TopologyPlanBuilder::BuildFailureFinal(const TopologyState &latest, TopologyState &next) const
 {
     RETURN_IF_NOT_OK(ValidateBatch(latest, TopologyChangeType::FAILURE));
