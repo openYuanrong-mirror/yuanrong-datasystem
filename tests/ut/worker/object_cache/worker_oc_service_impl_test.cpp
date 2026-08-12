@@ -550,6 +550,16 @@ protected:
     std::shared_ptr<WorkerOcServiceClearDataFlow> dataClearImpl_;
 };
 
+TEST_F(WorkerOcServiceImplTest, RestartReconciliationIsDisabledByDefault)
+{
+    ASSERT_FALSE(FLAGS_enable_reconciliation);
+    auto restartImpl = std::make_shared<WorkerOCServiceImpl>(
+        localAddress_, localAddress_, objectTable_, nullptr, evictionManager_, nullptr, nullptr, nullptr,
+        topologyRuntime_.Engine(), metadataRoute_, topologyRuntime_.Engine()->Membership(), &exitRequested_, true, true);
+
+    EXPECT_TRUE(restartImpl->reconciliationReady_.load(std::memory_order_acquire));
+}
+
 TEST_F(WorkerOcServiceImplTest, MultiPublishCreateMultiMetaFollowsRedirectToTarget)
 {
     ScopedRequestContext requestContext;

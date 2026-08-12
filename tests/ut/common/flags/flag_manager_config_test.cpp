@@ -187,5 +187,16 @@ TEST_F(FlagManagerConfigTest, DefaultConfigTemplatesDisableLogCompression)
     ExpectLineMatches("k8s/helm_chart/datasystem/values.yaml", logCompressFalseLine);
 }
 
+TEST_F(FlagManagerConfigTest, ReconciliationDefaultsMatchDeploymentPolicy)
+{
+    ExpectJsonConfigValue("cli/deploy/conf/worker_config.json", "enable_reconciliation", "false");
+    ExpectJsonConfigValue("k8s_deployment/helm_chart/worker.config", "enable_reconciliation", "true");
+    const std::regex reconciliationTrueLine(R"((^|\n)\s*enableReconciliation:\s*true\s*($|\n))");
+    ExpectLineMatches("k8s/helm_chart/datasystem/values.yaml", reconciliationTrueLine);
+    const std::regex reconciliationArgument(
+        R"(-enable_reconciliation=\{\{\s*\$\.Values\.global\.reliability\.enableReconciliation\s*\}\})");
+    ExpectLineMatches("k8s/helm_chart/datasystem/templates/worker_daemonset.yaml", reconciliationArgument);
+}
+
 }  // namespace ut
 }  // namespace datasystem
