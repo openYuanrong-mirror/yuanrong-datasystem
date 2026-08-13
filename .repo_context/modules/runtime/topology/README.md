@@ -160,6 +160,8 @@
 - An ordinary ScaleIn records each participant's membership generation in the active batch. For a one-participant
   batch, a later `RESTARTING`, `RECOVERING`, or `READY` generation proves that the old migration executor is gone: after
   expiry the Controller rolls the batch back to stable `ACTIVE` ownership without changing identity or tokens. A
+  restarted Worker that already observed the old drain reopens its process-local write and incoming-migration admission
+  when that stable `ACTIVE` snapshot is published, even if an older admitted migration is still completing. A
   same-generation record and every multi-participant batch preserve the lossless wait because surviving executors have
   not completed a distributed abort/drain protocol.
 - Repeated expected backend-access failures while already in `CONTROL_DEGRADED` still refresh the diagnostic

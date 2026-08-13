@@ -1715,6 +1715,13 @@ void WorkerOCServer::ReconcileUbAdmissionTopology(const cluster::TopologySnapsho
 void WorkerOCServer::HandleTopologySnapshotPublished(std::shared_ptr<const cluster::TopologySnapshot> snapshot)
 {
     if (snapshot != nullptr) {
+        const cluster::Member *local = nullptr;
+        if (!snapshot->GetActiveBatch().has_value()
+            && snapshot->FindMemberByAddress(hostPort_.ToString(), local).IsOk() && local != nullptr
+            && local->state == cluster::MemberState::ACTIVE && objCacheClientWorkerSvc_ != nullptr) {
+            LOG_IF_ERROR(objCacheClientWorkerSvc_->RestoreTopologyScaleInAdmission(),
+                         "Restore local admission after interrupted ScaleIn failed");
+        }
         CleanupRpcStubsForFailedMembers(*snapshot);
         ReconcileUbAdmissionTopology(*snapshot);
     }

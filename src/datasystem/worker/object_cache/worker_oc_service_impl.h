@@ -292,6 +292,9 @@ public:
      */
     Status CloseIncomingMigrationAdmissionAndWait(std::chrono::steady_clock::time_point deadline);
 
+    /** Restore local write and migration admission after an interrupted topology ScaleIn. */
+    Status RestoreTopologyScaleInAdmission();
+
     /**
      * @brief Migrate data when voluntary scale down happen.
      * @param[in] objectKeys Need migrate data object key list.

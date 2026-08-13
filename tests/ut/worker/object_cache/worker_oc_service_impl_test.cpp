@@ -2145,5 +2145,24 @@ TEST_F(WorkerOcServiceImplTest, DrainWaitsForIncomingMigrationBeforeSnapshotColl
     EXPECT_EQ(inject::GetExecuteCount(snapshotPoint), 1U);
 }
 
+TEST_F(WorkerOcServiceImplTest, RestoreTopologyScaleInAdmissionReopensMigrationGate)
+{
+    ASSERT_NE(impl_->gMigrateProc_, nullptr);
+    DS_ASSERT_OK(topologyRuntime_.StartWithActiveLocalMember(localAddress_));
+    DS_ASSERT_OK(impl_->gMigrateProc_->AcquireIncomingMigrationAdmission(false));
+    EXPECT_EQ(impl_->gMigrateProc_->CloseIncomingMigrationAdmissionAndWait(std::chrono::steady_clock::now()).GetCode(),
+              StatusCode::K_RPC_DEADLINE_EXCEEDED);
+    impl_->topologyScaleInDataDrainStarted_.store(true, std::memory_order_release);
+
+    DS_ASSERT_OK(impl_->RestoreTopologyScaleInAdmission());
+
+    EXPECT_FALSE(impl_->MigrateDataStarted());
+    EXPECT_FALSE(impl_->gMigrateProc_->IsIncomingMigrationAdmissionClosed());
+    EXPECT_FALSE(impl_->gMigrateProc_->IsIncomingMigrationDrainTimedOut());
+    DS_ASSERT_OK(impl_->gMigrateProc_->AcquireIncomingMigrationAdmission(false));
+    impl_->gMigrateProc_->ReleaseIncomingMigrationAdmission();
+    impl_->gMigrateProc_->ReleaseIncomingMigrationAdmission();
+}
+
 }  // namespace ut
 }  // namespace datasystem

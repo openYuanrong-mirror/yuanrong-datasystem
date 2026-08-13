@@ -211,6 +211,14 @@ Status WorkerOcServiceMigrateImpl::CloseIncomingMigrationAdmissionAndWait(
     return Status::OK();
 }
 
+Status WorkerOcServiceMigrateImpl::ReopenIncomingMigrationAdmission()
+{
+    std::lock_guard<std::mutex> lock(incomingMigrationMutex_);
+    incomingMigrationDrainTimedOut_.store(false, std::memory_order_release);
+    incomingMigrationAdmissionClosed_.store(false, std::memory_order_release);
+    return Status::OK();
+}
+
 Status WorkerOcServiceMigrateImpl::MigrateData(const MigrateDataReqPb &req, MigrateDataRspPb &rsp,
                                                std::vector<RpcMessage> payloads)
 {

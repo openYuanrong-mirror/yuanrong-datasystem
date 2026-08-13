@@ -1049,6 +1049,18 @@ Status WorkerOCServiceImpl::CloseIncomingMigrationAdmissionAndWait(std::chrono::
     return gMigrateProc_->CloseIncomingMigrationAdmissionAndWait(deadline);
 }
 
+Status WorkerOCServiceImpl::RestoreTopologyScaleInAdmission()
+{
+    if (!topologyScaleInDataDrainStarted_.load(std::memory_order_acquire)) {
+        return Status::OK();
+    }
+    RETURN_OK_IF_TRUE(gMigrateProc_ == nullptr);
+    RETURN_IF_NOT_OK(gMigrateProc_->ReopenIncomingMigrationAdmission());
+    topologyScaleInDataDrainStarted_.store(false, std::memory_order_release);
+    LOG(WARNING) << "CLUSTER_SCALE_IN action=restore_local_admission address=" << localAddress_.ToString();
+    return Status::OK();
+}
+
 Status WorkerOCServiceImpl::MigrateData(const std::vector<std::string> &objectKeys, const std::string &taskId)
 {
     DataMigrator migrator(MigrateType::SCALE_DOWN, metadataRoute_, membership_, endpointPolicy_,
