@@ -259,7 +259,8 @@ Status TopologyRepository::ReadMemberships(std::vector<MembershipRecord> &member
     for (const auto &[address, bytes] : values) {
         MembershipValue value;
         RETURN_IF_NOT_OK(MembershipValueCodec::Decode(bytes, value));
-        decoded.emplace_back(MembershipRecord{ address, value.lifecycleState, value.timestamp, value.hostId });
+        decoded.emplace_back(MembershipRecord{ address, value.lifecycleState, value.timestamp, value.hostId,
+                                               value.processIncarnation });
     }
     std::sort(decoded.begin(), decoded.end(),
               [](const auto &left, const auto &right) { return left.address < right.address; });

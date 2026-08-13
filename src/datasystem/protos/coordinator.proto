@@ -180,6 +180,7 @@ message WorkerServiceInfoPb {
   StatePb state = 2;
   string host_id = 3;
   string compatibility_version = 4;
+  bytes process_incarnation = 5;
 }
 
 message RangeReqPb {

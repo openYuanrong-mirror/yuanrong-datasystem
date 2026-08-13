@@ -157,6 +157,16 @@
   candidates take priority over pending `PRE_LEAVING` ScaleIn candidates, so a replacement Worker reaches
   `JOINING`/`ACTIVE` before old committed owners enter ScaleIn. Once any batch is active, later ordinary candidates wait
   and never preempt it. Failure remains higher priority.
+- For a one-participant ordinary ScaleIn, a `RESTARTING`, `RECOVERING`, or `READY` membership whose derived opaque
+  identity differs from the topology's `LEAVING` identity proves that the old migration executor is gone. A replacement
+  observed during `PRE_LEAVING` cancels that old candidate; after an active batch expires, Controller rolls it back to
+  stable `ACTIVE` ownership re-anchored to the replacement identity without changing tokens. Before publishing the
+  stable Snapshot, Worker cancels
+  and drains the stale executor epoch, then reopens process-local write and incoming-migration admission. A matching
+  identity and every multi-participant batch preserve the lossless wait because surviving executors have not completed
+  a distributed abort/drain protocol. Process identity uses an optional membership-only incarnation while preserving
+  the legacy timestamp for rolling-upgrade ordering; it does not extend task-notify wire contracts or add per-task
+  participant metadata.
 - Repeated expected backend-access failures while already in `CONTROL_DEGRADED` still refresh the diagnostic
   `lastError`, but the warning log is sampled. State transitions and unexpected runtime failures remain unsampled.
 - Topology observability is carried by structured `CLUSTER_*` logs on the low-frequency control path: watch events and

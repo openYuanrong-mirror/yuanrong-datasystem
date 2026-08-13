@@ -1142,6 +1142,34 @@ TEST(DsCoordinationBackendSessionTest, EnsureTransactionCannotReplayRecoveringAf
     EXPECT_TRUE(backend.ShutdownEventSources().IsOk());
 }
 
+TEST(DsCoordinationBackendSessionTest, MembershipRejoinPreservesProcessIdentity)
+{
+    DeterministicCoordinatorProxy proxy;
+    proxy.SetKeepAliveStatus(Status::OK());
+    DsCoordinationBackend backend(&proxy, WATCHER_ADDRESS);
+    ASSERT_TRUE(backend.InitKeepAlive("/datasystem/c/cluster", WATCHER_ADDRESS, false, true).IsOk());
+
+    MembershipValue initial;
+    ASSERT_TRUE(ReadRenewalValue(backend, initial).IsOk());
+    ASSERT_TRUE(
+        backend
+            .EnsureMembership(
+                COORDINATOR_A,
+                [&](const DsCoordinationBackend::MembershipRenewalPayload &payload, int64_t &membershipModRevision) {
+                    MembershipValue rejoining;
+                    RETURN_IF_NOT_OK(MembershipValueCodec::Decode(payload.encodedValue, rejoining));
+                    CHECK_FAIL_RETURN_STATUS(rejoining.lifecycleState == MemberLifecycleState::RESTARTING, K_INVALID,
+                                             "Ensure did not mark membership RESTARTING");
+                    CHECK_FAIL_RETURN_STATUS(rejoining.timestamp == initial.timestamp, K_INVALID,
+                                             "Membership rejoin changed process identity");
+                    membershipModRevision = 1;
+                    return Status::OK();
+                },
+                true)
+            .IsOk());
+    EXPECT_TRUE(backend.ShutdownEventSources().IsOk());
+}
+
 TEST(DsCoordinationBackendSessionTest, FailedExitIntentFencesReconciliationAndEnsurePayload)
 {
     DeterministicCoordinatorProxy proxy;

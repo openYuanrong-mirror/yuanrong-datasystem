@@ -17,6 +17,8 @@
 
 #include "datasystem/common/kvstore/etcd/etcd_store.h"
 
+#include "datasystem/cluster/membership/membership_value_codec.h"
+
 #include <csignal>
 #include <etcd/api/mvccpb/kv.pb.h>
 #include <sstream>
@@ -483,10 +485,7 @@ Status EtcdStore::AutoCreate()
     INJECT_POINT("AutoCreate");
     std::lock_guard<std::timed_mutex> mutationLock(membershipMutationMutex_);
     LOG(INFO) << "Sending cluster node to etcd and establish lease.";
-    // set timestamp before each put
-    int64_t timeStamp = std::chrono::system_clock::now().time_since_epoch().count();
     cluster::MemberServiceInfo value = keepAliveValue_;
-    value.timestamp = timeStamp;
     if (exitMembershipRequested_.load(std::memory_order_acquire)) {
         value.state = cluster::MemberLifecycleState::EXITING;
     }
@@ -531,8 +530,8 @@ Status EtcdStore::InitKeepAlive(const std::string &tableName, const std::string 
             LOG(INFO) << "Host id is " << hostId << " from env " << FLAGS_host_id_env_name;
         }
     }
-    // The timestamp is replaced when the first lease connection is established.
-    keepAliveValue_.timestamp = 0;
+    keepAliveValue_.timestamp = std::chrono::system_clock::now().time_since_epoch().count();
+    keepAliveValue_.processIncarnation = cluster::MembershipValueCodec::NewProcessIncarnation();
     keepAliveValue_.hostId = hostId;
     keepAliveValue_.compatibilityVersion = CompatibilityManager::Instance().GetCurrentCompatibilityVersion().ToString();
     if (!isEtcdAvailableWhenStart) {

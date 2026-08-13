@@ -54,6 +54,11 @@ public:
      * @return K_OK on success; K_INVALID for malformed or unsupported input.
      */
     static Status Decode(const std::string &bytes, MembershipValue &value);
+
+    /**
+     * @brief Generate one positive opaque process incarnation for the legacy timestamp field.
+     */
+    static std::string NewProcessIncarnation();
 };
 
 }  // namespace datasystem::cluster

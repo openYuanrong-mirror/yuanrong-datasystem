@@ -550,6 +550,7 @@ Status TopologyTaskExecutor::SubmitCallback(const TopologyTask &task, TopologyEx
         });
     } catch (const std::exception &error) {
         --callbackBodies_;
+        --epochCallbackBodies_;
         auto iter = operations_.find(operation);
         if (iter != operations_.end()) {
             ReleaseInFlightLocked(iter->second);
@@ -564,6 +565,7 @@ Status TopologyTaskExecutor::SubmitCallback(const TopologyTask &task, TopologyEx
         RETURN_STATUS(K_RUNTIME_ERROR, std::string("enqueue topology callback failed: ") + error.what());
     } catch (...) {
         --callbackBodies_;
+        --epochCallbackBodies_;
         auto iter = operations_.find(operation);
         if (iter != operations_.end()) {
             ReleaseInFlightLocked(iter->second);
@@ -638,6 +640,7 @@ Status TopologyTaskExecutor::AdmitCallbackLocked(const TopologyTask &task, const
     ++state.attempts;
     ++inFlightOperations_;
     ++callbackBodies_;
+    ++epochCallbackBodies_;
     diagnostics_.queuedCallbacks = callbackBodies_;
     diagnostics_.inFlightCallbacks = inFlightOperations_;
     if (fence.phase == TopologyCallbackPhase::SCALE_IN && !allowScaleInDataDrain) {
@@ -757,6 +760,7 @@ void TopologyTaskExecutor::FinishCallbackBody(TopologyCallbackPhase phase, const
 {
     std::lock_guard<std::mutex> lock(mutex_);
     --callbackBodies_;
+    --epochCallbackBodies_;
     diagnostics_.queuedCallbacks = callbackBodies_;
     drained_.notify_all();
     if (submitStatus.IsError()) {
@@ -852,6 +856,7 @@ Status TopologyTaskExecutor::SubmitCleanupApply(const TopologyExecutionFence &fe
         CHECK_FAIL_RETURN_STATUS(iter != operations_.end() && iter->second.cancellation != nullptr, K_INVALID,
                                  "topology cleanup operation is no longer in flight");
         ++callbackBodies_;
+        ++epochCallbackBodies_;
         diagnostics_.queuedCallbacks = callbackBodies_;
         try {
             auto traceID = Trace::Instance().GetTraceID();
@@ -865,11 +870,13 @@ Status TopologyTaskExecutor::SubmitCleanupApply(const TopologyExecutionFence &fe
                 });
         } catch (const std::exception &error) {
             --callbackBodies_;
+            --epochCallbackBodies_;
             diagnostics_.queuedCallbacks = callbackBodies_;
             drained_.notify_all();
             return Status(K_TRY_AGAIN, std::string("enqueue topology cleanup effect failed: ") + error.what());
         } catch (...) {
             --callbackBodies_;
+            --epochCallbackBodies_;
             diagnostics_.queuedCallbacks = callbackBodies_;
             drained_.notify_all();
             return Status(K_TRY_AGAIN, "enqueue topology cleanup effect failed with an unknown exception");
@@ -1373,6 +1380,33 @@ Status TopologyTaskExecutor::Stop(std::chrono::steady_clock::time_point deadline
     diagnostics_.running = false;
     diagnostics_.inFlightCallbacks = 0;
     return drainStatus;
+}
+
+Status TopologyTaskExecutor::CancelCurrentEpochAndDrain()
+{
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (!started_ || currentEpoch_ == 0) {
+        return Status::OK();
+    }
+    for (auto &[operation, state] : operations_) {
+        if (state.cancellation != nullptr) {
+            state.cancellation->Cancel();
+        }
+    }
+    const auto deadline = std::chrono::steady_clock::now() + options_.ordinaryDrain;
+    CHECK_FAIL_RETURN_STATUS(drained_.wait_until(lock, deadline, [this] { return epochCallbackBodies_ == 0; }),
+                             K_RPC_DEADLINE_EXCEEDED,
+                             "stale topology callback drain deadline exceeded before stable Snapshot publication");
+    diagnostics_.cancelled += inFlightOperations_;
+    operations_.clear();
+    scheduledOperations_.clear();
+    inFlightOperations_ = 0;
+    ordinaryDeadlineByMember_.clear();
+    failureDeadlineByEpoch_.clear();
+    scaleInMetadataPendingByGate_.clear();
+    currentEpoch_ = 0;
+    diagnostics_.inFlightCallbacks = 0;
+    return Status::OK();
 }
 
 TopologyTaskExecutorDiagnostics TopologyTaskExecutor::GetDiagnostics() const

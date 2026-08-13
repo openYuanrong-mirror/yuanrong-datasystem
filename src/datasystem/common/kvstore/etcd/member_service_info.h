@@ -22,6 +22,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 
 #include "datasystem/protos/coordinator.pb.h"
 #include "datasystem/cluster/membership/membership_types.h"
@@ -30,10 +31,22 @@
 namespace datasystem::cluster {
 
 struct MemberServiceInfo {
+    MemberServiceInfo() = default;
+    MemberServiceInfo(int64_t timestamp, MemberLifecycleState state, std::string hostId,
+                      std::string compatibilityVersion, std::string processIncarnation = {})
+        : timestamp(timestamp),
+          state(state),
+          hostId(std::move(hostId)),
+          compatibilityVersion(std::move(compatibilityVersion)),
+          processIncarnation(std::move(processIncarnation))
+    {
+    }
+
     int64_t timestamp = 0;
     MemberLifecycleState state = MemberLifecycleState::UNKNOWN;
     std::string hostId;
     std::string compatibilityVersion;
+    std::string processIncarnation;
 
     std::string ToString() const;
     static Status FromString(const std::string &str, MemberServiceInfo &value);

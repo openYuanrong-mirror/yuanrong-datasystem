@@ -107,6 +107,9 @@ public:
      */
     Status CloseIncomingMigrationAdmissionAndWait(std::chrono::steady_clock::time_point deadline);
 
+    /** Reopen admission after an interrupted topology ScaleIn returns this Worker to ACTIVE. */
+    Status ReopenIncomingMigrationAdmission();
+
     /**
      * @brief Whether the admission gate has been closed by CloseIncomingMigrationAdmissionAndWait.
      * @return true once the drain starts; admitted requests use this to short-circuit.

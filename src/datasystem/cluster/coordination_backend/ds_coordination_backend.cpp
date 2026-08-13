@@ -462,6 +462,7 @@ Status DsCoordinationBackend::InitKeepAlive(const std::string &tableName, const 
     keepAliveIntervalMs_ = static_cast<int64_t>(FLAGS_node_timeout_s) * MS_PER_SECOND / KEEP_ALIVE_INTERVAL_DIVISOR;
     // Keep one process incarnation across ambiguous lease-publication retries.
     keepAliveValue_.timestamp = std::chrono::system_clock::now().time_since_epoch().count();
+    keepAliveValue_.processIncarnation = MembershipValueCodec::NewProcessIncarnation();
     keepAliveValue_.hostId = hostId;
     keepAliveValue_.compatibilityVersion = CompatibilityManager::Instance().GetCurrentCompatibilityVersion().ToString();
     keepAliveValue_.lifecycleState = !isStoreAvailableWhenStart ? MemberLifecycleState::DOWNGRADE_RESTARTING
@@ -1136,7 +1137,6 @@ Status DsCoordinationBackend::EnsureMembership(const std::string &coordinatorId,
     if (markRestarting && !exitMembershipRequested_.load(std::memory_order_acquire)) {
         std::lock_guard<std::mutex> lock(keepAliveMutex_);
         keepAliveValue_.lifecycleState = MemberLifecycleState::RESTARTING;
-        keepAliveValue_.timestamp = std::chrono::system_clock::now().time_since_epoch().count();
     }
     MembershipRenewalPayload payload;
     RETURN_IF_NOT_OK(GetMembershipRenewalPayload(payload));

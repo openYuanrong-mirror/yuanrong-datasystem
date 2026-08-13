@@ -45,10 +45,19 @@ constexpr std::array<LifecycleCase, 6> LIFECYCLE_CASES = {
     LifecycleCase{ MemberLifecycleState::DOWNGRADE_RESTARTING, coordinator::WorkerServiceInfoPb::DOWNGRADE_RESTART },
 };
 
+TEST(MembershipContractTest, ProcessIncarnationsAreOpaqueAndDistinct)
+{
+    const auto first = MembershipValueCodec::NewProcessIncarnation();
+    const auto second = MembershipValueCodec::NewProcessIncarnation();
+    EXPECT_EQ(first.size(), 36U);
+    EXPECT_EQ(second.size(), 36U);
+    EXPECT_NE(first, second);
+}
+
 TEST(MembershipContractTest, PreservesMasterGoldenPayloadForEveryWireState)
 {
     for (const auto &testCase : LIFECYCLE_CASES) {
-        MembershipValue input{ 123456, testCase.state, "host-a", "v1" };
+        MembershipValue input{ 123456, testCase.state, "host-a", "v1", std::string(16, 'i') };
         std::string bytes;
         DS_ASSERT_OK(MembershipValueCodec::Encode(input, bytes));
 
@@ -58,6 +67,7 @@ TEST(MembershipContractTest, PreservesMasterGoldenPayloadForEveryWireState)
         EXPECT_EQ(wire.state(), testCase.statePb);
         EXPECT_EQ(wire.host_id(), input.hostId);
         EXPECT_EQ(wire.compatibility_version(), input.compatibilityVersion);
+        EXPECT_EQ(wire.process_incarnation(), input.processIncarnation);
 
         MembershipValue output;
         DS_ASSERT_OK(MembershipValueCodec::Decode(bytes, output));
@@ -65,6 +75,7 @@ TEST(MembershipContractTest, PreservesMasterGoldenPayloadForEveryWireState)
         EXPECT_EQ(output.lifecycleState, input.lifecycleState);
         EXPECT_EQ(output.hostId, input.hostId);
         EXPECT_EQ(output.compatibilityVersion, input.compatibilityVersion);
+        EXPECT_EQ(output.processIncarnation, input.processIncarnation);
     }
 }
 

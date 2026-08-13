@@ -1064,8 +1064,7 @@ TEST(TopologyEngineTest, MatchingPeerOutageEvidenceEntersControlDegraded)
     proxy.FailRangeForKeyTimes(TopologyStorageKey(*keys), K_RPC_UNAVAILABLE, 100);
     DS_ASSERT_OK(EmitTopologyEvent(proxy, ingress, *keys, 2));
     ASSERT_TRUE(WaitFor([&] { return engine->GetAvailability() == TopologyAvailabilityLevel::CONTROL_DEGRADED; }));
-    ASSERT_TRUE(WaitFor([&] { return probeCalls.load() > 0; }));
-    EXPECT_EQ(probedPeers.load(), 3U);
+    ASSERT_TRUE(WaitFor([&] { return probeCalls.load() > 0 && probedPeers.load() == 3U; }));
     EXPECT_EQ(engine->GetControlBackendObservation().state, ControlBackendState::UNAVAILABLE);
     DS_ASSERT_OK(engine->Shutdown(std::chrono::steady_clock::now() + TEST_WAIT));
 }

@@ -19,6 +19,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 
 namespace datasystem::cluster {
 
@@ -40,20 +41,44 @@ enum class MemberLifecycleState {
  * @brief Master-compatible backend membership payload before address-key projection.
  */
 struct MembershipValue {
+    MembershipValue() = default;
+    MembershipValue(int64_t timestamp, MemberLifecycleState lifecycleState, std::string hostId,
+                    std::string compatibilityVersion, std::string processIncarnation = {})
+        : timestamp(timestamp),
+          lifecycleState(lifecycleState),
+          hostId(std::move(hostId)),
+          compatibilityVersion(std::move(compatibilityVersion)),
+          processIncarnation(std::move(processIncarnation))
+    {
+    }
+
     int64_t timestamp = 0;
     MemberLifecycleState lifecycleState = MemberLifecycleState::UNKNOWN;
     std::string hostId;
     std::string compatibilityVersion;
+    std::string processIncarnation;
 };
 
 /**
  * @brief Authoritative value read from `/cluster/{address}`.
  */
 struct MembershipRecord {
+    MembershipRecord() = default;
+    MembershipRecord(std::string address, MemberLifecycleState state, int64_t timestamp, std::string hostId,
+                     std::string processIncarnation = {})
+        : address(std::move(address)),
+          state(state),
+          timestamp(timestamp),
+          hostId(std::move(hostId)),
+          processIncarnation(std::move(processIncarnation))
+    {
+    }
+
     std::string address;
     MemberLifecycleState state{ MemberLifecycleState::STARTING };
     int64_t timestamp{ 0 };
     std::string hostId;
+    std::string processIncarnation;
 };
 
 /**

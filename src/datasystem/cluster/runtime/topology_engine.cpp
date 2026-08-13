@@ -1172,6 +1172,17 @@ Status TopologyEngine::ReloadTopology(bool fullRebuildAllowed)
         }
         return rc;
     }
+    const bool stableAdvancesCurrent = !candidate->GetActiveBatch().has_value()
+                                       && (!hasPrevious || candidate->Version() > previous->Version()
+                                           || (candidate->Version() == previous->Version()
+                                               && candidate->CanonicalDigest() == previous->CanonicalDigest()));
+    if (stableAdvancesCurrent) {
+        auto drainStatus = executor_.CancelCurrentEpochAndDrain();
+        if (drainStatus.IsError()) {
+            (void)EnqueueCoordinationEvent({ CoordinationEventType::RESET, "", "", 0, 0 });
+            return drainStatus;
+        }
+    }
     SnapshotUpdateOutcome outcome;
     rc = snapshots_.Publish(candidate, outcome);
     bool newlyPublished = rc.IsOk() && outcome == SnapshotUpdateOutcome::PUBLISHED;

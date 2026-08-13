@@ -96,6 +96,15 @@ public:
     Status BuildScaleInFinal(const TopologyState &latest, TopologyState &next) const;
 
     /**
+     * @brief Roll back an interrupted ScaleIn batch.
+     * @param[in] latest Latest topology.
+     * @param[out] next Next topology.
+     * @return Operation status.
+     */
+    Status BuildInterruptedScaleInRecovery(const TopologyState &latest, const MemberIdentity &replacement,
+                                           TopologyState &next) const;
+
+    /**
      * @brief Finalize Failure and re-anchor ordinary facts.
      * @param[in] latest Latest topology.
      * @param[out] next Next topology.

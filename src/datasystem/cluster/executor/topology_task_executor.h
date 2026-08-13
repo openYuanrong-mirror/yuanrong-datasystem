@@ -145,6 +145,9 @@ public:
      */
     Status HandleTick(std::chrono::steady_clock::time_point now);
 
+    /** Cancel and drain the current epoch before publishing a stable topology. */
+    Status CancelCurrentEpochAndDrain();
+
     /**
      * @brief Cancel and bounded-drain.
      * @param[in] deadline Absolute deadline.
@@ -288,6 +291,7 @@ private:
     bool started_{ false };
     bool stopping_{ false };
     size_t callbackBodies_{ 0 };
+    size_t epochCallbackBodies_{ 0 };
     size_t inFlightOperations_{ 0 };
     uint64_t currentEpoch_{ 0 };
     // One mutex-protected state record owns every per-operation retry, callback, progress and ScaleIn stage fact.

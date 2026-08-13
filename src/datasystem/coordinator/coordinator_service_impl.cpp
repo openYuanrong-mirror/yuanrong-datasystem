@@ -124,7 +124,8 @@ Status ReadMembershipRecord(CoordinatorStore &store, const std::string &physical
     CHECK_FAIL_RETURN_STATUS(entries.size() == 1, K_NOT_FOUND, "membership key is absent");
     cluster::MembershipValue value;
     RETURN_IF_NOT_OK(cluster::MembershipValueCodec::Decode(entries.front().value, value));
-    record = cluster::MembershipRecord{ address, value.lifecycleState, value.timestamp, value.hostId };
+    record = cluster::MembershipRecord{ address, value.lifecycleState, value.timestamp, value.hostId,
+                                        value.processIncarnation };
     return Status::OK();
 }
 

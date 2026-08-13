@@ -92,6 +92,20 @@ public:
     {
         ++scaleInCalls;
         scaleInOperation = context.businessOperationId;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            scaleInEntered = true;
+        }
+        entered.notify_all();
+        if (blockScaleInUntilCancelled) {
+            const auto futureOwnedCancellation = context.cancellation;
+            EXPECT_TRUE(futureOwnedCancellation.WaitUntil(context.deadline));
+            const auto commitStatus = futureOwnedCancellation.CommitSourceMutationIfActive(context.deadline, [this] {
+                ++sourceCommits;
+                return Status::OK();
+            });
+            EXPECT_EQ(commitStatus.GetCode(), K_NOT_READY);
+        }
         return scaleInStatus;
     }
 
@@ -141,6 +155,12 @@ public:
         return entered.wait_until(lock, deadline, [this] { return scaleOutEntered; });
     }
 
+    bool WaitUntilScaleInEntered(std::chrono::steady_clock::time_point deadline)
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        return entered.wait_until(lock, deadline, [this] { return scaleInEntered; });
+    }
+
     void ReleaseScaleOut()
     {
         {
@@ -156,6 +176,7 @@ public:
     Status cleanupStatus{ Status::OK() };
     Status failureStatus{ Status::OK() };
     bool blockScaleOutUntilCancelled{ false };
+    bool blockScaleInUntilCancelled{ false };
     bool blockScaleOutUntilReleased{ false };
     bool throwScaleOut{ false };
     bool throwCleanupAuthorization{ false };
@@ -177,6 +198,7 @@ public:
     // Uses mutex to release a deliberately non-cooperative callback in shutdown tests.
     std::condition_variable released;
     bool scaleOutEntered{ false };
+    bool scaleInEntered{ false };
     bool releaseScaleOut{ false };
 };
 
@@ -970,6 +992,25 @@ TEST(TopologyTaskExecutorTest, StopCooperativelyCancelsAndDrainsAcceptedCallback
     DS_ASSERT_OK(executor.Stop(std::chrono::steady_clock::now() + TEST_WAIT));
     EXPECT_FALSE(executor.GetDiagnostics().running);
     EXPECT_EQ(scenario.callbacks.sourceCommits.load(), 0U);
+}
+
+TEST(TopologyTaskExecutorTest, StableTopologyCancelsAndDrainsCurrentEpoch)
+{
+    ExecutorScenario scenario;
+    DS_ASSERT_OK(scenario.SetUp(TopologyChangeType::SCALE_IN));
+    scenario.callbacks.blockScaleInUntilCancelled = true;
+    const auto &task = std::get<TopologyMigrateTask>(scenario.expected.tasks.front());
+    TopologyTaskExecutor executor(task.executorAddress, *scenario.repository, scenario.snapshots, scenario.callbacks,
+                                  scenario.dispatcher, {});
+    DS_ASSERT_OK(executor.Start());
+    DS_ASSERT_OK(executor.HandleNotify(scenario.expected.notifiesByAddress.at(task.executorAddress)));
+    ASSERT_TRUE(scenario.callbacks.WaitUntilScaleInEntered(std::chrono::steady_clock::now() + TEST_WAIT));
+
+    DS_ASSERT_OK(executor.CancelCurrentEpochAndDrain());
+
+    EXPECT_EQ(executor.GetDiagnostics().queuedCallbacks, 0U);
+    EXPECT_EQ(scenario.callbacks.sourceCommits.load(), 0U);
+    DS_ASSERT_OK(executor.Stop(std::chrono::steady_clock::now() + TEST_WAIT));
 }
 
 TEST(TopologyTaskExecutorTest, StopJoinsNonCooperativeCallbackAfterReportingDrainTimeout)

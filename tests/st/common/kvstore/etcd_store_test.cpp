@@ -298,6 +298,19 @@ TEST(EtcdStoreWorkerServiceInfoTest, TestToStringAndFromStringRoundTrip)
     EXPECT_EQ(out.compatibilityVersion, "v1");
 }
 
+TEST(EtcdStoreWorkerServiceInfoTest, TestProcessIncarnationRoundTripKeepsLegacyPrefix)
+{
+    cluster::MemberServiceInfo in{ 12345, cluster::MemberLifecycleState::READY, "host-a", "v1",
+                                   "process-incarnation" };
+    const auto str = in.ToString();
+    EXPECT_EQ(str, "12345;ready;host-a;v1;process-incarnation");
+
+    cluster::MemberServiceInfo out;
+    DS_ASSERT_OK(cluster::MemberServiceInfo::FromString(str, out));
+    EXPECT_EQ(out.timestamp, in.timestamp);
+    EXPECT_EQ(out.processIncarnation, in.processIncarnation);
+}
+
 TEST(EtcdStoreWorkerServiceInfoTest, TestWithoutSecondDelimiter)
 {
     cluster::MemberServiceInfo value{ 123, cluster::MemberLifecycleState::READY, "", "" };

@@ -288,8 +288,10 @@
     already-selected or in-flight socket/direct/NotifyRemoteGet work. At the start of its own ScaleIn data callback, a
     source atomically closes incoming migration admission and waits within the callback deadline for every admitted
     request to finish before selecting its local drain snapshot. Subsequent requests are rejected; timeout keeps the
-    gate closed and returns an explicit error. Concurrent leavers cannot exchange objects after either member takes its
-    drain snapshot.
+    gate closed and returns an explicit error. If a restarted source observes that batch before the Controller rolls the
+    expired single-participant restart back, Worker cancels and drains the stale executor epoch before publishing the
+    later stable `ACTIVE` snapshot and reopening both local write and incoming-migration admission. Concurrent leavers
+    cannot exchange objects after either member takes its drain snapshot.
   - tear down runtime services and service threads
   - `WorkerOCServer` first drains business RPC ingress and then calls only `TopologyEngine::Shutdown(deadline)`. In ETCD
     mode Engine closes the Worker-owned Store's unified watch and keepalive once, drains Worker execution, and stops the

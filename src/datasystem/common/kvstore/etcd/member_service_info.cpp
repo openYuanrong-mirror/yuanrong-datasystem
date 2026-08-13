@@ -166,11 +166,14 @@ std::string MemberServiceInfo::ToString() const
     }
     std::stringstream ss;
     ss << timestamp << ";" << stateStr;
-    if (!hostId.empty() || !compatibilityVersion.empty()) {
+    if (!hostId.empty() || !compatibilityVersion.empty() || !processIncarnation.empty()) {
         ss << ";" << hostId;
     }
-    if (!compatibilityVersion.empty()) {
+    if (!compatibilityVersion.empty() || !processIncarnation.empty()) {
         ss << ";" << compatibilityVersion;
+    }
+    if (!processIncarnation.empty()) {
+        ss << ";" << processIncarnation;
     }
     return ss.str();
 }
@@ -195,7 +198,13 @@ Status MemberServiceInfo::FromString(const std::string &str, MemberServiceInfo &
             value.hostId = str.substr(secondPos + 1);
         } else {
             value.hostId = str.substr(secondPos + 1, thirdPos - secondPos - 1);
-            value.compatibilityVersion = str.substr(thirdPos + 1);
+            const auto fourthPos = str.find(';', thirdPos + 1);
+            value.compatibilityVersion = fourthPos == std::string::npos
+                                             ? str.substr(thirdPos + 1)
+                                             : str.substr(thirdPos + 1, fourthPos - thirdPos - 1);
+            if (fourthPos != std::string::npos) {
+                value.processIncarnation = str.substr(fourthPos + 1);
+            }
         }
     }
     RETURN_IF_NOT_OK(StringToMemberLifecycleState(stateStr, value.state));
@@ -214,6 +223,7 @@ std::string MemberServiceInfo::ToProto() const
     info.set_state(statePb);
     info.set_host_id(hostId);
     info.set_compatibility_version(compatibilityVersion);
+    info.set_process_incarnation(processIncarnation);
     return info.SerializeAsString();
 }
 
@@ -226,6 +236,7 @@ Status MemberServiceInfo::FromProto(const std::string &str, MemberServiceInfo &v
     RETURN_IF_NOT_OK(ProtoToMemberLifecycleState(info.state(), value.state));
     value.hostId = info.host_id();
     value.compatibilityVersion = info.compatibility_version();
+    value.processIncarnation = info.process_incarnation();
     return Status::OK();
 }
 }  // namespace datasystem::cluster

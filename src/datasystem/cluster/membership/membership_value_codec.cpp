@@ -21,6 +21,7 @@
 #include <utility>
 
 #include "datasystem/common/util/status_helper.h"
+#include "datasystem/common/util/uuid_generator.h"
 #include "datasystem/protos/coordinator.pb.h"
 
 namespace datasystem::cluster {
@@ -94,7 +95,14 @@ Status DecodeLegacyEtcdValue(const std::string &bytes, MembershipValue &value)
                              ? bytes.substr(secondDelimiter + 1)
                              : bytes.substr(secondDelimiter + 1, thirdDelimiter - secondDelimiter - 1);
         if (thirdDelimiter != std::string::npos) {
-            decoded.compatibilityVersion = bytes.substr(thirdDelimiter + 1);
+            const auto fourthDelimiter = bytes.find(';', thirdDelimiter + 1);
+            decoded.compatibilityVersion = fourthDelimiter == std::string::npos
+                                               ? bytes.substr(thirdDelimiter + 1)
+                                               : bytes.substr(thirdDelimiter + 1,
+                                                              fourthDelimiter - thirdDelimiter - 1);
+            if (fourthDelimiter != std::string::npos) {
+                decoded.processIncarnation = bytes.substr(fourthDelimiter + 1);
+            }
         }
     }
     value = std::move(decoded);
@@ -163,6 +171,7 @@ Status MembershipValueCodec::Encode(const MembershipValue &value, std::string &b
     pb.set_state(statePb);
     pb.set_host_id(value.hostId);
     pb.set_compatibility_version(value.compatibilityVersion);
+    pb.set_process_incarnation(value.processIncarnation);
     std::string encoded;
     CHECK_FAIL_RETURN_STATUS(pb.SerializeToString(&encoded), K_RUNTIME_ERROR,
                              "serialize membership value proto failed");
@@ -200,8 +209,14 @@ Status MembershipValueCodec::Decode(const std::string &bytes, MembershipValue &v
     decoded.timestamp = pb.timestamp();
     decoded.hostId = pb.host_id();
     decoded.compatibilityVersion = pb.compatibility_version();
+    decoded.processIncarnation = pb.process_incarnation();
     value = std::move(decoded);
     return Status::OK();
+}
+
+std::string MembershipValueCodec::NewProcessIncarnation()
+{
+    return GetStringUuid();
 }
 
 }  // namespace datasystem::cluster

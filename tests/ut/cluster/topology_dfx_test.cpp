@@ -393,7 +393,7 @@ TEST(TopologyDfxTest, ScaleInBudgetKeepsLeavingUntilExternalTerminationBecomesFa
     TopologyPlan plan;
     DS_ASSERT_OK(builder.BuildScaleInStart(state, { state.members.front().identity }, plan));
     backend.PutRaw(keys->TopologyTable(), TopologyKeyHelper::TopologyKey(), plan.next);
-    PutDfxMembership(backend, *keys, "127.0.0.1:1", MemberLifecycleState::READY);
+    PutDfxMembership(backend, *keys, "127.0.0.1:1", MemberLifecycleState::EXITING);
     PutDfxMembership(backend, *keys, "127.0.0.1:2", MemberLifecycleState::READY);
     CoordinationEventDispatcher dispatcher(DFX_QUEUE_CAPACITY);
     auto clock = std::make_shared<std::atomic<int64_t>>(0);

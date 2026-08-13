@@ -137,6 +137,7 @@ struct TopologyControllerDiagnostics {
     uint64_t topologyVersion{ 0 };
     int64_t topologyRevision{ 0 };
     std::optional<ActiveBatch> activeBatch;
+    uint64_t deadlineArmedEpoch{ 0 };
     size_t queuedEvents{ 0 };
     size_t dirtyDerivedOperations{ 0 };
     std::string lastError;
@@ -345,6 +346,9 @@ private:
 
     Status CommitScaleOutExhaustion(const TopologySnapshot &latest, const std::vector<MemberIdentity> &failedJoining,
                                     const std::vector<MembershipRecord> &memberships);
+
+    Status CommitInterruptedScaleInRecovery(const TopologySnapshot &latest,
+                                            const std::vector<MembershipRecord> &memberships, bool &recovered);
 
     Status CommitExpiredBatch(const TopologySnapshot &latest, const std::vector<MemberIdentity> &failedJoining,
                               const std::vector<MembershipRecord> &memberships);
