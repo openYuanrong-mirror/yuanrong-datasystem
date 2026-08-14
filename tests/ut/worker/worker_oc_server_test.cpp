@@ -20,13 +20,14 @@
 
 #include "datasystem/worker/worker_oc_server.h"
 
-#include <chrono>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
+#include <thread>
 #include <utility>
 
 #include "datasystem/cluster/model/topology_snapshot.h"
@@ -56,6 +57,26 @@ Status MakeSnapshot(cluster::MemberState targetState, uint64_t version,
     }
     return cluster::TopologySnapshot::Create(std::move(state), version, std::string(64, 'a'), snapshot);
 }
+
+Status MakeLocalScaleInSnapshot(uint64_t version, std::shared_ptr<const cluster::TopologySnapshot> &snapshot)
+{
+    cluster::TopologyState state;
+    state.clusterHasInit = true;
+    state.version = version;
+    state.members = { MakeMember('a', "127.0.0.1:31501", cluster::MemberState::LEAVING, 10),
+                      MakeMember('b', "127.0.0.1:31502", cluster::MemberState::ACTIVE, 20) };
+    state.activeBatch = cluster::ActiveBatch{ cluster::TopologyChangeType::SCALE_IN, version };
+    return cluster::TopologySnapshot::Create(std::move(state), version, std::string(64, 'a'), snapshot);
+}
+
+Status MakeSnapshotWithoutLocal(uint64_t version, std::shared_ptr<const cluster::TopologySnapshot> &snapshot)
+{
+    cluster::TopologyState state;
+    state.clusterHasInit = true;
+    state.version = version;
+    state.members = { MakeMember('b', "127.0.0.1:31502", cluster::MemberState::ACTIVE, 20) };
+    return cluster::TopologySnapshot::Create(std::move(state), version, std::string(64, 'a'), snapshot);
+}
 }  // namespace
 
 class WorkerOCServerTest : public CommonTest {
@@ -66,6 +87,7 @@ public:
         DS_ASSERT_OK(RpcStubCacheMgr::Instance().Init(100));
         server_ = std::make_unique<worker::WorkerOCServer>(HostPort("127.0.0.1", 31501),
                                                           HostPort("127.0.0.1", 31501), HostPort(), nullptr);
+        server_->SetScaleInShutdownRequester([this] { ++shutdownRequestCount_; });
         RemoveDeadWorkerEvent::GetInstance().AddSubscriber(SUBSCRIBER_NAME, [this](const std::string &address) {
             recoveredAddress_ = address;
             ++recoveryCount_;
@@ -82,6 +104,48 @@ public:
     void Publish(std::shared_ptr<const cluster::TopologySnapshot> snapshot)
     {
         server_->HandleTopologySnapshotPublished(std::move(snapshot));
+    }
+
+    bool HasScaleInPreparationWorkers() const
+    {
+        return server_->checkAsyncTasksThread_ != nullptr && server_->clientsExitChecker_ != nullptr;
+    }
+
+    bool IsTopologyExitRequested() const
+    {
+        return server_->topologyExitRequested_.load();
+    }
+
+    std::pair<std::thread::id, std::thread::id> ScaleInPreparationWorkerIds() const
+    {
+        return { server_->checkAsyncTasksThread_->get_id(), server_->clientsExitChecker_->get_id() };
+    }
+
+    Status StartScaleInPreparation()
+    {
+        return server_->StartPreShutdownWorkers(true, Trace::Instance().GetTraceID());
+    }
+
+    bool ShouldPublishReadyMembership(bool needsRestartReconciliation) const
+    {
+        return server_->ShouldPublishReadyMembership(needsRestartReconciliation);
+    }
+
+    void SetScaleInExitPublishFn(std::function<Status(int32_t)> publish)
+    {
+        server_->scaleInExitPublishFn_ = std::move(publish);
+    }
+
+    bool WaitForScaleInExitPublished(std::chrono::milliseconds timeout)
+    {
+        std::unique_lock<std::mutex> lock(server_->scaleInExitPublisherMutex_);
+        return server_->scaleInExitPublisherCv_.wait_for(
+            lock, timeout, [this] { return server_->scaleInExitPublicationPublished_; });
+    }
+
+    void StopScaleInExitPublisher()
+    {
+        server_->StopScaleInExitPublisher();
     }
 
     Status WaitForExitingRemoval(std::chrono::steady_clock::time_point deadline,
@@ -111,6 +175,7 @@ protected:
     std::unique_ptr<worker::WorkerOCServer> server_;
     std::string recoveredAddress_;
     size_t recoveryCount_{ 0 };
+    size_t shutdownRequestCount_{ 0 };
 };
 
 TEST_F(WorkerOCServerTest, ActiveAddressRemovesPreviouslyFailedWorker)
@@ -137,6 +202,109 @@ TEST_F(WorkerOCServerTest, ActiveAddressWithoutFailureDoesNotPublishRecovery)
     Publish(active);
 
     EXPECT_EQ(recoveryCount_, 0);
+}
+
+TEST_F(WorkerOCServerTest, LeavingSnapshotDoesNotWaitForRecoveredExitingPublication)
+{
+    std::shared_ptr<const cluster::TopologySnapshot> leaving;
+    DS_ASSERT_OK(MakeLocalScaleInSnapshot(3, leaving));
+    WaitPost publishEntered;
+    WaitPost releasePublish;
+    WaitPost snapshotReturned;
+    SetScaleInExitPublishFn([&](int32_t) {
+        publishEntered.Set();
+        releasePublish.Wait();
+        return Status::OK();
+    });
+
+    std::thread snapshotThread([&] {
+        Publish(leaving);
+        snapshotReturned.Set();
+    });
+    const bool entered = publishEntered.WaitFor(1'000);
+    const bool returnedBeforeRelease = entered && snapshotReturned.WaitFor(1'000);
+    releasePublish.Set();
+    snapshotThread.join();
+
+    EXPECT_TRUE(entered);
+    EXPECT_TRUE(returnedBeforeRelease);
+}
+
+TEST_F(WorkerOCServerTest, LeavingLocalMemberRetriesRecoveredExitAndRequestsShutdownOnce)
+{
+    std::shared_ptr<const cluster::TopologySnapshot> leaving;
+    std::shared_ptr<const cluster::TopologySnapshot> removed;
+    DS_ASSERT_OK(MakeLocalScaleInSnapshot(3, leaving));
+    DS_ASSERT_OK(MakeSnapshotWithoutLocal(4, removed));
+    std::atomic<size_t> publishCount{ 0 };
+    std::atomic<int32_t> publishTimeoutMs{ 0 };
+    SetScaleInExitPublishFn([&](int32_t timeoutMs) {
+        publishTimeoutMs.store(timeoutMs);
+        const auto attempt = publishCount.fetch_add(1) + 1;
+        return attempt == 1 ? Status(K_NOT_READY, "injected first publication failure") : Status::OK();
+    });
+
+    EXPECT_TRUE(ShouldPublishReadyMembership(false));
+    EXPECT_FALSE(ShouldPublishReadyMembership(true));
+    Publish(leaving);
+
+    ASSERT_TRUE(WaitForScaleInExitPublished(std::chrono::milliseconds(2'500)));
+    EXPECT_EQ(publishCount.load(), 2UL);
+    EXPECT_GT(publishTimeoutMs.load(), 0);
+    EXPECT_LE(publishTimeoutMs.load(), 1'000);
+    EXPECT_TRUE(IsTopologyExitRequested());
+    EXPECT_FALSE(ShouldPublishReadyMembership(false));
+    ASSERT_TRUE(HasScaleInPreparationWorkers());
+    const auto workerIds = ScaleInPreparationWorkerIds();
+
+    Publish(leaving);
+
+    ASSERT_TRUE(HasScaleInPreparationWorkers());
+    EXPECT_EQ(ScaleInPreparationWorkerIds(), workerIds);
+    EXPECT_EQ(publishCount.load(), 2UL);
+
+    Publish(removed);
+    Publish(removed);
+
+    EXPECT_EQ(shutdownRequestCount_, 1UL);
+}
+
+TEST_F(WorkerOCServerTest, RecoveredExitPublisherStopsDuringRetryBackoff)
+{
+    std::shared_ptr<const cluster::TopologySnapshot> leaving;
+    DS_ASSERT_OK(MakeLocalScaleInSnapshot(3, leaving));
+    WaitPost firstAttempt;
+    SetScaleInExitPublishFn([&](int32_t) {
+        firstAttempt.Set();
+        return Status(K_NOT_READY, "injected persistent publication failure");
+    });
+    Publish(leaving);
+    ASSERT_TRUE(firstAttempt.WaitFor(1'000));
+
+    const auto start = std::chrono::steady_clock::now();
+    StopScaleInExitPublisher();
+
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::milliseconds(500));
+}
+
+TEST_F(WorkerOCServerTest, ExistingScaleInPreparationIsNotClaimedAsRestartRecovery)
+{
+    std::shared_ptr<const cluster::TopologySnapshot> leaving;
+    std::shared_ptr<const cluster::TopologySnapshot> removed;
+    DS_ASSERT_OK(MakeLocalScaleInSnapshot(3, leaving));
+    DS_ASSERT_OK(MakeSnapshotWithoutLocal(4, removed));
+    std::atomic<size_t> publishCount{ 0 };
+    SetScaleInExitPublishFn([&](int32_t) {
+        publishCount.fetch_add(1);
+        return Status::OK();
+    });
+    DS_ASSERT_OK(StartScaleInPreparation());
+
+    Publish(leaving);
+    Publish(removed);
+
+    EXPECT_EQ(publishCount.load(), 0UL);
+    EXPECT_EQ(shutdownRequestCount_, 0UL);
 }
 
 TEST_F(WorkerOCServerTest, FailedProbeResultAttachesObservationOnlyToErrorOutcome)

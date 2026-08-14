@@ -308,6 +308,9 @@
   removal share one bounded deadline: lock acquisition, the backend write, retry sleep, and topology polling consume the
   same remaining budget. A failed publication is retried, but the first successful publication stops repeated writes;
   the backend's terminal EXITING latch republishes that intent if later lease or Leader recovery occurs.
+  A restarted Worker that observes its own authoritative state as `LEAVING` restores the same local drain lifecycle and
+  asynchronously republishes EXITING with bounded per-attempt RPC time and retry backoff. Snapshot processing never waits
+  for that RPC; local topology removal cancels the publisher and wakes process shutdown exactly once.
   After lease
   recreation publishes the local ACTIVE member as `RECOVERING`, only that Worker's ETCD Controller requests restoration
   to `READY`. `TopologyEngine` accepts the request only while RUNNING and after this process has already completed a

@@ -217,6 +217,8 @@ constexpr int32_t MASTER_RPC_WARMUP_THREAD_NUM = 4;
 constexpr auto TOPOLOGY_CALLBACK_POLL_INTERVAL = std::chrono::milliseconds(100);
 constexpr auto TOPOLOGY_MEMBERSHIP_POLL_INTERVAL = std::chrono::milliseconds(100);
 constexpr auto EXITING_MEMBERSHIP_RETRY_INTERVAL = std::chrono::seconds(1);
+constexpr int32_t RECOVERED_EXIT_PUBLISH_TIMEOUT_MS = 1'000;
+constexpr int RECOVERED_EXIT_PUBLISH_LOG_INTERVAL = 30;
 constexpr int64_t TOPOLOGY_READY_WAIT_TIMEOUT_S = 60;
 constexpr auto TOPOLOGY_STOP_GRACE = std::chrono::seconds(10);
 #ifdef WITH_TESTS
@@ -629,6 +631,7 @@ WorkerOCServer::WorkerOCServer(HostPort workerAddr, HostPort bindAddr, HostPort 
 
 WorkerOCServer::~WorkerOCServer()
 {
+    StopScaleInExitPublisher();
     StopConnectionWarmup();
     StopWorkerMasterRpcWarmup();
     StopRebalanceExecutor();
@@ -637,15 +640,7 @@ WorkerOCServer::~WorkerOCServer()
     if (rpcServer_) {
         rpcServer_->Shutdown();
     }
-    checkThreadRunning_ = false;
-    if (checkAsyncTasksThread_ != nullptr) {
-        checkAsyncTasksThread_->join();
-        checkAsyncTasksThread_.reset();
-    }
-    if (clientsExitChecker_ != nullptr) {
-        clientsExitChecker_->join();
-        clientsExitChecker_.reset();
-    }
+    StopPreShutdownWorkers();
     const auto topologyStopDeadline = std::chrono::steady_clock::now() + TOPOLOGY_STOP_GRACE;
     const auto topologyStopStatus = StopTopologyRuntime(topologyStopDeadline);
     if (topologyStopStatus.IsError()) {
@@ -1687,7 +1682,12 @@ Status WorkerOCServer::InitUbHealthSidecar()
 Status WorkerOCServer::StartTopologyRuntime()
 {
     CHECK_FAIL_RETURN_STATUS(topologyEngine_ != nullptr, K_NOT_READY, "topology engine is not constructed");
-    return topologyEngine_->Start();
+    RETURN_IF_NOT_OK(topologyEngine_->Start());
+    std::shared_ptr<const cluster::TopologySnapshot> snapshot;
+    if (topologyEngine_->GetSnapshot(snapshot).IsOk() && snapshot != nullptr) {
+        RestoreScaleInPreparation(*snapshot);
+    }
+    return Status::OK();
 }
 
 void WorkerOCServer::ReconcileUbAdmissionTopology(const cluster::TopologySnapshot &snapshot)
@@ -1715,10 +1715,135 @@ void WorkerOCServer::ReconcileUbAdmissionTopology(const cluster::TopologySnapsho
 void WorkerOCServer::HandleTopologySnapshotPublished(std::shared_ptr<const cluster::TopologySnapshot> snapshot)
 {
     if (snapshot != nullptr) {
+        RestoreScaleInPreparation(*snapshot);
         CleanupRpcStubsForFailedMembers(*snapshot);
         ReconcileUbAdmissionTopology(*snapshot);
     }
     ScheduleTopologySnapshotWarmup(std::move(snapshot));
+}
+
+void WorkerOCServer::RestoreScaleInPreparation(const cluster::TopologySnapshot &snapshot)
+{
+    const cluster::Member *local = nullptr;
+    auto rc = snapshot.FindMemberByAddress(hostPort_.ToString(), local);
+    if (rc.GetCode() == K_NOT_FOUND) {
+        bool cancelExitPublication = false;
+        bool requestShutdown = false;
+        {
+            std::lock_guard<std::mutex> lock(preShutdownWorkersMutex_);
+            cancelExitPublication = scaleInRecoveryStarted_;
+            if (scaleInRecoveryStarted_ && scaleInShutdownRequester_ != nullptr && !scaleInShutdownRequested_) {
+                scaleInShutdownRequested_ = true;
+                requestShutdown = true;
+            }
+        }
+        if (cancelExitPublication) {
+            CancelScaleInExitPublication();
+        }
+        if (requestShutdown) {
+            scaleInShutdownRequester_();
+        }
+        return;
+    }
+    if (rc.IsError() || local == nullptr || local->state != cluster::MemberState::LEAVING) {
+        return;
+    }
+    bool recovered = false;
+    rc = RestorePreShutdownWorkers(Trace::Instance().GetTraceID(), recovered);
+    if (rc.IsError()) {
+        LOG(ERROR) << "Failed to restore local scale-in preparation from topology: " << rc.ToString();
+        return;
+    }
+    if (!recovered) {
+        return;
+    }
+    rc = ScheduleScaleInExitPublication();
+    if (rc.IsError() && rc.GetCode() != K_NOT_READY) {
+        LOG(ERROR) << "Failed to schedule restored scale-in membership exit: " << rc.ToString();
+    }
+}
+
+Status WorkerOCServer::ScheduleScaleInExitPublication()
+{
+    std::unique_lock<std::mutex> lock(scaleInExitPublisherMutex_);
+    CHECK_FAIL_RETURN_STATUS(!scaleInExitPublisherStopping_, K_NOT_READY, "scale-in exit publisher is stopping");
+    if (scaleInExitPublicationPublished_) {
+        return Status::OK();
+    }
+    if (scaleInExitPublisherThread_ == nullptr) {
+        RETURN_IF_EXCEPTION_OCCURS(
+            scaleInExitPublisherThread_ = std::make_unique<Thread>([this] { RunScaleInExitPublisher(); }));
+        scaleInExitPublisherThread_->set_name("ScaleInExitPub");
+    }
+    scaleInExitPublicationRequested_ = true;
+    lock.unlock();
+    scaleInExitPublisherCv_.notify_all();
+    return Status::OK();
+}
+
+void WorkerOCServer::RunScaleInExitPublisher()
+{
+    std::unique_lock<std::mutex> lock(scaleInExitPublisherMutex_);
+    while (!scaleInExitPublisherStopping_) {
+        scaleInExitPublisherCv_.wait(lock, [this] {
+            return scaleInExitPublisherStopping_ || scaleInExitPublicationRequested_;
+        });
+        if (scaleInExitPublisherStopping_) {
+            break;
+        }
+        auto publish = scaleInExitPublishFn_;
+        lock.unlock();
+        Status rc(K_NOT_READY, "topology engine is not constructed");
+        if (publish != nullptr) {
+            rc = publish(RECOVERED_EXIT_PUBLISH_TIMEOUT_MS);
+        } else if (topologyEngine_ != nullptr) {
+            rc = topologyEngine_->MarkExiting(RECOVERED_EXIT_PUBLISH_TIMEOUT_MS);
+        }
+        lock.lock();
+        if (scaleInExitPublisherStopping_ || !scaleInExitPublicationRequested_) {
+            continue;
+        }
+        if (rc.IsOk()) {
+            scaleInExitPublicationPublished_ = true;
+            scaleInExitPublicationRequested_ = false;
+            scaleInExitPublisherCv_.notify_all();
+            continue;
+        }
+        lock.unlock();
+        LOG_FIRST_AND_EVERY_N(WARNING, RECOVERED_EXIT_PUBLISH_LOG_INTERVAL)
+            << "Failed to publish EXITING membership for restored scale-in; will retry: " << rc.ToString();
+        lock.lock();
+        if (scaleInExitPublisherStopping_ || !scaleInExitPublicationRequested_) {
+            continue;
+        }
+        (void)scaleInExitPublisherCv_.wait_for(lock, EXITING_MEMBERSHIP_RETRY_INTERVAL, [this] {
+            return scaleInExitPublisherStopping_ || !scaleInExitPublicationRequested_;
+        });
+    }
+}
+
+void WorkerOCServer::CancelScaleInExitPublication()
+{
+    {
+        std::lock_guard<std::mutex> lock(scaleInExitPublisherMutex_);
+        scaleInExitPublicationRequested_ = false;
+    }
+    scaleInExitPublisherCv_.notify_all();
+}
+
+void WorkerOCServer::StopScaleInExitPublisher()
+{
+    std::unique_ptr<Thread> publisherThread;
+    {
+        std::lock_guard<std::mutex> lock(scaleInExitPublisherMutex_);
+        scaleInExitPublisherStopping_ = true;
+        scaleInExitPublicationRequested_ = false;
+        publisherThread = std::move(scaleInExitPublisherThread_);
+    }
+    scaleInExitPublisherCv_.notify_all();
+    if (publisherThread != nullptr) {
+        publisherThread->join();
+    }
 }
 
 Status WorkerOCServer::PublishReadyMembership()
@@ -1742,6 +1867,11 @@ Status WorkerOCServer::PublishReadyMembership()
     RETURN_STATUS(K_RPC_DEADLINE_EXCEEDED,
                   "timed out publishing READY membership after first lease within " + std::to_string(timeoutS)
                       + " seconds: " + lastStatus.ToString());
+}
+
+bool WorkerOCServer::ShouldPublishReadyMembership(bool needsRestartReconciliation) const
+{
+    return !needsRestartReconciliation && !topologyExitRequested_.load();
 }
 
 Status WorkerOCServer::StartUbHealthLeaseSync()
@@ -1952,12 +2082,12 @@ Status WorkerOCServer::InitClusterRuntimeAndServices()
     RETURN_IF_NOT_OK(StartBrpcIfEnabled());
     const bool needsRestartReconciliation =
         topologyEngine_->IsRestart() && EnableOCService() && FLAGS_enable_reconciliation;
-    if (!needsRestartReconciliation) {
+    if (ShouldPublishReadyMembership(needsRestartReconciliation)) {
         RETURN_IF_NOT_OK_PRINT_ERROR_MSG(PublishReadyMembership(), "Publish Worker topology READY membership failed");
     } else {
+        const auto reason = topologyExitRequested_.load() ? "scale_in_recovery" : "restart_reconciliation";
         LOG(INFO) << "CLUSTER_MEMBERSHIP cluster=" << FLAGS_cluster_name
-                  << " role=worker action=defer_ready reason=restart_reconciliation address="
-                  << hostPort_.ToString();
+                  << " role=worker action=defer_ready reason=" << reason << " address=" << hostPort_.ToString();
     }
     RETURN_IF_NOT_OK_PRINT_ERROR_MSG(StartUbHealthLeaseSync(), "Start UB health lease synchronization failed");
     RETURN_IF_NOT_OK(InitSlotRecovery());
@@ -2767,6 +2897,7 @@ void WorkerOCServer::PruneWorkerMasterRpcWarmupCache(const std::unordered_map<st
 Status WorkerOCServer::ReadinessProbe()
 {
     RETURN_IF_NOT_OK(WaitForServiceReady());
+    RETURN_OK_IF_TRUE(IsTermSignalReceived() && topologyExitRequested_.load());
     // delete health check flag for worker service
     if (FLAGS_ready_check_path.empty()) {
         return Status::OK();
@@ -2816,6 +2947,7 @@ Status WorkerOCServer::Start()
     RETURN_IF_NOT_OK_APPEND_MSG(MaybeStartConnectionWarmup(), "\nWorker Start failed.");
     RETURN_IF_NOT_OK_APPEND_MSG(MaybeStartWorkerMasterRpcWarmup(), "\nWorker Start failed.");
     RETURN_IF_NOT_OK_APPEND_MSG(ReadinessProbe(), "\nWorker Start failed.");
+    RETURN_OK_IF_TRUE(IsTermSignalReceived() && topologyExitRequested_.load());
     RETURN_IF_NOT_OK(ResMetricCollector::Instance().Init());
     RegisteringAllResourceCollectionCallbackFunc();
     ResMetricCollector::Instance().Start();
@@ -2957,21 +3089,38 @@ Status WorkerOCServer::PreShutDown()
 
 Status WorkerOCServer::StartPreShutdownWorkers(bool scaleIn, const std::string &traceId)
 {
-    if (scaleIn) {
-        // Stop new client traffic now; keep incoming migration open until topology drain starts.
-        topologyExitRequested_.store(true);
+    std::lock_guard<std::mutex> lock(preShutdownWorkersMutex_);
+    CHECK_FAIL_RETURN_STATUS(!preShutdownWorkersStopped_, K_NOT_READY, "pre-shutdown workers are stopping");
+    return StartPreShutdownWorkersLocked(scaleIn, traceId);
+}
+
+Status WorkerOCServer::RestorePreShutdownWorkers(const std::string &traceId, bool &recovered)
+{
+    std::lock_guard<std::mutex> lock(preShutdownWorkersMutex_);
+    CHECK_FAIL_RETURN_STATUS(!preShutdownWorkersStopped_, K_NOT_READY, "pre-shutdown workers are stopping");
+    recovered = scaleInRecoveryStarted_;
+    if (!recovered && topologyExitRequested_.load()) {
+        return Status::OK();
     }
-    if (EnableOCService() || EnableSCService()) {
+    RETURN_IF_NOT_OK(StartPreShutdownWorkersLocked(true, traceId));
+    scaleInRecoveryStarted_ = true;
+    recovered = true;
+    return Status::OK();
+}
+
+Status WorkerOCServer::StartPreShutdownWorkersLocked(bool scaleIn, const std::string &traceId)
+{
+    if ((EnableOCService() || EnableSCService()) && checkAsyncTasksThread_ == nullptr) {
         RETURN_IF_EXCEPTION_OCCURS(checkAsyncTasksThread_ = std::make_unique<Thread>([this, traceId]() {
                                        TraceGuard traceGuard = Trace::Instance().SetTraceNewID(traceId);
                                        CheckAsyncTasks();
                                    }));
         checkAsyncTasksThread_->set_name("CheckAsyncTask");
-    } else {
+    } else if (!EnableOCService() && !EnableSCService()) {
         SetCheckAsyncTasksDone(true);
     }
 
-    if (scaleIn) {
+    if (scaleIn && clientsExitChecker_ == nullptr) {
         RETURN_IF_EXCEPTION_OCCURS(clientsExitChecker_ = std::make_unique<Thread>([this, traceId]() {
                                        TraceGuard traceGuard = Trace::Instance().SetTraceNewID(traceId);
                                        WaitClientsExit();
@@ -2979,7 +3128,30 @@ Status WorkerOCServer::StartPreShutdownWorkers(bool scaleIn, const std::string &
         clientsExitChecker_->set_name("ClientsExitChecker");
         LOG(INFO) << "[Graceful exit] Begin to active reduction node.";
     }
+    if (scaleIn) {
+        // Stop new client traffic after every required pre-shutdown worker is available.
+        topologyExitRequested_.store(true);
+    }
     return Status::OK();
+}
+
+void WorkerOCServer::StopPreShutdownWorkers()
+{
+    checkThreadRunning_ = false;
+    std::unique_ptr<Thread> checkAsyncTasksThread;
+    std::unique_ptr<Thread> clientsExitChecker;
+    {
+        std::lock_guard<std::mutex> lock(preShutdownWorkersMutex_);
+        preShutdownWorkersStopped_ = true;
+        checkAsyncTasksThread = std::move(checkAsyncTasksThread_);
+        clientsExitChecker = std::move(clientsExitChecker_);
+    }
+    if (checkAsyncTasksThread != nullptr) {
+        checkAsyncTasksThread->join();
+    }
+    if (clientsExitChecker != nullptr) {
+        clientsExitChecker->join();
+    }
 }
 
 void WorkerOCServer::MigrateUnfinishedAsyncDataIfNeeded(bool scaleIn)
@@ -3060,6 +3232,7 @@ Status WorkerOCServer::Shutdown()
             clientWorkerCommonSvcStatus_.get();
         }
     }
+    StopScaleInExitPublisher();
     // Drain external RPC ingress before stopping the Engine. Rebalance and Worker common-service producers are
     // already stopped above, so no business owner can start a new topology-dependent operation during Engine drain.
     (void)CommonServer::Shutdown();
