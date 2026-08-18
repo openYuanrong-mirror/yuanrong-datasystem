@@ -19,6 +19,7 @@
  */
 
 #include <unistd.h>
+#include <algorithm>
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
@@ -671,13 +672,13 @@ public:
                   << (enableLosslessAfterRestart ? "true" : "false")
                   << ", old worker shutdown signal=" << (useSigterm ? "SIGTERM" : "SIGKILL");
 
-        // The production cluster was healthy before all pods were taken offline. Build the old generation in two
+        // The production cluster was healthy before all pods were taken offline. Build the old generation in small
         // batches so a concurrent first-cluster bootstrap cannot mask the restart behavior under test.
-        const uint32_t firstOldWorkerBatch = workersPerGeneration / 2;
-        StartWorkerRangeAndWaitReady(0, firstOldWorkerBatch, false);
-        WaitAllNodesJoinIntoHashRing(firstOldWorkerBatch, convergeTimeoutSec_);
-        StartWorkerRangeAndWaitReady(firstOldWorkerBatch, workersPerGeneration, false);
-        WaitAllNodesJoinIntoHashRing(workersPerGeneration, convergeTimeoutSec_);
+        for (uint32_t begin = 0; begin < workersPerGeneration; begin += oldWorkerStartBatchSize_) {
+            const uint32_t end = std::min(begin + oldWorkerStartBatchSize_, workersPerGeneration);
+            StartWorkerRangeAndWaitReady(begin, end, false);
+            WaitAllNodesJoinIntoHashRing(end, convergeTimeoutSec_);
+        }
 
         std::set<std::string> oldWorkerAddresses;
         for (uint32_t i = 0; i < workersPerGeneration; ++i) {
@@ -822,6 +823,7 @@ private:
 
     static constexpr uint32_t defaultWorkersPerGeneration_ = 12;
     static constexpr uint32_t maxWorkersPerGeneration_ = 57;
+    static constexpr uint32_t oldWorkerStartBatchSize_ = 4;
     static constexpr int nodeTimeoutSec_ = 6;
     static constexpr int nodeDeadTimeoutSec_ = 8;
     static constexpr int workerExitTimeoutSec_ = 60;
