@@ -664,10 +664,12 @@ public:
     {
         const uint32_t workersPerGeneration = GetWorkersPerGeneration();
         const uint32_t totalWorkerCount = workersPerGeneration * 2;
+        const bool useSigterm = UseSigtermForOldWorkers();
         LOG(INFO) << "Run large scale-down-all scenario, old workers=" << workersPerGeneration
                   << ", new workers=" << workersPerGeneration
                   << ", lossless before restart=false, lossless after restart="
-                  << (enableLosslessAfterRestart ? "true" : "false");
+                  << (enableLosslessAfterRestart ? "true" : "false")
+                  << ", old worker shutdown signal=" << (useSigterm ? "SIGTERM" : "SIGKILL");
 
         StartWorkerRangeAndWaitReady(0, workersPerGeneration, false);
         WaitAllNodesJoinIntoHashRing(workersPerGeneration, convergeTimeoutSec_);
@@ -695,8 +697,13 @@ public:
         clients.clear();
 
         for (uint32_t i = 0; i < workersPerGeneration; ++i) {
-            DS_ASSERT_OK(externalCluster_->KillWorker(i));
+            if (useSigterm) {
+                ASSERT_EQ(kill(cluster_->GetWorkerPid(i), SIGTERM), 0) << i;
+            } else {
+                DS_ASSERT_OK(externalCluster_->KillWorker(i));
+            }
         }
+        WaitWorkersExit(workersPerGeneration);
 
         // No worker is alive to update the ring. Keep etcd untouched long enough for every old endpoint to become
         // stale before workers with new endpoints join.
@@ -781,10 +788,38 @@ private:
         return static_cast<uint32_t>(parsedCount);
     }
 
+    static bool UseSigtermForOldWorkers()
+    {
+        const char *configuredSignal = std::getenv("DS_TEST_LARGE_RESTART_SHUTDOWN_SIGNAL");
+        return configuredSignal != nullptr && std::string(configuredSignal) == "SIGTERM";
+    }
+
+    void WaitWorkersExit(uint32_t workerCount)
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(workerExitTimeoutSec_);
+        while (std::chrono::steady_clock::now() < deadline) {
+            bool allWorkersExited = true;
+            for (uint32_t i = 0; i < workerCount; ++i) {
+                if (externalCluster_->CheckWorkerProcess(i)) {
+                    allWorkersExited = false;
+                    break;
+                }
+            }
+            if (allWorkersExited) {
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        for (uint32_t i = 0; i < workerCount; ++i) {
+            ASSERT_FALSE(externalCluster_->CheckWorkerProcess(i)) << i;
+        }
+    }
+
     static constexpr uint32_t defaultWorkersPerGeneration_ = 12;
     static constexpr uint32_t maxWorkersPerGeneration_ = 57;
     static constexpr int nodeTimeoutSec_ = 6;
     static constexpr int nodeDeadTimeoutSec_ = 8;
+    static constexpr int workerExitTimeoutSec_ = 60;
     static constexpr int workerReadyTimeoutSec_ = 180;
     static constexpr int convergeTimeoutSec_ = 360;
 };
