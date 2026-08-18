@@ -21,6 +21,7 @@
 #include <unistd.h>
 #include <chrono>
 #include <csignal>
+#include <cstdlib>
 #include <set>
 #include <thread>
 
@@ -661,23 +662,25 @@ class STCLargeScaleDownAllTest : public STCScaleTest {
 public:
     void RunScaleDownAllThenScaleUp(bool enableLosslessAfterRestart)
     {
-        LOG(INFO) << "Run large scale-down-all scenario, old workers=" << workersPerGeneration_
-                  << ", new workers=" << workersPerGeneration_
+        const uint32_t workersPerGeneration = GetWorkersPerGeneration();
+        const uint32_t totalWorkerCount = workersPerGeneration * 2;
+        LOG(INFO) << "Run large scale-down-all scenario, old workers=" << workersPerGeneration
+                  << ", new workers=" << workersPerGeneration
                   << ", lossless before restart=false, lossless after restart="
                   << (enableLosslessAfterRestart ? "true" : "false");
 
-        StartWorkerRangeAndWaitReady(0, workersPerGeneration_, false);
-        WaitAllNodesJoinIntoHashRing(workersPerGeneration_, convergeTimeoutSec_);
+        StartWorkerRangeAndWaitReady(0, workersPerGeneration, false);
+        WaitAllNodesJoinIntoHashRing(workersPerGeneration, convergeTimeoutSec_);
 
         std::set<std::string> oldWorkerAddresses;
-        for (uint32_t i = 0; i < workersPerGeneration_; ++i) {
+        for (uint32_t i = 0; i < workersPerGeneration; ++i) {
             HostPort workerAddress;
             DS_ASSERT_OK(cluster_->GetWorkerAddr(i, workerAddress));
             oldWorkerAddresses.emplace(workerAddress.ToString());
         }
 
         std::vector<std::shared_ptr<KVClient>> clients;
-        for (auto index : { 0u, workersPerGeneration_ / 2, workersPerGeneration_ - 1 }) {
+        for (auto index : { 0u, workersPerGeneration / 2, workersPerGeneration - 1 }) {
             std::shared_ptr<KVClient> client;
             InitTestKVClient(index, client);
             clients.emplace_back(std::move(client));
@@ -691,7 +694,7 @@ public:
         }
         clients.clear();
 
-        for (uint32_t i = 0; i < workersPerGeneration_; ++i) {
+        for (uint32_t i = 0; i < workersPerGeneration; ++i) {
             DS_ASSERT_OK(externalCluster_->KillWorker(i));
         }
 
@@ -699,21 +702,21 @@ public:
         // stale before workers with new endpoints join.
         std::this_thread::sleep_for(std::chrono::seconds(nodeDeadTimeoutSec_ + 1));
         HashRingPb ringBeforeRestart = GetHashRing();
-        ASSERT_EQ(ringBeforeRestart.workers_size(), static_cast<int>(workersPerGeneration_))
+        ASSERT_EQ(ringBeforeRestart.workers_size(), static_cast<int>(workersPerGeneration))
             << worker::HashRingToJsonString(ringBeforeRestart);
         LOG(INFO) << "Hash ring retained after all old workers exited: "
                   << worker::HashRingToJsonString(ringBeforeRestart);
 
-        StartWorkerRangeAndWaitReady(workersPerGeneration_, totalWorkerCount_, enableLosslessAfterRestart);
+        StartWorkerRangeAndWaitReady(workersPerGeneration, totalWorkerCount, enableLosslessAfterRestart);
         std::set<std::string> newWorkerAddresses;
-        for (uint32_t i = workersPerGeneration_; i < totalWorkerCount_; ++i) {
+        for (uint32_t i = workersPerGeneration; i < totalWorkerCount; ++i) {
             HostPort workerAddress;
             DS_ASSERT_OK(cluster_->GetWorkerAddr(i, workerAddress));
             ASSERT_EQ(oldWorkerAddresses.count(workerAddress.ToString()), 0u);
             newWorkerAddresses.emplace(workerAddress.ToString());
         }
 
-        WaitAllNodesJoinIntoHashRing(workersPerGeneration_, convergeTimeoutSec_);
+        WaitAllNodesJoinIntoHashRing(workersPerGeneration, convergeTimeoutSec_);
         HashRingPb ringAfterRestart = GetHashRing();
         for (const auto &workerAddress : oldWorkerAddresses) {
             ASSERT_EQ(ringAfterRestart.workers().count(workerAddress), 0u)
@@ -732,7 +735,7 @@ private:
     void SetClusterSetupOptions(ExternalClusterOptions &opts) override
     {
         opts.numEtcd = 1;
-        opts.numWorkers = totalWorkerCount_;
+        opts.numWorkers = GetWorkersPerGeneration() * 2;
         opts.enableDistributedMaster = "true";
         opts.addNodeTime = SCALE_DOWN_ADD_TIME;
         opts.workerGflagParams = FormatString(
@@ -764,12 +767,26 @@ private:
         return ring;
     }
 
-    static constexpr uint32_t workersPerGeneration_ = 12;
-    static constexpr uint32_t totalWorkerCount_ = workersPerGeneration_ * 2;
+    static uint32_t GetWorkersPerGeneration()
+    {
+        const char *configuredCount = std::getenv("DS_TEST_LARGE_RESTART_WORKERS");
+        if (configuredCount == nullptr) {
+            return defaultWorkersPerGeneration_;
+        }
+        char *end = nullptr;
+        const auto parsedCount = std::strtoul(configuredCount, &end, 10);
+        if (end == configuredCount || *end != '\0' || parsedCount == 0 || parsedCount > maxWorkersPerGeneration_) {
+            return defaultWorkersPerGeneration_;
+        }
+        return static_cast<uint32_t>(parsedCount);
+    }
+
+    static constexpr uint32_t defaultWorkersPerGeneration_ = 12;
+    static constexpr uint32_t maxWorkersPerGeneration_ = 57;
     static constexpr int nodeTimeoutSec_ = 6;
     static constexpr int nodeDeadTimeoutSec_ = 8;
-    static constexpr int workerReadyTimeoutSec_ = 120;
-    static constexpr int convergeTimeoutSec_ = 180;
+    static constexpr int workerReadyTimeoutSec_ = 180;
+    static constexpr int convergeTimeoutSec_ = 360;
 };
 
 TEST_F(STCLargeScaleDownAllTest, LEVEL1_LargeScaleDownAllThenScaleUpLosslessOff)
