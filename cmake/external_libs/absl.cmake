@@ -2,10 +2,13 @@ set(absl_COMMIT_ID "20240722")
 set(absl_VERSION 20240722)
 if (NOT "$ENV{DS_LOCAL_LIBS_DIR}" STREQUAL "")
     set(absl_URL "$ENV{DS_LOCAL_LIBS_DIR}/opensource_third_party/lts_2024_07_22.zip")
+    set(absl_SHA256 "c1e391c517790669dfcbbfda1278a61053679c303c0fb05018bf2266197f054e")
 else()
-    set(absl_URL "https://gitee.com/mirrors/abseil-cpp/repository/archive/lts_2024_07_22.zip")
+    # Pin the public archive to the commit referenced by the 20240722.0 tag. The
+    # lts_2024_07_22 branch is mutable and eventually no longer matched the hash.
+    set(absl_URL "https://codeload.github.com/abseil/abseil-cpp/zip/4447c7562e3bc702ade25105912dce503f0c4010")
+    set(absl_SHA256 "d8342ad77aa9e16103c486b615460c24a695a1f04cdb760eb02fef780df99759")
 endif()
-set(absl_SHA256 "c1e391c517790669dfcbbfda1278a61053679c303c0fb05018bf2266197f054e")
 
 set(absl_CMAKE_OPTIONS
         -DCMAKE_BUILD_TYPE:STRING=Release
