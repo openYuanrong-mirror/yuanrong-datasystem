@@ -671,7 +671,12 @@ public:
                   << (enableLosslessAfterRestart ? "true" : "false")
                   << ", old worker shutdown signal=" << (useSigterm ? "SIGTERM" : "SIGKILL");
 
-        StartWorkerRangeAndWaitReady(0, workersPerGeneration, false);
+        // The production cluster was healthy before all pods were taken offline. Build the old generation in two
+        // batches so a concurrent first-cluster bootstrap cannot mask the restart behavior under test.
+        const uint32_t firstOldWorkerBatch = workersPerGeneration / 2;
+        StartWorkerRangeAndWaitReady(0, firstOldWorkerBatch, false);
+        WaitAllNodesJoinIntoHashRing(firstOldWorkerBatch, convergeTimeoutSec_);
+        StartWorkerRangeAndWaitReady(firstOldWorkerBatch, workersPerGeneration, false);
         WaitAllNodesJoinIntoHashRing(workersPerGeneration, convergeTimeoutSec_);
 
         std::set<std::string> oldWorkerAddresses;
@@ -782,7 +787,7 @@ private:
         }
         char *end = nullptr;
         const auto parsedCount = std::strtoul(configuredCount, &end, 10);
-        if (end == configuredCount || *end != '\0' || parsedCount == 0 || parsedCount > maxWorkersPerGeneration_) {
+        if (end == configuredCount || *end != '\0' || parsedCount < 2 || parsedCount > maxWorkersPerGeneration_) {
             return defaultWorkersPerGeneration_;
         }
         return static_cast<uint32_t>(parsedCount);
