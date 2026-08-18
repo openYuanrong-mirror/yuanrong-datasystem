@@ -1,10 +1,12 @@
 set(curl_VERSION 8.8.0)
 if (NOT "$ENV{DS_LOCAL_LIBS_DIR}" STREQUAL "")
   set(curl_URL "$ENV{DS_LOCAL_LIBS_DIR}/opensource_third_party/curl-8_8_0.zip")
+  set(curl_SHA256 "73c70c94f487c5ae26f9f27094249e40bb1667ae6c0406a75c3b11f86f0c1128")
 else()
-  set(curl_URL "https://gitee.com/mirrors/curl/repository/archive/curl-8_8_0.zip")
+  # Pin the public archive to the commit referenced by the curl-8_8_0 tag.
+  set(curl_URL "https://codeload.github.com/curl/curl/zip/fd567d4f06857f4fc8e2f64ea727b1318f76ad33")
+  set(curl_SHA256 "5531e2840a045b401231a7b9af0ff53b96fe77e5ff5e2b1f2e89a7a51275e690")
 endif()
-set(curl_SHA256 "73c70c94f487c5ae26f9f27094249e40bb1667ae6c0406a75c3b11f86f0c1128")
 
 set(curl_CMAKE_OPTIONS
     -DCMAKE_CXX_STANDARD=11
