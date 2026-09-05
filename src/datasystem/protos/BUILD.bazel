@@ -57,23 +57,6 @@ cc_proto_library(
 )
 
 proto_library(
-    name = "meta_zmq_proto",
-    srcs = ["meta_zmq.proto"],
-    strip_import_prefix = PROTO_ROOT,
-    deps = [
-        ":utils_proto",
-        ":log_sample_proto",
-    ],
-)
-
-cc_proto_library(
-    name = "meta_zmq_cc_proto",
-    deps = [
-        ":meta_zmq_proto",
-    ],
-)
-
-proto_library(
     name = "p2p_subscribe_proto",
     srcs = ["p2p_subscribe.proto"],
     strip_import_prefix = PROTO_ROOT,

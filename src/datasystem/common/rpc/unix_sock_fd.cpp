@@ -33,7 +33,6 @@
 #include "datasystem/common/util/format.h"
 #include "datasystem/common/util/strings_util.h"
 #include "datasystem/common/util/timer.h"
-#include "datasystem/protos/meta_zmq.pb.h"
 #include "datasystem/protos/utils.pb.h"
 
 constexpr int RECV_RETRY_COUNT = 10;

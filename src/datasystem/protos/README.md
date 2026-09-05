@@ -39,5 +39,4 @@
 
 | layer | type              | protos files                                      |
 | ----- |-------------------|---------------------------------------------------|
-| 0     | utils proto files | rpc_options.proto、meta_zmq.proto/rpc_option.proto |
-| 1     | zmq perf          | zmq_perf.proto                                    |
+| 0     | utils proto files | rpc_options.proto、rpc_option.proto |

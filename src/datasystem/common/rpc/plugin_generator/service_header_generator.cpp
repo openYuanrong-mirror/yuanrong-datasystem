@@ -58,8 +58,6 @@ void RpcGenerator::GenerateServiceClass(io::Printer &printer, const google::prot
         "    : localAddress_(std::move(localAddress)) { serviceName_ = \"$svc_name$\"; }\n";
     printer.Print(vars, impl.c_str());
 
-    // Implement the override function CallMethod.
-    ImplementZmqCallMethodDecl(printer);
     // Implement the override function ServiceName.
     GenerateSvcName(printer, svcName, indent);
 
@@ -156,16 +154,5 @@ void RpcGenerator::ListVirtualFunctions(io::Printer &printer, const google::prot
         virtual_func += ") = 0;\n";
         printer.PrintRaw(virtual_func);
     }
-}
-
-void RpcGenerator::ImplementZmqCallMethodDecl(io::Printer &printer)
-{
-    printer.PrintRaw(
-        "    ::datasystem::Status CallMethod(::datasystem::MetaPb meta, std::deque<::datasystem::RpcMessage> &&inMsg,"
-        " int64_t seqNo) override;\n");
-    printer.PrintRaw(
-        "    ::datasystem::Status DirectCallMethod(::datasystem::MetaPb meta,"
-        " std::deque<::datasystem::RpcMessage> &&inMsg, int64_t seqNo,"
-        " std::deque<::datasystem::RpcMessage> &outMsg) override;\n");
 }
 }  // namespace datasystem

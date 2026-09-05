@@ -315,7 +315,7 @@ Status TopologyManager::GetAllProducerFromWorker(const HostPort &workerAddress,
             producerMeta.mutable_worker_address()->set_port(workerHostPort.Port());
             producerMeta.set_producer_count(kv.second.count_);
 
-            // Key: WorkerAddress Value: MetaPb
+            // Key: WorkerAddress Value: ProducerMetaPb
             producerMap.emplace(kv.first, producerMeta);
         }
     }

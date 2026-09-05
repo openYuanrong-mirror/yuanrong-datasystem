@@ -28,7 +28,6 @@
 #include "datasystem/common/rpc/rpc_service_cfg.h"
 #include "datasystem/common/util/status_helper.h"
 #include "datasystem/common/util/thread_pool.h"
-#include "datasystem/protos/meta_zmq.pb.h"
 
 namespace datasystem {
 /**
@@ -51,10 +50,6 @@ public:
     virtual std::string FullServiceName() const = 0;
 
     virtual std::string ServiceName() const = 0;
-
-    virtual Status CallMethod(MetaPb meta, RpcMsgFrames &&inMsg, int64_t seqNo) = 0;
-
-    virtual Status DirectCallMethod(MetaPb meta, RpcMsgFrames &&inMsg, int64_t seqNo, RpcMsgFrames &outMsg) = 0;
 
     Status Init(RpcServiceCfg cfg)
     {
