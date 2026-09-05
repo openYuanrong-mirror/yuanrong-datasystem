@@ -33,6 +33,7 @@
 #include "datasystem/common/util/net_util.h"
 #include "datasystem/common/util/rpc_util.h"
 #include "datasystem/common/util/status_helper.h"
+#include "datasystem/common/util/thread_pool.h"
 #include "datasystem/protos/coordinator.pb.h"
 
 namespace datasystem::cluster {
@@ -48,6 +49,9 @@ constexpr auto DEFAULT_COORDINATOR_READY_TIMEOUT = std::chrono::seconds(10);
 // This background write is retried by the Controller; keep one attempt below the default Engine stop grace so
 // Controller shutdown is not pinned by ETCD's 50-second default RPC timeout.
 constexpr int32_t LOCAL_RECOVERY_READY_TIMEOUT_MS = 3'000;
+// Synthetic key that only wakes the serial Run loop after a progress-pool completion rescheduled executor work
+// (ScaleIn metadata-gate handoff, retries). It carries no coordination payload and never reaches the backend.
+constexpr char PROGRESS_DOORBELL_KEY[] = "topology/progress-doorbell";
 
 Status RegisterEtcdTopologyTables(EtcdStore &store, const TopologyKeyHelper &keys)
 {
@@ -185,6 +189,7 @@ struct TopologyEngine::Builder::Config {
     std::chrono::seconds localIsolationTimeout{ TopologyControllerOptions{}.nodeDeadTimeout };
     std::chrono::milliseconds scopeProbeInterval{ 5'000 };
     std::chrono::milliseconds scaleInCollectWindow{ TopologyControllerOptions{}.scaleInCollectWindow };
+    size_t progressThreads{ TopologyEngine::DEFAULT_PROGRESS_THREADS };
     bool buildAttempted{ false };
     bool backendSelectionInvalid{ false };
     bool isRestart{ false };
@@ -351,6 +356,14 @@ TopologyEngine::Builder &TopologyEngine::Builder::SetScaleInCollectWindow(std::c
     return *this;
 }
 
+TopologyEngine::Builder &TopologyEngine::Builder::SetProgressThreads(size_t threads)
+{
+    if (config_ != nullptr) {
+        config_->progressThreads = threads;
+    }
+    return *this;
+}
+
 Status TopologyEngine::Builder::Validate() const
 {
     CHECK_FAIL_RETURN_STATUS(config_ != nullptr && IsCanonicalAddress(config_->localAddress)
@@ -360,6 +373,7 @@ Status TopologyEngine::Builder::Validate() const
                                  && config_->scopeProbeInterval.count() > 0
                                  && config_->scaleInCollectWindow.count() >= 0
                                  && config_->scaleInCollectWindow.count() <= MAX_SCALE_IN_COLLECT_WINDOW_MS
+                                 && config_->progressThreads <= TopologyEngine::MAX_PROGRESS_THREADS
                                  && !config_->backendSelectionInvalid,
                              K_INVALID, "invalid cluster topology Engine Builder settings");
     if (config_->backendKind == Config::BackendKind::ETCD) {
@@ -451,6 +465,7 @@ TopologyEngine::RuntimeOptions TopologyEngine::ConsumeRuntimeOptions(Builder::Co
     options.coordinatorReadyTimeout = config.coordinatorReadyTimeout;
     options.localIsolationTimeout = config.localIsolationTimeout;
     options.scopeProbeInterval = config.scopeProbeInterval;
+    options.progressThreads = config.progressThreads;
     options.controlBackendProbe = std::move(config.controlBackendProbe);
     options.peerTopologyRefresh = std::move(config.peerTopologyRefresh);
     options.workerProbeHandler = std::move(config.workerProbeHandler);
@@ -779,6 +794,7 @@ Status TopologyEngine::StartMemberRole()
               << " notify_revision=" << (watchRevision == WATCH_FROM_NOW ? "none" : std::to_string(watchRevision))
               << " status=registered";
 
+    StartProgressPool();
     RETURN_IF_NOT_OK(executor_.Start());
     return StartStateThread();
 }
@@ -815,6 +831,24 @@ Status TopologyEngine::WaitForCoordinatorReady()
             std::min(retryInterval * RETRY_BACKOFF_MULTIPLIER, COORDINATOR_READY_MAX_RETRY_INTERVAL);
     }
     RETURN_STATUS(K_SHUTTING_DOWN, "cluster topology Engine startup was cancelled");
+}
+
+void TopologyEngine::StartProgressPool()
+{
+    if (options_.progressThreads == 0 || progressPool_ != nullptr) {
+        return;
+    }
+    try {
+        // Elastic pool: resident floor plus on-demand growth to the bound; idle threads beyond the floor shrink
+        // back after the pool's default idle timeout. A creation failure only disables concurrency.
+        progressPool_ = std::make_unique<ThreadPool>(PROGRESS_POOL_MIN_THREADS, options_.progressThreads,
+                                                     "TopologyProgress");
+    } catch (const std::exception &error) {
+        progressPool_ = nullptr;
+        LOG(WARNING) << "CLUSTER_LIFECYCLE cluster=" << options_.clusterName
+                     << " role=worker action=progress_pool_start_failed progress_threads=" << options_.progressThreads
+                     << " fallback=inline_serial error=" << error.what();
+    }
 }
 
 Status TopologyEngine::CleanupAfterStartFailure()
@@ -912,8 +946,17 @@ Status TopologyEngine::ShutdownComponents(std::chrono::steady_clock::time_point 
     if (!stateThreadExited) {
         PreserveFirstError(Status(K_RPC_DEADLINE_EXCEEDED, "cluster topology Engine shutdown deadline exceeded"),
                            firstError);
-    } else if (stateThread_.joinable()) {
-        stateThread_.join();
+        // The Run loop is still alive and remains the sole submitter into the pool; resetting here would race its
+        // HandleProgressCompletion. Leave the pool to the process hard exit, as with callback drain.
+    } else {
+        if (stateThread_.joinable()) {
+            stateThread_.join();
+        }
+        // Join the progress pool only after the Run loop (its sole submitter) exited. Executor Stop already fenced new
+        // completions: unstarted work returns via DiscardIfStopping, while work already inside a revalidation chain is
+        // bounded only by that chain's per-call backend RPC timeouts (ReadTask + authority read + progress CAS), which
+        // can outlast stopGrace. The process lifecycle manager owns the outer hard bound, as with callback drain.
+        progressPool_.reset();
     }
     if (controllerRuntime_ != nullptr) {
         PreserveFirstError(controllerRuntime_->Stop(deadline), firstError);
@@ -1491,9 +1534,14 @@ bool TopologyEngine::RequireMembershipRejoinOnce(const char *reason)
 Status TopologyEngine::HandleRuntimeEvent(RuntimeEvent event)
 {
     if (auto *completion = std::get_if<TopologyCallbackCompletion>(&event.payload)) {
-        return executor_.HandleCompletion(std::move(*completion));
+        return HandleProgressCompletion(std::move(*completion));
     }
     auto coordination = std::get<CoordinationEvent>(std::move(event.payload));
+    if (coordination.key == PROGRESS_DOORBELL_KEY) {
+        // Wake-only event: a progress-pool completion rescheduled executor work due now, and the tick that follows
+        // every loop event submits it without another backend round trip.
+        return Status::OK();
+    }
     const auto kind = keys_->ClassifyPhysicalKey(coordination.key, options_.localAddress);
     if (coordinatorProxy_ != nullptr && coordination.type == CoordinationEventType::PUT
         && kind == TopologyPhysicalKeyKind::LOCAL_PROBE) {
@@ -1516,6 +1564,58 @@ Status TopologyEngine::HandleRuntimeEvent(RuntimeEvent event)
         }
     }
     return rc;
+}
+
+Status TopologyEngine::HandleProgressCompletion(TopologyCallbackCompletion completion)
+{
+    if (progressPool_ == nullptr) {
+        return executor_.HandleCompletion(std::move(completion));
+    }
+    // The shared_ptr keeps the move-only completion inside a copyable pool closure and stays complete until the pool
+    // accepts the closure, so the inline fallback after a rejected submit still sees the full completion.
+    auto owned = std::make_shared<TopologyCallbackCompletion>(std::move(completion));
+    bool submitted = false;
+    try {
+        // Completions are independent per-task fences: the executor validates each fence against the authority and
+        // the repository CAS is idempotent per task key, so bounded concurrent processing preserves the ordering
+        // contract while keeping the serial Run loop free of the per-completion backend round trips.
+        progressPool_->Execute([this, owned]() {
+            const auto taskPrefix = TopologyDiagnosticPrefix(owned->fence.taskId);
+            try {
+                auto rc = executor_.HandleCompletion(std::move(*owned));
+                if (rc.IsError()) {
+                    LOG(WARNING) << "CLUSTER_RUNTIME_OPERATION_FAILED scope=task_progress"
+                                 << " task_prefix=" << taskPrefix << " status=" << rc.ToString();
+                }
+                // A completion can reschedule executor work due immediately, such as the ScaleIn metadata-gate
+                // handoff to the data-drain callback or a bounded retry. The serial loop would otherwise sleep
+                // until its next probe deadline, so wake it with a coalesced doorbell; the loop's own tick then
+                // submits the work.
+                auto doorbell = dispatcher_.SubmitCoordination(
+                    { CoordinationEventType::PUT, PROGRESS_DOORBELL_KEY, "", 0, 0 });
+                // K_NOT_READY is post-shutdown and K_TRY_AGAIN means the ingress queue overflowed, i.e. the loop is
+                // busy draining events and its own tick reschedules the work; a lost doorbell is benign either way.
+                if (doorbell.IsError() && doorbell.GetCode() != K_NOT_READY && doorbell.GetCode() != K_TRY_AGAIN) {
+                    LOG(WARNING) << "CLUSTER_RUNTIME_OPERATION_FAILED scope=progress_doorbell status="
+                                 << doorbell.ToString();
+                }
+            } catch (const std::exception &error) {
+                LOG(ERROR) << "CLUSTER_RUNTIME_OPERATION_FAILED scope=task_progress task_prefix=" << taskPrefix
+                           << " reason=exception error=" << error.what();
+            } catch (...) {
+                LOG(ERROR) << "CLUSTER_RUNTIME_OPERATION_FAILED scope=task_progress task_prefix=" << taskPrefix
+                           << " reason=unknown_exception";
+            }
+        });
+        submitted = true;
+    } catch (const std::exception &error) {
+        LOG(WARNING) << "CLUSTER_LIFECYCLE cluster=" << options_.clusterName
+                     << " role=worker action=progress_submit_failed fallback=inline error=" << error.what();
+    }
+    if (submitted) {
+        return Status::OK();
+    }
+    return executor_.HandleCompletion(std::move(*owned));
 }
 
 Status TopologyEngine::HandleWorkerProbeEvent(const CoordinationEvent &event)

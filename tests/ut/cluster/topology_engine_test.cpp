@@ -23,6 +23,7 @@
 
 #include "datasystem/cluster/algorithm/hash_algorithm.h"
 #include "datasystem/cluster/coordination_backend/ds_coordination_backend.h"
+#include "datasystem/cluster/control/topology_task_materializer.h"
 #include "datasystem/cluster/membership/membership_value_codec.h"
 #include "datasystem/cluster/repository/topology_key_helper.h"
 #include "datasystem/cluster/repository/topology_repository_codec.h"
@@ -52,6 +53,11 @@ public:
     static Status ApplyCoordinatorTopologyEvent(TopologyEngine &engine, const CoordinationEvent &event)
     {
         return engine.ApplyCoordinatorTopologyEvent(event);
+    }
+
+    static Status HandleRuntimeEvent(TopologyEngine &engine, CoordinationEvent &&event)
+    {
+        return engine.HandleRuntimeEvent(RuntimeEvent{ RuntimeEventPayload{ std::move(event) } });
     }
 
     static void InvalidateCoordinatorWatches(TopologyEngine &engine)
@@ -99,6 +105,21 @@ public:
         auto *backend = dynamic_cast<DsCoordinationBackend *>(engine.memberBackend_.get());
         CHECK_FAIL_RETURN_STATUS(backend != nullptr, K_RUNTIME_ERROR, "expected Coordinator membership backend");
         return backend->OnMembershipEnsured(coordinatorId, membershipModRevision);
+    }
+
+    static Status SubmitProgressCompletion(TopologyEngine &engine, TopologyCallbackCompletion completion)
+    {
+        return engine.dispatcher_.SubmitCompletion(std::move(completion));
+    }
+
+    static bool HasProgressPool(const TopologyEngine &engine)
+    {
+        return engine.progressPool_ != nullptr;
+    }
+
+    static uint64_t ExecutorStaleCount(const TopologyEngine &engine)
+    {
+        return engine.executor_.GetDiagnostics().stale;
     }
 };
 
@@ -401,6 +422,37 @@ std::unique_ptr<TopologyEngine> BuildEngine(testing::FakeCoordinatorServiceProxy
     std::unique_ptr<TopologyEngine> engine;
     EXPECT_TRUE(builder.Build(engine).IsOk());
     return engine;
+}
+
+TopologyCallbackCompletion MakeUnmatchedTaskCompletion(size_t index)
+{
+    // A distinct target per completion yields distinct deterministic task ids; the task record itself stays absent
+    // so revalidation always ends as one bounded stale completion.
+    const auto targetAddress = "127.0.0.1:" + std::to_string(10'003 + index);
+    TopologyMigrateTask task;
+    task.type = TopologyChangeType::SCALE_OUT;
+    task.epoch = 1;
+    task.executorAddress = LOCAL_ADDRESS;
+    task.targetAddress = targetAddress;
+    task.sourceRanges = { { LOCAL_ADDRESS, { 0U, 100U }, false } };
+    task.taskId = TopologyTaskMaterializer::BuildTaskId(task);
+    TopologyExecutionFence fence;
+    fence.taskId = task.taskId;
+    fence.taskKind = TopologyTaskKind::MIGRATE;
+    fence.batchType = TopologyChangeType::SCALE_OUT;
+    fence.batchEpoch = 1;
+    fence.phase = TopologyCallbackPhase::SCALE_OUT;
+    fence.executor = { std::string(16, 'a'), LOCAL_ADDRESS };
+    fence.source = fence.executor;
+    fence.target = { std::string(16, 'c'), targetAddress };
+    fence.ranges = { { 0U, 100U } };
+    TopologyCallbackCompletion completion;
+    completion.fence = std::move(fence);
+    completion.businessOperationId =
+        TopologyTaskMaterializer::BuildBusinessOperationId(completion.fence.phase, completion.fence);
+    completion.status = Status::OK();
+    completion.deadline = std::chrono::steady_clock::now() + TEST_WAIT + TEST_WAIT;
+    return completion;
 }
 
 TEST(TopologyEngineTest, BuilderRejectsIncompleteAndConflictingConfiguration)
@@ -1852,6 +1904,154 @@ TEST(TopologyEngineTest, HostIdsRecoverAtTheSameTopologyVersion)
     DS_ASSERT_OK(TopologyEngineTestPeer::ReloadTopology(*engine));
     DS_ASSERT_OK(engine->GetRoutingHostIds(hostIds));
     EXPECT_EQ(hostIds.at(LOCAL_ADDRESS), "host-b");
+}
+
+TEST(TopologyEngineTest, CompletionProcessingRunsConcurrentlyWithinPoolBound)
+{
+    testing::FakeCoordinatorServiceProxy proxy;
+    TestWatchIngress ingress;
+    NoopTopologyCallbacks callbacks;
+    PutTopology(proxy, "progress-concurrent", MakeTopology());
+    TopologyEngine::Builder builder;
+    ConfigureBuilder(builder, proxy, ingress, callbacks, "progress-concurrent");
+    constexpr size_t poolBound = 4;
+    builder.SetProgressThreads(poolBound);
+    std::unique_ptr<TopologyEngine> engine;
+    DS_ASSERT_OK(builder.Build(engine));
+    DS_ASSERT_OK(engine->Start());
+    ASSERT_TRUE(TopologyEngineTestPeer::HasProgressPool(*engine));
+
+    // Submit more completions than the pool bound so every pool thread must pile up inside the interceptor; the
+    // observed in-flight high-water mark then proves the pool scales up to the bound and never dispatches past it.
+    constexpr size_t completionCount = 8;
+    auto keys = MakeKeys("progress-concurrent");
+    const std::string migratePrefix = keys->MigrateTaskTable() + "/";
+    // The barrier only counts and blocks migrate-task reads driven by completion revalidation; engine background
+    // reads use other keys and pass through unblocked.
+    std::mutex mutex;
+    std::condition_variable arrivedCv;
+    std::condition_variable releaseCv;
+    size_t entered = 0;
+    size_t exited = 0;
+    size_t maxInFlight = 0;
+    bool release = false;
+    proxy.SetRangeEntryInterceptor([&](const std::string &key) {
+        if (key.rfind(migratePrefix, 0) != 0) {
+            return;
+        }
+        std::unique_lock<std::mutex> lock(mutex);
+        ++entered;
+        maxInFlight = std::max(maxInFlight, entered - exited);
+        arrivedCv.notify_all();
+        releaseCv.wait_for(lock, std::chrono::seconds(2), [&] { return release; });
+        ++exited;
+    });
+    for (size_t index = 0; index < completionCount; ++index) {
+        DS_ASSERT_OK(TopologyEngineTestPeer::SubmitProgressCompletion(
+            *engine, MakeUnmatchedTaskCompletion(index)));
+    }
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        // With a serial inline consumer the second task read could never arrive while the first one blocks, and an
+        // unbounded dispatcher would exceed the bound; wait until the whole pool is inside the barrier.
+        EXPECT_TRUE(arrivedCv.wait_for(lock, TEST_WAIT, [&] { return entered >= poolBound; }));
+        release = true;
+    }
+    releaseCv.notify_all();
+    ASSERT_TRUE(WaitFor([&] { return TopologyEngineTestPeer::ExecutorStaleCount(*engine) == completionCount; }));
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        EXPECT_EQ(entered, completionCount);
+        // A scheduler-jitter environment may relax this to >= 2 (concurrency exists) and <= poolBound (bounded).
+        EXPECT_EQ(maxInFlight, poolBound);
+    }
+    proxy.SetRangeEntryInterceptor(nullptr);
+    DS_ASSERT_OK(engine->Shutdown(std::chrono::steady_clock::now() + TEST_WAIT));
+    EXPECT_EQ(engine->GetState(), TopologyEngineState::STOPPED);
+}
+
+TEST(TopologyEngineTest, ProgressDoorbellWakesLoopWithoutBackendRoundTrip)
+{
+    testing::FakeCoordinatorServiceProxy proxy;
+    TestWatchIngress ingress;
+    NoopTopologyCallbacks callbacks;
+    PutTopology(proxy, "progress-doorbell", MakeTopology());
+    auto engine = BuildEngine(proxy, ingress, callbacks, "progress-doorbell");
+    DS_ASSERT_OK(engine->Start());
+
+    std::atomic<size_t> rangeCalls{ 0 };
+    proxy.SetRangeEntryInterceptor([&](const std::string &) { rangeCalls.fetch_add(1); });
+    const auto before = rangeCalls.load();
+    DS_ASSERT_OK(TopologyEngineTestPeer::HandleRuntimeEvent(
+        *engine, { CoordinationEventType::PUT, "topology/progress-doorbell", "", 0, 0 }));
+    EXPECT_EQ(rangeCalls.load(), before);
+    proxy.SetRangeEntryInterceptor(nullptr);
+
+    DS_ASSERT_OK(engine->Shutdown(std::chrono::steady_clock::now() + TEST_WAIT));
+    EXPECT_EQ(engine->GetState(), TopologyEngineState::STOPPED);
+}
+
+TEST(TopologyEngineTest, ProgressPoolDisabledMatchesLegacyBehavior)
+{
+    testing::FakeCoordinatorServiceProxy proxy;
+    TestWatchIngress ingress;
+    NoopTopologyCallbacks callbacks;
+    PutTopology(proxy, "progress-legacy", MakeTopology());
+    TopologyEngine::Builder builder;
+    ConfigureBuilder(builder, proxy, ingress, callbacks, "progress-legacy");
+    builder.SetProgressThreads(0);
+    std::unique_ptr<TopologyEngine> engine;
+    DS_ASSERT_OK(builder.Build(engine));
+    DS_ASSERT_OK(engine->Start());
+    ASSERT_FALSE(TopologyEngineTestPeer::HasProgressPool(*engine));
+
+    DS_ASSERT_OK(TopologyEngineTestPeer::SubmitProgressCompletion(*engine, MakeUnmatchedTaskCompletion(0)));
+    ASSERT_TRUE(WaitFor([&] { return TopologyEngineTestPeer::ExecutorStaleCount(*engine) == 1U; }));
+    DS_ASSERT_OK(engine->Shutdown(std::chrono::steady_clock::now() + TEST_WAIT));
+    EXPECT_EQ(engine->GetState(), TopologyEngineState::STOPPED);
+}
+
+TEST(TopologyEngineTest, ShutdownDrainsProgressPoolWithoutCrash)
+{
+    testing::FakeCoordinatorServiceProxy proxy;
+    TestWatchIngress ingress;
+    NoopTopologyCallbacks callbacks;
+    PutTopology(proxy, "progress-drain", MakeTopology());
+    TopologyEngine::Builder builder;
+    ConfigureBuilder(builder, proxy, ingress, callbacks, "progress-drain");
+    builder.SetProgressThreads(4);
+    std::unique_ptr<TopologyEngine> engine;
+    DS_ASSERT_OK(builder.Build(engine));
+    DS_ASSERT_OK(engine->Start());
+
+    constexpr size_t completionCount = 4;
+    auto keys = MakeKeys("progress-drain");
+    const std::string migratePrefix = keys->MigrateTaskTable() + "/";
+    std::mutex mutex;
+    std::condition_variable arrivedCv;
+    std::condition_variable releaseCv;
+    size_t arrived = 0;
+    bool release = false;
+    proxy.SetRangeEntryInterceptor([&](const std::string &key) {
+        if (key.rfind(migratePrefix, 0) != 0) {
+            return;
+        }
+        std::unique_lock<std::mutex> lock(mutex);
+        ++arrived;
+        arrivedCv.notify_all();
+        releaseCv.wait_for(lock, std::chrono::seconds(1), [&] { return release; });
+    });
+    for (size_t index = 0; index < completionCount; ++index) {
+        DS_ASSERT_OK(TopologyEngineTestPeer::SubmitProgressCompletion(
+            *engine, MakeUnmatchedTaskCompletion(index)));
+    }
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        ASSERT_TRUE(arrivedCv.wait_for(lock, TEST_WAIT, [&] { return arrived >= 1U; }));
+    }
+    // Shutdown must join the pool while revalidation work is still blocked inside the interceptor.
+    DS_ASSERT_OK(engine->Shutdown(std::chrono::steady_clock::now() + TEST_WAIT + TEST_WAIT));
+    EXPECT_EQ(engine->GetState(), TopologyEngineState::STOPPED);
 }
 
 }  // namespace

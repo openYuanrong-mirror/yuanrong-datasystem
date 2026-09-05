@@ -36,6 +36,7 @@
 namespace datasystem {
 class EtcdStore;
 class ICoordinatorServiceProxy;
+class ThreadPool;
 }
 
 namespace datasystem::cluster {
@@ -210,6 +211,13 @@ public:
          * @return This Builder.
          */
         Builder &SetScaleInCollectWindow(std::chrono::milliseconds window);
+
+        /**
+         * @brief Bind the maximum concurrency for task-progress completion processing.
+         * @param[in] threads Maximum progress-pool threads; 0 keeps the legacy inline serial path.
+         * @return This Builder.
+         */
+        Builder &SetProgressThreads(size_t threads);
 
         /**
          * @brief Validate once, exact-read restart state, and construct every role component.
@@ -393,6 +401,12 @@ private:
     friend class TopologyEngineTestPeer;
 
     static constexpr int32_t ENGINE_READ_TIMEOUT_MS = 3'000;
+    // Progress pool: 1 resident consumer grows on demand up to the bound, then shrinks back after the idle timeout.
+    // The bound covers one executor marking every task of a maximum-size batch within the startup budget. Keeping a
+    // single resident thread also makes a pool-construction thread failure fall back cleanly (no half-built pool).
+    static constexpr size_t DEFAULT_PROGRESS_THREADS = 32;
+    static constexpr size_t MAX_PROGRESS_THREADS = 64;
+    static constexpr size_t PROGRESS_POOL_MIN_THREADS = 1;
 
     /**
      * @brief Private Worker runtime settings hidden from business composition code.
@@ -409,6 +423,7 @@ private:
         std::chrono::seconds coordinatorReadyTimeout{ 0 };
         std::chrono::seconds localIsolationTimeout{ 0 };
         std::chrono::seconds stopGrace{ 10 };
+        size_t progressThreads{ DEFAULT_PROGRESS_THREADS };
         ControlBackendProbe controlBackendProbe;
         PeerTopologyRefresh peerTopologyRefresh;
         std::function<Status(WorkerProbeRequest)> workerProbeHandler;
@@ -502,10 +517,24 @@ private:
     void Run();
 
     /**
+     * @brief Dispatch one task-progress completion to the bounded pool or the legacy inline path.
+     *
+     * Only the Run loop calls this; the pool is joined in ShutdownComponents after the Run loop exits.
+     */
+    Status HandleProgressCompletion(TopologyCallbackCompletion completion);
+
+    /**
      * @brief Start the Worker state thread after dependencies are ready.
      * @return K_OK on success; K_RUNTIME_ERROR when thread construction fails.
      */
     Status StartStateThread();
+
+    /**
+     * @brief Start the optional bounded task-progress completion pool before the state thread runs.
+     *
+     * Failure leaves the pool null and the Run loop falls back to inline serial completion processing.
+     */
+    void StartProgressPool();
 
     /**
      * @brief Disable event ingress and restore lifecycle state after a failed Start step.
@@ -651,6 +680,9 @@ private:
     std::unique_ptr<TopologyControllerRuntime> controllerRuntime_;
     std::unique_ptr<TopologyRecoveryReporter> recoveryReporter_;
     std::unique_ptr<WorkerLeaderReconciler> workerLeaderReconciler_;
+    // Optional bounded pool for task-progress completion processing. Null keeps the legacy inline serial path in the
+    // Run loop. Only the Run loop submits; ShutdownComponents joins it after the Run loop exits.
+    std::unique_ptr<ThreadPool> progressPool_{ nullptr };
     // Monotonic while RUNNING after successful admission/reconciliation; shutdown clears it before backend teardown.
     // Membership write order and terminal EXITING intent are owned by the coordination backend.
     std::atomic<bool> readyMembershipPublished_{ false };

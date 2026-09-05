@@ -137,7 +137,16 @@
   unrelated protobuf contracts remain separate schemas.
 - `TopologyEngine`, `TopologyController`, and standalone `TopologyObserver` each own one serialized state loop. ETCD
   Workers use the Worker-owned `EtcdStore` and one unified watch stream for exact topology/local notify plus membership;
-  Engine routes physical-key events by role. Controller validates and applies ETCD topology/membership PUT values to its
+  Engine routes physical-key events by role. The Engine loop hands `TopologyCallbackCompletion` events to its elastic
+  `TopologyProgress` pool (floor 1, bound 32, idle shrink; `Builder::SetProgressThreads(0)` restores inline serial
+  processing) so per-completion fence revalidation and the progress CAS run with bounded concurrency; each completion
+  is still independently revalidated against the authority, so pool concurrency preserves the fence/epoch ordering
+  contract. After each pooled completion the worker submits a coalesced `topology/progress-doorbell` event so the
+  serial loop wakes and its executor tick promptly submits work the completion rescheduled due-now (ScaleIn
+  metadata-gate handoff to data drain, bounded retries); without the doorbell the loop would sleep until its next
+  probe deadline. Fence revalidation always performs a full authoritative read: a revision alone cannot prove the
+  authority generation, so conditional-read reuse is only safe once revision is bound to the authority instance
+  identity. Controller validates and applies ETCD topology/membership PUT values to its
   state-thread-owned fact cache; a membership DELETE exact-resyncs the complete prefix because the event carries no
   replacement value and same-revision deletes are dispatched individually. A Coordinator-mode Worker directly validates
   and publishes a complete exact topology PUT only while its captured `CoordinatorId` and watch ID still own the current
@@ -278,6 +287,7 @@
   | `CLUSTER_DEGRADED` | Worker Engine | business-admission level and reason transitions during backend loss and recovery. |
   | `CLUSTER_RING` | Controller/Worker/Observer topology publication | newly committed or locally published version, membership counts, and per-member `committed_ring`/`prospective_ring` ranges. |
   | `CLUSTER_TASK` | Materializer/executor | task materialization, notify, stage start/finish/failure, exact participants/ranges, cleanup, and progress outcomes. |
+  | `CLUSTER_TASK action=progress_latency` | Executor progress path | slow (`>20ms`) fence revalidation or progress-CAS round trips; includes stage and `elapsed_ms` for startup-time diagnosis. |
 
   Membership mutation diagnostics acquire neither the mutation lock nor a separate diagnostic mutex. `owner=changing`
   means every bounded snapshot read overlapped an owner transition; the reader does not retry beyond its fixed budget.

@@ -22,7 +22,8 @@ Use with:
 
 - Persistence: only `ClusterTopologyPb` is authority; derived task/notify state is deterministic and regenerable.
 - Concurrency: one engine serializes backend events; callbacks run in a bounded pool and return completion to the serial
-  runtime for full-fence revalidation.
+  runtime, which dispatches each completion to the elastic `TopologyProgress` pool (or inline when
+  `SetProgressThreads(0)`) for full-fence revalidation with bounded concurrency.
 - Foreground path: use one immutable `TopologySnapshot`; no backend IO, token exposure, or callback work.
 - Recovery: every crash point must replay idempotently or terminate the affected batch without blocking future batches.
 - Failure: temporary endpoint status is local; confirmed Failure may preempt ordinary work and must heal from latest
