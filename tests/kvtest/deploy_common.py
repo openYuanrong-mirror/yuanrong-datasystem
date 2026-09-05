@@ -928,8 +928,12 @@ def start_service_standalone(pod, namespace, binary_name, remote_dir, config_pat
         caller does its own pgrep verify (client-style binaries)
 
     ``pod['_start_elapsed']`` records the actual launch + readiness wait
-    (same semantics as ``start_service``'s dscli path). The post-launch
-    pgrep fallback is excluded from the timing.
+    (same semantics as ``start_service``'s dscli path). When the launcher
+    path is used, the elapsed is measured inside the launcher (Popen →
+    ready), excluding ``kubectl exec`` connection setup and ``python3``
+    interpreter startup — this matters on large clusters where
+    ``kubectl exec`` latency can dominate. The post-launch pgrep fallback
+    is also excluded from the timing.
 
     If launcher upload fails, falls back to the legacy ``nohup ... &`` path
     (slow but works without the launcher script).
@@ -967,9 +971,11 @@ def start_service_standalone(pod, namespace, binary_name, remote_dir, config_pat
                                       procmon_remote_dir, timeout=timeout)
     import time
     t_start = time.monotonic()
+    pid = None
+    launch_elapsed = None
     try:
         if launcher_remote:
-            pid = _launch_via_launcher(
+            pid, launch_elapsed = _launch_via_launcher(
                 name, namespace, launcher_remote,
                 binary_path, remote_dir, log_path, lib_path, binary_argv,
                 port=port, host=pod_ip,
@@ -984,7 +990,14 @@ def start_service_standalone(pod, namespace, binary_name, remote_dir, config_pat
                 lib_path, config_path, jf_addr, service_name, extra_args,
                 pod, port, process_name, timeout)
     finally:
-        pod['_start_elapsed'] = time.monotonic() - t_start
+        # Use the launcher-reported elapsed (Popen → ready, excludes
+        # kubectl exec / python3 startup overhead) when available. Fall
+        # back to the outer measurement for the nohup path or when the
+        # launcher didn't report a timing.
+        if launch_elapsed is not None:
+            pod['_start_elapsed'] = launch_elapsed
+        else:
+            pod['_start_elapsed'] = time.monotonic() - t_start
 
     # Launcher / nohup path returned no PID (timeout, error, or fallback).
     # Fall back to pgrep / find_pid_by_port as a sanity check before
@@ -1023,14 +1036,22 @@ def _launch_via_launcher(name, namespace, launcher_remote, binary_path,
                          port=None, host='127.0.0.1',
                          ready_file=None,
                          ready_timeout=30, subprocess_timeout=DEFAULT_TIMEOUT):
-    """Invoke standalone_launcher.py via kubectl exec; return parsed PID.
+    """Invoke standalone_launcher.py via kubectl exec; return (pid, elapsed).
 
-    Returns the PID string if the launcher printed one, or ``None`` if the
-    launcher timed out, exited non-zero, or did not print a parseable PID.
+    Returns a ``(pid_str, elapsed_float)`` tuple if the launcher printed a
+    PID, or ``(None, None)`` if the launcher timed out, exited non-zero,
+    or did not print a parseable PID.
+
+    The ``elapsed`` is measured inside the launcher (Popen → ready signal),
+    excluding ``kubectl exec`` connection setup and ``python3`` interpreter
+    startup overhead. The caller should use this value for
+    ``pod['_start_elapsed']`` instead of the outer ``time.monotonic()``
+    diff so that large-cluster ``kubectl exec`` latency does not inflate
+    the reported startup time.
 
     Readiness signal priority (matches dscli): ``ready_file`` (authoritative,
     e.g. worker ``ready_check_path``) > ``port`` (TCP connect, e.g.
-    coordinator) > none (print PID immediately).
+    coordinator) > none (grace-poll for early exits).
     """
     cmd = ['kubectl', 'exec', '-n', namespace, name, '--',
            'python3', launcher_remote,
@@ -1049,19 +1070,33 @@ def _launch_via_launcher(name, namespace, launcher_remote, binary_path,
         result = subprocess.run(cmd, capture_output=True, text=True,
                                 timeout=subprocess_timeout)
     except subprocess.TimeoutExpired:
-        return None
+        return None, None
+    stderr = (result.stderr or '').strip()
     if result.returncode != 0:
-        stderr = (result.stderr or '').strip()
         if stderr:
             log_error(stderr)
-        return None
+        return None, None
+    # Surface launcher warnings (e.g. not-ready-timeout with PID) even on
+    # success so the caller knows readiness was not confirmed.
+    if stderr:
+        log_info(stderr)
     out = (result.stdout or '').strip()
     if not out:
-        return None
-    # Launcher prints only the PID to stdout; pick the last line in case
-    # kubectl adds any prefix noise.
+        return None, None
+    # Launcher prints "{pid} {elapsed}" to stdout; pick the last line in
+    # case kubectl adds any prefix noise.
     pid_line = out.splitlines()[-1].strip()
-    return pid_line if pid_line.isdigit() else None
+    parts = pid_line.split()
+    pid = parts[0] if parts and parts[0].isdigit() else None
+    if not pid:
+        return None, None
+    elapsed = None
+    if len(parts) > 1:
+        try:
+            elapsed = float(parts[1])
+        except ValueError:
+            pass
+    return pid, elapsed
 
 
 def _extract_ready_check_path(config):

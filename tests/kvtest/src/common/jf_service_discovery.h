@@ -96,9 +96,15 @@ private:
         if (heartbeatThreads_.count(key) > 0)
             return;
         heartbeatThreads_[key] = std::thread([this, service, ip, port]() {
-            int interval = defaultTtl_ / 3;
-            if (interval < 1)
+            // ttl/6 (was ttl/3) tolerates two consecutive missed heartbeats
+            // before TTL expiry. On a 1-core host the leader is CPU-starved
+            // by brpc + SHA-256 recovery + watch fan-out after winning
+            // election; the heartbeat pthread can be preempted >10s, so the
+            // old ttl/3=10s interval left zero slack after one slow round.
+            int interval = defaultTtl_ / 6;
+            if (interval < 1) {
                 interval = 1;
+            }
             while (running_.load()) {
                 {
                     std::unique_lock<std::mutex> lk(mutex_);
@@ -112,6 +118,19 @@ private:
                 if (rc.IsError()) {
                     fprintf(stderr, "JF heartbeat failed for %s:%d: %s\n", service.c_str(), port,
                             rc.ToString().c_str());
+                    // Immediate retry before waiting another full interval:
+                    // breaks the "slow round -> wait interval -> slow round
+                    // -> TTL gone" positive feedback that expires the
+                    // coordinator under worker-startup CPU saturation.
+                    std::unique_lock<std::mutex> lk(mutex_);
+                    if (cv_.wait_for(lk, std::chrono::seconds(1), [this] { return !running_.load(); })) {
+                        break;
+                    }
+                    auto rc2 = HttpPost("/heartbeat", body.dump(), resp);
+                    if (rc2.IsError()) {
+                        fprintf(stderr, "JF heartbeat retry failed for %s:%d: %s\n", service.c_str(), port,
+                                rc2.ToString().c_str());
+                    }
                 }
             }
         });
@@ -191,7 +210,16 @@ private:
         auto pos = jfAddr_.find(':');
         std::string host = (pos != std::string::npos) ? jfAddr_.substr(0, pos) : jfAddr_;
         int port = (pos != std::string::npos) ? std::stoi(jfAddr_.substr(pos + 1)) : 80;
-        return std::make_unique<httplib::Client>(host.c_str(), port);
+        auto cli = std::make_unique<httplib::Client>(host.c_str(), port);
+        // Without explicit timeouts, httplib::Client can block on connect()
+        // for tens of seconds when the JF server's listen backlog overflows
+        // (2000-worker startup burst). The coordinator heartbeat thread
+        // would then miss TTL and be expired. 2s connect / 5s read bounds
+        // a single failed heartbeat round so the next interval (TTL/3)
+        // can retry, instead of blocking past TTL.
+        cli->set_connection_timeout(2);
+        cli->set_read_timeout(5);
+        return cli;
     }
 
     static std::string DetectLocalIp()

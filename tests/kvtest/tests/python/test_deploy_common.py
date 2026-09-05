@@ -187,8 +187,10 @@ class TestUploadLauncher(unittest.TestCase):
 
 class TestStartServiceStandaloneTiming(unittest.TestCase):
     """start_service_standalone must set pod['_start_elapsed'] covering the
-    actual launch + readiness wait (mirrors dscli semantics), regardless of
-    whether the launcher path or the legacy nohup fallback was used."""
+    actual launch + readiness wait. When the launcher path is used, the
+    elapsed is the launcher-reported value (Popen → ready, excludes kubectl
+    exec / python3 overhead); for the nohup fallback it falls back to the
+    outer time.monotonic() diff."""
 
     def _pod(self):
         return {'name': 'p1', 'ip': '10.0.0.1'}
@@ -197,10 +199,11 @@ class TestStartServiceStandaloneTiming(unittest.TestCase):
     @patch('deploy_common.subprocess.run')
     def test_launcher_path_records_elapsed_and_invokes_python(self, mock_run,
                                                                mock_upload):
-        # upload_launcher succeeds; launcher prints PID 1234 on stdout.
+        # upload_launcher succeeds; launcher prints "PID ELAPSED" on stdout.
         mock_upload.return_value = '/tmp/standalone_launcher.py'
-        mock_run.return_value = MagicMock(returncode=0, stdout='1234\n',
-                                           stderr='')
+        mock_run.return_value = MagicMock(returncode=0,
+                                          stdout='1234 0.52\n',
+                                          stderr='')
         pod = self._pod()
         ok = start_service_standalone(
             pod, 'default', 'worker_test', '/tmp/ds', '/tmp/cfg.json',
@@ -208,12 +211,11 @@ class TestStartServiceStandaloneTiming(unittest.TestCase):
             enable_procmon=False, port=31501, process_name='worker_test',
             timeout=10)
         self.assertTrue(ok)
-        # Timing recorded as a non-negative float (mocked subprocess returns
-        # instantly so the value may be 0.0; we only assert the field is set
-        # and is numeric).
+        # _start_elapsed must use the launcher-reported elapsed (0.52),
+        # not the outer time.monotonic() diff (which includes kubectl exec
+        # overhead and would be ~0.0 in the mock).
         self.assertIn('_start_elapsed', pod)
-        self.assertIsInstance(pod['_start_elapsed'], (int, float))
-        self.assertGreaterEqual(pod['_start_elapsed'], 0)
+        self.assertAlmostEqual(pod['_start_elapsed'], 0.52, places=2)
         # Launcher invoked via subprocess.run; command must include python3
         # and the launcher script path. NOT the nohup sh -c path.
         self.assertGreaterEqual(mock_run.call_count, 1)
@@ -231,8 +233,9 @@ class TestStartServiceStandaloneTiming(unittest.TestCase):
         # authoritative readiness file (worker_oc_server.cpp:2911-2933)
         # instead of falling back to TCP port polling.
         mock_upload.return_value = '/tmp/standalone_launcher.py'
-        mock_run.return_value = MagicMock(returncode=0, stdout='1234\n',
-                                           stderr='')
+        mock_run.return_value = MagicMock(returncode=0,
+                                          stdout='1234 0.52\n',
+                                          stderr='')
         pod = self._pod()
         config = {
             'worker_address': {'value': '10.0.0.1:31501'},
@@ -256,8 +259,9 @@ class TestStartServiceStandaloneTiming(unittest.TestCase):
         # worker with the flag unset), the launcher command must NOT
         # include --ready-file; it falls back to --port polling.
         mock_upload.return_value = '/tmp/standalone_launcher.py'
-        mock_run.return_value = MagicMock(returncode=0, stdout='1234\n',
-                                           stderr='')
+        mock_run.return_value = MagicMock(returncode=0,
+                                          stdout='1234 0.52\n',
+                                          stderr='')
         pod = self._pod()
         config = {'coordinator_address': {'value': '10.0.0.1:31511'}}
         ok = start_service_standalone(

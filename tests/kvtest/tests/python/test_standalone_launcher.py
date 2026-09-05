@@ -6,9 +6,19 @@ processes or opening real sockets:
 
 * ``is_port_ready`` against a local listener and a closed port
 * ``build_env`` LD_LIBRARY_PATH prepending (empty / set / no lib path)
-* ``parse_args`` shape, including the `--` passthrough separator and that
-  a leading `--` in positional argv is preserved (launcher strips it
-  defensively in ``main``, but ``parse_args`` itself does not).
+* ``parse_args`` shape, including the `--` passthrough separator,
+  ``--no-signal-grace`` default, and that a leading `--` in positional
+  argv is preserved (launcher strips it defensively in ``main``, but
+  ``parse_args`` itself does not).
+* ``main()`` no-signal early-exit detection (binary exits during grace
+  period → return 1, no PID on stdout)
+* ``main()`` no-signal grace success (binary stays alive → print
+  ``PID ELAPSED`` and return 0)
+* ``main()`` timeout final-poll check (binary exits during last sleep →
+  return 1, not 0 with a dead PID)
+* ``main()`` early-exit with port (binary exits before port opens →
+  return 1, no PID on stdout)
+* ``main()`` stale ready_file cleanup before Popen
 
 The end-to-end fork+setsid+poll path is covered by integration tests
 (deploy_worker / deploy_coordinator standalone smoke), not here, because
@@ -200,6 +210,7 @@ class TestParseArgs(unittest.TestCase):
              '--ready-file', '/tmp/ready',
              '--port', '1234', '--host', '127.0.0.1',
              '--ready-timeout', '5', '--ready-interval', '0.25',
+             '--no-signal-grace', '3',
              '--', '--config', 'cfg.json', '--jf', 'jf:9999'])
         self.assertEqual(args.binary, '/bin/true')
         self.assertEqual(args.cwd, '/tmp')
@@ -209,7 +220,13 @@ class TestParseArgs(unittest.TestCase):
         self.assertEqual(args.host, '127.0.0.1')
         self.assertEqual(args.ready_timeout, 5.0)
         self.assertEqual(args.ready_interval, 0.25)
+        self.assertEqual(args.no_signal_grace, 3.0)
         self.assertEqual(args.argv, ['--config', 'cfg.json', '--jf', 'jf:9999'])
+
+    def test_no_signal_grace_defaults_to_2(self):
+        args = launcher.parse_args(['--binary', '/bin/true',
+                                    '--log', '/tmp/x'])
+        self.assertEqual(args.no_signal_grace, 2.0)
 
     def test_passthrough_args_without_double_dash(self):
         # Without `--`, the first non-option token starts argv. Use values
@@ -243,18 +260,19 @@ class TestParseArgs(unittest.TestCase):
                  '--port', 'not-a-port'])
 
 
-class TestMainNoPortImmediatePid(unittest.TestCase):
-    """main() with no --port must print PID immediately and exit 0.
+class TestMainNoPortEarlyExitFails(unittest.TestCase):
+    """main() with no --port/--ready-file must detect early exits.
 
-    Uses /bin/true (exits 0 immediately) as the binary; the launcher should
-    fork it, see no port to poll, print the PID, and return 0. The forked
-    child becomes /bin/true which exits right away, but the parent returns
-    before checking the child's exit (no port path returns immediately).
+    Uses /bin/true (exits 0 immediately) as the binary. The launcher's
+    no-signal grace-poll loop must detect the early exit via proc.poll(),
+    print nothing to stdout, and return 1 — not report success with a
+    dead PID. This is the core fix for false-success on gflag/config
+    failures that cause the binary to exit during initialization.
     """
 
     @unittest.skipUnless(os.path.exists('/bin/true'),
                          '/bin/true not available on this platform')
-    def test_no_port_returns_zero_with_pid_on_stdout(self):
+    def test_no_port_early_exit_returns_nonzero(self):
         import io
         import contextlib
         stdout_buf = io.StringIO()
@@ -262,21 +280,113 @@ class TestMainNoPortImmediatePid(unittest.TestCase):
         with contextlib.redirect_stdout(stdout_buf), \
                 contextlib.redirect_stderr(stderr_buf):
             rc = launcher.main(['--binary', '/bin/true',
-                                '--log', '/tmp/launcher_test_no_port.log'])
+                                '--log', '/tmp/launcher_test_no_port.log',
+                                '--no-signal-grace', '2',
+                                '--ready-interval', '0.1'])
+        self.assertEqual(rc, 1)
+        # Must not have printed a PID — early exit is a failure.
+        self.assertEqual(stdout_buf.getvalue().strip(), '')
+
+
+class TestMainNoSignalGraceSuccess(unittest.TestCase):
+    """main() with no --port/--ready-file must survive the grace period
+    and print ``PID ELAPSED`` to stdout when the binary stays alive.
+
+    Uses mocks: Popen returns a process that never exits (poll → None),
+    time.monotonic advances past the grace deadline so the loop exits
+    naturally. The launcher should print ``{pid} {elapsed}`` and return 0.
+    """
+
+    def test_no_signal_grace_prints_pid_and_elapsed(self):
+        import io
+        import contextlib
+        import tempfile
+        from unittest.mock import patch, MagicMock
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mock_proc.pid = 54321
+        log_path = os.path.join(tempfile.gettempdir(),
+                                'launcher_test_grace.log')
+        stdout_buf = io.StringIO()
+        stderr_buf = io.StringIO()
+        # time.monotonic side_effect: t_launch=0, while-check=0, while-check=3
+        # (past deadline), final-elapsed=3
+        with contextlib.redirect_stdout(stdout_buf), \
+                contextlib.redirect_stderr(stderr_buf), \
+                patch('standalone_launcher.subprocess.Popen',
+                      return_value=mock_proc), \
+                patch('standalone_launcher.time.sleep'), \
+                patch('standalone_launcher.time.monotonic',
+                      side_effect=[0.0, 0.0, 3.0, 3.0]):
+            rc = launcher.main([
+                '--binary', '/bin/true',
+                '--log', log_path,
+                '--no-signal-grace', '2',
+                '--ready-interval', '0.5',
+            ])
         self.assertEqual(rc, 0)
         out = stdout_buf.getvalue().strip()
-        self.assertTrue(out, 'launcher must print PID to stdout')
-        last_line = out.splitlines()[-1].strip()
-        self.assertTrue(last_line.isdigit(),
-                         f'last stdout line must be a PID, got: {last_line!r}')
+        self.assertTrue(out, 'launcher must print PID + elapsed to stdout')
+        parts = out.splitlines()[-1].strip().split()
+        self.assertEqual(parts[0], '54321')
+        self.assertAlmostEqual(float(parts[1]), 3.0, places=1)
+
+
+class TestMainTimeoutFinalPollDetectsExit(unittest.TestCase):
+    """main() must do a final proc.poll() after the readiness deadline.
+
+    Regression guard: previously the timeout path printed the PID and
+    returned 0 without checking if the binary had exited during the last
+    sleep interval. Now it must detect the exit and return 1.
+
+    Uses mocks: is_file_ready always returns False (never ready),
+    time.monotonic advances past the deadline, and proc.poll() returns
+    non-zero on the final check (simulating the binary exiting during
+    the last sleep).
+    """
+
+    def test_timeout_final_poll_returns_nonzero_on_exit(self):
+        import io
+        import contextlib
+        import tempfile
+        from unittest.mock import patch, MagicMock
+        mock_proc = MagicMock()
+        # poll() returns None during the loop, then 1 on the final check.
+        # The while loop runs once (monotonic 0 < deadline 0.5), then
+        # exits (monotonic 100 >= deadline 0.5). The final poll() returns 1.
+        mock_proc.poll.side_effect = [None, 1]
+        mock_proc.pid = 99999
+        log_path = os.path.join(tempfile.gettempdir(),
+                                'launcher_test_final_poll.log')
+        stdout_buf = io.StringIO()
+        stderr_buf = io.StringIO()
+        with contextlib.redirect_stdout(stdout_buf), \
+                contextlib.redirect_stderr(stderr_buf), \
+                patch('standalone_launcher.subprocess.Popen',
+                      return_value=mock_proc), \
+                patch('standalone_launcher.is_file_ready',
+                      return_value=False), \
+                patch('standalone_launcher.time.sleep'), \
+                patch('standalone_launcher.time.monotonic',
+                      side_effect=[0.0, 0.0, 100.0, 100.0]):
+            rc = launcher.main([
+                '--binary', '/bin/true',
+                '--log', log_path,
+                '--ready-file', '/tmp/nonexistent_ready',
+                '--ready-timeout', '0.5',
+                '--ready-interval', '0.1',
+            ])
+        self.assertEqual(rc, 1)
+        # Must not have printed a PID — binary exited, not just timed out.
+        self.assertEqual(stdout_buf.getvalue().strip(), '')
 
 
 class TestMainEarlyExitFails(unittest.TestCase):
     """main() must return non-zero if the binary exits before becoming ready.
 
     Uses /bin/false (exits 1 immediately) with a port that never opens; the
-    launcher's poll loop should detect the early exit and return non-zero
-    without printing a PID to stdout.
+    launcher's poll loop should detect the early exit and return 1 (not the
+    binary's raw exit code, and not 0) without printing a PID to stdout.
     """
 
     @unittest.skipUnless(os.path.exists('/bin/false'),
@@ -294,7 +404,7 @@ class TestMainEarlyExitFails(unittest.TestCase):
                                 '--host', '127.0.0.1',
                                 '--ready-timeout', '5',
                                 '--ready-interval', '0.1'])
-        self.assertNotEqual(rc, 0)
+        self.assertEqual(rc, 1)
         # Must not have printed a PID — early exit is a failure.
         self.assertEqual(stdout_buf.getvalue().strip(), '')
 

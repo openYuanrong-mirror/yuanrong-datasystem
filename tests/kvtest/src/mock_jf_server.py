@@ -24,7 +24,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 
@@ -239,6 +239,24 @@ class JFRegistry:
 registry = None
 
 
+class JfHttpServer(ThreadingHTTPServer):
+    """Threading server + larger listen backlog.
+
+    Default ``HTTPServer`` is single-threaded and ``TCPServer.request_queue_size``
+    defaults to 5 (the ``listen()`` backlog). When 2000 worker pods start
+    concurrently and each issues ``/discover`` within a short window, the
+    default backlog overflows and the OS drops SYN packets — including the
+    coordinator's ``/heartbeat`` connect(), which then blocks until TTL
+    expires. ``request_queue_size = 4096`` covers the worker-startup burst;
+    threading lets the coordinator heartbeat be accepted while worker
+    discovers are still being processed. ``daemon_threads = True`` so
+    in-flight request threads do not block process shutdown.
+    """
+
+    request_queue_size = 4096
+    daemon_threads = True
+
+
 class Handler(BaseHTTPRequestHandler):
     def _send_json(self, code, data):
         body = json.dumps(data).encode()
@@ -417,7 +435,7 @@ def main():
     # PID and exits — at that point the port is already listening, so the
     # caller knows the server is ready (no separate port-ready poll needed).
     try:
-        server = HTTPServer(("0.0.0.0", args.port), Handler)
+        server = JfHttpServer(("0.0.0.0", args.port), Handler)
     except OSError as e:
         _log_error(f"mock_jf_server: failed to bind port {args.port}: {e}")
         sys.exit(1)

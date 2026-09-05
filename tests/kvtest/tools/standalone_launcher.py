@@ -20,15 +20,42 @@ shell pattern:
 
 Readiness polling matches ``dscli start`` (``cli/start.py``):
 
-* If ``--port`` is given, poll TCP connect to ``--host:--port`` until it
-  succeeds (or ``--ready-timeout`` elapses). Used by worker / coordinator
-  standalones that listen on a known port.
-* If no ``--port`` is given, print the PID immediately after launch. Used
-  by client-style binaries that do not listen; the caller does its own
-  ``pgrep`` verify.
+* If ``--ready-file`` is given, poll for that file's existence until it
+  appears (or ``--ready-timeout`` elapses). Used by worker standalones;
+  the worker binary writes ``FLAGS_ready_check_path`` only after
+  ``WaitForServiceReady()`` + ``WaitForTopologyReady()`` complete, so this
+  is the authoritative readiness signal.
+* If ``--port`` is given (and no ``--ready-file``), poll TCP connect to
+  ``--host:--port`` until it succeeds. Used by coordinator standalones.
+* If neither is given, poll ``proc.poll()`` for ``--no-signal-grace``
+  seconds (default 2) to catch early exits (bad gflags, missing .so,
+  config errors), then print the PID. Used by client-style binaries that
+  do not expose a readiness signal; the grace window catches the common
+  failure mode where the binary parses gflags and exits before the caller
+  can verify via ``pgrep``.
 
-If the binary exits before becoming ready, the launcher exits with the
-binary's exit code so the caller can detect the failure.
+Failure detection:
+
+* If the binary exits before becoming ready (or before the no-signal grace
+  period elapses), the launcher prints an error to stderr and returns 1
+  — no PID is printed to stdout, so the caller can distinguish success
+  from failure by checking stdout.
+* If the readiness deadline elapses without the binary becoming ready and
+  without the binary exiting, the launcher does a final ``proc.poll()``
+  check. If the binary has exited (race with the last sleep), it returns
+  1. Otherwise it prints the PID + elapsed and returns 0 with a WARNING
+  on stderr, so the caller can verify via ``pgrep``.
+
+Output format:
+
+* On success: prints ``{pid} {elapsed}`` to stdout, where ``elapsed`` is
+  the actual binary startup time measured inside the launcher (Popen →
+  ready signal), excluding ``kubectl exec`` / ``python3`` startup overhead.
+* On failure: prints nothing to stdout; error details on stderr.
+
+The caller should parse stdout's last line, split on whitespace: first
+field is the PID (digit string), second field (if present) is the elapsed
+time in seconds (float).
 """
 
 import argparse
@@ -128,6 +155,13 @@ def parse_args(argv=None):
                         help='Max seconds to wait for readiness (default: 30)')
     parser.add_argument('--ready-interval', type=float, default=0.5,
                         help='Polling interval in seconds (default: 0.5)')
+    parser.add_argument('--no-signal-grace', type=float, default=2.0,
+                        help='Max seconds to poll proc.poll() for early '
+                             'exits when no readiness signal (--ready-file '
+                             'or --port) is given (default: 2). Catches '
+                             'gflag/config failures before reporting '
+                             'success. Ignored when --ready-file or --port '
+                             'is set.')
     parser.add_argument('argv', nargs='*',
                         help='Arguments for the binary (separate with --)')
     return parser.parse_args(argv)
@@ -156,6 +190,10 @@ def main(argv=None):
     if args.ready_file:
         clear_stale_ready_file(args.ready_file, args.cwd)
 
+    # t_launch anchors the actual binary startup timing (Popen → ready),
+    # excluding kubectl exec / python3 startup overhead that the caller's
+    # outer time.monotonic() diff would include.
+    t_launch = time.monotonic()
     try:
         proc = subprocess.Popen(
             [args.binary] + binary_argv,
@@ -180,39 +218,66 @@ def main(argv=None):
 
     # Readiness polling priority: --ready-file (authoritative, e.g. worker
     # ready_check_path) > --port (TCP connect, e.g. coordinator) > none
-    # (print PID immediately, caller verifies via pgrep). This mirrors
-    # dscli's split: start_worker waits on ready_check_path, start_coordinator
-    # waits on is_tcp_ready.
-    deadline = time.monotonic() + args.ready_timeout
+    # (grace-poll proc.poll() to catch early exits). This mirrors dscli's
+    # split: start_worker waits on ready_check_path, start_coordinator waits
+    # on is_tcp_ready.
+    #
+    # For the no-signal path, use a shorter grace deadline instead of the
+    # full ready_timeout: the goal is to catch gflag/config failures (which
+    # happen within the first few hundred ms), not to wait for indefinite
+    # readiness. The binary is expected to stay running; if it survives the
+    # grace period, print PID + elapsed and return 0.
+    has_readiness_signal = bool(args.ready_file) or args.port is not None
+    if has_readiness_signal:
+        deadline = t_launch + args.ready_timeout
+    else:
+        deadline = t_launch + min(args.ready_timeout, args.no_signal_grace)
+
     while time.monotonic() < deadline:
         rc = proc.poll()
         if rc is not None:
-            print(f'standalone_launcher: binary exited early with code {rc}',
+            elapsed = time.monotonic() - t_launch
+            print(f'standalone_launcher: binary exited early with code {rc} '
+                  f'after {elapsed:.3f}s',
                   file=sys.stderr, flush=True)
-            return rc if isinstance(rc, int) else 1
+            return 1
         if args.ready_file:
             if is_file_ready(args.ready_file, args.cwd):
-                print(proc.pid, flush=True)
+                elapsed = time.monotonic() - t_launch
+                print(f'{proc.pid} {elapsed:.3f}', flush=True)
                 return 0
         elif args.port is not None:
             if is_port_ready(args.host, args.port,
                              timeout=args.ready_interval):
-                print(proc.pid, flush=True)
+                elapsed = time.monotonic() - t_launch
+                print(f'{proc.pid} {elapsed:.3f}', flush=True)
                 return 0
-        else:
-            # No readiness signal given: print PID immediately and let the
-            # caller verify (pgrep etc). Matches procmon.py --background.
-            print(proc.pid, flush=True)
-            return 0
+        # No readiness signal: keep polling proc.poll() until the grace
+        # deadline to catch early exits (bad gflags, missing .so, etc).
         time.sleep(args.ready_interval)
 
-    # Timeout: print PID anyway so caller can pgrep/kill, but warn on stderr.
-    print(proc.pid, flush=True)
+    # Deadline expired. Final poll: if the binary exited during the last
+    # sleep interval (race window), report failure instead of printing a
+    # dead PID.
+    rc = proc.poll()
+    if rc is not None:
+        elapsed = time.monotonic() - t_launch
+        print(f'standalone_launcher: binary exited with code {rc} '
+              f'after {elapsed:.3f}s',
+              file=sys.stderr, flush=True)
+        return 1
+
+    # Binary is still running but not ready within the deadline. Print
+    # PID + elapsed so the caller can pgrep/kill, with a warning on stderr.
+    elapsed = time.monotonic() - t_launch
+    print(f'{proc.pid} {elapsed:.3f}', flush=True)
+    timeout_label = (args.ready_timeout if has_readiness_signal
+                     else min(args.ready_timeout, args.no_signal_grace))
     waited_on = (f'file={args.ready_file}' if args.ready_file
                  else f'port={args.host}:{args.port}' if args.port is not None
                  else 'no-signal')
     print(f'standalone_launcher: WARNING: not ready within '
-          f'{args.ready_timeout}s ({waited_on}, pid={proc.pid}); '
+          f'{timeout_label}s ({waited_on}, pid={proc.pid}); '
           f'printed PID for caller verify',
           file=sys.stderr, flush=True)
     return 0
