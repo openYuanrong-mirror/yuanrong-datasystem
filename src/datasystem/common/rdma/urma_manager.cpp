@@ -1027,11 +1027,14 @@ Status UrmaManager::ServerEventHandleThreadMain()
         LOG(WARNING) << "Failed to set nice for UrmaManager server event thread, nice=" << FLAGS_io_thread_nice
                      << ", errno=" << errno;
     }
+    // Keep the trace across poll attempts. In particular, sleepStartUs/sleepEndUs
+    // describe the most recent sleep before polling, including when the next
+    // PollJfcWait invocation gets a completion without sleeping first.
+    UrmaWriteTrace pollTrace;
     // Run this method until serverStop is called.
     while (!serverStop_.load()) {
         std::unordered_set<uint64_t> successCompletedReqs;
         std::unordered_map<uint64_t, int> failedCompletedReqs;
-        UrmaWriteTrace pollTrace;
         Status rc = PollJfcWait(urmaResource_->GetJfc(), MAX_POLL_JFC_TRY_CNT, successCompletedReqs,
                                 failedCompletedReqs, pollTrace, FLAGS_urma_poll_size);
         if (rc.IsError() && rc.GetCode() != K_TRY_AGAIN) {
@@ -1909,8 +1912,6 @@ Status UrmaManager::PollJfcWait(urma_jfc_t *urmaJfc, const uint64_t maxTryCount,
     urma_cr_t completeRecords[numPollCRS];
     urma_jfc_t *ev_jfc = nullptr;
     int cnt;
-    uint64_t sleepStartUsForNextPoll = 0;
-    uint64_t sleepEndUsForNextPoll = 0;
 
     if (IsEventModeEnabled()) {
         // wait for the event
@@ -1983,8 +1984,10 @@ Status UrmaManager::PollJfcWait(urma_jfc_t *urmaJfc, const uint64_t maxTryCount,
             }
             sleepTimer.Stop();
             auto sleepElapsedUs = sleepTimer.ElapsedMicroSecond();
-            sleepStartUsForNextPoll = sleepTimer.GetStartTimeStampUs();
-            sleepEndUsForNextPoll = sleepTimer.GetEndTimeStampUs();
+            // Preserve this across PollJfcWait invocations so a completion
+            // observed by a later invocation still reports the latest sleep.
+            pollTrace.sleepStartUs = sleepTimer.GetStartTimeStampUs();
+            pollTrace.sleepEndUs = sleepTimer.GetEndTimeStampUs();
             LOG_IF(INFO, sleepElapsedUs > URMA_LOG_LIMIT_US)
                 << "[URMA_ELAPSED_THREAD_SHED]: urma_poll_jfc thread wake up after nanosleep(1us) cost "
                 << sleepElapsedUs << "us, cpuid: " << sched_getcpu()
@@ -1995,8 +1998,6 @@ Status UrmaManager::PollJfcWait(urma_jfc_t *urmaJfc, const uint64_t maxTryCount,
                                                  URMA_ERROR_SUGGEST));
         } else if (cnt > 0) {
             pollTrace.pollBeginUs = timer.GetStartTimeStampUs();
-            pollTrace.sleepStartUs = sleepStartUsForNextPoll;
-            pollTrace.sleepEndUs = sleepEndUsForNextPoll;
             pollTrace.pollEndUs = timer.GetEndTimeStampUs();
             return CheckCompletionRecordStatus(completeRecords, cnt, successCompletedReqs, failedCompletedReqs);
         }
