@@ -1,4 +1,4 @@
-from ._transfer_engine import ErrorCode, Result, TransferEngine
+from ._transfer_engine import ErrorCode, MemoryRegistration, Result, TransferEngine
 
 
-__all__ = ["Result", "ErrorCode", "TransferEngine"]
+__all__ = ["Result", "ErrorCode", "MemoryRegistration", "TransferEngine"]

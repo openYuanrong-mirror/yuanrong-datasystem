@@ -699,6 +699,67 @@
   - `src/datasystem/client/service_discovery.cpp`
   - `src/datasystem/pybind_api/pybind_register_*.cpp`
 
+## Transfer Engine Registration Contract
+
+- The legacy `RegisterMemory(address, length)` API remains available and means that
+  the remotely authorized logical range and the backend-registered physical backing
+  are identical.
+- `MemoryRegistration` plus `RegisterMemoryEx`/`BatchRegisterMemoryEx` separates a
+  logical range from its caller-owned backing. The logical range must be fully
+  contained in the backing; overlapping logical ranges and non-identical overlapping
+  backings are rejected before backend registration. Registration and unregistration
+  batches are capped at 4096 logical ranges. Backing-range planning and batch-internal
+  logical-range overlap validation use ordered indexes, avoiding quadratic work within
+  one request; batch removal builds hash indexes instead of repeatedly scanning the
+  request under the memory-table mutex.
+- `TransferEngineState` reference-counts exact backing ranges. One backing is sent to
+  the data-plane backend once even when multiple logical ranges share it, and it is
+  unregistered only after the last logical reference is removed. Read leases continue
+  to protect logical ranges, not the unexposed gaps in a backing.
+- HIXL CS mode defaults to `on` and route policy defaults to `roce`, making CS Device RoCE the fail-closed default.
+  Runtimes without the HIXL client-server capability fail initialization instead of falling back. Operators can set
+  CS mode to `auto` explicitly to restore capability-driven legacy fallback, or `off` to require legacy; they can set
+  the route to `auto` explicitly to restore vendor route matching.
+  `auto` and `hccs` policies require a 2 MiB-aligned backing base before calling HIXL. Explicit `roce` preserves
+  byte-addressed legacy registration. Registration length and transfer address/length remain byte-granular.
+- The HIXL backend uses `9.1.0+` as its fully supported baseline. Detected `8.5.2` through `9.0.x` retains a
+  warning-backed legacy compatibility path that requires `TRANSFER_ENGINE_HIXL_CS_MODE=off`; lower or unknown versions
+  disable the backend. The default CS mode remains `on` and fails closed when `CLIENT_SERVER_COMM` is unavailable;
+  `auto` enables CS when the capability is reported and otherwise falls back to legacy. In CS mode an
+  explicit `TRANSFER_ENGINE_HIXL_ROUTE=roce` injects the
+  `roce:device` protocol filter and does not require `HCCL_INTRA_ROCE_ENABLE`. Legacy explicit RoCE still requires the
+  HCCL switch. Both peers exchange and validate effective engine mode and route before HIXL Connect.
+- `TRANSFER_ENGINE_HIXL_LOCAL_COMM_RES` optionally supplies a validated HIXL 1.3 JSON object for deployments that need
+  explicit `net_instance_id` and endpoint lists. The core `hixl::Hixl` Engine and its AutoConnect capability probe are
+  available from HIXL `9.1.0`. `TRANSFER_ENGINE_HIXL_AUTO_CONNECT=auto|on|off` defaults to auto mode; `off` retains
+  explicit vendor Connect as the rollback path. AutoConnect does not bypass TE authorization or generation checks.
+- Receiver-driven READ retries one `kNotReady` or `kRuntimeError` failure after releasing the old lease, clearing the
+  route and generation cache, and rebuilding the full connection/authorization chain. Other errors are not retried.
+- Transfer-engine control frames are capped at 4 MiB, control strings at 64 KiB, one READ batch at 4096 items, and
+  active leased ranges at 65536. Socket operations use bounded connect/read/write waits. Server shutdown cancels queued
+  and active sockets instead of draining slow connections.
+- Receiver-driven read leases use non-sequential bearer tokens bound to requester host/port/device. Finalize closes new lease
+  admission and waits for owner-side leases before clearing registration or finalizing HIXL; a 30-second wait expiry
+  returns `kNotReady` so callers can retry without freeing HBM early. HIXL initialization rejects a read-lease TTL that
+  does not exceed the transfer timeout by at least one second.
+- Connection readiness state is capped at 4096 entries and cleared across engine incarnations. The opt-in environment
+  diagnostic logs a fixed TransferEngine configuration allowlist once per process, never the complete process environment.
+- The Python facade accepts the Mooncake-compatible four-argument initialization
+  form with empty metadata or `P2PHANDSHAKE`, while retaining the three-argument
+  YuanRong overload. `location` and `transport_hint` are compatibility arguments;
+  `transport_hint` does not select HCCS versus RoCE.
+- The integrated DataSystem wheel lazily exports `TransferEngine`, `MemoryRegistration`, `Result`, and `ErrorCode`
+  from its optional `_transfer_engine` extension without loading the main client native library during parent import.
+- Registration rollback failure moves the backend to a fail-closed degraded state;
+  subsequent operations require `Finalize` and reinitialization.
+- Source-of-truth files:
+  - `transfer_engine/include/datasystem/transfer_engine/transfer_engine.h`
+  - `transfer_engine/src/transfer_engine.cpp`
+  - `transfer_engine/src/internal/memory/registered_memory_table.*`
+  - `transfer_engine/src/internal/backend/ascend/hixl_config.*`
+  - `transfer_engine/src/internal/backend/ascend/ascend_backend.*`
+  - `transfer_engine/src/python/py_transfer_engine.cpp`
+
 ## Fast Verification
 
 - Rebuild repository artifacts:

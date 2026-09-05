@@ -9,6 +9,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "datasystem/transfer_engine/control_plane_messages.h"
@@ -19,6 +20,10 @@ namespace datasystem {
 class ITransferControlService {
 public:
     virtual ~ITransferControlService() = default;
+
+    virtual void BeginShutdown()
+    {
+    }
 
     virtual Result ExchangeRootInfo(const ExchangeRootInfoRequest &req, ExchangeRootInfoResponse *rsp) = 0;
     virtual Result QueryConnReady(const QueryConnReadyRequest &req, QueryConnReadyResponse *rsp) = 0;
@@ -79,6 +84,7 @@ private:
     std::mutex queueMutex_;
     std::condition_variable queueCv_;
     std::deque<int> clientFdQueue_;
+    std::unordered_set<int> activeClientFds_;
     std::shared_ptr<ITransferControlService> service_;
 };
 

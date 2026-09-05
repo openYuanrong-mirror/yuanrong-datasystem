@@ -1,5 +1,8 @@
 # transfer_engine Python API Guide
 
+The control endpoint is an internal trusted-cluster interface. Restrict it with the bind address and network policy;
+the current protocol does not provide TLS or cluster identity authentication.
+
 ## 1. Build Python Wheel
 
 ### Option A: one-click script
@@ -26,37 +29,97 @@ from yr.datasystem import TransferEngine, Result, ErrorCode
 
 ## Backend and HIXL Route Selection
 
-TransferEngine uses HIXL as its only data-plane backend. `protocol` accepts `"hixl"`, `"ascend"`, or an empty
-string. When set, `TRANSFER_ENGINE_BACKEND` must be `hixl`.
+TransferEngine exposes `"ascend"` as its only protocol. The Ascend backend uses HIXL internally; HIXL is not a
+separate public protocol selector.
 
-When HIXL is selected, `TRANSFER_ENGINE_HIXL_ROUTE` accepts `auto`, `hccs`, or `roce` and defaults to `auto`.
-This value is a TransferEngine peer-consistency policy: both peers must use the same value. TransferEngine does not pass
-it to HIXL as an endpoint filter. HIXL generates and matches endpoints as follows on the supported Atlas A2/A3 path:
+`TRANSFER_ENGINE_HIXL_CS_MODE` accepts `auto`, `on`, or `off` and defaults to `on`:
 
-- With `HCCL_INTRA_ROCE_ENABLE=1`, HIXL keeps or generates only RoCE endpoints, so the connection uses RoCE.
-- Otherwise, HIXL normally advertises both device RoCE and HCCS endpoints. If both peers have the same
-  `net_instance_id`, HIXL prefers HCCS and falls back to a mutually available RoCE endpoint. If their
-  `net_instance_id` values differ, HIXL does not consider HCCS and selects a mutually available RoCE endpoint.
-- HIXL derives `net_instance_id` from the SuperPod ID on Atlas A3 and from the local host IP on Atlas A2.
+- `auto` uses HIXL CS when `GetCapability(CLIENT_SERVER_COMM)` reports support, and otherwise keeps the legacy
+  CommEngine path.
+- `on` requires CANN/HIXL 9.1.0 or newer with the CS capability. Initialization returns `kNotSupported` instead of
+  silently falling back when the capability is unavailable.
+- `off` is the rollback setting and always keeps the legacy path.
 
-Use the following settings on both peers to make the route intent explicit:
+`TRANSFER_ENGINE_HIXL_ROUTE` accepts `auto`, `hccs`, or `roce` and defaults to `roce`. Both peers must use the same
+effective CS mode and route. In CS mode, TransferEngine maps an explicit route to HIXL's endpoint filter:
+
+- `roce` injects `comm_resource_config.protocol_desc=roce:device`.
+- `hccs` injects `comm_resource_config.protocol_desc=hccs:device`.
+- `auto` leaves endpoint matching to HIXL; on A3, HCCS can still win when both endpoints are in the same network
+  instance.
+
+The default `CS_MODE=on` and `ROUTE=roce` combination requires HIXL client-server capability and selects CS Device RoCE.
+If the capability is unavailable, initialization fails with `kNotSupported` instead of falling back to legacy. Set
+`TRANSFER_ENGINE_HIXL_CS_MODE=auto` explicitly to restore capability-driven legacy fallback, or `off` to require legacy.
+Set `TRANSFER_ENGINE_HIXL_ROUTE=auto` explicitly to restore vendor automatic route matching.
+
+CANN/HIXL 9.1.0 is the minimum fully supported version. Builds that detect HIXL 8.5.2 through 9.0.x retain a
+compatibility-only legacy path and print a CMake warning. They must disable CS explicitly on both peers:
 
 ```bash
-# Force HIXL to advertise and use RoCE endpoints only.
-export TRANSFER_ENGINE_BACKEND=hixl
+export TRANSFER_ENGINE_HIXL_CS_MODE=off
+export TRANSFER_ENGINE_HIXL_AUTO_CONNECT=off
+export TRANSFER_ENGINE_HIXL_ROUTE=auto
+unset HCCL_INTRA_ROCE_ENABLE
+
+# Legacy RoCE alternative:
 export TRANSFER_ENGINE_HIXL_ROUTE=roce
 export HCCL_INTRA_ROCE_ENABLE=1
+```
 
-# Declare an expected HCCS route and reject a peer with a different TransferEngine route policy. HIXL still selects
-# HCCS only when both peers are in the same network instance and have a mutually available HCCS endpoint.
-export TRANSFER_ENGINE_BACKEND=hixl
+The core `hixl::Hixl` Engine supports AutoConnect starting with HIXL 9.1.0. Use `off` on the compatibility-only legacy
+path; on 9.1+, leave it at `auto` for capability-driven selection or set it to `off` for explicit Connect.
+
+Use this deterministic A3 Device RoCE configuration on both peers:
+
+```bash
+# CANN/HIXL >= 9.1.0 and HDK >= 25.5.0.
+export TRANSFER_ENGINE_HIXL_CS_MODE=on
+export TRANSFER_ENGINE_HIXL_ROUTE=roce
+unset HCCL_INTRA_ROCE_ENABLE
+
+# Deterministic Device HCCS through CS.
+export TRANSFER_ENGINE_HIXL_CS_MODE=on
 export TRANSFER_ENGINE_HIXL_ROUTE=hccs
 unset HCCL_INTRA_ROCE_ENABLE
 ```
 
-Setting only `TRANSFER_ENGINE_HIXL_ROUTE=roce` does not force HIXL to remove HCCS endpoints; use
-`HCCL_INTRA_ROCE_ENABLE=1` as shown above. Likewise, `TRANSFER_ENGINE_HIXL_ROUTE=hccs` is not itself an HIXL endpoint
-filter. TransferEngine rejects `hccs` together with `HCCL_INTRA_ROCE_ENABLE=1` because those settings conflict.
+TransferEngine does not set `HCCL_INTRA_ROCE_ENABLE`. In CS mode the `roce:device` filter is sufficient, so A3 RoCE
+does not require that environment variable. In legacy mode, an explicit `roce` route still requires
+`HCCL_INTRA_ROCE_ENABLE=1`; otherwise initialization rejects the ambiguous configuration. TransferEngine also rejects
+`hccs` together with `HCCL_INTRA_ROCE_ENABLE=1`.
+
+### Protocol and backend compatibility
+
+`ascend` is the public protocol name. It replaced the former public `hixl` selector; HIXL remains the internal
+implementation. New callers must pass `"ascend"` (case-insensitive). `"hixl"`, the empty protocol, and the former
+`TRANSFER_ENGINE_BACKEND` selector are not compatibility aliases. During a rolling upgrade, both peers must expose the
+`ascend` backend kind; an older peer that advertises `hixl` fails the backend-kind handshake with `kNotSupported`.
+
+`IDataPlaneBackend::BackendKind()` is a public C++ extension point whose default is now `"ascend"`. An injected custom
+backend must report `"ascend"` to initialize successfully, and both peers must report the same kind. A custom backend
+that still relies on the old default `"hixl"` must update its override before upgrading.
+
+`TRANSFER_ENGINE_HIXL_GLOBAL_RESOURCE_CONFIG` remains available for additional HIXL JSON settings. An explicit route
+adds its `protocol_desc` while preserving other fields; a conflicting user-supplied `protocol_desc` returns `kInvalid`.
+`TRANSFER_ENGINE_HIXL_LOCAL_COMM_RES` can supply an explicit HIXL 1.3 JSON object when deployment must provide
+`net_instance_id` and a deterministic endpoint list. It is rejected outside CS mode or when its version is not `1.3`.
+
+`TRANSFER_ENGINE_HIXL_AUTO_CONNECT` accepts `auto`, `on`, or `off` and defaults to `auto`. The core `hixl::Hixl` Engine
+and `GetCapability(AUTO_CONNECT)` support it starting with HIXL 9.1.0. `on` fails closed when unsupported, and `off` is
+the connection-policy rollback. Existing `1` and `0` values remain accepted as aliases for `on` and `off`. AutoConnect
+does not bypass TransferEngine's mode/route compatibility check, owner authorization, read lease, or memory generation
+check.
+
+For memory registration, the backing base address must be 2 MiB-aligned when `TRANSFER_ENGINE_HIXL_ROUTE` is `auto` or
+`hccs`; transfer lengths remain byte-granular. Explicit `roce` does not impose this alignment check. This validation is
+also applied in legacy mode because `auto` may still select HCCS, so a legacy deployment that previously used an
+unaligned backing allocation and reached RoCE through `route=auto` can fail registration after upgrading. For a
+RoCE-only legacy deployment, set `TRANSFER_ENGINE_HIXL_ROUTE=roce` on both peers and set
+`HCCL_INTRA_ROCE_ENABLE=1` as required by the legacy path.
+
+Retryable synchronous READ failures (`kNotReady` or `kRuntimeError`) trigger one route cleanup and full authorization/
+connection rebuild before the error is returned. Other failures are not retried.
 
 ## 3. API Reference
 
@@ -69,15 +132,35 @@ engine = TransferEngine()
 Methods:
 
 1. `initialize(local_hostname: str, protocol: str, device_name: str) -> Result`
-   `protocol` accepts `"hixl"`, `"ascend"`, or an empty string. `TRANSFER_ENGINE_BACKEND=hixl` overrides
-   `protocol`. `device_name` must match `npu:${device_id}`.
-2. `register_memory(buffer_addr_regisrterch: int, length: int) -> Result`
-3. `batch_register_memory(buffer_addrs: list[int], lengths: list[int]) -> Result`
-4. `unregister_memory(buffer_addr_regisrterch: int) -> Result`
-5. `batch_unregister_memory(buffer_addrs: list[int]) -> Result`
-6. `transfer_sync_read(target_hostname: str, buffer: int, peer_buffer_address: int, length: int) -> Result`
-7. `batch_transfer_sync_read(target_hostname: str, buffers: list[int], peer_buffer_addresses: list[int], lengths: list[int]) -> Result`
-8. `finalize() -> Result`
+   `protocol` only accepts `"ascend"` (case-insensitive). `device_name` must match `npu:${device_id}`.
+2. `initialize(local_hostname: str, metadata_server: str, protocol: str, device_name: str) -> Result`
+   Compatibility form; `metadata_server` must be empty or `"P2PHANDSHAKE"` (case-insensitive), and does not select a
+   separate metadata service.
+3. `get_rpc_port() -> int`
+4. `get_route_policy() -> str`
+   Returns `auto`, `hccs`, or `roce` after initialization, and an empty string before initialization.
+5. `register_memory(buffer_addr: int, capacity: int, location: str = "*") -> Result`
+6. `batch_register_memory(buffer_addresses: list[int], capacities: list[int], location: str = "*") -> Result`
+7. `register_memory_ex(registration: MemoryRegistration, location: str = "*") -> Result`
+8. `batch_register_memory_ex(registrations: list[MemoryRegistration], location: str = "*") -> Result`
+9. `unregister_memory(buffer_addr: int) -> Result`
+10. `batch_unregister_memory(buffer_addresses: list[int]) -> Result`
+11. `transfer_sync_read(target_hostname: str, buffer: int, peer_buffer_address: int, length: int,
+    transport_hint: str = "") -> Result`
+12. `batch_transfer_sync_read(target_hostname: str, buffers: list[int], peer_buffer_addresses: list[int],
+    lengths: list[int], transport_hint: str = "") -> Result`
+13. `finalize() -> Result`
+
+`location` is a validation-only compatibility argument. It accepts `""`, `"*"`, or the exact initialized device name
+(for example, `"npu:0"`); it does not choose a device or route. `transport_hint` is also compatibility-only: it accepts
+an empty string or `"ascend"` and does not choose HCCS or RoCE. Configure the route with
+`TRANSFER_ENGINE_HIXL_ROUTE` instead.
+
+`MemoryRegistration(logical_addr, logical_length, backing_addr, backing_length)` authorizes the logical byte range to
+peers while registering the caller-owned backing range with the backend. The backing range must contain the logical
+range, and the underlying allocation must remain alive until the registration is successfully unregistered and any
+remote read lease has drained. The non-`_ex` registration methods use the same address and capacity for both ranges.
+Registration and unregistration batch methods accept at most 4096 items per call.
 
 `Result`:
 
@@ -96,6 +179,12 @@ Methods:
 - `kNotReady`
 - `kNotAuthorized`
 - `kNotSupported`
+
+`finalize()` closes new read-lease admission and waits for in-flight reads and active remote leases. It may return
+`kNotReady` when leases do not drain within the shutdown wait window; keep every registered allocation alive and retry
+until it returns `kOk`. The native destructor retries this operation, so relying on Python garbage collection can block
+for the configured read-lease TTL (30 seconds by default). Do not release or reuse registered device memory merely
+because `finalize()` has returned `kNotReady`.
 
 ## 4. Quick Example (single process)
 

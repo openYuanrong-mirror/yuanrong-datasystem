@@ -1,6 +1,9 @@
 #include <gtest/gtest.h>
 
+#include <unistd.h>
+
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <memory>
 #include <string>
@@ -8,6 +11,7 @@
 #include <vector>
 
 #include "internal/control_plane/control_plane.h"
+#include "internal/control_plane/socket_rpc_transport.h"
 
 namespace datasystem {
 namespace {
@@ -80,11 +84,11 @@ public:
     }
 
     int32_t ownerDeviceId = 7;
-    std::atomic<int32_t> exchangeCallCount {0};
-    std::atomic<int32_t> queryCallCount {0};
-    std::atomic<int32_t> readCallCount {0};
-    std::atomic<int32_t> lastRootInfoSize {0};
-    std::atomic<int64_t> lastReadLength {0};
+    std::atomic<int32_t> exchangeCallCount{ 0 };
+    std::atomic<int32_t> queryCallCount{ 0 };
+    std::atomic<int32_t> readCallCount{ 0 };
+    std::atomic<int32_t> lastRootInfoSize{ 0 };
+    std::atomic<int64_t> lastReadLength{ 0 };
     std::mutex lastRequesterHostMutex;
     std::string lastRequesterHost;
 };
@@ -183,7 +187,7 @@ TEST(RpcFrameworkLltTest, ConcurrentQueryConnReady)
     auto server = std::make_shared<SocketControlServer>();
     ASSERT_TRUE(server->Start("127.0.0.1", kPort, service).IsOk());
 
-    std::atomic<int32_t> successCount {0};
+    std::atomic<int32_t> successCount{ 0 };
     std::vector<std::thread> workers;
     workers.reserve(kThreadCount);
 
@@ -245,6 +249,23 @@ TEST(RpcFrameworkLltTest, BinaryRootInfoParsed)
     EXPECT_EQ(service->lastRootInfoSize.load(), 1024);
 
     server->Stop();
+}
+
+TEST(RpcFrameworkLltTest, StopCancelsSlowClient)
+{
+    constexpr uint16_t kPort = 55105;
+    auto service = std::make_shared<FakeControlService>();
+    auto server = std::make_shared<SocketControlServer>();
+    ASSERT_TRUE(server->Start("127.0.0.1", kPort, service).IsOk());
+
+    int clientFd = -1;
+    ASSERT_TRUE(ConnectTo("127.0.0.1", kPort, &clientFd, 1000).IsOk());
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const auto start = std::chrono::steady_clock::now();
+    server->Stop();
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    EXPECT_LT(elapsed, std::chrono::seconds(2));
+    close(clientFd);
 }
 
 }  // namespace

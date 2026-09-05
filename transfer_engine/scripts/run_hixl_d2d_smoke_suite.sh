@@ -7,7 +7,8 @@ RUNNER="${SCRIPT_DIR}/run_cross_node_smoke_cases.sh"
 LOCAL_IP="${LOCAL_IP:-127.0.0.1}"
 RPC_BASE_PORT="${RPC_BASE_PORT:-65051}"
 HIXL_BASE_PORT="${TRANSFER_ENGINE_HIXL_BASE_PORT:-21000}"
-ROUTE="${TRANSFER_ENGINE_HIXL_ROUTE:-hccs}"
+ROUTE="${TRANSFER_ENGINE_HIXL_ROUTE:-roce}"
+CS_MODE="${TRANSFER_ENGINE_HIXL_CS_MODE:-on}"
 LOG_DIR="${TRANSFER_ENGINE_HIXL_SMOKE_LOG_DIR:-/tmp/te_hixl_d2d_smoke_$(date +%Y%m%d_%H%M%S)}"
 OWNER_HOLD_SECONDS="${OWNER_HOLD_SECONDS:-600}"
 OWNER_READY_TIMEOUT_S="${OWNER_READY_TIMEOUT_S:-30}"
@@ -17,6 +18,7 @@ REQUESTER_DEVICE="${REQUESTER_DEVICE:-1}"
 REQUESTER_DEVICE_STEP="${REQUESTER_DEVICE_STEP:-1}"
 
 OWNER_PIDS=()
+RUN_LOG_FILES=()
 
 usage() {
   cat <<USAGE
@@ -28,6 +30,7 @@ Environment overrides:
   RPC_BASE_PORT                    default: ${RPC_BASE_PORT}
   TRANSFER_ENGINE_HIXL_BASE_PORT   default: ${HIXL_BASE_PORT}
   TRANSFER_ENGINE_HIXL_ROUTE       default: ${ROUTE}
+  TRANSFER_ENGINE_HIXL_CS_MODE     default: ${CS_MODE}
   TRANSFER_ENGINE_HIXL_SMOKE_LOG_DIR
   OWNER_HOLD_SECONDS               default: ${OWNER_HOLD_SECONDS}
   OWNER_READY_TIMEOUT_S            default: ${OWNER_READY_TIMEOUT_S}
@@ -119,6 +122,7 @@ start_owner() {
   local size="$4"
   local register_count="$5"
   local log_file="${LOG_DIR}/${name}_owner.log"
+  RUN_LOG_FILES+=("${log_file}")
 
   require_port_range "${port}" "${name} owner port"
   echo "[RUN] owner ${name}: device=${device}, port=${port}, size=${size}, register_count=${register_count}"
@@ -154,6 +158,7 @@ run_requester_success() {
   local size="$6"
   local addrs="$7"
   local log_file="${LOG_DIR}/${name}_requester.log"
+  RUN_LOG_FILES+=("${log_file}")
 
   require_port_range "${port}" "${name} requester port"
   echo "[RUN] requester ${name}: device=${device}, port=${port}, peer_port=${peer_port}, size=${size}"
@@ -179,6 +184,7 @@ run_concurrent_requesters() {
   local size="$6"
   local addrs="$7"
   local log_file="${LOG_DIR}/${name}_requester.log"
+  RUN_LOG_FILES+=("${log_file}")
 
   require_port_range "${port}" "${name} requester port"
   echo "[RUN] concurrent requesters ${name}: count=${REQUESTER_COUNT}, device_base=${device}, port_base=${port}"
@@ -209,6 +215,7 @@ run_requester_expect_reject() {
   local size="$6"
   local bad_addr="$7"
   local log_file="${LOG_DIR}/${name}_requester.log"
+  RUN_LOG_FILES+=("${log_file}")
 
   require_port_range "${port}" "${name} requester port"
   echo "[RUN] requester rejection ${name}: bad_addr=${bad_addr}"
@@ -247,17 +254,21 @@ main() {
   require_nonnegative_int "${OWNER_DEVICE}" "OWNER_DEVICE"
   require_nonnegative_int "${REQUESTER_DEVICE}" "REQUESTER_DEVICE"
   require_nonnegative_int "${REQUESTER_DEVICE_STEP}" "REQUESTER_DEVICE_STEP"
+  case "${CS_MODE}" in
+    auto|on|off) ;;
+    *) fail "TRANSFER_ENGINE_HIXL_CS_MODE must be auto, on, or off: ${CS_MODE}" ;;
+  esac
   mkdir -p "${LOG_DIR}"
-  export TRANSFER_ENGINE_BACKEND=hixl
   export TRANSFER_ENGINE_HIXL_ROUTE="${ROUTE}"
+  export TRANSFER_ENGINE_HIXL_CS_MODE="${CS_MODE}"
   export TRANSFER_ENGINE_HIXL_BASE_PORT="${HIXL_BASE_PORT}"
   export TRANSFER_ENGINE_ACL_MALLOC_POLICY="${TRANSFER_ENGINE_ACL_MALLOC_POLICY:-huge_only}"
-  if [[ "${ROUTE}" == "hccs" ]]; then
+  if [[ "${ROUTE}" == "hccs" || ( "${ROUTE}" == "roce" && "${CS_MODE}" != "off" ) ]]; then
     unset HCCL_INTRA_ROCE_ENABLE
   fi
 
   echo "[INFO] log dir: ${LOG_DIR}"
-  echo "[INFO] env: TRANSFER_ENGINE_BACKEND=${TRANSFER_ENGINE_BACKEND}, TRANSFER_ENGINE_HIXL_ROUTE=${TRANSFER_ENGINE_HIXL_ROUTE}, TRANSFER_ENGINE_HIXL_BASE_PORT=${TRANSFER_ENGINE_HIXL_BASE_PORT}, TRANSFER_ENGINE_ACL_MALLOC_POLICY=${TRANSFER_ENGINE_ACL_MALLOC_POLICY}"
+  echo "[INFO] env: TRANSFER_ENGINE_HIXL_ROUTE=${TRANSFER_ENGINE_HIXL_ROUTE}, TRANSFER_ENGINE_HIXL_CS_MODE=${TRANSFER_ENGINE_HIXL_CS_MODE}, TRANSFER_ENGINE_HIXL_BASE_PORT=${TRANSFER_ENGINE_HIXL_BASE_PORT}, TRANSFER_ENGINE_ACL_MALLOC_POLICY=${TRANSFER_ENGINE_ACL_MALLOC_POLICY}, HCCL_INTRA_ROCE_ENABLE=${HCCL_INTRA_ROCE_ENABLE:-<unset>}"
   echo "[INFO] devices: OWNER_DEVICE=${OWNER_DEVICE}, REQUESTER_DEVICE=${REQUESTER_DEVICE}, REQUESTER_COUNT=${REQUESTER_COUNT}, REQUESTER_DEVICE_STEP=${REQUESTER_DEVICE_STEP}"
   trap cleanup EXIT
 
@@ -297,6 +308,11 @@ main() {
   remote_addrs="${OWNER_ADDRS}"
   run_requester_success "${forward_case}_batch4_16m" "${requester_port}" "${REQUESTER_DEVICE}" "${owner_port}" "${OWNER_DEVICE}" 16777216 "${remote_addrs}"
   stop_owners
+
+  if [[ "${CS_MODE}" == "on" || ( "${CS_MODE}" == "auto" && "${ROUTE}" == "roce" ) ]]; then
+    grep -q "ascend backend initialized.*hixl_engine_mode=cs" -- "${RUN_LOG_FILES[@]}" ||
+      fail "the suite transferred data but did not observe effective HIXL CS mode"
+  fi
 
   echo "[PASS] HIXL D2D smoke suite passed"
   echo "[INFO] logs: ${LOG_DIR}"

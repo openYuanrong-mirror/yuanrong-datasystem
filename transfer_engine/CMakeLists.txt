@@ -125,7 +125,6 @@ set(TRANSFER_ENGINE_SRCS
     src/internal/memory/registered_memory_table.cpp
     src/internal/control_plane/socket_rpc_transport.cpp
     src/internal/control_plane/transfer_control_dispatcher.cpp
-    src/internal/backend/mock_data_plane_backend.cpp
     src/internal/control_plane/transfer_control_service.cpp
 )
 
@@ -144,7 +143,9 @@ if (TRANSFER_ENGINE_ENABLE_HIXL)
 endif()
 
 if (TRANSFER_ENGINE_ENABLE_HIXL)
-    set(TRANSFER_ENGINE_HIXL_MIN_VERSION "8.5.2")
+    set(TRANSFER_ENGINE_HIXL_LEGACY_COMPAT_MIN_VERSION "8.5.2")
+    set(TRANSFER_ENGINE_HIXL_AUTO_CONNECT_MIN_VERSION "9.1.0")
+    set(TRANSFER_ENGINE_HIXL_MIN_VERSION "9.1.0")
     find_path(TRANSFER_ENGINE_HIXL_INCLUDE_DIR
         NAMES hixl/hixl.h hixl/hixl_types.h
         PATHS ${_te_ascend_include_dir}
@@ -196,31 +197,55 @@ if (TRANSFER_ENGINE_ENABLE_HIXL)
         NOT TRANSFER_ENGINE_METADEF_LIBRARY OR NOT TRANSFER_ENGINE_ASCENDCL_LIBRARY)
         message(WARNING
             "TRANSFER_ENGINE_ENABLE_HIXL=ON requires an Ascend CANN toolkit with HIXL. "
-            "HIXL D2D backend will be disabled. Check ASCEND_HOME_PATH or ASCEND_CUSTOM_PATH.")
+            "Ascend backend will be disabled. Check ASCEND_HOME_PATH or ASCEND_CUSTOM_PATH.")
     elseif (TRANSFER_ENGINE_HIXL_VERSION AND
         "${TRANSFER_ENGINE_HIXL_VERSION}" VERSION_GREATER_EQUAL "${TRANSFER_ENGINE_HIXL_MIN_VERSION}")
         set(TRANSFER_ENGINE_HIXL_SUPPORTED TRUE)
+    elseif (TRANSFER_ENGINE_HIXL_VERSION AND
+        "${TRANSFER_ENGINE_HIXL_VERSION}" VERSION_GREATER_EQUAL "${TRANSFER_ENGINE_HIXL_LEGACY_COMPAT_MIN_VERSION}")
+        set(TRANSFER_ENGINE_HIXL_SUPPORTED TRUE)
+        message(WARNING
+            "cann_hixl version ${TRANSFER_ENGINE_HIXL_VERSION} is lower than the supported minimum "
+            "${TRANSFER_ENGINE_HIXL_MIN_VERSION}; enabling the legacy compatibility path only. "
+            "Set TRANSFER_ENGINE_HIXL_CS_MODE=off. Use TRANSFER_ENGINE_HIXL_ROUTE=auto, or set "
+            "TRANSFER_ENGINE_HIXL_ROUTE=roce together with HCCL_INTRA_ROCE_ENABLE=1.")
     elseif (TRANSFER_ENGINE_HIXL_VERSION)
         message(WARNING
             "cann_hixl version ${TRANSFER_ENGINE_HIXL_VERSION} is lower than "
             "${TRANSFER_ENGINE_HIXL_MIN_VERSION}. "
-            "HIXL D2D backend will be disabled.")
+            "Ascend backend will be disabled.")
     else()
         message(WARNING
-            "cann_hixl version is unknown. HIXL D2D backend will be disabled. "
-            "Build with CANN/HIXL ${TRANSFER_ENGINE_HIXL_MIN_VERSION}+ to enable HIXL D2D.")
+            "cann_hixl version is unknown. Ascend backend will be disabled. "
+            "Build with CANN/HIXL ${TRANSFER_ENGINE_HIXL_MIN_VERSION}+ to enable the Ascend backend.")
     endif()
     if (NOT TRANSFER_ENGINE_HIXL_SUPPORTED)
-        set(TRANSFER_ENGINE_ENABLE_HIXL OFF CACHE BOOL "Enable HIXL D2D backend" FORCE)
+        set(TRANSFER_ENGINE_ENABLE_HIXL OFF CACHE BOOL "Enable Ascend backend backed by HIXL" FORCE)
     endif()
 endif()
 
 if (TRANSFER_ENGINE_ENABLE_HIXL)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/external_libs/nlohmann_json.cmake)
+    set(TRANSFER_ENGINE_HIXL_CS_AVAILABLE FALSE)
+    set(TRANSFER_ENGINE_HIXL_AUTO_CONNECT_AVAILABLE FALSE)
+    if ("${TRANSFER_ENGINE_HIXL_VERSION}" VERSION_GREATER_EQUAL "${TRANSFER_ENGINE_HIXL_MIN_VERSION}")
+        set(TRANSFER_ENGINE_HIXL_CS_AVAILABLE TRUE)
+    endif()
+    if ("${TRANSFER_ENGINE_HIXL_VERSION}" VERSION_GREATER_EQUAL
+        "${TRANSFER_ENGINE_HIXL_AUTO_CONNECT_MIN_VERSION}")
+        set(TRANSFER_ENGINE_HIXL_AUTO_CONNECT_AVAILABLE TRUE)
+    endif()
+    message(STATUS
+        "TransferEngine HIXL ${TRANSFER_ENGINE_HIXL_VERSION}: "
+        "client-server compile support=${TRANSFER_ENGINE_HIXL_CS_AVAILABLE}, "
+        "AutoConnect support=${TRANSFER_ENGINE_HIXL_AUTO_CONNECT_AVAILABLE}")
     set(_te_hixl_libraries
         ${TRANSFER_ENGINE_HIXL_LIBRARY}
         ${TRANSFER_ENGINE_METADEF_LIBRARY}
         ${TRANSFER_ENGINE_ASCENDCL_LIBRARY})
-    list(APPEND TRANSFER_ENGINE_SRCS src/internal/backend/ascend/hixl_d2d_backend.cpp)
+    list(APPEND TRANSFER_ENGINE_SRCS
+        src/internal/backend/ascend/hixl_config.cpp
+        src/internal/backend/ascend/ascend_backend.cpp)
 endif()
 
 add_library(transfer_engine_obj OBJECT ${TRANSFER_ENGINE_SRCS})
@@ -251,6 +276,13 @@ target_link_libraries(transfer_engine_obj PRIVATE ds_spdlog::spdlog dl)
 if (TRANSFER_ENGINE_ENABLE_HIXL)
     target_include_directories(transfer_engine_obj PRIVATE ${TRANSFER_ENGINE_HIXL_INCLUDE_DIR})
     target_compile_definitions(transfer_engine_obj PRIVATE TRANSFER_ENGINE_ENABLE_HIXL=1)
+    target_link_libraries(transfer_engine_obj PRIVATE nlohmann_json::nlohmann_json)
+    if (TRANSFER_ENGINE_HIXL_CS_AVAILABLE)
+        target_compile_definitions(transfer_engine_obj PRIVATE TRANSFER_ENGINE_HIXL_CS_AVAILABLE=1)
+    endif()
+    if (TRANSFER_ENGINE_HIXL_AUTO_CONNECT_AVAILABLE)
+        target_compile_definitions(transfer_engine_obj PRIVATE TRANSFER_ENGINE_HIXL_AUTO_CONNECT_AVAILABLE=1)
+    endif()
 endif()
 
 add_library(transfer_engine STATIC $<TARGET_OBJECTS:transfer_engine_obj>)
@@ -279,28 +311,8 @@ target_include_directories(transfer_engine_cross_node_smoke PRIVATE
 )
 target_link_libraries(transfer_engine_cross_node_smoke PRIVATE transfer_engine dl pthread)
 
-add_executable(transfer_engine_multi_node_multi_npu_smoke tests/smoke/multi_node_multi_npu_smoke.cpp)
-target_include_directories(transfer_engine_multi_node_multi_npu_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(transfer_engine_multi_node_multi_npu_smoke PRIVATE transfer_engine)
-
 if (TRANSFER_ENGINE_BUILD_TESTS)
     enable_testing()
-
-    add_executable(transfer_engine_basic_ut
-        tests/st/transfer_engine_basic_test.cpp
-        tests/acl_test_utils.cpp
-    )
-    target_include_directories(transfer_engine_basic_ut PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests
-    )
-    target_link_libraries(transfer_engine_basic_ut PRIVATE transfer_engine GTest::gtest GTest::gtest_main dl)
-    add_test(NAME transfer_engine_basic_ut COMMAND transfer_engine_basic_ut)
-
-    add_executable(transfer_engine_sync_read_ut tests/st/transfer_engine_sync_read_test.cpp)
-    target_include_directories(transfer_engine_sync_read_ut PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    target_link_libraries(transfer_engine_sync_read_ut PRIVATE transfer_engine GTest::gtest GTest::gtest_main)
-    add_test(NAME transfer_engine_sync_read_ut COMMAND transfer_engine_sync_read_ut)
 
     add_executable(transfer_engine_control_plane_e2e_llt tests/llt/control_plane_e2e_llt_test.cpp)
     target_include_directories(transfer_engine_control_plane_e2e_llt PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -316,6 +328,13 @@ if (TRANSFER_ENGINE_BUILD_TESTS)
     target_include_directories(transfer_engine_core_modules_llt PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(transfer_engine_core_modules_llt PRIVATE transfer_engine GTest::gtest GTest::gtest_main)
     add_test(NAME transfer_engine_core_modules_llt COMMAND transfer_engine_core_modules_llt)
+
+    if (TRANSFER_ENGINE_ENABLE_HIXL)
+        add_executable(transfer_engine_hixl_config_ut tests/llt/hixl_config_llt_test.cpp)
+        target_include_directories(transfer_engine_hixl_config_ut PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(transfer_engine_hixl_config_ut PRIVATE transfer_engine GTest::gtest GTest::gtest_main)
+        add_test(NAME transfer_engine_hixl_config_ut COMMAND transfer_engine_hixl_config_ut)
+    endif()
 
     add_executable(transfer_engine_logging_llt tests/llt/logging_llt_test.cpp)
     target_include_directories(transfer_engine_logging_llt PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

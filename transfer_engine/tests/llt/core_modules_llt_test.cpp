@@ -1,21 +1,26 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
-#include <memory>
+#include <chrono>
+#include <string>
 #include <vector>
 
 #include "internal/connection/connection_manager.h"
-#include "internal/backend/mock_data_plane_backend.h"
 #include "internal/memory/registered_memory_table.h"
 
 namespace datasystem {
 namespace {
 
+ReadLeaseRequester DefaultRequester()
+{
+    return ReadLeaseRequester{ "requester", 12345, 1 };
+}
+
 // 中文说明：验证 ConnectionManager 初始状态下，链路未就绪且状态字段为默认值。
 TEST(ConnectionManagerLltTest, DefaultNotReady)
 {
     ConnectionManager mgr;
-    ConnectionKey key { 0, "127.0.0.1", 50001, 1 };
+    ConnectionKey key{ 0, "127.0.0.1", 50001, 1 };
 
     EXPECT_FALSE(mgr.HasReadyConnection(key));
     ConnectionState state = mgr.GetState(key);
@@ -28,7 +33,7 @@ TEST(ConnectionManagerLltTest, DefaultNotReady)
 TEST(ConnectionManagerLltTest, ReadyStaleRecover)
 {
     ConnectionManager mgr;
-    ConnectionKey key { 2, "127.0.0.1", 50002, 3 };
+    ConnectionKey key{ 2, "127.0.0.1", 50002, 3 };
 
     mgr.MarkRequesterRecvReady(key);
     EXPECT_FALSE(mgr.HasReadyConnection(key));
@@ -46,11 +51,22 @@ TEST(ConnectionManagerLltTest, ReadyStaleRecover)
     EXPECT_TRUE(mgr.HasReadyConnection(key));
 }
 
+TEST(ConnectionManagerLltTest, BoundsAndClearsConnectionStates)
+{
+    ConnectionManager mgr;
+    for (uint32_t i = 0; i < 5000; ++i) {
+        mgr.MarkRequesterRecvReady(ConnectionKey{ 0, "peer-" + std::to_string(i), static_cast<uint16_t>(i), 1 });
+    }
+    EXPECT_LE(mgr.Size(), 4096U);
+    mgr.Clear();
+    EXPECT_EQ(mgr.Size(), 0U);
+}
+
 // 中文说明：验证 RegisteredMemoryTable 对已注册范围、跨范围访问和错误设备号的判定逻辑。
 TEST(RegisteredMemoryTableLltTest, RangeDeviceValidation)
 {
     RegisteredMemoryTable table;
-    RegisteredRegion region { 0x1000, 0x100, 0 };
+    RegisteredRegion region{ 0x1000, 0x100, 0 };
     ASSERT_TRUE(table.AddRegion(region));
 
     EXPECT_TRUE(table.IsRegistered(0x1000, 0x40, 0));
@@ -68,7 +84,7 @@ TEST(RegisteredMemoryTableLltTest, AddInvalidRemove)
     EXPECT_FALSE(table.AddRegion(RegisteredRegion{ 0x2000, 0, 0 }));
     EXPECT_FALSE(table.AddRegion(RegisteredRegion{ UINT64_MAX - 7, 16, 0 }));
 
-    RegisteredRegion valid { 0x3000, 0x80, 1 };
+    RegisteredRegion valid{ 0x3000, 0x80, 1 };
     ASSERT_TRUE(table.AddRegion(valid));
     EXPECT_TRUE(table.IsRegistered(0x3010, 0x10, 1));
 
@@ -102,11 +118,15 @@ TEST(RegisteredMemoryTableLltTest, ReadLeaseBlocksRemoveUntilRelease)
     ASSERT_TRUE(table.AddRegion(RegisteredRegion{ 0x6000, 0x100, 5 }));
 
     uint64_t leaseId = 0;
-    ASSERT_TRUE(table.AcquireReadLease({ TransferMemoryRegion{ 0x6040, 0x20 } }, 5, 30000, &leaseId).IsOk());
+    ASSERT_TRUE(
+        table.AcquireReadLease({ TransferMemoryRegion{ 0x6040, 0x20 } }, 5, DefaultRequester(), 30000, &leaseId)
+            .IsOk());
     EXPECT_NE(leaseId, 0);
     EXPECT_EQ(table.RemoveByBaseAddrIfNoActiveLease(0x6000), RegisteredMemoryTable::RemoveResult::K_BUSY);
 
-    table.ReleaseReadLease(leaseId);
+    EXPECT_FALSE(table.ReleaseReadLease(leaseId, ReadLeaseRequester{ "other", 12345, 1 }));
+    EXPECT_EQ(table.RemoveByBaseAddrIfNoActiveLease(0x6000), RegisteredMemoryTable::RemoveResult::K_BUSY);
+    EXPECT_TRUE(table.ReleaseReadLease(leaseId, DefaultRequester()));
     EXPECT_EQ(table.RemoveByBaseAddrIfNoActiveLease(0x6000), RegisteredMemoryTable::RemoveResult::K_REMOVED);
     EXPECT_EQ(table.RemoveByBaseAddrIfNoActiveLease(0x6000), RegisteredMemoryTable::RemoveResult::K_NOT_FOUND);
 }
@@ -118,64 +138,141 @@ TEST(RegisteredMemoryTableLltTest, ReadLeaseRejectsUnregisteredRange)
     ASSERT_TRUE(table.AddRegion(RegisteredRegion{ 0x7000, 0x80, 6 }));
 
     uint64_t leaseId = 0;
-    Result rc = table.AcquireReadLease({ TransferMemoryRegion{ 0x7070, 0x20 } }, 6, 30000, &leaseId);
+    Result rc =
+        table.AcquireReadLease({ TransferMemoryRegion{ 0x7070, 0x20 } }, 6, DefaultRequester(), 30000, &leaseId);
     EXPECT_EQ(rc.GetCode(), ErrorCode::kNotAuthorized);
     EXPECT_EQ(leaseId, 0);
 }
 
-// 中文说明：验证 MockDataPlaneBackend 在双端建链后，可通过 PostRecv/PostSend/WaitRecv 完成数据拷贝。
-TEST(MockDataPlaneBackendLltTest, SendRecvRoundTrip)
+TEST(RegisteredMemoryTableLltTest, BatchRemoveIsAtomicWhenOneRegionIsBusy)
 {
-    auto sharedState = std::make_shared<MockDataPlaneBackend::SharedState>();
-    MockDataPlaneBackend owner(sharedState);
-    MockDataPlaneBackend requester(sharedState);
+    RegisteredMemoryTable table;
+    ASSERT_TRUE(table.AddRegions({ RegisteredRegion{ 0x8000, 0x80, 7 }, RegisteredRegion{ 0x9000, 0x80, 7 } }));
 
-    ConnectionSpec recvSpec;
-    recvSpec.localHost = "127.0.0.1";
-    recvSpec.localPort = 51052;
-    recvSpec.localDeviceId = 0;
-    recvSpec.peerHost = "127.0.0.1";
-    recvSpec.peerPort = 51051;
-    recvSpec.peerDeviceId = 0;
+    uint64_t leaseId = 0;
+    ASSERT_TRUE(
+        table.AcquireReadLease({ TransferMemoryRegion{ 0x9010, 0x10 } }, 7, DefaultRequester(), 30000, &leaseId)
+            .IsOk());
+    std::vector<RegisteredRegion> removedRegions;
+    EXPECT_EQ(table.RemoveByBaseAddrsIfNoActiveLease({ 0x8000, 0x9000 }, &removedRegions),
+              RegisteredMemoryTable::RemoveResult::K_BUSY);
+    EXPECT_TRUE(removedRegions.empty());
+    EXPECT_TRUE(table.IsRegistered(0x8010, 0x10, 7));
+    EXPECT_TRUE(table.IsRegistered(0x9010, 0x10, 7));
 
-    ConnectionSpec sendSpec;
-    sendSpec.localHost = "127.0.0.1";
-    sendSpec.localPort = 51051;
-    sendSpec.localDeviceId = 0;
-    sendSpec.peerHost = "127.0.0.1";
-    sendSpec.peerPort = 51052;
-    sendSpec.peerDeviceId = 0;
-
-    ASSERT_TRUE(requester.InitRecv(recvSpec, "mock_root_info").IsOk());
-    ASSERT_TRUE(owner.InitSend(sendSpec, "mock_root_info").IsOk());
-
-    std::vector<uint8_t> src {1, 2, 3, 4, 5, 6, 7, 8};
-    std::vector<uint8_t> dst(src.size(), 0);
-
-    ASSERT_TRUE(requester.PostRecv(recvSpec, reinterpret_cast<uint64_t>(dst.data()), dst.size()).IsOk());
-    ASSERT_TRUE(owner.PostSend(sendSpec, reinterpret_cast<uint64_t>(src.data()), src.size()).IsOk());
-    ASSERT_TRUE(requester.WaitRecv(recvSpec, 1000).IsOk());
-    EXPECT_EQ(src, dst);
+    EXPECT_TRUE(table.ReleaseReadLease(leaseId, DefaultRequester()));
+    EXPECT_EQ(table.RemoveByBaseAddrsIfNoActiveLease({ 0x8000, 0x9000 }, &removedRegions),
+              RegisteredMemoryTable::RemoveResult::K_REMOVED);
+    EXPECT_EQ(removedRegions.size(), 2U);
 }
 
-// 中文说明：验证 MockDataPlaneBackend 在未收到对应 Send 时，WaitRecv 会超时返回 NotReady。
-TEST(MockDataPlaneBackendLltTest, WaitRecvTimeout)
+TEST(RegisteredMemoryTableLltTest, BatchRemoveRejectsDuplicateBaseAddress)
 {
-    auto sharedState = std::make_shared<MockDataPlaneBackend::SharedState>();
-    MockDataPlaneBackend requester(sharedState);
+    RegisteredMemoryTable table;
+    ASSERT_TRUE(table.AddRegions({ RegisteredRegion{ 0xe000, 0x80, 7 }, RegisteredRegion{ 0xf000, 0x80, 7 } }));
 
-    ConnectionSpec recvSpec;
-    recvSpec.localHost = "127.0.0.1";
-    recvSpec.localPort = 52052;
-    recvSpec.localDeviceId = 0;
-    recvSpec.peerHost = "127.0.0.1";
-    recvSpec.peerPort = 52051;
-    recvSpec.peerDeviceId = 0;
+    std::vector<RegisteredRegion> removedRegions;
+    EXPECT_EQ(table.RemoveByBaseAddrsIfNoActiveLease({ 0xe000, 0xe000 }, &removedRegions),
+              RegisteredMemoryTable::RemoveResult::K_NOT_FOUND);
+    EXPECT_TRUE(removedRegions.empty());
+    EXPECT_TRUE(table.IsRegistered(0xe010, 0x10, 7));
+    EXPECT_TRUE(table.IsRegistered(0xf010, 0x10, 7));
+}
 
-    std::vector<uint8_t> dst(16, 0);
-    ASSERT_TRUE(requester.PostRecv(recvSpec, reinterpret_cast<uint64_t>(dst.data()), dst.size()).IsOk());
-    Result rc = requester.WaitRecv(recvSpec, 10);
-    EXPECT_EQ(rc.GetCode(), ErrorCode::kNotReady);
+TEST(RegisteredMemoryTableLltTest, BatchRemoveRemovesAllRequestedRegions)
+{
+    RegisteredMemoryTable table;
+    ASSERT_TRUE(table.AddRegions({ RegisteredRegion{ 0x10000, 0x80, 7 }, RegisteredRegion{ 0x11000, 0x80, 7 },
+                                   RegisteredRegion{ 0x12000, 0x80, 7 } }));
+
+    std::vector<RegisteredRegion> removedRegions;
+    EXPECT_EQ(table.RemoveByBaseAddrsIfNoActiveLease({ 0x10000, 0x12000 }, &removedRegions),
+              RegisteredMemoryTable::RemoveResult::K_REMOVED);
+    EXPECT_EQ(removedRegions.size(), 2U);
+    EXPECT_FALSE(table.IsRegistered(0x10010, 0x10, 7));
+    EXPECT_TRUE(table.IsRegistered(0x11010, 0x10, 7));
+    EXPECT_FALSE(table.IsRegistered(0x12010, 0x10, 7));
+}
+
+TEST(RegisteredMemoryTableLltTest, BatchAddAllowsAdjacentRegionsAndCrossDeviceSameAddress)
+{
+    RegisteredMemoryTable table;
+    EXPECT_TRUE(table.AddRegions({ RegisteredRegion{ 0x13000, 0x100, 7 }, RegisteredRegion{ 0x13100, 0x100, 7 },
+                                   RegisteredRegion{ 0x13000, 0x100, 8 } }));
+    EXPECT_TRUE(table.IsRegistered(0x13010, 0x10, 7));
+    EXPECT_TRUE(table.IsRegistered(0x13110, 0x10, 7));
+    EXPECT_TRUE(table.IsRegistered(0x13010, 0x10, 8));
+}
+
+TEST(RegisteredMemoryTableLltTest, BatchAddRejectsOverlapsRegardlessOfInputOrder)
+{
+    RegisteredMemoryTable table;
+    EXPECT_FALSE(table.AddRegions({ RegisteredRegion{ 0x14000, 0x40, 7 }, RegisteredRegion{ 0x14200, 0x40, 7 },
+                                   RegisteredRegion{ 0x14020, 0x20, 7 } }));
+    EXPECT_FALSE(table.IsRegistered(0x14010, 0x10, 7));
+
+    ASSERT_TRUE(table.AddRegions({ RegisteredRegion{ 0x15000, 0x100, 7 }, RegisteredRegion{ 0x15200, 0x100, 7 } }));
+    EXPECT_FALSE(table.AddRegions({ RegisteredRegion{ 0x15100, 0x120, 7 } }));
+    EXPECT_TRUE(table.IsRegistered(0x15010, 0x10, 7));
+    EXPECT_TRUE(table.IsRegistered(0x15210, 0x10, 7));
+}
+
+TEST(RegisteredMemoryTableLltTest, LeaseAdmissionClosesAndReopens)
+{
+    RegisteredMemoryTable table;
+    ASSERT_TRUE(table.AddRegion(RegisteredRegion{ 0xa000, 0x80, 8 }));
+    table.CloseReadLeaseAdmission();
+    uint64_t leaseId = 0;
+    Result closedRc =
+        table.AcquireReadLease({ TransferMemoryRegion{ 0xa010, 0x10 } }, 8, DefaultRequester(), 30000, &leaseId);
+    EXPECT_EQ(closedRc.GetCode(), ErrorCode::kNotReady);
+    table.OpenReadLeaseAdmission();
+    ASSERT_TRUE(
+        table.AcquireReadLease({ TransferMemoryRegion{ 0xa010, 0x10 } }, 8, DefaultRequester(), 30000, &leaseId)
+            .IsOk());
+    EXPECT_TRUE(table.ReleaseReadLease(leaseId, DefaultRequester()));
+    EXPECT_TRUE(table.WaitForNoActiveReadLeases(1));
+}
+
+TEST(RegisteredMemoryTableLltTest, LeaseWaitWakesAtExpiry)
+{
+    RegisteredMemoryTable table;
+    ASSERT_TRUE(table.AddRegion(RegisteredRegion{ 0xb000, 0x80, 9 }));
+    uint64_t leaseId = 0;
+    ASSERT_TRUE(table.AcquireReadLease({ TransferMemoryRegion{ 0xb010, 0x10 } }, 9, DefaultRequester(), 20, &leaseId)
+                    .IsOk());
+    const auto start = std::chrono::steady_clock::now();
+    EXPECT_TRUE(table.WaitForNoActiveReadLeases(500));
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::milliseconds(400));
+}
+
+TEST(RegisteredMemoryTableLltTest, ReadLeaseRejectsTooManyRanges)
+{
+    RegisteredMemoryTable table;
+    std::vector<TransferMemoryRegion> ranges(4097, TransferMemoryRegion{ 0xc000, 1 });
+    uint64_t leaseId = 0;
+    Result rc = table.AcquireReadLease(ranges, 10, DefaultRequester(), 30000, &leaseId);
+    EXPECT_EQ(rc.GetCode(), ErrorCode::kInvalid);
+    EXPECT_EQ(leaseId, 0);
+}
+
+TEST(RegisteredMemoryTableLltTest, ReadLeaseBoundsTotalActiveRanges)
+{
+    RegisteredMemoryTable table;
+    ASSERT_TRUE(table.AddRegion(RegisteredRegion{ 0xd000, 0x100, 11 }));
+    std::vector<TransferMemoryRegion> ranges(4096, TransferMemoryRegion{ 0xd000, 1 });
+    std::vector<uint64_t> leaseIds;
+    for (int i = 0; i < 16; ++i) {
+        uint64_t leaseId = 0;
+        ASSERT_TRUE(table.AcquireReadLease(ranges, 11, DefaultRequester(), 30000, &leaseId).IsOk());
+        leaseIds.push_back(leaseId);
+    }
+    uint64_t rejectedLeaseId = 0;
+    Result rejected = table.AcquireReadLease(ranges, 11, DefaultRequester(), 30000, &rejectedLeaseId);
+    EXPECT_EQ(rejected.GetCode(), ErrorCode::kNotReady);
+    for (const uint64_t leaseId : leaseIds) {
+        EXPECT_TRUE(table.ReleaseReadLease(leaseId, DefaultRequester()));
+    }
 }
 
 }  // namespace

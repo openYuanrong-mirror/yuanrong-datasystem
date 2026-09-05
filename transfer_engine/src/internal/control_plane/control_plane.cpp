@@ -123,6 +123,16 @@ void SocketControlServer::Stop()
     if (acceptThread_.joinable()) {
         acceptThread_.join();
     }
+    {
+        std::lock_guard<std::mutex> lock(queueMutex_);
+        while (!clientFdQueue_.empty()) {
+            ::close(clientFdQueue_.front());
+            clientFdQueue_.pop_front();
+        }
+        for (const int clientFd : activeClientFds_) {
+            (void)::shutdown(clientFd, SHUT_RDWR);
+        }
+    }
     queueCv_.notify_all();
     for (auto &worker : workerThreads_) {
         if (worker.joinable()) {
@@ -130,13 +140,6 @@ void SocketControlServer::Stop()
         }
     }
     workerThreads_.clear();
-    {
-        std::lock_guard<std::mutex> lock(queueMutex_);
-        while (!clientFdQueue_.empty()) {
-            ::close(clientFdQueue_.front());
-            clientFdQueue_.pop_front();
-        }
-    }
     workerCount_ = 0;
     service_.reset();
     TE_LOG_INFO << "control server stopped";
@@ -185,10 +188,23 @@ void SocketControlServer::WorkerLoop()
                 }
                 continue;
             }
+            if (!running_) {
+                while (!clientFdQueue_.empty()) {
+                    ::close(clientFdQueue_.front());
+                    clientFdQueue_.pop_front();
+                }
+                break;
+            }
             clientFd = clientFdQueue_.front();
             clientFdQueue_.pop_front();
+            activeClientFds_.insert(clientFd);
         }
         HandleClient(clientFd);
+        {
+            std::lock_guard<std::mutex> lock(queueMutex_);
+            activeClientFds_.erase(clientFd);
+            ::close(clientFd);
+        }
     }
 }
 
@@ -198,13 +214,12 @@ void SocketControlServer::HandleClient(int clientFd)
 
     RpcMethod method;
     std::vector<uint8_t> reqPayload;
-    Result recvRc = RecvFrame(clientFd, &method, &reqPayload);
+    Result recvRc = RecvFrame(clientFd, &method, &reqPayload, kServerSocketTimeoutSec * 1000);
     if (recvRc.IsError()) {
         TE_LOG_WARNING << "recv rpc frame failed, reason=" << recvRc.ToString();
         std::vector<uint8_t> err;
         (void)MakeServerErrorPayload(recvRc.GetMsg(), &err);
         (void)SendFrame(clientFd, RpcMethod::kReadTrigger, err);
-        ::close(clientFd);
         return;
     }
 
@@ -212,7 +227,6 @@ void SocketControlServer::HandleClient(int clientFd)
     std::vector<uint8_t> rspPayload;
     (void)DispatchControlRequest(service_, method, reqPayload, &rspMethod, &rspPayload);
     (void)SendFrame(clientFd, rspMethod, rspPayload);
-    ::close(clientFd);
 }
 
 }  // namespace datasystem

@@ -2,6 +2,7 @@
 #define TRANSFER_ENGINE_INTERNAL_CONNECTION_MANAGER_H
 
 #include <cstdint>
+#include <cstddef>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -28,9 +29,12 @@ public:
     void MarkStale(const ConnectionKey &key);
     void MarkRequesterRecvReady(const ConnectionKey &key);
     void MarkOwnerSendReady(const ConnectionKey &key);
+    void Clear();
+    size_t Size() const;
 
 private:
     static std::string ToMapKey(const ConnectionKey &key);
+    ConnectionState &GetOrCreateStateLocked(const std::string &mapKey);
 
     mutable std::mutex mutex_;
     std::unordered_map<std::string, ConnectionState> states_;
