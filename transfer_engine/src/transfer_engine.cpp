@@ -86,7 +86,7 @@ Result ResolveBackendKind(const std::string &protocol, std::string &backendKind)
     return TE_MAKE_STATUS(ErrorCode::kInvalid, "unsupported transfer engine protocol: " + protocol);
 }
 
-Result CreateBackendByKind(const std::string &backendKind, std::shared_ptr<IDataPlaneBackend> &backend)
+Result CreateBackendByKind(const std::string &backendKind, [[maybe_unused]] std::shared_ptr<IDataPlaneBackend> &backend)
 {
     if (backendKind == "hixl") {
 #ifdef TRANSFER_ENGINE_ENABLE_HIXL
