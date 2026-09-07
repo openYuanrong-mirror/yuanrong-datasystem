@@ -79,6 +79,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 DEFAULT_MAX_TRACES = 96
 DEFAULT_JOBS = 32
 ACCESS_STATUS_CODE_RE = re.compile(r'\|\s*(\d+)\s*\|\s*DS(?:_|\b)')
+CLIENT_ACCESS_LOG_RE = re.compile(r'^ds_client_access(?:_.*)?\.log(?:[.-].*)?$')
+GREP_LINE_RE = re.compile(r'^(.*):(\d+):(.*)$')
 
 
 def sanitize_filename(name: str) -> str:
@@ -271,13 +273,11 @@ def limit_traces(traces: list, max_traces: int) -> list:
 
 
 def find_access_log_files(collected_dir: str) -> list:
-    """Return every plain or gzip-compressed client access log under collected_dir."""
+    """Return current and rotated client access logs under collected_dir."""
     access_files = []
     for root, _, files in os.walk(collected_dir):
         for filename in files:
-            if not filename.startswith("ds_client_access_"):
-                continue
-            if filename.endswith(".log") or filename.endswith(".log.gz"):
+            if CLIENT_ACCESS_LOG_RE.fullmatch(filename):
                 access_files.append(os.path.join(root, filename))
     return sorted(access_files)
 
@@ -286,6 +286,12 @@ def open_access_log(filepath: str):
     """Open a plain or gzip-compressed access log as replacement-decoded text."""
     opener = gzip.open if filepath.endswith('.gz') else open
     return opener(filepath, 'rt', encoding='utf-8', errors='replace')
+
+
+def grep_line_content(line: str) -> str:
+    """Extract content from grep's file:line:content output without losing colons."""
+    match = GREP_LINE_RE.match(line.rstrip('\n'))
+    return match.group(3) if match else ''
 
 
 def find_files(root_dir: str, predicate) -> list:
@@ -341,14 +347,16 @@ def locate_worker_dirs(traces: set, logs_dir: str, jobs: int, debug_search: bool
     started = time.monotonic()
     def scan(path):
         try:
-            command = ['zgrep' if path.endswith('.gz') else 'grep', '-aF', '-f', '-', path]
+            # -Hn makes the persisted evidence consistently file:line:content,
+            # including when grep receives exactly one input file.
+            command = ['zgrep' if path.endswith('.gz') else 'grep', '-aFHn', '-f', '-', path]
             if debug_search:
                 print(f"  [{time.strftime('%H:%M:%S')}] [DEBUG] exec: {' '.join(shlex.quote(x) for x in command)}", flush=True)
             result = subprocess.run(command, input=patterns, capture_output=True, text=True,
                                     encoding='utf-8', errors='replace', timeout=300)
             return result.returncode, result.stdout, result.stderr
         except Exception as exc:
-            return exc
+            return None, '', str(exc)
     with ThreadPoolExecutor(max_workers=min(jobs, len(worker_access))) as executor:
         futures = {executor.submit(scan, path): path for path in worker_access}
         for index, future in enumerate(as_completed(futures), 1):
@@ -358,10 +366,12 @@ def locate_worker_dirs(traces: set, logs_dir: str, jobs: int, debug_search: bool
             if returncode == 0:
                 worker_dirs.add(os.path.dirname(path))
                 for line in stdout.splitlines(keepends=True):
-                    content = line.split(':', 2)[-1]
+                    content = grep_line_content(line)
                     for trace in traces:
                         if trace in content:
-                            access_lines[trace].append(f"{path}:{content}")
+                            # Keep grep's file:line:content evidence verbatim.  Splitting
+                            # on ':' corrupts ISO-8601 timestamps in the content.
+                            access_lines[trace].append(line)
             elif returncode not in (1,):
                 print(f"  [SKIPPED] {os.path.basename(path)}: {stderr}")
             if index == 1 or index % 50 == 0 or index == len(worker_access):
@@ -372,7 +382,8 @@ def locate_worker_dirs(traces: set, logs_dir: str, jobs: int, debug_search: bool
 def _scan_log_file(filepath: str, patterns: str, debug_search: bool = False) -> list:
     matches = []
     try:
-        command = ['zgrep' if filepath.endswith('.gz') else 'grep', '-aFn', '-f', '-', filepath]
+        # -Hn provides a stable file:line:content prefix for both plain and gzip logs.
+        command = ['zgrep' if filepath.endswith('.gz') else 'grep', '-aFHn', '-f', '-', filepath]
         if debug_search:
             print(f"  [{time.strftime('%H:%M:%S')}] [DEBUG] exec: {' '.join(shlex.quote(x) for x in command)}", flush=True)
         result = subprocess.run(command, input=patterns, capture_output=True, text=True,
@@ -380,13 +391,13 @@ def _scan_log_file(filepath: str, patterns: str, debug_search: bool = False) -> 
         if result.returncode not in (0, 1):
             return [(None, f"[ERROR] {' '.join(command)}: {result.stderr}\n")]
         for line in result.stdout.splitlines(keepends=True):
-            match = re.search(r':([^:]+):', line)
-            if match:
-                # grep -F -f output starts with file:line:content; identify the trace in content.
-                content = line.split(':', 2)[-1]
-                for trace in patterns.splitlines():
-                    if trace in content:
-                        matches.append((trace, line))
+            # Do not parse the prefix by ':': paths and ISO-8601 timestamps both
+            # legitimately contain colons.  The trace is unique enough to associate
+            # this complete source line with its output.
+            content = grep_line_content(line)
+            for trace in patterns.splitlines():
+                if trace in content:
+                    matches.append((trace, line))
     except Exception as exc:
         return [(None, f"[SKIPPED] {os.path.basename(filepath)}: {exc}\n")]
     return matches
