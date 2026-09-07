@@ -73,6 +73,20 @@ public:
         return shmConnection_->Acquire(context, session);
     }
 
+    /**
+     * @brief Acquire the endpoint session without waiting for an in-flight connection attempt.
+     * @param[in] context Request authentication and tenant context.
+     * @param[out] session Acquired endpoint session.
+     * @param[in] recorder Optional request-scoped phase recorder.
+     * @return K_TRY_AGAIN while another attempt is running; K_OK on success; the error code otherwise.
+     */
+    Status TryAcquireSession(const TransportRequestContext &context, std::shared_ptr<ShmSession> &session,
+                             TransportPhaseLatencyRecorder *recorder = nullptr)
+    {
+        RETURN_RUNTIME_ERROR_IF_NULL(shmConnection_);
+        return shmConnection_->TryAcquire(context, session, recorder);
+    }
+
     Status Get(const DataGetRequest &input, DataGetResult &output) override
     {
         RETURN_RUNTIME_ERROR_IF_NULL(rpcClient_);

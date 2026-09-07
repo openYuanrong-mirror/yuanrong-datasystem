@@ -60,10 +60,11 @@ public:
      * @param[in] address Initial metadata owner.
      * @param[in,out] items Ordered object metadata states belonging to address.
      * @param[in] readContext Read context required by the shared-memory transport.
+     * @param[in] traceEnabled Whether to record detailed transport phase timing.
      * @return K_OK after every item has an independent result; a group-wide error otherwise.
      */
     virtual Status QueryAndGet(const HostPort &address, const ObjectMetadataBatch &items,
-                               std::shared_ptr<const TransportReadContext> readContext);
+                               std::shared_ptr<const TransportReadContext> readContext, bool traceEnabled = false);
 
     /** @brief Query object locations without requesting inline object data. */
     virtual Status QueryMetadata(const HostPort &address, const ObjectMetadataBatch &items);
@@ -92,26 +93,30 @@ private:
     };
 
     Status Query(const HostPort &address, const ObjectMetadataBatch &items, bool enableInlineData,
-                 std::shared_ptr<const TransportReadContext> readContext = nullptr);
+                 std::shared_ptr<const TransportReadContext> readContext = nullptr, bool traceEnabled = false);
 
     Status QueryWithRetry(const HostPort &address, const ObjectMetadataBatch &items,
                           QueryAndGetRspPb &response, std::vector<RpcMessage> &payloads,
-                          InlineRequestContext &context);
+                          InlineRequestContext &context, TransportPhaseLatencyRecorder *recorder);
     Status BuildQueryRequest(const HostPort &address, const ObjectMetadataBatch &items,
-                             InlineRequestContext &context, QueryAndGetReqPb &request) const;
+                             InlineRequestContext &context, QueryAndGetReqPb &request,
+                             TransportPhaseLatencyRecorder *recorder) const;
     Status InvokeQueryAndGet(const HostPort &address, QueryAndGetReqPb &request,
                              QueryAndGetRspPb &response, std::vector<RpcMessage> &payloads,
-                             InlineRequestContext &context, bool &rpcDispatched);
+                             InlineRequestContext &context, bool &rpcDispatched,
+                             TransportPhaseLatencyRecorder *recorder);
     Status InvokeInlineQueryAndGet(const HostPort &address, QueryAndGetReqPb &request,
                                    QueryAndGetRspPb &response, std::vector<RpcMessage> &payloads,
-                                   InlineRequestContext &context, bool &invoked, bool &rpcDispatched);
+                                   InlineRequestContext &context, bool &invoked, bool &rpcDispatched,
+                                   TransportPhaseLatencyRecorder *recorder);
     Status InvokeTcpQueryAndGet(const HostPort &address, QueryAndGetReqPb &request,
                                 QueryAndGetRspPb &response, std::vector<RpcMessage> &payloads,
                                 bool &rpcDispatched);
     void SwitchInlineRequestToTcp(QueryAndGetReqPb &request, std::vector<RpcMessage> &payloads,
                                   InlineRequestContext &context) const;
     Status PrepareQueryRetry(const HostPort &address, const ObjectMetadataBatch &items, const Status &rc,
-                             bool rpcDispatched, InlineRequestContext &context, int64_t &backoffMs);
+                             bool rpcDispatched, InlineRequestContext &context, int64_t &backoffMs,
+                             TransportPhaseLatencyRecorder *recorder);
     void DelayReleaseUbBuffers(InlineRequestContext &context, const Status &reason,
                                const std::string &reasonSource) const;
     bool HandleUbTransportStatus(ObjectMetadataItem &item, const QueryAndGetResultPb &result,
@@ -126,15 +131,15 @@ private:
      */
     Status InitializeInlineRequest(const HostPort &address, const ObjectMetadataBatch &items,
                                    std::shared_ptr<const TransportReadContext> readContext,
-                                   InlineRequestContext &context) const;
+                                   InlineRequestContext &context, TransportPhaseLatencyRecorder *recorder) const;
 
     Status PrepareShmInlineRequest(const HostPort &address,
                                    std::shared_ptr<const TransportReadContext> readContext,
-                                   InlineRequestContext &context) const;
+                                   InlineRequestContext &context, TransportPhaseLatencyRecorder *recorder) const;
 
     /** @brief Replace an unavailable SHM inline request with an available UB or TCP request. */
     Status PrepareShmInlineFallback(const HostPort &address, const ObjectMetadataBatch &items,
-                                    InlineRequestContext &context) const;
+                                    InlineRequestContext &context, TransportPhaseLatencyRecorder *recorder) const;
 
     /**
      * @brief Prepare UB inline transfer when the endpoint and client configuration support it.
@@ -144,7 +149,7 @@ private:
      * @return K_OK on success or when UB is unavailable; the error code otherwise.
      */
     Status PrepareUbInlineRequest(const HostPort &address, const ObjectMetadataBatch &items,
-                                  InlineRequestContext &context) const;
+                                  InlineRequestContext &context, TransportPhaseLatencyRecorder *recorder) const;
 
     /**
      * @brief Allocate one UB receive buffer for each object metadata item.

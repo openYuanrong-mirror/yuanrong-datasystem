@@ -107,21 +107,25 @@ public:
      * @param[in] workerAddr Target worker address.
      * @param[in] hint Transport suggestion from the advisor.
      * @param[out] lease Lease owning the selected transporter and RPC client.
+     * @param[in] recorder Optional request-scoped phase recorder.
      * @return K_OK when the endpoint is ready and leased; the error code otherwise.
      */
     Status AcquireDataPlaneLease(const HostPort &workerAddr, TransportHint hint,
-                                 std::unique_ptr<DataPlaneLease> &lease);
+                                 std::unique_ptr<DataPlaneLease> &lease,
+                                 TransportPhaseLatencyRecorder *recorder = nullptr);
 
     /**
      * @brief Run an operation while the selected data plane cannot be torn down.
      * @param[in] workerAddr Target worker address.
      * @param[in] hint Transport suggestion from the advisor.
      * @param[in] operation Operation executed with the endpoint data-plane lease held.
+     * @param[in] recorder Optional request-scoped phase recorder.
      * @return K_OK when the operation succeeds; the connection or operation error otherwise.
      */
     Status WithDataPlaneLease(const HostPort &workerAddr, TransportHint hint,
                               const std::function<Status(const std::shared_ptr<IDataTransporter> &,
-                                                         const std::shared_ptr<WorkerRpcClient> &)> &operation);
+                                                         const std::shared_ptr<WorkerRpcClient> &)> &operation,
+                              TransportPhaseLatencyRecorder *recorder = nullptr);
 
     /**
      * @brief Get or lazily create the shared RPC client for an endpoint without creating a data transporter.
@@ -143,8 +147,15 @@ public:
     virtual Status ProbeProviderUbRecovery(const HostPort &workerAddr, const std::string &expectedIncarnation,
                                            int32_t timeoutMs, UbHealthSummary &summary);
 
-    /** @brief Drop only the selected data-plane transporter while retaining the shared RPC connection. */
+    /** @brief Drop every data-plane transporter while retaining the shared RPC connection. */
     void ResetDataPlane(const HostPort &workerAddr);
+
+    /**
+     * @brief Drop one transport kind while retaining other transporters and the shared RPC connection.
+     * @param[in] workerAddr Target worker address.
+     * @param[in] kind Transport kind to reset.
+     */
+    void ResetTransporter(const HostPort &workerAddr, AccessTransportKind kind);
 
     /** @brief Permanently reject SHM rebuilds for the current endpoint entry after scale-in is observed. */
     void MarkShmDraining(const HostPort &workerAddr);
@@ -187,13 +198,18 @@ private:
 
     struct WorkerTransportEntry {
         bool HasAliveTransporter(AccessTransportKind expectedKind) const;
+        std::shared_ptr<IDataTransporter> GetTransporter(AccessTransportKind expectedKind) const;
+        std::shared_ptr<IDataTransporter> &GetTransporterSlot(AccessTransportKind expectedKind);
         void ResetDataPlaneLocked();
+        void ResetTransporterLocked(AccessTransportKind expectedKind);
         void ResetDataPlane();
+        void ResetTransporter(AccessTransportKind expectedKind);
 
         bthread::RWLock mutex;
         std::shared_ptr<WorkerRpcClient> rpcClient;
-        std::shared_ptr<IDataTransporter> transporter;
-        AccessTransportKind kind = AccessTransportKind::TCP;
+        std::shared_ptr<IDataTransporter> shmTransporter;
+        std::shared_ptr<IDataTransporter> fallbackTransporter;
+        AccessTransportKind fallbackKind = AccessTransportKind::TCP;
         bool shmDraining = false;
         // Access under the EntryMap accessor so location admission is ordered with reconcile deletion.
         uint64_t locationAdmissionVersion = 0;
@@ -238,7 +254,8 @@ private:
                                  TransportPhaseLatencyRecorder *recorder);
 
     Status EnsureTransporterLocked(const TransportBuildContext &context,
-                                   const std::shared_ptr<WorkerTransportEntry> &entry);
+                                   const std::shared_ptr<WorkerTransportEntry> &entry,
+                                   bool &cachedFallbackAlongsideShm);
 
     Status BuildUbTransporter(const HostPort &workerAddr, const std::shared_ptr<WorkerRpcClient> &rpcClient,
                               TransportPhaseLatencyRecorder *recorder, std::shared_ptr<IDataTransporter> &out);

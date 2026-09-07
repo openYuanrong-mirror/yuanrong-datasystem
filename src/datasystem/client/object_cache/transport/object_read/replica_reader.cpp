@@ -277,7 +277,6 @@ bool ReplicaReader::IsRetryableLocationError(const Status &status) const
         case K_URMA_DATA_WORKER_UNAVAILABLE:
         case K_URMA_READ_SOURCE_DENIED:
         case K_WORKER_PULL_OBJECT_NOT_FOUND:
-        case K_NOT_FOUND:
         case K_OUT_OF_MEMORY:
             return true;
         default:

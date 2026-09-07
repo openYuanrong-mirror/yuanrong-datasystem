@@ -109,7 +109,7 @@ bool DataPlaneExecutor::PrepareRetry(const HostPort &workerAddr, const std::shar
     };
     if (rc.GetCode() == K_URMA_NEED_CONNECT) {
         logRebuild("Rebuild data plane");
-        manager_->ResetDataPlane(workerAddr);
+        manager_->ResetTransporter(workerAddr, transporter->Kind());
     } else if (rc.GetCode() == K_RPC_UNAVAILABLE || rc.GetCode() == K_RPC_NETWORK_BLIP) {
         // K_RPC_NETWORK_BLIP (ECONNRESET/ECONNABORTED/EHOSTUNREACH/ENETUNREACH) is a transient
         // transport hiccup, not a dead peer: rebuild the connection and retry once, same as the

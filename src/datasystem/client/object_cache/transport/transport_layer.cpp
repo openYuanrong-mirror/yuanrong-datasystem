@@ -742,7 +742,7 @@ bool TransportLayer::RebuildPlaneOnSetFailure(const Status &rc, const HostPort &
 {
     if (rc.GetCode() == K_URMA_NEED_CONNECT) {
         LOG(WARNING) << "Rebuild UB data plane for worker " << workerAddr.ToString() << " after Set failed: " << rc;
-        manager_->ResetDataPlane(workerAddr);
+        manager_->ResetTransporter(workerAddr, AccessTransportKind::UB);
         return true;
     }
     if (IsNonRetryableRpcError(rc)) {
@@ -995,7 +995,7 @@ Status TransportLayer::RetryOrReplayMSet(const HostPort &workerAddr,
     }
     if (retryUbWrite) {
         LOG(WARNING) << "Rebuild UB data plane for worker " << workerAddr.ToString() << " after MSet failed: " << rc;
-        manager_->ResetDataPlane(workerAddr);
+        manager_->ResetTransporter(workerAddr, AccessTransportKind::UB);
     } else {
         LOG(WARNING) << "Rebuild RPC and data plane for worker " << workerAddr.ToString()
                      << " after MSet failed before publish: " << rc;

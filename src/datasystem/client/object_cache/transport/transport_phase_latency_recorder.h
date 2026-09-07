@@ -90,7 +90,7 @@ private:
     std::string FormatSlowPhases(uint64_t processThresholdUs, uint64_t rpcThresholdUs) const;
     std::string FormatPhases() const;
 
-    static constexpr size_t MAX_PHASE_COUNT = 16;
+    static constexpr size_t MAX_PHASE_COUNT = 24;
     HostPort endpoint_;
     std::array<Phase, MAX_PHASE_COUNT> phases_;
     size_t phaseCount_ = 0;

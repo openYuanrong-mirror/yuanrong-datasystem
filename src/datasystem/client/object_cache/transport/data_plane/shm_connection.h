@@ -32,6 +32,7 @@
 #include "datasystem/client/object_cache/transport/data_plane/i_data_transporter.h"
 #include "datasystem/client/object_cache/transport/rpc/worker_rpc_client.h"
 #include "datasystem/client/object_cache/transport/shm_fd.h"
+#include "datasystem/client/object_cache/transport/transport_phase_latency_recorder.h"
 #include "datasystem/common/object_cache/object_base.h"
 #include "datasystem/common/util/thread_pool.h"
 
@@ -77,7 +78,8 @@ public:
                          const TransportRequestContext &context, std::weak_ptr<ThreadPool> releasePool,
                          std::shared_ptr<std::atomic<bool>> scaleInDraining,
                          const std::shared_ptr<HostMemoryPinManager> &hostMemoryPinManager,
-                         std::shared_ptr<ShmSession> &session);
+                         std::shared_ptr<ShmSession> &session,
+                         TransportPhaseLatencyRecorder *recorder = nullptr);
 
     ~ShmSession();
 
@@ -174,6 +176,16 @@ public:
 
     Status Acquire(const TransportRequestContext &context, std::shared_ptr<ShmSession> &session);
 
+    /**
+     * @brief Acquire the endpoint session without waiting for another connection attempt.
+     * @param[in] context Request authentication and tenant context.
+     * @param[out] session Acquired endpoint session.
+     * @param[in] recorder Optional request-scoped phase recorder.
+     * @return K_TRY_AGAIN while another attempt is running; K_OK on success; the error code otherwise.
+     */
+    Status TryAcquire(const TransportRequestContext &context, std::shared_ptr<ShmSession> &session,
+                      TransportPhaseLatencyRecorder *recorder = nullptr);
+
     bool IsAlive() const override;
 
     AccessTransportKind Kind() const override;
@@ -181,12 +193,20 @@ public:
     void Teardown() override;
 
 private:
-    // Waits (under mutex_) for an in-flight connection attempt to finish or the connection to close,
-    // bounded by the API deadline. Extracted from Acquire to keep that function within the codecheck limit.
+    // The blocking acquisition path waits for the single in-flight connection attempt, bounded by the API deadline.
     Status WaitForConnecting(std::unique_lock<bthread::Mutex> &lock);
 
+    Status AcquireImpl(const TransportRequestContext &context, bool waitForConnecting,
+                       std::shared_ptr<ShmSession> &session, TransportPhaseLatencyRecorder *recorder = nullptr);
+
+    Status PrepareAcquire(bool waitForConnecting, uint64_t &attemptId, bool &startConnection,
+                          std::shared_ptr<ShmSession> &session, TransportPhaseLatencyRecorder *recorder);
+
+    Status WaitForExistingAttempt(std::unique_lock<bthread::Mutex> &lock, bool waitForConnecting,
+                                  TransportPhaseLatencyRecorder *recorder);
+
     Status CompleteConnectionAttempt(uint64_t attemptId, const std::shared_ptr<ShmSession> &candidate, Status result,
-                                     std::shared_ptr<ShmSession> &session);
+                                     uint64_t connectUs, std::shared_ptr<ShmSession> &session);
 
     HostPort workerAddr_;
     std::shared_ptr<WorkerRpcClient> rpcClient_;

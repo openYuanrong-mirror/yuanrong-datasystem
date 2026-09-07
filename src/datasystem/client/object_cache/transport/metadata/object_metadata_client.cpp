@@ -19,9 +19,11 @@
 #include "datasystem/client/object_cache/transport/metadata/object_metadata_client.h"
 
 #include "datasystem/client/object_cache/transport/object_read/object_read_types.h"
+#include "datasystem/client/object_cache/transport/transport_phase_latency_recorder.h"
 
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <utility>
 
 #include "datasystem/common/inject/inject_point.h"
@@ -81,16 +83,17 @@ ObjectMetadataClient::ObjectMetadataClient(std::shared_ptr<DataPlaneManager> man
 
 Status ObjectMetadataClient::InitializeInlineRequest(const HostPort &address, const ObjectMetadataBatch &items,
                                                      std::shared_ptr<const TransportReadContext> readContext,
-                                                     InlineRequestContext &context) const
+                                                     InlineRequestContext &context,
+                                                     TransportPhaseLatencyRecorder *recorder) const
 {
     context = InlineRequestContext{};
     const auto hint = advisor_ == nullptr ? TransportHint::TCP_ONLY : advisor_->GetTransportHint(address);
     if (hint == TransportHint::SHM_CANDIDATE) {
-        RETURN_IF_NOT_OK(PrepareShmInlineRequest(address, std::move(readContext), context));
+        RETURN_IF_NOT_OK(PrepareShmInlineRequest(address, std::move(readContext), context, recorder));
         RETURN_OK_IF_TRUE(context.mode == InlineTransportMode::SHM);
     }
     if (hint == TransportHint::UB_CANDIDATE || IsUrmaEnabled()) {
-        return PrepareUbInlineRequest(address, items, context);
+        return PrepareUbInlineRequest(address, items, context, recorder);
     }
     context.mode = InlineTransportMode::TCP;
     return Status::OK();
@@ -98,7 +101,8 @@ Status ObjectMetadataClient::InitializeInlineRequest(const HostPort &address, co
 
 Status ObjectMetadataClient::PrepareShmInlineRequest(const HostPort &address,
                                                      std::shared_ptr<const TransportReadContext> readContext,
-                                                     InlineRequestContext &context) const
+                                                     InlineRequestContext &context,
+                                                     TransportPhaseLatencyRecorder *recorder) const
 {
     RETURN_RUNTIME_ERROR_IF_NULL(manager_);
     if (readContext == nullptr) {
@@ -106,14 +110,14 @@ Status ObjectMetadataClient::PrepareShmInlineRequest(const HostPort &address,
         return Status::OK();
     }
     std::shared_ptr<IDataTransporter> transporter;
-    Status rc = manager_->GetOrCreate(address, TransportHint::SHM_CANDIDATE, transporter);
+    Status rc = manager_->GetOrCreate(address, TransportHint::SHM_CANDIDATE, transporter, recorder);
     auto shmTransporter = std::dynamic_pointer_cast<ShmTransporter>(transporter);
     if (rc.IsError() || shmTransporter == nullptr) {
         context.DisableInlineData();
         return Status::OK();
     }
     std::shared_ptr<ShmSession> session;
-    rc = shmTransporter->AcquireSession(readContext->requestContext, session);
+    rc = shmTransporter->TryAcquireSession(readContext->requestContext, session, recorder);
     if (rc.IsError()) {
         context.DisableInlineData();
         return Status::OK();
@@ -127,18 +131,20 @@ Status ObjectMetadataClient::PrepareShmInlineRequest(const HostPort &address,
 
 Status ObjectMetadataClient::PrepareShmInlineFallback(const HostPort &address,
                                                       const ObjectMetadataBatch &items,
-                                                      InlineRequestContext &context) const
+                                                      InlineRequestContext &context,
+                                                      TransportPhaseLatencyRecorder *recorder) const
 {
     context.DisableInlineData();
     if (IsUrmaEnabled()) {
-        return PrepareUbInlineRequest(address, items, context);
+        return PrepareUbInlineRequest(address, items, context, recorder);
     }
     context.mode = InlineTransportMode::TCP;
     return Status::OK();
 }
 
 Status ObjectMetadataClient::PrepareUbInlineRequest(const HostPort &address, const ObjectMetadataBatch &items,
-                                                    InlineRequestContext &context) const
+                                                    InlineRequestContext &context,
+                                                    TransportPhaseLatencyRecorder *recorder) const
 {
     if (ubBufferSize_ == 0 || ubBufferProvider_ == nullptr || ubBufferSize_ > ubBufferProvider_->MaxGetSize()
         || items.size() > ubBufferProvider_->MaxGetSize() / ubBufferSize_) {
@@ -149,7 +155,7 @@ Status ObjectMetadataClient::PrepareUbInlineRequest(const HostPort &address, con
     RETURN_RUNTIME_ERROR_IF_NULL(manager_);
     // Establish UB first so a connection miss does not consume receive-buffer capacity.
     std::shared_ptr<IDataTransporter> transporter;
-    Status connectionRc = manager_->GetOrCreate(address, TransportHint::UB_CANDIDATE, transporter);
+    Status connectionRc = manager_->GetOrCreate(address, TransportHint::UB_CANDIDATE, transporter, recorder);
     if (connectionRc.IsError()) {
         VLOG(1) << "[TransportGet][Metadata] Disable UB inline data because the connection is unavailable: "
                 << connectionRc.ToString();
@@ -224,13 +230,15 @@ Status ObjectMetadataClient::AddInlineDataRequest(const ObjectMetadataBatch &ite
 
 Status ObjectMetadataClient::InvokeQueryAndGet(const HostPort &address, QueryAndGetReqPb &request,
                                                QueryAndGetRspPb &response, std::vector<RpcMessage> &payloads,
-                                               InlineRequestContext &context, bool &rpcDispatched)
+                                               InlineRequestContext &context, bool &rpcDispatched,
+                                               TransportPhaseLatencyRecorder *recorder)
 {
     rpcDispatched = false;
     RETURN_RUNTIME_ERROR_IF_NULL(manager_);
     if (context.mode == InlineTransportMode::UB || context.mode == InlineTransportMode::SHM) {
         bool invoked = false;
-        Status leaseRc = InvokeInlineQueryAndGet(address, request, response, payloads, context, invoked, rpcDispatched);
+        Status leaseRc =
+            InvokeInlineQueryAndGet(address, request, response, payloads, context, invoked, rpcDispatched, recorder);
         if (invoked) {
             return leaseRc;
         }
@@ -244,7 +252,8 @@ Status ObjectMetadataClient::InvokeQueryAndGet(const HostPort &address, QueryAnd
 Status ObjectMetadataClient::InvokeInlineQueryAndGet(const HostPort &address, QueryAndGetReqPb &request,
                                                      QueryAndGetRspPb &response, std::vector<RpcMessage> &payloads,
                                                      InlineRequestContext &context, bool &invoked,
-                                                     bool &rpcDispatched)
+                                                     bool &rpcDispatched,
+                                                     TransportPhaseLatencyRecorder *recorder)
 {
     const auto hint = context.mode == InlineTransportMode::UB ? TransportHint::UB_CANDIDATE
                                                              : TransportHint::SHM_CANDIDATE;
@@ -259,7 +268,8 @@ Status ObjectMetadataClient::InvokeInlineQueryAndGet(const HostPort &address, Qu
             }
             invoked = true;
             return rpcClient->InvokeQueryAndGet(request, response, payloads, &rpcDispatched);
-        });
+        },
+        recorder);
 }
 
 Status ObjectMetadataClient::InvokeTcpQueryAndGet(const HostPort &address, QueryAndGetReqPb &request,
@@ -283,7 +293,8 @@ void ObjectMetadataClient::SwitchInlineRequestToTcp(QueryAndGetReqPb &request, s
 
 Status ObjectMetadataClient::QueryWithRetry(const HostPort &address, const ObjectMetadataBatch &items,
                                             QueryAndGetRspPb &response,
-                                            std::vector<RpcMessage> &payloads, InlineRequestContext &context)
+                                            std::vector<RpcMessage> &payloads, InlineRequestContext &context,
+                                            TransportPhaseLatencyRecorder *recorder)
 {
     RETURN_RUNTIME_ERROR_IF_NULL(retry_);
     CHECK_FAIL_RETURN_STATUS(!items.empty(), K_INVALID, "Metadata query items are empty");
@@ -294,21 +305,21 @@ Status ObjectMetadataClient::QueryWithRetry(const HostPort &address, const Objec
         ++attempt;
         RETURN_IF_NOT_OK(retry_->CheckDeadline());
         QueryAndGetReqPb request;
-        RETURN_IF_NOT_OK(BuildQueryRequest(address, items, context, request));
+        RETURN_IF_NOT_OK(BuildQueryRequest(address, items, context, request, recorder));
         response.Clear();
         payloads.clear();
         VLOG(1) << "[TransportGet][Metadata] Query, meta owner: " << address.ToString()
                 << ", key count: " << items.size() << ", attempt: " << attempt;
         bool rpcDispatched = false;
-        Status rc = InvokeQueryAndGet(address, request, response, payloads, context, rpcDispatched);
+        Status rc = InvokeQueryAndGet(address, request, response, payloads, context, rpcDispatched, recorder);
         RETURN_OK_IF_TRUE(rc.IsOk());
-        RETURN_IF_NOT_OK(PrepareQueryRetry(address, items, rc, rpcDispatched, context, backoffMs));
+        RETURN_IF_NOT_OK(PrepareQueryRetry(address, items, rc, rpcDispatched, context, backoffMs, recorder));
     }
 }
 
 Status ObjectMetadataClient::PrepareQueryRetry(const HostPort &address, const ObjectMetadataBatch &items,
                                                const Status &rc, bool rpcDispatched, InlineRequestContext &context,
-                                               int64_t &backoffMs)
+                                               int64_t &backoffMs, TransportPhaseLatencyRecorder *recorder)
 {
     const bool quarantineUbBuffers =
         rpcDispatched && context.mode == InlineTransportMode::UB && NeedDelayReleaseShmUnit(rc);
@@ -343,7 +354,7 @@ Status ObjectMetadataClient::PrepareQueryRetry(const HostPort &address, const Ob
             << ", status: " << rc.ToString();
     RETURN_IF_NOT_OK(retry_->Backoff(backoffMs));
     if (quarantineUbBuffers) {
-        RETURN_IF_NOT_OK(PrepareUbInlineRequest(address, items, context));
+        RETURN_IF_NOT_OK(PrepareUbInlineRequest(address, items, context, recorder));
     }
     return Status::OK();
 }
@@ -373,7 +384,8 @@ bool ObjectMetadataClient::HandleUbTransportStatus(ObjectMetadataItem &item, con
 }
 
 Status ObjectMetadataClient::BuildQueryRequest(const HostPort &address, const ObjectMetadataBatch &items,
-                                               InlineRequestContext &context, QueryAndGetReqPb &request) const
+                                               InlineRequestContext &context, QueryAndGetReqPb &request,
+                                               TransportPhaseLatencyRecorder *recorder) const
 {
     for (const auto *item : items) {
         request.add_object_keys(item->objectKey);
@@ -385,7 +397,7 @@ Status ObjectMetadataClient::BuildQueryRequest(const HostPort &address, const Ob
         if (!sessionAvailable) {
             VLOG(1) << "[TransportGet][Metadata] SHM session is unavailable while building QueryAndGet; "
                        "selecting UB or TCP fallback";
-            RETURN_IF_NOT_OK(PrepareShmInlineFallback(address, items, context));
+            RETURN_IF_NOT_OK(PrepareShmInlineFallback(address, items, context, recorder));
         }
     }
     return AddInlineDataRequest(items, context, request);
@@ -518,24 +530,30 @@ Status ObjectMetadataClient::BuildUbInlineData(ObjectMetadataItem &item,
 }
 
 Status ObjectMetadataClient::Query(const HostPort &address, const ObjectMetadataBatch &items,
-                                   bool enableInlineData, std::shared_ptr<const TransportReadContext> readContext)
+                                   bool enableInlineData, std::shared_ptr<const TransportReadContext> readContext,
+                                   bool traceEnabled)
 {
     RETURN_IF_NOT_OK(ValidateAndResetItems(items));
+    std::optional<TransportPhaseLatencyRecorder> recorder;
+    if (traceEnabled) {
+        recorder.emplace(address);
+    }
     InlineRequestContext context;
     if (enableInlineData) {
-        RETURN_IF_NOT_OK(InitializeInlineRequest(address, items, std::move(readContext), context));
+        RETURN_IF_NOT_OK(
+            InitializeInlineRequest(address, items, std::move(readContext), context, recorder ? &*recorder : nullptr));
     }
 
     QueryAndGetRspPb response;
     std::vector<RpcMessage> payloads;
-    RETURN_IF_NOT_OK(QueryWithRetry(address, items, response, payloads, context));
+    RETURN_IF_NOT_OK(QueryWithRetry(address, items, response, payloads, context, recorder ? &*recorder : nullptr));
     return ApplyResults(items, response, payloads, context);
 }
 
 Status ObjectMetadataClient::QueryAndGet(const HostPort &address, const ObjectMetadataBatch &items,
-                                         std::shared_ptr<const TransportReadContext> readContext)
+                                         std::shared_ptr<const TransportReadContext> readContext, bool traceEnabled)
 {
-    return Query(address, items, true, std::move(readContext));
+    return Query(address, items, true, std::move(readContext), traceEnabled);
 }
 
 Status ObjectMetadataClient::QueryMetadata(const HostPort &address, const ObjectMetadataBatch &items)
