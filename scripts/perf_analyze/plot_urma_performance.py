@@ -35,12 +35,14 @@ Examples:
 
 import argparse
 import gzip
+import heapq
 import hashlib
 import json
 import os
 import re
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 
 
@@ -167,8 +169,9 @@ def find_workers(root, prefixes):
 
 
 def worker_payload(name, worker_dir, downsample_width):
+    started = time.monotonic()
     elapsed, post, completions, request_times, info_files = scan_worker(worker_dir)
-    top_elapsed = sorted(elapsed, key=lambda sample: sample[1], reverse=True)[:1000]
+    top_elapsed = heapq.nlargest(1000, elapsed, key=lambda sample: sample[1])
     post_qpm = qpm_samples([timestamp for timestamp, _ in post])
     completion_qpm = qpm_samples(completions)
     request_qpm = qpm_samples(request_times)
@@ -177,6 +180,7 @@ def worker_payload(name, worker_dir, downsample_width):
     return {
         "name": name,
         "infoFiles": info_files,
+        "scanSeconds": time.monotonic() - started,
         "topElapsed": [(row[1], row[0].isoformat()) for row in top_elapsed],
         "elapsed": {
             "time": [row[0].isoformat() for row in elapsed],
@@ -257,12 +261,27 @@ def generate_report(root, output, prefixes, jobs, downsample_width, report_mode)
     os.makedirs(os.path.dirname(html_path) or ".", exist_ok=True)
     os.makedirs(data_dir, exist_ok=True)
     payloads = [None] * len(workers)
-    with ThreadPoolExecutor(max_workers=jobs) as executor:
+    total = len(workers)
+    started = time.monotonic()
+    print(f"  Found {total} workers; scanning with {min(jobs, total) if total else 0} processes...")
+    if not total:
+        print("  No workers with INFO logs found")
+    with ProcessPoolExecutor(max_workers=jobs) as executor:
         futures = {executor.submit(worker_payload, name, path, downsample_width): index
                    for index, (name, path) in enumerate(workers)}
+        print(f"  Submitted {total}/{total} worker scan tasks")
+        completed = 0
         for future in as_completed(futures):
-            payloads[futures[future]] = future.result()
+            index = futures[future]
+            payload = future.result()
+            payloads[index] = payload
+            completed += 1
+            elapsed_seconds = time.monotonic() - started
+            print(f"  Progress: {completed}/{total} ({completed / total:.1%}) | "
+                  f"{payload['name']} | scan {payload['scanSeconds']:.1f}s | "
+                  f"elapsed {elapsed_seconds:.1f}s", flush=True)
     metadata = []
+    write_started = time.monotonic()
     for index, payload in enumerate(payloads):
         filename = safe_filename(payload["name"], index)
         chart_payload = {key: value for key, value in payload.items() if key != "topElapsed"}
@@ -284,8 +303,8 @@ def generate_report(root, output, prefixes, jobs, downsample_width, report_mode)
                                  "requestSamples": len(payload["qpm"]["requests"]),
                                  "postSamples": len(payload["qpm"]["posts"]),
                                  "completionSamples": len(payload["qpm"]["completions"])})
-        print(f"  - {payload['name']}: URMA_ELAPSED_TOTAL={len(payload['elapsed']['time'])}, "
-              f"URMA_POST_AFTER={len(payload['postAfter']['time'])}")
+        print(f"  Report data {index + 1}/{total}: {payload['name']} | "
+              f"elapsed={len(payload['elapsed']['time'])}, post={len(payload['postAfter']['time'])}", flush=True)
     if report_mode in ("old", "both"):
         with open(html_path, "w", encoding="utf-8") as report_file:
             report_file.write(html_page(metadata, "URMA post/inflight correlation"))
@@ -293,7 +312,7 @@ def generate_report(root, output, prefixes, jobs, downsample_width, report_mode)
         for payload in payloads:
             top_samples.extend((elapsed_ms, payload["name"], timestamp) for elapsed_ms, timestamp in payload["topElapsed"])
         top_workers = {}
-        for _, name, _ in sorted(top_samples, reverse=True)[:1000]:
+        for _, name, _ in heapq.nlargest(1000, top_samples):
             top_workers[name] = top_workers.get(name, 0) + 1
         top_path = html_path[:-5] + "_top_elapsed.html"
         with open(top_path, "w", encoding="utf-8") as top_file:
@@ -314,6 +333,8 @@ def generate_report(root, output, prefixes, jobs, downsample_width, report_mode)
     if report_mode in ("qpm", "both"):
         print(f"qpm report: {html_path[:-5]}_qpm.html")
     print(f"worker data: {data_dir}")
+    print(f"  Completed {total} workers in {time.monotonic() - started:.1f}s "
+          f"(report writing {time.monotonic() - write_started:.1f}s)")
 
 
 def read_roots(list_path):
@@ -328,7 +349,7 @@ def main():
     input_group.add_argument("--list", help="text file containing one worker-log root per line")
     parser.add_argument("-o", "--out", required=True, help="HTML file for -f, or output directory for --list")
     parser.add_argument("--prefix", help="comma-separated worker-name prefixes to include")
-    parser.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 1, help="worker scan threads")
+    parser.add_argument("-j", "--jobs", type=int, default=8, help="worker scan processes (default: 8)")
     parser.add_argument("--downsample", type=int, default=1, help="mean aggregate every N samples")
     parser.add_argument("--report", choices=("old", "qpm", "both"), default="old",
                         help="generate old report, QPM-only report, or both (default: old)")

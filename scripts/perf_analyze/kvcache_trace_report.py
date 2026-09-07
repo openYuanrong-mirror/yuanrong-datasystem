@@ -31,6 +31,21 @@ Scenario and field semantics:
   server_exec_us.  Stage distributions are independent diagnostic components:
   retries, overlaps, missing logs, and uninstrumented work make them non-additive.
 
+Overview statistic definitions (the overview table and trend chart use different denominators):
+
+| 报表项 | 数据来源 | 单 Trace/窗口计算 | 全局统计口径 |
+|---|---|---|---|
+| 端到端总时延 | client `ds_client_access` | `latency_us`；缺失时用 SDK + Worker/Remote 外层窗口回退估算 | 全部过滤后请求；avg/P99/P99.99/max；占比 100% |
+| SDK/Worker/RPC 阶段 | client/worker access 与 `RPC_FRAMEWORK_SLOW` | 每 Trace 保留对应阶段值；RPC 非服务端=`max(0,e2e_us-server_exec_us)`，网络=`network_residual_us`，框架=非服务端-网络 | 仅该阶段有效正值样本；样本数为有效值数；占比=阶段平均/全请求端到端平均 |
+| URMA 通信/调度 | `URMA_ELAPSED_TOTAL`、调度字段 | 每 Trace 取 URMA `cost` 最大值（ms→us）；调度取最大值 | 仅有效正值样本；属于诊断阶段，不保证与其它阶段可加 |
+| Worker Access | worker `access*.log` | 同 Trace 多条记录取 `latency_us` 最大值 | 仅有效正值样本；可能与内部阶段重叠 |
+| URMA 并发数 | URMA 记录 `urma_inflight_wr_count` | 同 Trace 取最大值 | 仅有效正值样本；单位为个，不是时延 |
+| sleep 时间 | worker `.info` nanosleep | 窗口基数=`2 × UB 通信数`；真实样本不足补 0 | avg/P99 等按补零后的基数；样本数列显示真实记录数，非请求时延 |
+| URMA PERF 采样 | worker `.info` 周期采样 | 每条采样先按指标读取 avg/max/P99/P99.99；窗口内取各统计量最大值 | 独立运行时采样，非请求级数据；不能与请求阶段相加 |
+| 趋势窗口 | 过滤后的请求及 `.info` | 请求阶段每窗口以全部请求为分母，缺失阶段按 0；窗口宽度由 `--window-ms` 决定 | 趋势 avg/P99/P99.99/max 仅反映该窗口，和总览阶段统计口径不同 |
+
+阶段统计是独立诊断分布：由于缺失日志、重试和阶段重叠，各阶段平均值/百分比不可相加为 100%。
+
 Performance, outputs, and failure interpretation:
   Input logs stream through a multi-process disk-sharded map/reduce flow.
   setandget collects/correlates once, then produces GET and SET reports without
@@ -2642,15 +2657,19 @@ class KVCacheAnalyzer:
         ];
         generateLegend('topLegend', topExclusiveFields);
 
-        const trendChart = echarts.init(document.getElementById('trendChart'));
+        // Force full canvas repaint and avoid retaining intermediate zoom paths.
+        const trendChart = echarts.init(document.getElementById('trendChart'), null, {
+            renderer: 'canvas', useDirtyRect: false
+        });
         let currentMetric = 'avg';
 
         function getTrendOption(metric) {
             const series = requestTrendFields.map(([fp, name]) => {
                 const idx = SEGMENT_FIELDS.findIndex(([f]) => f === fp);
                 return ({
-                name: name, type: 'line', smooth: true, symbol: 'circle', symbolSize: 3,
+                name: name, type: 'line', smooth: false, symbol: 'circle', symbolSize: 3,
                 lineStyle: { width: 1.5 }, itemStyle: { color: colors[idx] },
+                progressive: 0,
                 emphasis: { focus: 'series' },
                 data: timeWindows.map(tw => { const v = aggData[tw][fp]; return v ? v[metric] : 0; })
                 });
@@ -2661,8 +2680,9 @@ class KVCacheAnalyzer:
             ];
             infoFields.forEach(info => {
                 series.push({
-                    name: info.name, type: 'line', smooth: true, symbol: 'triangle', symbolSize: 5,
+                    name: info.name, type: 'line', smooth: false, symbol: 'triangle', symbolSize: 5,
                     lineStyle: { width: 2, type: 'dashed' }, itemStyle: { color: info.color },
+                    progressive: 0,
                     emphasis: { focus: 'series' },
                     data: timeWindows.map(tw => { const v = aggData[tw][info.fp]; return v ? v[metric] : 0; })
                 });
@@ -2670,12 +2690,16 @@ class KVCacheAnalyzer:
             // urma info 4\u4E2A\u72EC\u7ACB\u5B57\u6BB5\uFF08UB_JETTY_POST_SEND / BOND_JETTY_POST_SEND / UB_POLL_JFC / BOND_POLL_JFC\uFF09
             // \u5DF2\u5305\u542B\u5728 SEGMENT_FIELDS \u4E3B\u7CFB\u5217\u4E2D\uFF1A\u7A97\u53E3\u5185\u5404\u7EDF\u8BA1\u91CF(avg/p99/p9999/pmax)\u53D6\u6700\u5927\u503C\uFF0C\u968F metric \u5207\u6362
             series.push({
-                name: '\u603B\u65F6\u5EF6', type: 'line', smooth: true, symbol: 'diamond', symbolSize: 6,
+                name: '\u603B\u65F6\u5EF6', type: 'line', smooth: false, symbol: 'diamond', symbolSize: 6,
                 lineStyle: { width: 3, type: 'solid' }, itemStyle: { color: '#d32f2f' },
+                progressive: 0,
                 emphasis: { focus: 'series', lineStyle: { width: 4 } }, z: 10,
                 data: timeWindows.map(tw => { const v = aggData[tw]['__total_latency__']; return v ? v[metric] : 0; })
             });
             return {
+                animation: false,
+                animationDuration: 0,
+                animationDurationUpdate: 0,
                 tooltip: {
                     trigger: 'axis', backgroundColor: 'rgba(26, 26, 46, 0.95)', borderColor: 'transparent',
                     textStyle: { color: '#fff', fontSize: 12 }, padding: 12,
@@ -2697,7 +2721,7 @@ class KVCacheAnalyzer:
                 xAxis: { type: 'category', data: timeWindows, axisLabel: { fontSize: 11, rotate: 30, formatter: v => v.substring(11) }, axisLine: { lineStyle: { color: '#e2e8f0' } } },
                 yAxis: { type: 'value', name: metric === 'avg' ? '\u5E73\u5747\u65F6\u5EF6 (\u00B5s)' : metric === 'p99' ? 'P99 (\u00B5s)' : metric === 'p9999' ? 'P99.99 (\u00B5s)' : '\u6700\u5927\u503C (\u00B5s)', nameTextStyle: { fontSize: 12 }, axisLabel: { fontSize: 11 }, splitLine: { lineStyle: { color: '#f1f5f9' } } },
                 series: series,
-                dataZoom: [{ type: 'inside', start: 0, end: 100 }, { type: 'slider', start: 0, end: 100, bottom: 30, height: 20 }]
+                dataZoom: [{ type: 'inside', start: 0, end: 100, realtime: false }, { type: 'slider', start: 0, end: 100, realtime: false, bottom: 30, height: 20 }]
             };
         }
         trendChart.setOption(getTrendOption('avg'));
