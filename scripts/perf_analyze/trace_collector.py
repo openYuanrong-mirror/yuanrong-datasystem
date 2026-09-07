@@ -18,7 +18,7 @@ trace_collector.py - Unified trace collection tool for scripts/perf_analyze.
 
 Supports four modes:
   1. core: Extract traces from access logs by search string, then search in parallel.
-  2. time: Extract traces by operation type and latency range, then search in parallel.
+  2. time-buckets: Extract multiple operation/latency buckets in one pass and search only related logs.
   3. percentile: Extract high-latency traces by percentile, then search in parallel.
   4. all-core: Extract traces for every non-zero access-log status code, then search in parallel.
 
@@ -51,11 +51,10 @@ Examples:
   # all-core mode: collect every non-zero access-log status code
   python3 trace_collector.py --type all-core
 
-  # time mode: extract traces by operation type and latency range
-  python3 trace_collector.py --type time DS_KV_CLIENT_GET 1000,2000
-  python3 trace_collector.py --type time DS_KV_CLIENT_GET 1000
-  python3 trace_collector.py --type time DS_KV_CLIENT_GET ,2000
-  python3 trace_collector.py --type time "DS_KV_CLIENT_GET:DS_KV_CLIENT_PUT" 1000,2000
+  # time-buckets mode: scan access logs once for multiple operations and ranges
+  python3 trace_collector.py --type time-buckets \
+      --ops DS_KV_CLIENT_GET,DS_KV_CLIENT_SET \
+      --ranges 5000,7000 7000,10000 10000,20000 20000
 
   # percentile mode: extract high-latency traces by percentile
   python3 trace_collector.py --type percentile DS_KV_CLIENT_GET P99
@@ -71,6 +70,9 @@ import random
 import math
 import argparse
 import gzip
+import time
+import shlex
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
@@ -117,7 +119,8 @@ def extract_trace_id(line: str) -> str:
     return parts[5].strip()
 
 
-def run_grep_and_zgrep(trace: str, search_dirs: list, gz_files_by_dir: dict, output_path: str) -> dict:
+def run_grep_and_zgrep(trace: str, search_dirs: list, gz_files_by_dir: dict, output_path: str,
+                       debug_search: bool = False) -> dict:
     """Search one trace across directories and write results to a file."""
     trace = trace.strip()
     if not trace:
@@ -130,8 +133,11 @@ def run_grep_and_zgrep(trace: str, search_dirs: list, gz_files_by_dir: dict, out
 
         # grep -raFn: recursive, binary-safe fixed-string matching with line numbers.
         try:
+            command = ["grep", "-raFn", trace, search_dir]
+            if debug_search:
+                print(f"  [DEBUG] exec: {' '.join(command)}", flush=True)
             result = subprocess.run(
-                ["grep", "-raFn", trace, search_dir],
+                command,
                 capture_output=True, text=True,
                 encoding='utf-8', errors='replace',
                 timeout=300
@@ -151,8 +157,11 @@ def run_grep_and_zgrep(trace: str, search_dirs: list, gz_files_by_dir: dict, out
             gz_files = gz_files_by_dir[search_dir]
 
             if gz_files:
+                command = ["zgrep", "-aFn", trace] + gz_files
+                if debug_search:
+                    print(f"  [DEBUG] exec: {' '.join(command)}", flush=True)
                 result = subprocess.run(
-                    ["zgrep", "-aFn", trace] + gz_files,
+                    command,
                     capture_output=True, text=True,
                     encoding='utf-8', errors='replace',
                     timeout=300
@@ -183,7 +192,8 @@ def run_grep_and_zgrep(trace: str, search_dirs: list, gz_files_by_dir: dict, out
     return {"trace": trace, "status": "success", "sections": match_count}
 
 
-def search_traces(traces: list, search_dirs: list, output_dir: str, jobs: int) -> None:
+def search_traces(traces: list, search_dirs: list, output_dir: str, jobs: int,
+                  debug_search: bool = False) -> None:
     """Search all traces in parallel and write results to the output directory."""
     total = len(traces)
     if total == 0:
@@ -229,6 +239,7 @@ def search_traces(traces: list, search_dirs: list, output_dir: str, jobs: int) -
                 search_dirs,
                 gz_files_by_dir,
                 output_path,
+                debug_search,
             )
             future_to_trace[future] = trace
 
@@ -277,6 +288,185 @@ def open_access_log(filepath: str):
     return opener(filepath, 'rt', encoding='utf-8', errors='replace')
 
 
+def find_files(root_dir: str, predicate) -> list:
+    """Return files below root_dir matching predicate, in stable order."""
+    found = []
+    for root, _, files in os.walk(root_dir):
+        found.extend(os.path.join(root, name) for name in files if predicate(name))
+    return sorted(found)
+
+
+def collect_bucket_traces(ops: list, ranges: list, collected_dir: str) -> dict:
+    """Read client access logs once and return buckets, source directories, and matched access lines."""
+    access_files = find_access_log_files(collected_dir)
+    bucket_traces = {(op, label): set() for op in ops for _, label, _ in ranges}
+    trace_client_dirs = defaultdict(set)
+    access_lines = defaultdict(list)
+    for filepath in access_files:
+        try:
+            with open_access_log(filepath) as stream:
+                source_dir = os.path.dirname(filepath)
+                for line_no, line in enumerate(stream, 1):
+                    op = next((candidate for candidate in ops if candidate in line), None)
+                    if op is None:
+                        continue
+                    parts = line.split('|')
+                    if len(parts) < 10:
+                        continue
+                    try:
+                        value = float(parts[9].strip())
+                    except ValueError:
+                        continue
+                    trace = extract_trace_id(line)
+                    if not trace:
+                        continue
+                    for _, label, time_range in ranges:
+                        if check_time_value(value, time_range):
+                            bucket_traces[(op, label)].add(trace)
+                            trace_client_dirs[trace].add(source_dir)
+                            access_lines[trace].append(f"{filepath}:{line_no}:{line}")
+        except Exception as exc:
+            print(f"  [SKIPPED] {os.path.basename(filepath)}: {exc}")
+    return bucket_traces, trace_client_dirs, access_lines
+
+
+def locate_worker_dirs(traces: set, logs_dir: str, jobs: int, debug_search: bool = False) -> tuple:
+    """Scan worker access logs once and return matched directories and original lines."""
+    if not traces:
+        return set(), defaultdict(list)
+    worker_access = find_files(logs_dir, lambda n: ('access' in n.lower()) and n.endswith(('.log', '.log.gz')))
+    worker_dirs = set()
+    access_lines = defaultdict(list)
+    patterns = ''.join(trace + '\n' for trace in traces)
+    started = time.monotonic()
+    def scan(path):
+        try:
+            command = ['zgrep' if path.endswith('.gz') else 'grep', '-aF', '-f', '-', path]
+            if debug_search:
+                print(f"  [{time.strftime('%H:%M:%S')}] [DEBUG] exec: {' '.join(shlex.quote(x) for x in command)}", flush=True)
+            result = subprocess.run(command, input=patterns, capture_output=True, text=True,
+                                    encoding='utf-8', errors='replace', timeout=300)
+            return result.returncode, result.stdout, result.stderr
+        except Exception as exc:
+            return exc
+    with ThreadPoolExecutor(max_workers=min(jobs, len(worker_access))) as executor:
+        futures = {executor.submit(scan, path): path for path in worker_access}
+        for index, future in enumerate(as_completed(futures), 1):
+            path = futures[future]
+            result = future.result()
+            returncode, stdout, stderr = result
+            if returncode == 0:
+                worker_dirs.add(os.path.dirname(path))
+                for line in stdout.splitlines(keepends=True):
+                    content = line.split(':', 2)[-1]
+                    for trace in traces:
+                        if trace in content:
+                            access_lines[trace].append(f"{path}:{content}")
+            elif returncode not in (1,):
+                print(f"  [SKIPPED] {os.path.basename(path)}: {stderr}")
+            if index == 1 or index % 50 == 0 or index == len(worker_access):
+                print(f"  [{time.strftime('%H:%M:%S')}] worker access: {index}/{len(worker_access)} files, {len(worker_dirs)} matched dirs, {time.monotonic()-started:.1f}s")
+    return worker_dirs, access_lines
+
+
+def _scan_log_file(filepath: str, patterns: str, debug_search: bool = False) -> list:
+    matches = []
+    try:
+        command = ['zgrep' if filepath.endswith('.gz') else 'grep', '-aFn', '-f', '-', filepath]
+        if debug_search:
+            print(f"  [{time.strftime('%H:%M:%S')}] [DEBUG] exec: {' '.join(shlex.quote(x) for x in command)}", flush=True)
+        result = subprocess.run(command, input=patterns, capture_output=True, text=True,
+                                encoding='utf-8', errors='replace', timeout=300)
+        if result.returncode not in (0, 1):
+            return [(None, f"[ERROR] {' '.join(command)}: {result.stderr}\n")]
+        for line in result.stdout.splitlines(keepends=True):
+            match = re.search(r':([^:]+):', line)
+            if match:
+                # grep -F -f output starts with file:line:content; identify the trace in content.
+                content = line.split(':', 2)[-1]
+                for trace in patterns.splitlines():
+                    if trace in content:
+                        matches.append((trace, line))
+    except Exception as exc:
+        return [(None, f"[SKIPPED] {os.path.basename(filepath)}: {exc}\n")]
+    return matches
+
+
+def search_traces_once(traces: set, search_dirs: set, output_by_trace: dict, jobs: int,
+                       debug_search: bool = False) -> None:
+    """Scan each relevant log once and append matching lines to trace outputs."""
+    if not traces or not search_dirs:
+        return
+    patterns = ''.join(trace + '\n' for trace in traces)
+    files = []
+    for directory in sorted(search_dirs):
+        files.extend(find_files(directory, lambda n: n.endswith(('.log', '.log.gz')) and 'access' not in n.lower()))
+    if not files:
+        return
+    if debug_search:
+        print(f"  [DEBUG] targeted search dirs ({len(search_dirs)}):", flush=True)
+        for directory in sorted(search_dirs):
+            print(f"    {directory}", flush=True)
+        print(f"  [DEBUG] targeted detail files ({len(files)}):", flush=True)
+        for filepath in files:
+            print(f"    {filepath}", flush=True)
+        print(f"  [DEBUG] multi-pattern search: {'grep/zgrep -aFn -f - <targeted-file>'} ({len(traces)} patterns)", flush=True)
+    started = time.monotonic()
+    with ThreadPoolExecutor(max_workers=min(jobs, len(files))) as executor:
+        futures = {executor.submit(_scan_log_file, path, patterns, debug_search): path for path in files}
+        for index, future in enumerate(as_completed(futures), 1):
+            matches = future.result()
+            for trace, line in matches:
+                if trace is None:
+                    print(line, end='')
+                else:
+                    output_by_trace[trace].append(line)
+            if index == 1 or index % 10 == 0 or index == len(files):
+                print(f"  [{time.strftime('%H:%M:%S')}] detail logs: {index}/{len(files)} files, {len(output_by_trace)} traces matched, {time.monotonic()-started:.1f}s", flush=True)
+
+
+def parse_bucket_specs(range_values: list) -> list:
+    """Parse ranges and retain a stable, human-readable bucket label."""
+    parsed = []
+    for value in range_values:
+        parsed.append((value, value, parse_time_range(value)))
+    return parsed
+
+
+def process_time_buckets(ops: list, range_values: list, collected_dir: str, logs_dir: str,
+                         base_output_dir: str, trace_file_base: str, max_traces: int, jobs: int,
+                         debug_search: bool = False) -> None:
+    """Collect multiple latency buckets with one access and one targeted log scan."""
+    ranges = parse_bucket_specs(range_values)
+    bucket_traces, trace_client_dirs, access_lines = collect_bucket_traces(ops, ranges, collected_dir)
+    selected = {}
+    for key, traces in bucket_traces.items():
+        selected[key] = limit_traces(sorted(traces), max_traces)
+    all_traces = set(trace for traces in selected.values() for trace in traces)
+    worker_dirs, worker_access_lines = locate_worker_dirs(all_traces, logs_dir, jobs, debug_search)
+    if debug_search:
+        print(f"  [DEBUG] selected traces: {len(all_traces)}; worker dirs: {len(worker_dirs)}", flush=True)
+    search_dirs = set(trace_dir for trace in all_traces for trace_dir in trace_client_dirs[trace]) | worker_dirs
+    output_by_trace = defaultdict(list)
+    search_traces_once(all_traces, search_dirs, output_by_trace, jobs, debug_search)
+    for (op, label), traces in selected.items():
+        bucket_dir = os.path.join(base_output_dir, sanitize_dirname(f"{op}_{label}"))
+        os.makedirs(bucket_dir, exist_ok=True)
+        trace_file = os.path.join(base_output_dir, f"{trace_file_base}_{sanitize_dirname(f'{op}_{label}')}.txt")
+        with open(trace_file, 'w', encoding='utf-8') as stream:
+            stream.write('\n'.join(traces) + ('\n' if traces else ''))
+        for trace in traces:
+            output_path = os.path.join(bucket_dir, sanitize_filename(trace))
+            with open(output_path, 'w', encoding='utf-8') as stream:
+                stream.write("=== client access ===\n")
+                stream.write(''.join(access_lines[trace]))
+                stream.write("\n=== worker access ===\n")
+                stream.write(''.join(worker_access_lines[trace]))
+                stream.write("\n=== client and worker detailed logs ===\n")
+                stream.write(''.join(output_by_trace[trace]) or f"[NO MATCH] No detailed-log matches found for trace '{trace}'\n")
+    print(f"  Targeted scan complete: {len(all_traces)} traces, {len(search_dirs)} directories")
+
+
 # ==================== Core mode ====================
 
 def extract_traces_core(search_core: str, collected_dir: str) -> list:
@@ -299,7 +489,7 @@ def extract_traces_core(search_core: str, collected_dir: str) -> list:
     for filepath in access_files:
         try:
             with open_access_log(filepath) as f:
-                for line in f:
+                for line_no, line in enumerate(f, 1):
                     if search_core in line:
                         trace = extract_trace_id(line)
                         if trace:
@@ -313,7 +503,7 @@ def extract_traces_core(search_core: str, collected_dir: str) -> list:
 
 
 def process_core(search_core: str, collected_dir: str, logs_dir: str, base_output_dir: str,
-                 trace_file_base: str, max_traces: int, jobs: int) -> None:
+                 trace_file_base: str, max_traces: int, jobs: int, debug_search: bool = False) -> None:
     """Process one search string in core mode."""
     core_dirname = sanitize_dirname(search_core)
     output_dir = os.path.join(base_output_dir, core_dirname)
@@ -340,24 +530,26 @@ def process_core(search_core: str, collected_dir: str, logs_dir: str, base_outpu
 
     # Step 3: Search in parallel.
     search_dirs = [collected_dir, logs_dir]
-    search_traces(traces, search_dirs, output_dir, jobs)
+    search_traces(traces, search_dirs, output_dir, jobs, debug_search)
 
     print(f"  Search string '{search_core}' complete, results: {output_dir}/")
 
 
 def extract_traces_by_status_code(collected_dir: str) -> dict:
-    """Extract trace IDs grouped by non-zero status code in one access-log pass."""
+    """Extract status-code traces, client directories, and original access lines in one pass."""
     access_files = find_access_log_files(collected_dir)
     if not access_files:
         print("  [WARNING] No access logs found")
-        return {}
+        return {}, defaultdict(set), defaultdict(list)
 
     print(f"  Found {len(access_files)} access logs")
     traces_by_code = {}
+    trace_client_dirs = defaultdict(set)
+    access_lines = defaultdict(list)
     for filepath in access_files:
         try:
             with open_access_log(filepath) as f:
-                for line in f:
+                for line_no, line in enumerate(f, 1):
                     match = ACCESS_STATUS_CODE_RE.search(line)
                     if match is None:
                         continue
@@ -367,24 +559,27 @@ def extract_traces_by_status_code(collected_dir: str) -> dict:
                     trace = extract_trace_id(line)
                     if trace:
                         traces_by_code.setdefault(code, set()).add(trace)
+                        trace_client_dirs[trace].add(os.path.dirname(filepath))
+                        access_lines[trace].append(f"{filepath}:{line_no}:{line}")
         except Exception as e:
             print(f"  [SKIPPED] {os.path.basename(filepath)}: {e}")
 
     print(f"  Extracted {len(traces_by_code)} non-zero status codes")
-    return traces_by_code
+    return traces_by_code, trace_client_dirs, access_lines
 
 
 def process_all_core(collected_dir: str, logs_dir: str, base_output_dir: str, trace_file_base: str,
-                     max_traces: int, jobs: int) -> None:
+                     max_traces: int, jobs: int, debug_search: bool = False) -> None:
     """Collect traces for every access-log error code with an independent trace limit."""
     print(f"\n{'='*60}")
     print("[all-core mode] Extracting all non-zero access-log status codes")
     print(f"{'='*60}")
     os.makedirs(base_output_dir, exist_ok=True)
-    traces_by_code = extract_traces_by_status_code(collected_dir)
+    traces_by_code, trace_client_dirs, access_lines = extract_traces_by_status_code(collected_dir)
     if not traces_by_code:
         return
 
+    selected_by_code = {}
     for code in sorted(traces_by_code, key=int):
         all_traces = sorted(traces_by_code[code])
         code_dir = os.path.join(base_output_dir, code)
@@ -403,8 +598,24 @@ def process_all_core(collected_dir: str, logs_dir: str, base_output_dir: str, tr
             for trace in traces:
                 f.write(trace + '\n')
         print(f"  Wrote trace file: {trace_file}")
-        search_traces(traces, [collected_dir, logs_dir], code_dir, jobs)
-        print(f"  Status code {code} complete, results: {code_dir}/")
+        selected_by_code[code] = (traces, code_dir)
+
+    all_traces = set(trace for traces, _ in selected_by_code.values() for trace in traces)
+    worker_dirs, worker_access_lines = locate_worker_dirs(all_traces, logs_dir, jobs, debug_search)
+    search_dirs = set(directory for trace in all_traces for directory in trace_client_dirs[trace]) | worker_dirs
+    output_by_trace = defaultdict(list)
+    search_traces_once(all_traces, search_dirs, output_by_trace, jobs, debug_search)
+    for code, (traces, code_dir) in selected_by_code.items():
+        os.makedirs(code_dir, exist_ok=True)
+        for trace in traces:
+            with open(os.path.join(code_dir, sanitize_filename(trace)), 'w', encoding='utf-8') as f:
+                f.write("=== client access ===\n")
+                f.write(''.join(access_lines[trace]))
+                f.write("\n=== worker access ===\n")
+                f.write(''.join(worker_access_lines[trace]))
+                f.write("\n=== client and worker detailed logs ===\n")
+                f.write(''.join(output_by_trace[trace]) or f"[NO MATCH] No detailed-log matches found for trace '{trace}'\n")
+        print(f"  Status code {code} complete: {len(traces)} traces")
 
 
 # ==================== Time mode ====================
@@ -764,15 +975,15 @@ Modes:
     Example:
       python3 trace_collector.py --type all-core
 
-  [time mode]
-    Extract traces from access logs by operation type and latency range, then search in parallel.
-    Use when locating traces for an operation within a latency range.
+  [time-buckets mode]
+    Extract multiple operation/latency buckets in one client access-log pass. The collector then
+    scans worker access logs once to identify relevant workers and scans only the matching client
+    and worker detailed-log directories once. Use this mode for predefined report buckets.
 
-    Examples:
-      python3 trace_collector.py --type time DS_KV_CLIENT_GET 1000,2000   # 1000 < time < 2000
-      python3 trace_collector.py --type time DS_KV_CLIENT_GET 1000        # time > 1000
-      python3 trace_collector.py --type time DS_KV_CLIENT_GET ,2000       # time < 2000
-      python3 trace_collector.py --type time "GET:PUT" 1000,2000          # Multiple operation types
+    Example:
+      python3 trace_collector.py --type time-buckets \\
+          --ops DS_KV_CLIENT_GET,DS_KV_CLIENT_SET \\
+          --ranges 5000,7000 7000,10000 10000,20000 20000
 
   [percentile mode]
     Calculate P99/P99.9/P99.99 by operation type, extract traces at or above the threshold, then search in parallel.
@@ -792,7 +1003,7 @@ Common options:
             return help_text + dir_structure
 
     parser = argparse.ArgumentParser(
-        description="Unified trace collection tool supporting core, all-core, time, and percentile modes",
+        description="Unified trace collection tool supporting core, all-core, time-buckets, and percentile modes",
         formatter_class=CustomHelpFormatter,
         epilog="""
 Examples:
@@ -802,8 +1013,10 @@ Examples:
   # all-core mode
   python3 trace_collector.py --type all-core
 
-  # time mode
-  python3 trace_collector.py --type time DS_KV_CLIENT_GET 1000,2000
+  # time-buckets mode: GET and SET, four latency buckets, one command
+  python3 trace_collector.py --type time-buckets \\
+      --ops DS_KV_CLIENT_GET,DS_KV_CLIENT_SET \\
+      --ranges 5000,7000 7000,10000 10000,20000 20000
 
   # percentile mode
   python3 trace_collector.py --type percentile DS_KV_CLIENT_GET P99.9
@@ -813,15 +1026,14 @@ Examples:
     parser.add_argument(
         "--type",
         required=True,
-        choices=["core", "all-core", "all_core", "time", "percentile"],
+        choices=["core", "all-core", "all_core", "time-buckets", "percentile"],
         help=("Mode: core (search string), all-core (all non-zero status codes), "
-              "time (latency range), or percentile (latency percentile)")
+              "time-buckets (latency ranges), or percentile (latency percentile)")
     )
     parser.add_argument(
         "values",
         nargs='*',
-        help=("Mode arguments: core uses search strings separated by ':', all-core uses none, "
-              "time uses operation type and latency range, percentile uses operation type and percentile")
+        help="Positional arguments: core search strings or percentile operation and percentile"
     )
     parser.add_argument(
         "--collected-dir",
@@ -854,6 +1066,18 @@ Examples:
         type=int,
         default=DEFAULT_JOBS,
         help=f"Parallel trace-search workers (default: {DEFAULT_JOBS})"
+    )
+    parser.add_argument(
+        "--ops", default="",
+        help="Comma-separated operation types for time-buckets mode"
+    )
+    parser.add_argument(
+        "--ranges", nargs="*", default=[],
+        help="Latency ranges for time-buckets mode, e.g. 5000,7000 7000,10000 20000"
+    )
+    parser.add_argument(
+        "--debug-search", action="store_true",
+        help="Print grep/zgrep commands and targeted search files for debugging"
     )
 
     args = parser.parse_args()
@@ -902,43 +1126,27 @@ Examples:
             print(f"  {i}. '{c}'")
 
         for core in search_cores:
-            process_core(core, collected_dir, logs_dir, output_dir, args.trace_file, args.max_traces, args.jobs)
+            process_core(core, collected_dir, logs_dir, output_dir, args.trace_file, args.max_traces, args.jobs, args.debug_search)
 
     elif args.type == "all-core":
         if args.values:
             parser.error("all-core mode does not accept positional values")
-        process_all_core(collected_dir, logs_dir, output_dir, args.trace_file, args.max_traces, args.jobs)
+        process_all_core(collected_dir, logs_dir, output_dir, args.trace_file, args.max_traces, args.jobs, args.debug_search)
 
-    elif args.type == "time":
-        # Time mode requires an operation type and a latency range.
-        # It supports "op1:op2 time_range" and "op time_range".
-        if len(args.values) < 2:
-            print("ERROR: time mode requires an operation type and latency range")
-            print("  Example: python3 trace_collector.py --type time DS_KV_CLIENT_GET 1000,2000")
-            sys.exit(1)
-
-        time_range_str = args.values[-1]
-        op_types_str = ' '.join(args.values[:-1])
-
+    elif args.type == "time-buckets":
+        if args.values:
+            parser.error("time-buckets mode uses --ops and --ranges, not positional values")
+        ops = [op.strip() for op in args.ops.split(',') if op.strip()]
+        ranges = args.ranges
+        if not ops or not ranges:
+            parser.error("time batch mode requires --ops and at least one --ranges value")
         try:
-            time_range = parse_time_range(time_range_str)
-        except ValueError as e:
-            print(f"ERROR: invalid latency range: {e}")
-            sys.exit(1)
-
-        op_types = [op.strip() for op in op_types_str.split(':') if op.strip()]
-        if not op_types:
-            print("ERROR: provide at least one operation type")
-            sys.exit(1)
-
-        print(f"\nOperation types: {len(op_types)}")
-        for i, op in enumerate(op_types, 1):
-            print(f"  {i}. '{op}'")
-        print(f"Latency range: {time_range_str if time_range_str else 'unlimited'}")
-
-        for op_type in op_types:
-            process_time(op_type, time_range, collected_dir, logs_dir, output_dir,
-                         args.trace_file, args.max_traces, args.jobs)
+            for value in ranges:
+                parse_time_range(value)
+        except ValueError as exc:
+            parser.error(str(exc))
+        process_time_buckets(ops, ranges, collected_dir, logs_dir, output_dir,
+                             args.trace_file, args.max_traces, args.jobs, args.debug_search)
 
     elif args.type == "percentile":
         # Percentile mode requires an operation type and a percentile.

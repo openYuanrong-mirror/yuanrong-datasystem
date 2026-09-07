@@ -46,7 +46,7 @@ Examples:
   # Collect all non-zero status-code traces from one task directory.
   $(basename "$0") -t core -f ./mode1_case6
 
-  # Collect the predefined DS_KV_CLIENT_GET latency buckets from one directory.
+  # Collect the predefined GET and SET latency buckets from one directory.
   $(basename "$0") -t time -f mode1_case6
 
   # Collect both all-core traces and the predefined time buckets in one run.
@@ -160,6 +160,7 @@ process_dir() {
     if [ "$TRACE_COLLECTOR" -ef "$dir_abs/trace_collector.py" ]; then
         echo "  [OK] Using trace_collector.py already in the task directory"
     else
+        rm -rf "$dir_abs/trace_collector.py"
         cp -- "$TRACE_COLLECTOR" "$dir_abs/trace_collector.py"
         echo "  [OK] Copied trace_collector.py"
     fi
@@ -175,27 +176,18 @@ process_dir() {
         fi
 
         if [ "$output_mode" = "all-core" ]; then
-        echo "  [RUN] python3 ./trace_collector.py --type all_core --max-traces 1500 --jobs 50"
-        if ! (cd -- "$dir_abs" && python3 ./trace_collector.py --type all_core --max-traces 1500 --jobs 50); then
+        echo "  [RUN] python3 ./trace_collector.py --type all_core --max-traces 500 --jobs 200"
+        if ! (cd -- "$dir_abs" && python3 ./trace_collector.py --type all_core --max-traces 500 --jobs 200); then
             echo "  [FAIL] trace_collector.py failed in $dir_abs"
             return 1
         fi
         else
-        echo "  [RUN] Collecting DS_KV_CLIENT_GET latency buckets"
-        if ! (cd -- "$dir_abs" && python3 ./trace_collector.py --type time DS_KV_CLIENT_GET 5000,7000 --max-traces 1500 --jobs 50); then
-            echo "  [FAIL] DS_KV_CLIENT_GET 5000,7000 failed"
-            return 1
-        fi
-        if ! (cd -- "$dir_abs" && python3 ./trace_collector.py --type time DS_KV_CLIENT_GET 7000,10000 --max-traces 1500 --jobs 50); then
-            echo "  [FAIL] DS_KV_CLIENT_GET 7000,10000 failed"
-            return 1
-        fi
-        if ! (cd -- "$dir_abs" && python3 ./trace_collector.py --type time DS_KV_CLIENT_GET 10000,20000 --max-traces 1500 --jobs 50); then
-            echo "  [FAIL] DS_KV_CLIENT_GET 10000,20000 failed"
-            return 1
-        fi
-        if ! (cd -- "$dir_abs" && python3 ./trace_collector.py --type time DS_KV_CLIENT_GET 20000 --max-traces 1500 --jobs 50); then
-            echo "  [FAIL] DS_KV_CLIENT_GET 20000 failed"
+        echo "  [RUN] Collecting DS_KV_CLIENT_GET and DS_KV_CLIENT_SET latency buckets"
+        if ! (cd -- "$dir_abs" && python3 ./trace_collector.py --type time-buckets \
+            --ops DS_KV_CLIENT_GET,DS_KV_CLIENT_SET \
+            --ranges 5000,7000 7000,10000 10000,20000 20000 \
+            --max-traces 500 --jobs 200); then
+            echo "  [FAIL] GET/SET latency buckets failed"
             return 1
         fi
         fi
@@ -218,7 +210,7 @@ process_dir() {
         collect_mode "all-core" "all-core" || return 1
     fi
     if [ "$MODE" = "time" ] || [ "$MODE" = "coreandtime" ]; then
-        collect_mode "time" "time" || return 1
+        collect_mode "time" "time-buckets" || return 1
     fi
 }
 
