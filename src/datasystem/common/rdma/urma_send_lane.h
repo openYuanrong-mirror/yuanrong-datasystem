@@ -35,6 +35,7 @@
 
 namespace datasystem {
 class UrmaJetty;
+class UrmaConnection;
 
 /** @brief UB NUMA source-chip selection granularity configured by the worker. */
 enum class UbNumaRrType : uint32_t {
@@ -60,8 +61,9 @@ public:
         uint64_t timeoutTimestampMs = 0;
     };
 
-    explicit UrmaSendLaneLease(std::shared_ptr<UrmaJetty> jetty, uint64_t requestIdFloor = 0)
-        : jetty_(std::move(jetty)), requestIdFloor_(requestIdFloor)
+    explicit UrmaSendLaneLease(std::shared_ptr<UrmaJetty> jetty, uint64_t requestIdFloor = 0,
+                               std::shared_ptr<UrmaConnection> connection = nullptr)
+        : jetty_(std::move(jetty)), connection_(std::move(connection)), requestIdFloor_(requestIdFloor)
     {
     }
 
@@ -79,8 +81,12 @@ public:
         pendingWrs_.fetch_add(1, std::memory_order_relaxed);
     }
 
-    SettleAction CompleteWr()
+    SettleAction CompleteWr(bool success = true)
     {
+        completedWr_.store(true, std::memory_order_release);
+        if (!success) {
+            failedWr_.store(true, std::memory_order_release);
+        }
         return MarkWrSettled(false);
     }
 
@@ -88,7 +94,14 @@ public:
     // post failure or the part of a gather chain after bad_wr).
     SettleAction CancelWr()
     {
+        failedWr_.store(true, std::memory_order_release);
         return MarkWrSettled(false);
+    }
+
+    bool CompletedSuccessfully() const
+    {
+        return completedWr_.load(std::memory_order_acquire) && !failedWr_.load(std::memory_order_acquire)
+               && !IsTimedOut() && !IsForceReleased() && !IsRetireRequested() && GetPendingWrCount() == 0;
     }
 
     // Mark the request as failed without consuming a submitted WR count. Standalone logical transfers use
@@ -140,6 +153,11 @@ public:
     std::shared_ptr<UrmaJetty> GetJetty() const
     {
         return jetty_;
+    }
+
+    const std::shared_ptr<UrmaConnection> &GetConnection() const
+    {
+        return connection_;
     }
 
     uint32_t GetPendingWrCount() const
@@ -247,7 +265,10 @@ private:
     }
 
     std::shared_ptr<UrmaJetty> jetty_;
+    std::shared_ptr<UrmaConnection> connection_;
     std::atomic<uint32_t> pendingWrs_{ 0 };
+    std::atomic<bool> completedWr_{ false };
+    std::atomic<bool> failedWr_{ false };
     std::atomic<bool> sealed_{ false };
     std::atomic<bool> retireRequested_{ false };
     std::atomic<bool> laneSettled_{ false };

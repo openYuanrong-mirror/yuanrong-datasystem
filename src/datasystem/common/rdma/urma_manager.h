@@ -960,6 +960,7 @@ private:
 
     // protect for segment maps.
     mutable std::shared_timed_mutex localMapMutex_;
+    friend class UrmaConnectionTestAccess;
     mutable std::shared_timed_mutex remoteMapMutex_;
     // Memory address to local segment mapping.
     std::unique_ptr<UrmaLocalSegmentMap> localSegmentMap_;

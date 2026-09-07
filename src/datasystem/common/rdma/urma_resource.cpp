@@ -734,6 +734,7 @@ Status UrmaConnection::UnimportRemoteSeg(uint64_t segmentAddress)
 
 void UrmaConnection::Clear()
 {
+    PerfPoint cleanup(PerfKey::URMA_CONNECTION_CLEANUP);
     targetJetty_.reset();
     tsegs_.clear();
     urmaJfrInfo_ = UrmaJfrInfo();
@@ -744,66 +745,125 @@ Status UrmaConnection::AcquireInflightSlot(int64_t remainingUs)
     if (remainingUs <= 0) {
         return Status(K_RPC_DEADLINE_EXCEEDED, "API deadline exceeded before acquiring peer in-flight jetty slot");
     }
-    std::unique_lock<bthread::Mutex> lock(inflightMutex_);
-    if (retiredJetties_ >= MAX_RETIRED_JETTIES) {
-        // Circuit-broken peer: its writes already retired MAX_RETIRED_JETTIES Jetties (fatal CQE
-        // form). Handing it more Jetties would let it rotate through the whole pool one batch at
-        // a time — exactly the amplification this PR must stop. K_URMA_TRY_AGAIN lets callers
-        // take the same fallback path as pool exhaustion. Recovery = connection rebuild.
-        return Status(K_URMA_TRY_AGAIN,
-                      FormatString("Peer circuit-broken: %u Jetties retired for this peer, no more will be "
-                                   "handed out (rebuild the connection to recover)",
-                                   retiredJetties_));
-    }
-    // bthread::ConditionVariable::wait_for returns only 0 (woken, possibly spurious) or ETIMEDOUT;
-    // the while re-check re-gates spurious wakes, so no other errno handling is needed.
-    while (inflightJettyCount_ >= MAX_INFLIGHT_JETTIES) {
-        if (inflightCv_.wait_for(lock, static_cast<long>(remainingUs)) == ETIMEDOUT) {
-            break;
+    INJECT_POINT_NO_RETURN("UrmaConnection.AcquireInflightSlot.ForceCircuitBroken", [this]() {
+        for (uint32_t i = 0; i < MAX_RETIRED_JETTIES; ++i) {
+            OnJettyRetired();
+        }
+    });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(remainingUs);
+    std::unique_lock<bthread::Mutex> lock(peerState_->mutex);
+    for (;;) {
+        CHECK_FAIL_RETURN_STATUS(!IsCircuitBroken(), K_URMA_TRY_AGAIN,
+                                 "Peer circuit-broken; reconnect after cooldown before sending a recovery probe");
+        const bool halfOpen = peerState_->phase.load(std::memory_order_acquire) == BreakerPhase::HALF_OPEN;
+        const auto limit = halfOpen ? 1U : MAX_INFLIGHT_JETTIES;
+        if (peerState_->inflight < limit) {
+            ++peerState_->inflight;
+            return Status::OK();
+        }
+        CHECK_FAIL_RETURN_STATUS(!halfOpen, K_URMA_TRY_AGAIN, "Peer circuit-breaker recovery probe is in flight");
+        const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
+            deadline - std::chrono::steady_clock::now()).count();
+        CHECK_FAIL_RETURN_STATUS(remaining > 0, K_URMA_TRY_AGAIN, "Peer in-flight jetty cap wait timed out");
+        if (peerState_->cv.wait_for(lock, static_cast<long>(remaining)) == ETIMEDOUT) {
+            RETURN_STATUS(K_URMA_TRY_AGAIN, "Peer in-flight jetty cap wait timed out");
         }
     }
-    if (inflightJettyCount_ >= MAX_INFLIGHT_JETTIES) {
-        return Status(K_URMA_TRY_AGAIN,
-                      FormatString("Peer in-flight jetty cap saturated (MAX_INFLIGHT_JETTIES=%u) and wait timed "
-                                   "out for slot; peer=%s",
-                                   MAX_INFLIGHT_JETTIES, urmaJfrInfo_.uniqueInstanceId.c_str()));
-    }
-    inflightJettyCount_++;
-    return Status::OK();
 }
 
 void UrmaConnection::ReleaseInflightSlot()
 {
-    std::lock_guard<bthread::Mutex> lock(inflightMutex_);
-    if (inflightJettyCount_ == 0) {
+    std::lock_guard<bthread::Mutex> lock(peerState_->mutex);
+    if (peerState_->inflight == 0) {
         // Unbalanced release (double free on an error path). Decrementing below zero would wrap
         // to ~4 billion and permanently freeze this peer's cap, so refuse and log instead.
         LOG(WARNING) << "[URMA_INFLIGHT_SLOT] Unbalanced ReleaseInflightSlot on peer "
                      << urmaJfrInfo_.uniqueInstanceId;
         return;
     }
-    inflightJettyCount_--;
-    inflightCv_.notify_one();
+    --peerState_->inflight;
+    peerState_->cv.notify_one();
 }
 
 void UrmaConnection::OnJettyRetired()
 {
-    std::lock_guard<bthread::Mutex> lock(inflightMutex_);
-    if (retiredJetties_ < MAX_RETIRED_JETTIES) {
-        ++retiredJetties_;
-        if (retiredJetties_ == MAX_RETIRED_JETTIES) {
-            LOG(WARNING) << "[URMA_PEER_CIRCUIT_BREAK] Peer " << urmaJfrInfo_.uniqueInstanceId
-                         << " retired " << retiredJetties_
-                         << " Jetties; further jetty acquisition for this peer is refused until "
-                            "the connection is rebuilt";
-        }
+    std::lock_guard<bthread::Mutex> lock(peerState_->mutex);
+    if (peerState_->retired < MAX_RETIRED_JETTIES) {
+        ++peerState_->retired;
+    }
+    if (peerState_->retired == MAX_RETIRED_JETTIES
+        && peerState_->phase.load() != BreakerPhase::OPEN) {
+        peerState_->retryAfter = std::chrono::steady_clock::now() + peerState_->backoff;
+        peerState_->backoff = std::min(peerState_->backoff + peerState_->backoff, MAX_RECONNECT_BACKOFF);
+        peerState_->phase.store(BreakerPhase::OPEN, std::memory_order_release);
+        peerState_->cv.notify_all();
+        LOG(WARNING) << "[URMA_PEER_CIRCUIT_BREAK] Peer " << urmaJfrInfo_.uniqueInstanceId
+                     << " retired " << peerState_->retired << " Jetties; recovery requires a cooled-down probe";
     }
 }
 
 bool UrmaConnection::IsCircuitBroken() const
 {
-    std::lock_guard<bthread::Mutex> lock(inflightMutex_);
-    return retiredJetties_ >= MAX_RETIRED_JETTIES;
+    return transportUnusable_.load(std::memory_order_acquire)
+           || generation_ != peerState_->generation.load(std::memory_order_acquire)
+           || peerState_->phase.load(std::memory_order_acquire) == BreakerPhase::OPEN;
+}
+
+bool UrmaConnection::CanReconnect() const
+{
+    std::lock_guard<bthread::Mutex> lock(peerState_->mutex);
+    return peerState_->phase.load() != BreakerPhase::OPEN
+           || std::chrono::steady_clock::now() >= peerState_->retryAfter;
+}
+
+void UrmaConnection::RequireReconnect()
+{
+    transportUnusable_.store(true, std::memory_order_release);
+    std::lock_guard<bthread::Mutex> lock(peerState_->mutex);
+    peerState_->retryAfter = std::chrono::steady_clock::now() + peerState_->backoff;
+    peerState_->backoff = std::min(peerState_->backoff + peerState_->backoff, MAX_RECONNECT_BACKOFF);
+    peerState_->phase.store(BreakerPhase::OPEN, std::memory_order_release);
+    peerState_->cv.notify_all();
+}
+
+Status UrmaConnection::PrepareReplacement(const UrmaConnection &previous)
+{
+    if (!urmaJfrInfo_.uniqueInstanceId.empty()
+        && urmaJfrInfo_.uniqueInstanceId != previous.urmaJfrInfo_.uniqueInstanceId) {
+        return Status::OK();
+    }
+    auto state = previous.peerState_;
+    std::lock_guard<bthread::Mutex> lock(state->mutex);
+    if (state->phase.load() == BreakerPhase::OPEN) {
+        CHECK_FAIL_RETURN_STATUS(std::chrono::steady_clock::now() >= state->retryAfter, K_URMA_TRY_AGAIN,
+                                 "Peer circuit-broken; reconnect cooldown has not elapsed");
+        state->phase.store(BreakerPhase::HALF_OPEN, std::memory_order_release);
+    }
+    peerState_ = std::move(state);
+    generation_ = peerState_->generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+    peerState_->cv.notify_all();
+    return Status::OK();
+}
+
+void UrmaConnection::OnTransferFinished(bool success)
+{
+    if (peerState_->phase.load(std::memory_order_acquire) != BreakerPhase::HALF_OPEN) {
+        return;
+    }
+    std::lock_guard<bthread::Mutex> lock(peerState_->mutex);
+    if (generation_ == peerState_->generation.load()
+        && peerState_->phase.load() == BreakerPhase::HALF_OPEN) {
+        if (success) {
+            peerState_->retired = 0;
+            peerState_->backoff = BASE_RECONNECT_BACKOFF;
+            peerState_->phase.store(BreakerPhase::CLOSED, std::memory_order_release);
+        } else {
+            peerState_->retryAfter = std::chrono::steady_clock::now() + peerState_->backoff;
+            peerState_->backoff = std::min(peerState_->backoff + peerState_->backoff, MAX_RECONNECT_BACKOFF);
+            peerState_->phase.store(BreakerPhase::OPEN, std::memory_order_release);
+        }
+        peerState_->cv.notify_all();
+    }
 }
 
 UrmaResource::~UrmaResource()
@@ -1311,13 +1371,12 @@ Status UrmaResource::ApplyActiveSendLaneAction(const std::shared_ptr<UrmaSendLan
     // Release the per-peer in-flight slot so a blocked peer (at the MAX_INFLIGHT_JETTIES cap) can
     // proceed. Both RELEASE (normal completion) and RETIRE (cqe9 failure) paths must release it;
     // a RETIRE that skipped release would permanently exhaust the peer's slot and block it.
-    // If the connection is already destroyed, the counter died with it (per-peer state lives on
-    // the UrmaConnection object), so there is nothing to release for a reconnect's fresh counter.
     auto connection = jetty->GetConnection().lock();
     if (action == UrmaSendLaneLease::SettleAction::RELEASE) {
         INJECT_POINT("UrmaManager.ApplySendLaneAction.Release");
         ReleaseJetty(jetty);
         if (connection != nullptr) {
+            connection->OnTransferFinished(laneLease->CompletedSuccessfully());
             connection->ReleaseInflightSlot();
         }
         return Status::OK();
@@ -1325,6 +1384,7 @@ Status UrmaResource::ApplyActiveSendLaneAction(const std::shared_ptr<UrmaSendLan
     INJECT_POINT("UrmaManager.ApplySendLaneAction.Retire");
     auto rc = RetireJetty(jetty);
     if (connection != nullptr) {
+        connection->OnTransferFinished(false);
         connection->ReleaseInflightSlot();
     }
     return rc;
@@ -1347,7 +1407,7 @@ Status UrmaResource::CompleteActiveSendLane(uint32_t jettyId, uint64_t requestId
             if (!laneLease->OwnsRequestId(requestId)) {
                 staleCompletion = true;
             } else {
-                action = laneLease->CompleteWr();
+                action = laneLease->CompleteWr(cqeStatus == 0);
                 if (action != UrmaSendLaneLease::SettleAction::NONE) {
                     activeSendLanes_.erase(iter);
                 }

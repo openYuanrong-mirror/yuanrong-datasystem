@@ -62,6 +62,7 @@ constexpr char kDeleteEventInject[] = "UrmaManager.DeleteEvent";
 constexpr char kAsyncDeleteCompleteInject[] = "urma.SendJettyAsyncDeleteComplete";
 constexpr char kRegistryUnregisterInject[] = "urma.SendJettyRegistryUnregister";
 constexpr char kRefillAddedInject[] = "urma.SendJettyPoolRefillAdded";
+constexpr char kForceCircuitBrokenInject[] = "UrmaConnection.AcquireInflightSlot.ForceCircuitBroken";
 
 bool IsUrmaTestEnvironmentAvailable()
 {
@@ -1429,6 +1430,39 @@ TEST_F(UrmaSendJettyPoolStTest, CqeRetirementRefillsSmallPoolAndSubsequentRemote
     DS_ASSERT_OK(cluster_->SetInjectAction(WORKER, kSourceWorker, kSendLaneReleaseInject, "16*call()"));
     GetEventually(*reader, keyAfter, valueAfter);
     WaitForWorkerInjectExecuteCount(kSourceWorker, kSendLaneReleaseInject, 1);
+}
+
+TEST_F(UrmaSendJettyPoolStTest, CircuitBrokenPeerReconnectsBeforeLargeTcpFallback)
+{
+    std::shared_ptr<KVClient> writer;
+    std::shared_ptr<KVClient> reader;
+    InitTestKVClient(kSourceWorker, writer);
+    InitTestKVClient(kDestinationWorker, reader, 10000, false, 10000);
+
+    const std::string key = "urma-circuit-broken-reconnect";
+    const std::string value(2 * UrmaFallbackTcpLimiter::kMaxSinglePayloadBytes, 'a');
+    DS_ASSERT_OK(writer->Set(key, value));
+
+    DS_ASSERT_OK(cluster_->SetInjectAction(WORKER, kSourceWorker, kForceCircuitBrokenInject, "1*call()"));
+    std::string got;
+    const auto faultStatus = reader->Get(key, got);
+    uint64_t forcedCount = 0;
+    const auto forceCountStatus = cluster_->GetInjectActionExecuteCount(
+        WORKER, kSourceWorker, kForceCircuitBrokenInject, forcedCount);
+    const auto clearForce = cluster_->ClearInjectAction(WORKER, kSourceWorker, kForceCircuitBrokenInject);
+
+    ASSERT_TRUE(faultStatus.IsError()) << faultStatus.ToString();
+    ASSERT_NE(faultStatus.GetMsg().find("Peer circuit-broken"), std::string::npos) << faultStatus.ToString();
+    ASSERT_NE(faultStatus.GetMsg().find("fallback tcp payload rejected by limiter"), std::string::npos)
+        << faultStatus.ToString();
+    ASSERT_TRUE(forceCountStatus.IsOk()) << forceCountStatus.ToString();
+    ASSERT_EQ(forcedCount, 1U);
+    ASSERT_TRUE(clearForce.IsOk()) << clearForce.ToString();
+
+    DS_ASSERT_OK(cluster_->SetInjectAction(WORKER, kSourceWorker, kBatchGetAfterAcquireInject, "call()"));
+    GetEventually(*reader, key, value);
+    WaitForWorkerInjectExecuteCount(kSourceWorker, kBatchGetAfterAcquireInject, 1);
+    DS_ASSERT_OK(cluster_->ClearInjectAction(WORKER, kSourceWorker, kBatchGetAfterAcquireInject));
 }
 
 TEST_F(UrmaSendJettyGateStTest, MultiChunkStatus9WaitsForPausedSecondPostPermitBeforeModify)

@@ -23,6 +23,7 @@
 
 #include <atomic>
 #include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <memory>
@@ -991,9 +992,8 @@ public:
      * @brief Record that serving this peer retired a Jetty (fatal-CQE form of issue #93: the
      *        peer's write drove the Jetty into URMA_JETTY_STATE_ERROR). Once MAX_RETIRED_JETTIES
      *        Jetties died for this peer, AcquireInflightSlot circuit-breaks the peer: the cap
-     *        alone only bounds CONCURRENT holding, while a bad peer rotating writes would
-     *        otherwise retire the whole pool one batch at a time. A re-established connection is
-     *        a fresh object with a zeroed counter, which is the recovery path.
+     *        alone only bounds CONCURRENT holding. Same-instance replacements retain this budget
+     *        and admit one cooled-down probe; only a successful probe resets the budget.
      */
     void OnJettyRetired();
 
@@ -1002,20 +1002,40 @@ public:
      */
     bool IsCircuitBroken() const;
 
+    bool CanReconnect() const;
+    Status PrepareReplacement(const UrmaConnection &previous);
+    void OnTransferFinished(bool success);
+    void RequireReconnect();
+
 private:
+    friend class UrmaConnectionTestAccess;
     std::unique_ptr<UrmaTargetJetty> targetJetty_;
     UrmaJfrInfo urmaJfrInfo_;
     UrmaRemoteSegmentMap tsegs_;
     // Per-peer in-flight jetty concurrency cap. Bounds the blast radius of a bad peer: at most
     // MAX_INFLIGHT_JETTIES of the pool can be simultaneously occupied by requests to one peer.
     static constexpr uint32_t MAX_INFLIGHT_JETTIES = 8;
-    uint32_t inflightJettyCount_ = 0;
-    // Circuit-breaker state: Jetties retired while serving this peer (fatal CQE attributed to
-    // the peer). Guarded by inflightMutex_ together with the in-flight counter.
     static constexpr uint32_t MAX_RETIRED_JETTIES = 8;
-    uint32_t retiredJetties_ = 0;
-    mutable bthread::Mutex inflightMutex_;
-    bthread::ConditionVariable inflightCv_;
+    static constexpr std::chrono::milliseconds BASE_RECONNECT_BACKOFF{ 1000 };
+    static constexpr std::chrono::milliseconds MAX_RECONNECT_BACKOFF{ 30000 };
+    enum class BreakerPhase { CLOSED, OPEN, HALF_OPEN };
+    struct PeerState {
+        PeerState() = default;
+        ~PeerState() = default;
+        bthread::Mutex mutex;
+        bthread::ConditionVariable cv;
+        uint32_t inflight = 0;
+        uint32_t retired = 0;
+        std::atomic<BreakerPhase> phase{ BreakerPhase::CLOSED };
+        std::atomic<uint64_t> generation{ 0 };
+        std::chrono::steady_clock::time_point retryAfter;
+        std::chrono::milliseconds backoff{ BASE_RECONNECT_BACKOFF };
+    };
+    // Same-incarnation replacements share the budget and in-flight cap. Old generations cannot admit new work
+    // or close a half-open breaker with a delayed completion; the map retains OPEN state until replacement.
+    std::shared_ptr<PeerState> peerState_ = std::make_shared<PeerState>();
+    uint64_t generation_ = 0;
+    std::atomic<bool> transportUnusable_{ false };
 };
 
 /**
