@@ -26,11 +26,12 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <unordered_map>
+#include <utility>
 
 #include "datasystem/client/mmap_manager/immap_table.h"
 #include "datasystem/client/mmap_manager/shm_mmap_table_entry.h"
 #include "datasystem/common/log/log.h"
-#include "datasystem/common/util/thread_pool.h"
+#include "datasystem/client/mmap_manager/host_memory_pin_manager.h"
 #include "datasystem/utils/status.h"
 
 namespace datasystem {
@@ -42,7 +43,8 @@ public:
 
     ~ShmMmapTable() override;
 
-    explicit ShmMmapTable(bool enableHugeTlb) : IMmapTable(enableHugeTlb)
+    explicit ShmMmapTable(bool enableHugeTlb, std::shared_ptr<HostMemoryPinManager> pinManager)
+        : IMmapTable(enableHugeTlb), pinManager_(std::move(pinManager))
     {
     }
 
@@ -58,10 +60,10 @@ public:
     Status MmapAndStoreFd(const int &clientFd, const int &workerFd, const uint64_t &mmapSize,
                           const std::string &tenantId, const std::string &clientId = "") override;
 
-private:
-    void SubmitHostMemoryPin(const std::shared_ptr<ShmMmapTableEntry> &entry);
+    void MarkVoluntaryScaleDown();
 
-    std::unique_ptr<ThreadPool> pinThread_;
+private:
+    std::shared_ptr<HostMemoryPinManager> pinManager_;
 };
 }  // namespace client
 }  // namespace datasystem

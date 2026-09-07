@@ -19,19 +19,29 @@
  */
 #include "datasystem/client/mmap_manager/shm_mmap_table_entry.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
+#include <chrono>
 #include <exception>
 #include <shared_mutex>
+#include <thread>
 #include <sys/mman.h>
 #include <unistd.h>
 
 #include "datasystem/common/device/nvidia/cuda_host_memory.h"
 #include "datasystem/common/inject/inject_point.h"
+#include "datasystem/common/util/status_helper.h"
 #include "datasystem/common/util/strings_util.h"
 
 namespace datasystem {
 namespace client {
+namespace {
+constexpr auto HOST_MEMORY_FRAGMENT_INTERVAL = std::chrono::milliseconds(5);
+constexpr size_t HOST_MEMORY_FRAGMENT_SIZE = 64UL * 1024UL * 1024UL;
+constexpr size_t HOST_MEMORY_PIN_MAX_RETRY_COUNT = 3;
+}  // namespace
+
 Status ShmMmapTableEntry::Init(bool enableHugeTlb, const std::string &tenantId)
 {
     (void)tenantId;
@@ -62,21 +72,122 @@ Status ShmMmapTableEntry::Init(bool enableHugeTlb, const std::string &tenantId)
     // Closing this fd has an effect on performance.
     RETRY_ON_EINTR(close(fd_));
     LOG(INFO) << FormatString("mmap success, client id: %s, fd: %d, size: %zu", clientId_, fd_, size_);
+    BuildPinRange();
     return Status::OK();
+}
+
+void ShmMmapTableEntry::BuildPinRange()
+{
+    pinRange_ = PinRange{ pointer_, size_, HOST_MEMORY_FRAGMENT_SIZE };
+}
+
+size_t ShmMmapTableEntry::GetPinFragmentCount() const
+{
+    if (pinRange_.sliceSize == 0) {
+        return 0;
+    }
+    return pinRange_.totalSize / pinRange_.sliceSize
+           + (pinRange_.totalSize % pinRange_.sliceSize == 0 ? 0 : 1);
+}
+
+ShmMmapTableEntry::PinFragment ShmMmapTableEntry::GetPinFragment(size_t fragmentIndex) const
+{
+    const size_t offset = fragmentIndex * pinRange_.sliceSize;
+    return PinFragment{ pinRange_.startAddr + offset, std::min(pinRange_.sliceSize, pinRange_.totalSize - offset) };
 }
 
 void ShmMmapTableEntry::PinHostMemory()
 {
-    pinAttempted_.store(true, std::memory_order_release);
+    std::lock_guard<std::mutex> lock(*hostMemoryOperationMutex_);
+    const bool registrationEnabled = IsCudaHostMemoryRegistrationEnabled();
+    const auto begin = std::chrono::steady_clock::now();
+    const size_t fragmentCount = GetPinFragmentCount();
+    LOG(INFO) << "[CudaHostMemory] Worker shared memory pin started, clientId: " << clientId_
+              << ", pointer: " << static_cast<void *>(pointer_) << ", size: " << size_
+              << ", fragmentCount: " << fragmentCount
+              << ", fragmentIntervalMs: " << HOST_MEMORY_FRAGMENT_INTERVAL.count()
+              << ", registrationEnabled: " << registrationEnabled;
     try {
         INJECT_POINT_NO_RETURN("ShmMmapTableEntry.PinHostMemory");
-        RegisterCudaHostMemory(pointer_, size_);
     } catch (const std::exception &e) {
-        LOG(WARNING) << "CUDA host memory pin task failed: " << e.what();
+        LOG(WARNING) << "CUDA host memory pin injection failed: " << e.what();
     } catch (...) {
-        LOG(WARNING) << "CUDA host memory pin task failed with an unknown exception";
+        LOG(WARNING) << "CUDA host memory pin injection failed with an unknown exception";
     }
+    if (!registrationEnabled) {
+        (void)RegisterCudaHostMemory(pointer_, size_);
+        pinCompleted_.store(true, std::memory_order_release);
+        const auto elapsedUs =
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin);
+        LOG(INFO) << "[CudaHostMemory] Worker shared memory pin finished, clientId: " << clientId_
+                  << ", pointer: " << static_cast<void *>(pointer_) << ", size: " << size_
+                  << ", fragmentCount: " << fragmentCount
+                  << ", attemptedCount: 0, successCount: 0, failedCount: 0"
+                  << ", registrationEnabled: false, completed: true, elapsedUs: " << elapsedUs.count();
+        return;
+    }
+    pinAttempted_.store(true, std::memory_order_release);
+    const auto pinResult = PinHostMemoryFragments();
+    pinnedFragmentCount_.store(pinResult.successCount, std::memory_order_release);
     pinCompleted_.store(true, std::memory_order_release);
+    const size_t failedCount = pinResult.attemptedFragmentCount - pinResult.successCount;
+    const auto elapsedUs =
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin);
+    LOG(INFO) << "[CudaHostMemory] Worker shared memory pin finished, clientId: " << clientId_
+              << ", pointer: " << static_cast<void *>(pointer_) << ", size: " << size_
+              << ", fragmentCount: " << fragmentCount
+              << ", attemptedCount: " << pinResult.attemptedFragmentCount
+              << ", successCount: " << pinResult.successCount << ", failedCount: " << failedCount
+              << ", retryCount: " << pinResult.retryCount
+              << ", registrationEnabled: true, completed: true, elapsedUs: " << elapsedUs.count();
+}
+
+ShmMmapTableEntry::PinResult ShmMmapTableEntry::PinHostMemoryFragments()
+{
+    PinResult result;
+    size_t remainingRetryCount = HOST_MEMORY_PIN_MAX_RETRY_COUNT;
+    const size_t fragmentCount = GetPinFragmentCount();
+    for (size_t i = 0; i < fragmentCount; ++i) {
+        if (i > 0) {
+            std::this_thread::sleep_for(HOST_MEMORY_FRAGMENT_INTERVAL);
+        }
+        ++result.attemptedFragmentCount;
+        while (!PinHostMemoryFragment(i)) {
+            if (remainingRetryCount == 0) {
+                const auto fragment = GetPinFragment(i);
+                LOG(ERROR) << "[CudaHostMemory] Worker shared memory pin stopped after retries were exhausted, "
+                           << "clientId: " << clientId_ << ", fragmentIndex: " << i
+                           << ", pointer: " << static_cast<void *>(fragment.pointer)
+                           << ", size: " << fragment.size << ", successCount: " << result.successCount;
+                return result;
+            }
+            --remainingRetryCount;
+            ++result.retryCount;
+            LOG(WARNING) << "[CudaHostMemory] Retry Worker shared memory fragment pin, clientId: " << clientId_
+                         << ", fragmentIndex: " << i << ", retryCount: " << result.retryCount
+                         << ", remainingRetryCount: " << remainingRetryCount;
+        }
+        ++result.successCount;
+    }
+    return result;
+}
+
+bool ShmMmapTableEntry::PinHostMemoryFragment(size_t fragmentIndex)
+{
+    const auto fragment = GetPinFragment(fragmentIndex);
+    try {
+        return RegisterCudaHostMemory(fragment.pointer, fragment.size);
+    } catch (const std::exception &e) {
+        LOG(ERROR) << "[CudaHostMemory] Worker shared memory fragment pin failed unexpectedly, clientId: "
+                   << clientId_ << ", fragmentIndex: " << fragmentIndex
+                   << ", pointer: " << static_cast<void *>(fragment.pointer)
+                   << ", size: " << fragment.size << ", error: " << e.what();
+    } catch (...) {
+        LOG(ERROR) << "[CudaHostMemory] Worker shared memory fragment pin failed with an unknown exception, clientId: "
+                   << clientId_ << ", fragmentIndex: " << fragmentIndex
+                   << ", pointer: " << static_cast<void *>(fragment.pointer) << ", size: " << fragment.size;
+    }
+    return false;
 }
 
 void ShmMmapTableEntry::SkipHostMemoryPin()
@@ -84,29 +195,132 @@ void ShmMmapTableEntry::SkipHostMemoryPin()
     pinCompleted_.store(true, std::memory_order_release);
 }
 
+void ShmMmapTableEntry::SetHostMemoryOperationMutex(const std::shared_ptr<std::mutex> &mutex)
+{
+    if (mutex != nullptr) {
+        hostMemoryOperationMutex_ = mutex;
+    }
+}
+
+void ShmMmapTableEntry::SetClientExitingFlag(const std::shared_ptr<std::atomic<bool>> &clientExiting)
+{
+    clientExiting_ = clientExiting;
+}
+
 bool ShmMmapTableEntry::IsCudaHostMemoryRegistrationDone() const
 {
     return pinCompleted_.load(std::memory_order_acquire);
 }
 
+void ShmMmapTableEntry::MarkVoluntaryScaleDown()
+{
+    voluntaryScaleDown_.store(true, std::memory_order_release);
+}
+
+bool ShmMmapTableEntry::Contains(const void *pointer) const
+{
+    const auto address = reinterpret_cast<uintptr_t>(pointer);
+    const auto begin = reinterpret_cast<uintptr_t>(pointer_);
+    return address >= begin && address - begin < size_;
+}
+
+Status ShmMmapTableEntry::GetMemcpySegmentSizes(const void *pointer, size_t size,
+                                                std::vector<size_t> &segmentSizes) const
+{
+    const auto address = reinterpret_cast<uintptr_t>(pointer);
+    const auto begin = reinterpret_cast<uintptr_t>(pinRange_.startAddr);
+    CHECK_FAIL_RETURN_STATUS(pinRange_.sliceSize > 0, K_RUNTIME_ERROR,
+                             "CUDA host-memory pin range is not initialized");
+    CHECK_FAIL_RETURN_STATUS(address >= begin && address - begin < pinRange_.totalSize, K_INVALID,
+                             "Host pointer is not in this Worker shared memory mapping");
+    const size_t offset = static_cast<size_t>(address - begin);
+    CHECK_FAIL_RETURN_STATUS(size <= pinRange_.totalSize - offset, K_INVALID,
+                             "CUDA memcpy range exceeds the Worker shared memory mapping");
+    size_t remaining = size;
+    size_t offsetInFragment = offset % pinRange_.sliceSize;
+    do {
+        const size_t bytes = std::min(remaining, pinRange_.sliceSize - offsetInFragment);
+        segmentSizes.emplace_back(bytes);
+        remaining -= bytes;
+        offsetInFragment = 0;
+    } while (remaining > 0);
+    return Status::OK();
+}
+
 ShmMmapTableEntry::~ShmMmapTableEntry()
 {
-    // munmap fd.
-    if (pointer_ != nullptr && pointer_ != MAP_FAILED) {
-        if (pinAttempted_.load(std::memory_order_acquire)) {
-            UnregisterCudaHostMemory(pointer_);
-        }
-        int ret = munmap(pointer_, size_);
-        if (ret != 0) {
-            LOG(ERROR) << FormatString("munmap failed, client id: %s, fd: %d, size: %zu, returned: [%d], errno = [%s]",
-                                       clientId_, fd_, size_, ret, StrErr(errno));
-        } else {
-            LOG(INFO) << FormatString("munmap success, client id: %s, fd: %d, size: %zu", clientId_, fd_, size_);
-        }
-    } else {
+    if (pointer_ == nullptr || pointer_ == MAP_FAILED) {
         LOG(ERROR) << FormatString("Mmap pointer is invalid, client id: %s, fd: %d, it may be nullptr", clientId_,
                                    fd_);
+        return;
     }
+    if (pinAttempted_.load(std::memory_order_acquire)) {
+        UnpinHostMemory();
+    }
+    int ret = munmap(pointer_, size_);
+    if (ret != 0) {
+        LOG(ERROR) << FormatString("munmap failed, client id: %s, fd: %d, size: %zu, returned: [%d], errno = [%s]",
+                                   clientId_, fd_, size_, ret, StrErr(errno));
+    } else {
+        LOG(INFO) << FormatString("munmap success, client id: %s, fd: %d, size: %zu", clientId_, fd_, size_);
+    }
+}
+
+void ShmMmapTableEntry::UnpinHostMemory()
+{
+    std::lock_guard<std::mutex> lock(*hostMemoryOperationMutex_);
+    const auto begin = std::chrono::steady_clock::now();
+    const size_t totalFragmentCount = GetPinFragmentCount();
+    const size_t pinnedFragmentCount = pinnedFragmentCount_.load(std::memory_order_acquire);
+    const bool voluntaryScaleDown = voluntaryScaleDown_.load(std::memory_order_acquire);
+    const bool initialClientExiting = clientExiting_ != nullptr && clientExiting_->load(std::memory_order_acquire);
+    const bool initialSkipFragmentInterval = voluntaryScaleDown || initialClientExiting;
+    LOG(INFO) << "[CudaHostMemory] Worker shared memory unpin started, clientId: " << clientId_
+              << ", pointer: " << static_cast<void *>(pointer_) << ", size: " << size_
+              << ", fragmentCount: " << totalFragmentCount << ", pinnedFragmentCount: " << pinnedFragmentCount
+              << ", fragmentIntervalMs: "
+              << (initialSkipFragmentInterval ? 0 : HOST_MEMORY_FRAGMENT_INTERVAL.count())
+              << ", voluntaryScaleDown: " << voluntaryScaleDown << ", clientExiting: " << initialClientExiting;
+    size_t failedCount = 0;
+    for (size_t i = 0; i < pinnedFragmentCount; ++i) {
+        const bool clientExiting = clientExiting_ != nullptr && clientExiting_->load(std::memory_order_acquire);
+        if (i > 0 && !voluntaryScaleDown && !clientExiting) {
+            std::this_thread::sleep_for(HOST_MEMORY_FRAGMENT_INTERVAL);
+        }
+        if (!UnpinHostMemoryFragment(i)) {
+            ++failedCount;
+            LOG(ERROR) << "[CudaHostMemory] Worker shared memory fragment unpin failed, clientId: " << clientId_
+                       << ", fragmentIndex: " << i;
+        }
+    }
+    const auto elapsedUs =
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin);
+    const bool finalClientExiting = clientExiting_ != nullptr && clientExiting_->load(std::memory_order_acquire);
+    LOG(INFO) << "[CudaHostMemory] Worker shared memory unpin finished, clientId: " << clientId_
+              << ", pointer: " << static_cast<void *>(pointer_) << ", size: " << size_
+              << ", fragmentCount: " << totalFragmentCount << ", pinnedFragmentCount: " << pinnedFragmentCount
+              << ", attemptedCount: " << pinnedFragmentCount
+              << ", successCount: " << pinnedFragmentCount - failedCount << ", failedCount: " << failedCount
+              << ", voluntaryScaleDown: " << voluntaryScaleDown << ", clientExiting: " << finalClientExiting
+              << ", completed: true, elapsedUs: " << elapsedUs.count();
+}
+
+bool ShmMmapTableEntry::UnpinHostMemoryFragment(size_t fragmentIndex)
+{
+    const auto fragment = GetPinFragment(fragmentIndex);
+    try {
+        return UnregisterCudaHostMemory(fragment.pointer);
+    } catch (const std::exception &e) {
+        LOG(ERROR) << "[CudaHostMemory] Worker shared memory fragment unpin failed unexpectedly, clientId: "
+                   << clientId_ << ", fragmentIndex: " << fragmentIndex
+                   << ", pointer: " << static_cast<void *>(fragment.pointer)
+                   << ", size: " << fragment.size << ", error: " << e.what();
+    } catch (...) {
+        LOG(ERROR) << "[CudaHostMemory] Worker shared memory fragment unpin failed with an unknown exception, "
+                   << "clientId: " << clientId_ << ", fragmentIndex: " << fragmentIndex
+                   << ", pointer: " << static_cast<void *>(fragment.pointer) << ", size: " << fragment.size;
+    }
+    return false;
 }
 }  // namespace client
 }  // namespace datasystem

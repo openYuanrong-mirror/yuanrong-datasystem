@@ -23,18 +23,33 @@
 #include <cstddef>
 #include <string>
 
+#include "datasystem/utils/cuda_funcs.h"
+#include "datasystem/utils/status.h"
+
 namespace datasystem {
 
 void *GetCudaRuntimeSymbol(const std::string &name);
 
+void RegisterCudaFuncs(const CudaFuncs &funcs);
+
+bool IsCudaHostMemoryRegistrationEnabled();
+
 /**
- * @brief Register host memory when CUDA headers and runtime are available.
+ * @brief Register host memory through the application-provided callback when available.
  * @param[in] pointer Host memory address.
  * @param[in] size Host memory size.
+ * @return True if the callback succeeds.
  */
-void RegisterCudaHostMemory(void *pointer, size_t size);
+bool RegisterCudaHostMemory(void *pointer, size_t size);
 
-void UnregisterCudaHostMemory(void *pointer);
+/**
+ * @brief Unregister host memory through the application-provided callback when available.
+ * @param[in] pointer Host memory address.
+ * @return True if the callback succeeds.
+ */
+bool UnregisterCudaHostMemory(void *pointer);
+
+Status DsCudaMemcpyAsync(void *dst, const void *src, size_t size, DsCudaMemcpyKind kind, void *stream);
 
 }  // namespace datasystem
 #endif  // DATASYSTEM_COMMON_DEVICE_NVIDIA_CUDA_HOST_MEMORY_H

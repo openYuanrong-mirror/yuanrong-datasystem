@@ -146,6 +146,11 @@ Status Routing::SelectWorkers(const std::vector<std::string> &keys, DataPlacemen
     return router_->SelectWorkers(keys, policy, groups, exclude);
 }
 
+std::vector<HostPort> Routing::GetAvailableSameNodeWorkers() const
+{
+    return router_->GetAvailableSameNodeWorkers();
+}
+
 void Routing::UpdateState(const HostPort &addr, StatusCode status)
 {
     if (initialized_.load()) {

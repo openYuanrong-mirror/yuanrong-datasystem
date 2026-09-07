@@ -184,6 +184,13 @@ public:
     void SetReleaseFdCallBack(std::function<void(const std::vector<int64_t> &)> callback);
 
     /**
+     * @brief Set the callback that marks resources owned by a voluntarily scaling-down Worker.
+     * Must be called before StartListenWorker.
+     * @param[in] callback The voluntary scale-down callback.
+     */
+    void SetVoluntaryScaleDownHandle(std::function<void()> callback);
+
+    /**
      * @brief Set the local worker recovery handle. Used from non-local listeners to
      * re-acquire a same-node worker (including after the original local worker
      * came back at a different address).
@@ -368,6 +375,7 @@ private:
 
     std::atomic<bool> isWorkerVoluntaryScaleDown_{ false };
     FdReleaseHelper fdReleaseHelper_;
+    std::function<void()> voluntaryScaleDownHandle_;
     std::function<bool()> recoverLocalWorkerHandle_;
     std::atomic<int64_t> lastLocalRecoveryAttemptMs_{ 0 };
     std::function<void()> workerTimeoutHandle_;

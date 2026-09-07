@@ -22,27 +22,18 @@
 #include <dlfcn.h>
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <exception>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 
 #include "datasystem/common/log/log.h"
 
-#if __has_include(<cuda_runtime_api.h>)
-#include <cuda_runtime_api.h>
-#define DATASYSTEM_HAS_CUDA_RUNTIME_API
-#endif
-
 namespace datasystem {
 namespace {
-#ifdef DATASYSTEM_HAS_CUDA_RUNTIME_API
-using HostRegisterFunc = decltype(&cudaHostRegister);
-using HostUnregisterFunc = decltype(&cudaHostUnregister);
-using GetErrorStringFunc = decltype(&cudaGetErrorString);
-#endif
-
 class CudaRuntimeApi {
 public:
     static CudaRuntimeApi &Instance()
@@ -57,55 +48,158 @@ public:
         return name.empty() || handle_ == nullptr ? nullptr : LoadSymbol<void *>(name);
     }
 
-    void Register(void *pointer, size_t size)
+    void RegisterCudaFuncs(const CudaFuncs &funcs)
     {
-#ifndef DATASYSTEM_HAS_CUDA_RUNTIME_API
-        (void)pointer;
-        (void)size;
-#else
-        Load();
-        if (hostRegister_ == nullptr) {
+        if (funcs.hostRegister == nullptr || funcs.hostUnregister == nullptr || funcs.getErrorString == nullptr
+            || funcs.memcpyAsync == nullptr) {
+            LOG(WARNING) << "[CudaHostMemory] Ignore invalid CUDA callback registration because hostRegister, "
+                            "hostUnregister, getErrorString and memcpyAsync must all be non-null";
             return;
+        }
+        bool alreadyRegistered = false;
+        {
+            std::lock_guard<std::mutex> lock(funcsMutex_);
+            if (funcsRegistered_.load(std::memory_order_relaxed)) {
+                alreadyRegistered = true;
+            } else {
+                funcs_ = funcs;
+                funcsRegistered_.store(true, std::memory_order_release);
+            }
+        }
+        if (alreadyRegistered) {
+            LOG(WARNING) << "[CudaHostMemory] Ignore repeated CUDA callback registration because the process-wide "
+                            "callbacks are already frozen";
+        }
+    }
+
+    bool IsHostMemoryRegistrationEnabled() const
+    {
+        const auto funcs = GetCudaFuncsSnapshot();
+        return funcs.hostRegister != nullptr && funcs.hostUnregister != nullptr;
+    }
+
+    bool Register(void *pointer, size_t size)
+    {
+        const auto funcs = GetCudaFuncsSnapshot();
+        if (funcs.hostRegister == nullptr) {
+            WarnNotRegistered();
+            return false;
         }
         if (pointer == nullptr || size == 0) {
             LOG(ERROR) << "[CudaHostMemory] Invalid CUDA host memory range, pointer: " << pointer << ", size: " << size;
-            return;
+            return false;
         }
         auto begin = std::chrono::steady_clock::now();
-        cudaError_t rc = hostRegister_(pointer, size, cudaHostRegisterPortable);
+        VLOG(1) << "[CudaHostMemory] cudaHostRegister started, pointer: " << pointer << ", size: " << size;
+        int rc = kCudaSuccess;
+        try {
+            rc = funcs.hostRegister(pointer, size, kCudaHostRegisterPortable);
+        } catch (const std::exception &e) {
+            const auto elapsedUs =
+                std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin);
+            VLOG(1) << "[CudaHostMemory] cudaHostRegister finished, pointer: " << pointer << ", size: " << size
+                    << ", elapsedUs: " << elapsedUs.count() << ", callbackException: true";
+            LOG(ERROR) << "[CudaHostMemory] cudaHostRegister callback threw an exception, pointer: " << pointer
+                       << ", size: " << size << ", error: " << e.what();
+            return false;
+        } catch (...) {
+            const auto elapsedUs =
+                std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin);
+            VLOG(1) << "[CudaHostMemory] cudaHostRegister finished, pointer: " << pointer << ", size: " << size
+                    << ", elapsedUs: " << elapsedUs.count() << ", callbackException: true";
+            LOG(ERROR) << "[CudaHostMemory] cudaHostRegister callback threw an unknown exception, pointer: " << pointer
+                       << ", size: " << size;
+            return false;
+        }
         auto elapsedUs =
             std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin);
-        LOG(INFO) << "[CudaHostMemory] cudaHostRegister finished, pointer: " << pointer << ", size: " << size
-                  << ", elapsedUs: " << elapsedUs.count() << ", return: " << static_cast<int>(rc);
-        if (rc != cudaSuccess && rc != cudaErrorHostMemoryAlreadyRegistered) {
-            LOG(ERROR) << "[CudaHostMemory] cudaHostRegister failed, return: " << static_cast<int>(rc)
-                       << ", error: " << GetErrorString(rc);
+        VLOG(1) << "[CudaHostMemory] cudaHostRegister finished, pointer: " << pointer << ", size: " << size
+                << ", elapsedUs: " << elapsedUs.count() << ", return: " << rc;
+        if (rc != kCudaSuccess && rc != kCudaErrorHostMemoryAlreadyRegistered) {
+            LOG(ERROR) << "[CudaHostMemory] cudaHostRegister failed, pointer: " << pointer << ", size: " << size
+                       << ", return: " << rc
+                       << ", error: " << GetErrorString(funcs, rc);
+            return false;
         }
-#endif
+        return true;
     }
 
-    void Unregister(void *pointer)
+    bool Unregister(void *pointer)
     {
-#ifdef DATASYSTEM_HAS_CUDA_RUNTIME_API
-        Load();
-        if (pointer != nullptr && hostUnregister_ != nullptr) {
-            auto begin = std::chrono::steady_clock::now();
-            cudaError_t rc = hostUnregister_(pointer);
-            auto elapsedUs =
-                std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin);
-            LOG(INFO) << "[CudaHostMemory] cudaHostUnregister finished, pointer: " << pointer
-                      << ", elapsedUs: " << elapsedUs.count() << ", return: " << static_cast<int>(rc);
-            if (rc != cudaSuccess) {
-                LOG(ERROR) << "[CudaHostMemory] cudaHostUnregister failed, return: " << static_cast<int>(rc)
-                           << ", error: " << GetErrorString(rc);
-            }
+        const auto funcs = GetCudaFuncsSnapshot();
+        if (funcs.hostUnregister == nullptr) {
+            WarnNotRegistered();
+            return false;
         }
-#else
-        (void)pointer;
-#endif
+        if (pointer == nullptr) {
+            LOG(ERROR) << "[CudaHostMemory] Invalid CUDA host memory unregister pointer: " << pointer;
+            return false;
+        }
+        auto begin = std::chrono::steady_clock::now();
+        VLOG(1) << "[CudaHostMemory] cudaHostUnregister started, pointer: " << pointer;
+        int rc = kCudaSuccess;
+        try {
+            rc = funcs.hostUnregister(pointer);
+        } catch (const std::exception &e) {
+            const auto elapsedUs =
+                std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin);
+            VLOG(1) << "[CudaHostMemory] cudaHostUnregister finished, pointer: " << pointer
+                    << ", elapsedUs: " << elapsedUs.count() << ", callbackException: true";
+            LOG(ERROR) << "[CudaHostMemory] cudaHostUnregister callback threw an exception, pointer: " << pointer
+                       << ", error: " << e.what();
+            return false;
+        } catch (...) {
+            const auto elapsedUs =
+                std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin);
+            VLOG(1) << "[CudaHostMemory] cudaHostUnregister finished, pointer: " << pointer
+                    << ", elapsedUs: " << elapsedUs.count() << ", callbackException: true";
+            LOG(ERROR) << "[CudaHostMemory] cudaHostUnregister callback threw an unknown exception, pointer: "
+                       << pointer;
+            return false;
+        }
+        auto elapsedUs =
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin);
+        VLOG(1) << "[CudaHostMemory] cudaHostUnregister finished, pointer: " << pointer
+                << ", elapsedUs: " << elapsedUs.count() << ", return: " << rc;
+        if (rc != kCudaSuccess) {
+            LOG(ERROR) << "[CudaHostMemory] cudaHostUnregister failed, pointer: " << pointer << ", return: " << rc
+                       << ", error: " << GetErrorString(funcs, rc);
+            return false;
+        }
+        return true;
+    }
+
+    Status MemcpyAsync(void *dst, const void *src, size_t size, DsCudaMemcpyKind kind, void *stream)
+    {
+        const auto funcs = GetCudaFuncsSnapshot();
+        if (funcs.memcpyAsync == nullptr) {
+            return Status(K_NOT_SUPPORTED, "CUDA memcpyAsync callback is not registered");
+        }
+        int rc = kCudaSuccess;
+        try {
+            rc = funcs.memcpyAsync(dst, src, size, kind, stream);
+        } catch (const std::exception &e) {
+            return Status(K_RUNTIME_ERROR, std::string("CUDA memcpyAsync callback threw an exception: ") + e.what());
+        } catch (...) {
+            return Status(K_RUNTIME_ERROR, "CUDA memcpyAsync callback threw an unknown exception");
+        }
+        if (rc != kCudaSuccess) {
+            return Status(K_RUNTIME_ERROR,
+                          "CUDA memcpyAsync failed, return: " + std::to_string(rc) +
+                              ", error: " + GetErrorString(funcs, rc));
+        }
+        return Status::OK();
     }
 
 private:
+    CudaFuncs GetCudaFuncsSnapshot() const
+    {
+        if (!funcsRegistered_.load(std::memory_order_acquire)) {
+            return {};
+        }
+        return funcs_;
+    }
+
     void Load()
     {
         std::call_once(loadOnce_, [this]() {
@@ -118,36 +212,33 @@ private:
                     break;
                 }
             }
-#ifdef DATASYSTEM_HAS_CUDA_RUNTIME_API
-            LoadHostMemorySymbols();
-#endif
         });
     }
 
-#ifdef DATASYSTEM_HAS_CUDA_RUNTIME_API
-    void LoadHostMemorySymbols()
+    void WarnNotRegistered()
     {
-        if (handle_ == nullptr) {
-            return;
-        }
-        auto hostRegister = LoadSymbol<HostRegisterFunc>("cudaHostRegister");
-        auto hostUnregister = LoadSymbol<HostUnregisterFunc>("cudaHostUnregister");
-        if (hostRegister != nullptr && hostUnregister != nullptr) {
-            hostRegister_ = hostRegister;
-            hostUnregister_ = hostUnregister;
-        }
-        getErrorString_ = LoadSymbol<GetErrorStringFunc>("cudaGetErrorString");
+        std::call_once(warnOnce_, []() {
+            LOG(WARNING) << "[CudaHostMemory] CUDA host memory functions not registered, call "
+                            "KVClient::RegisterCudaFuncs() to enable host memory registration";
+        });
     }
 
-    std::string GetErrorString(cudaError_t rc) const
+    std::string GetErrorString(const CudaFuncs &funcs, int rc) const
     {
-        if (getErrorString_ == nullptr) {
-            return std::to_string(static_cast<int>(rc));
+        if (funcs.getErrorString == nullptr) {
+            return std::to_string(rc);
         }
-        auto message = getErrorString_(rc);
-        return message == nullptr ? std::to_string(static_cast<int>(rc)) : std::string(message);
+        try {
+            const char *message = funcs.getErrorString(rc);
+            return message == nullptr ? std::to_string(rc) : std::string(message);
+        } catch (const std::exception &e) {
+            LOG(WARNING) << "[CudaHostMemory] CUDA getErrorString callback threw an exception, return: " << rc
+                         << ", error: " << e.what();
+        } catch (...) {
+            LOG(WARNING) << "[CudaHostMemory] CUDA getErrorString callback threw an unknown exception, return: " << rc;
+        }
+        return std::to_string(rc);
     }
-#endif
 
     template <typename T>
     T LoadSymbol(const std::string &name)
@@ -162,14 +253,13 @@ private:
     }
 
     std::once_flag loadOnce_;
+    std::once_flag warnOnce_;
     void *handle_{ nullptr };
     std::mutex symbolMutex_;
     std::unordered_map<std::string, void *> symbols_;
-#ifdef DATASYSTEM_HAS_CUDA_RUNTIME_API
-    HostRegisterFunc hostRegister_{ nullptr };
-    HostUnregisterFunc hostUnregister_{ nullptr };
-    GetErrorStringFunc getErrorString_{ nullptr };
-#endif
+    std::mutex funcsMutex_;
+    CudaFuncs funcs_{};
+    std::atomic<bool> funcsRegistered_{ false };
 };
 }  // namespace
 
@@ -178,16 +268,29 @@ void *GetCudaRuntimeSymbol(const std::string &name)
     return CudaRuntimeApi::Instance().GetSymbol(name);
 }
 
-void RegisterCudaHostMemory(void *pointer, size_t size)
+void RegisterCudaFuncs(const CudaFuncs &funcs)
 {
-    CudaRuntimeApi::Instance().Register(pointer, size);
+    CudaRuntimeApi::Instance().RegisterCudaFuncs(funcs);
 }
 
-void UnregisterCudaHostMemory(void *pointer)
+bool IsCudaHostMemoryRegistrationEnabled()
 {
-    CudaRuntimeApi::Instance().Unregister(pointer);
+    return CudaRuntimeApi::Instance().IsHostMemoryRegistrationEnabled();
+}
+
+bool RegisterCudaHostMemory(void *pointer, size_t size)
+{
+    return CudaRuntimeApi::Instance().Register(pointer, size);
+}
+
+bool UnregisterCudaHostMemory(void *pointer)
+{
+    return CudaRuntimeApi::Instance().Unregister(pointer);
+}
+
+Status DsCudaMemcpyAsync(void *dst, const void *src, size_t size, DsCudaMemcpyKind kind, void *stream)
+{
+    return CudaRuntimeApi::Instance().MemcpyAsync(dst, src, size, kind, stream);
 }
 
 }  // namespace datasystem
-
-#undef DATASYSTEM_HAS_CUDA_RUNTIME_API

@@ -40,7 +40,7 @@ class MmapTableTest : public CommonTest {
 public:
     void SetUp() override
     {
-        mmapTable_ = std::make_unique<ShmMmapTable>(false);
+        mmapTable_ = std::make_unique<ShmMmapTable>(false, std::make_shared<HostMemoryPinManager>());
         int32_t mmapSize = 1024;
         clientFd1_ = CreateFd(mmapSize);
         clientFd2_ = CreateFd(mmapSize);
@@ -93,6 +93,13 @@ TEST_F(MmapTableTest, TestMmapTableBasicFunction)
     ASSERT_EQ(existed, false);
 }
 
+TEST_F(MmapTableTest, TestMmapRejectsNullHostMemoryPinManager)
+{
+    ShmMmapTable mmapTable(false, nullptr);
+    auto rc = mmapTable.MmapAndStoreFd(clientFd1_, 10, 1024, "");
+    EXPECT_EQ(rc.GetCode(), StatusCode::K_RUNTIME_ERROR);
+}
+
 TEST_F(MmapTableTest, TestMmapTableEntryInvalidParameter)
 {
     LOG(INFO) << "Test mmap table entry invalid parameter.";
@@ -136,6 +143,37 @@ TEST_F(MmapTableTest, TestGetMmapEntry)
 
     mmapTable_->CleanInvalidMmapTable();
     ASSERT_FALSE(mmapTable_->FindFd(workerFd2));
+}
+
+TEST_F(MmapTableTest, TestCudaMemcpySegmentsFollowPinFragmentBoundaries)
+{
+    const size_t pageSize = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    constexpr size_t pinSliceSize = 64UL * 1024UL * 1024UL;
+    const size_t mmapSize = pinSliceSize * 2 + pageSize;
+    int fd = CreateFd(static_cast<int32_t>(mmapSize));
+    ASSERT_GE(fd, 0);
+    ShmMmapTableEntry entry(fd, mmapSize);
+    DS_ASSERT_OK(entry.Init(false, ""));
+
+    std::vector<size_t> segmentSizes;
+    DS_ASSERT_OK(entry.GetMemcpySegmentSizes(entry.Pointer(), mmapSize, segmentSizes));
+    ASSERT_EQ(segmentSizes.size(), 3);
+    EXPECT_EQ(segmentSizes[0], pinSliceSize);
+    EXPECT_EQ(segmentSizes[1], pinSliceSize);
+    EXPECT_EQ(segmentSizes[2], pageSize);
+
+    segmentSizes.clear();
+    // Start one page before a slice boundary and cross one complete slice into a third slice.
+    const auto *copyStart = entry.Pointer() + pinSliceSize - pageSize;
+    DS_ASSERT_OK(entry.GetMemcpySegmentSizes(copyStart, pinSliceSize + pageSize * 2, segmentSizes));
+    ASSERT_EQ(segmentSizes.size(), 3);
+    EXPECT_EQ(segmentSizes[0], pageSize);
+    EXPECT_EQ(segmentSizes[1], pinSliceSize);
+    EXPECT_EQ(segmentSizes[2], pageSize);
+
+    segmentSizes.clear();
+    auto status = entry.GetMemcpySegmentSizes(entry.Pointer() + mmapSize - pageSize, pageSize * 2, segmentSizes);
+    EXPECT_EQ(status.GetCode(), StatusCode::K_INVALID);
 }
 }  // namespace ut
 }  // namespace datasystem

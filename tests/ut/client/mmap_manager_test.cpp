@@ -106,7 +106,7 @@ TEST_F(MmapManagerTest, TestCleanRef)
     // This testcase is just for increased coverage.
     HostPort hostPort("127.0.0.1", 8080);
     auto clientApi = std::make_shared<ClientWorkerRemoteCommonApi>(hostPort);
-    MmapManager mmapManager(clientApi, false);
+    MmapManager mmapManager(clientApi, false, std::make_shared<HostMemoryPinManager>());
 
     mmapManager.CleanInvalidMmapTable();
     mmapManager.GetMmapEntryByFd(-1);
@@ -127,7 +127,7 @@ TEST_F(MmapManagerTest, TestEmbeddedMmapKeepsWorkerOwnedFdOpen)
     DS_ASSERT_OK(allocator->AllocateMemory(DEFAULT_TENANT_ID, 1, false, pointer, workerFd, offset, mmapSize));
 
     auto api = std::make_shared<MmapUtFakeWorkerApi>(HostPort("127.0.0.1", 1));
-    MmapManager mmapManager(api, true);
+    MmapManager mmapManager(api, true, std::make_shared<HostMemoryPinManager>());
     auto unit = std::make_shared<ShmUnitInfo>(workerFd, mmapSize);
     DS_ASSERT_OK(mmapManager.LookupUnitsAndMmapFd(DEFAULT_TENANT_ID, unit));
 
@@ -149,7 +149,7 @@ TEST_F(MmapManagerTest, TestLookupUnitsAndMmapFdsShmPathWithStubGetClientFd)
     auto api = std::make_shared<MmapUtFakeWorkerApi>(HostPort("127.0.0.1", 1));
     api->SetTestMemfd(memfd);
 
-    MmapManager mmapManager(api, false);
+    MmapManager mmapManager(api, false, std::make_shared<HostMemoryPinManager>());
     auto unit = std::make_shared<ShmUnitInfo>(901, static_cast<uint64_t>(mmapSize));
     std::vector<std::shared_ptr<ShmUnitInfo>> units{ unit };
 
@@ -189,7 +189,7 @@ TEST_F(MmapManagerTest, TestCudaHostMemoryPinRunsInBackground)
     ASSERT_TRUE(inject::Set("ShmMmapTableEntry.PinHostMemory", "1*sleep(1000)").IsOk());
     Raii clearInject([] { (void)inject::Clear("ShmMmapTableEntry.PinHostMemory"); });
 
-    MmapManager mmapManager(api, false);
+    MmapManager mmapManager(api, false, std::make_shared<HostMemoryPinManager>());
     auto unit = std::make_shared<ShmUnitInfo>(workerFd, static_cast<uint64_t>(mmapSize));
     auto start = std::chrono::steady_clock::now();
     ASSERT_TRUE(mmapManager.LookupUnitsAndMmapFd("tenant_ut", unit).IsOk());
@@ -221,7 +221,7 @@ TEST_F(MmapManagerTest, TestLookupUnitsAndMmapFdsConcurrentSameFdOnlyTransfersOn
     api->SetTestMemfd(memfd);
     api->SetGetClientFdDelayMs(50);
 
-    MmapManager mmapManager(api, false);
+    MmapManager mmapManager(api, false, std::make_shared<HostMemoryPinManager>());
     Barrier barrier(4);
     std::vector<std::shared_ptr<ShmUnitInfo>> units;
     std::vector<std::thread> threads;
@@ -274,7 +274,7 @@ TEST_F(MmapManagerTest, TestWorkerFdReuseAfterCleanupMapsNewMemfd)
     ASSERT_EQ(1, pwrite(newMemfd, &newValue, 1, 0));
 
     auto api = std::make_shared<MmapUtFakeWorkerApi>(HostPort("127.0.0.1", 1));
-    MmapManager mmapManager(api, false);
+    MmapManager mmapManager(api, false, std::make_shared<HostMemoryPinManager>());
     api->SetTestMemfd(oldMemfd);
     auto oldUnit = std::make_shared<ShmUnitInfo>(workerFd, static_cast<uint64_t>(mmapSize));
     ASSERT_TRUE(mmapManager.LookupUnitsAndMmapFd("tenant_ut", oldUnit).IsOk());
@@ -307,7 +307,7 @@ TEST_F(MmapManagerTest, TestClearExpiredByShmIdDoesNotCrossWorker)
 #if defined(__linux__)
     const int mmapSize = 4096;
     auto api = std::make_shared<MmapUtFakeWorkerApi>(HostPort("127.0.0.1", 1));
-    MmapManager mmapManager(api, false);
+    MmapManager mmapManager(api, false, std::make_shared<HostMemoryPinManager>());
 
     // mmap two distinct worker fds via LookupUnitsAndMmapFds so both entries exist in the table.
     int memfdA = static_cast<int>(syscall(SYS_memfd_create, "shm_id_ut_a", MFD_ALLOW_SEALING));

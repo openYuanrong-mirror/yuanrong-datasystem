@@ -197,6 +197,11 @@ void ListenWorker::SetReleaseFdCallBack(std::function<void(const std::vector<int
     fdReleaseHelper_.SetReleaseFdCallBack(std::move(callback));
 }
 
+void ListenWorker::SetVoluntaryScaleDownHandle(std::function<void()> callback)
+{
+    voluntaryScaleDownHandle_ = std::move(callback);
+}
+
 void ListenWorker::SetRecoverLocalWorkerHandle(std::function<bool()> callback)
 {
     recoverLocalWorkerHandle_ = std::move(callback);
@@ -281,7 +286,11 @@ void ListenWorker::HandleHeartbeatError(Timer &timer, uint64_t clientDeadTimeout
 
 bool ListenWorker::HandleScaleDownOrIdle(bool isWorkerVoluntaryScaleDown)
 {
-    isWorkerVoluntaryScaleDown_ = isWorkerVoluntaryScaleDown;
+    const bool wasVoluntaryScaleDown =
+        isWorkerVoluntaryScaleDown_.exchange(isWorkerVoluntaryScaleDown, std::memory_order_acq_rel);
+    if (isWorkerVoluntaryScaleDown && !wasVoluntaryScaleDown && voluntaryScaleDownHandle_) {
+        voluntaryScaleDownHandle_();
+    }
     if (IsVoluntarySwitchable()) {
         constexpr int logInterval = 10;
         LOG_EVERY_T(INFO, logInterval)

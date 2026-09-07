@@ -26,18 +26,21 @@
 
 namespace datasystem {
 namespace client {
-MmapManager::MmapManager(std::shared_ptr<IClientWorkerCommonApi> clientWorker, bool enableEmbeddedClient)
+MmapManager::MmapManager(std::shared_ptr<IClientWorkerCommonApi> clientWorker, bool enableEmbeddedClient,
+                         std::shared_ptr<HostMemoryPinManager> pinManager)
     : clientWorker_(std::move(clientWorker)), enableEmbeddedClient_(enableEmbeddedClient)
 {
     if (!enableEmbeddedClient) {
-        mmapTable_ = std::make_unique<ShmMmapTable>(clientWorker_->enableHugeTlb_);
+        mmapTable_ = std::make_unique<ShmMmapTable>(clientWorker_->enableHugeTlb_, std::move(pinManager));
     } else {
         mmapTable_ = std::make_unique<EmbeddedMmapTable>(clientWorker_->enableHugeTlb_);
     }
 }
 
-MmapManager::MmapManager(std::shared_ptr<IShmFdProvider> fdProvider, bool enableHugeTlb)
-    : fdProvider_(std::move(fdProvider)), mmapTable_(std::make_unique<ShmMmapTable>(enableHugeTlb)),
+MmapManager::MmapManager(std::shared_ptr<IShmFdProvider> fdProvider, bool enableHugeTlb,
+                         std::shared_ptr<HostMemoryPinManager> pinManager)
+    : fdProvider_(std::move(fdProvider)),
+      mmapTable_(std::make_unique<ShmMmapTable>(enableHugeTlb, std::move(pinManager))),
       enableEmbeddedClient_(false)
 {
 }
@@ -246,6 +249,15 @@ void MmapManager::Clear()
 void MmapManager::CleanInvalidMmapTable()
 {
     mmapTable_->CleanInvalidMmapTable();
+}
+
+void MmapManager::MarkVoluntaryScaleDown()
+{
+    bthread::RWLockRdGuard lck(mutex_);
+    auto *shmMmapTable = dynamic_cast<ShmMmapTable *>(mmapTable_.get());
+    if (shmMmapTable != nullptr) {
+        shmMmapTable->MarkVoluntaryScaleDown();
+    }
 }
 }  // namespace client
 }  // namespace datasystem

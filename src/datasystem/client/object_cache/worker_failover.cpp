@@ -719,9 +719,8 @@ WorkerFailover::StandbySwitchAttemptResult WorkerFailover::TrySwitchToLocalSameH
     if (rc.IsError()) {
         LOG(WARNING) << "[Switch] URMA handshake failed: " << rc.ToString();
     }
-    // Declared outside the lock so the old listener's destructor (which joins its heartbeat
-    // thread) runs after owner_.switchNodeMutex_ is released; otherwise it can deadlock against
-    // ProcessWorkerLost waiting on the same mutex.
+    // Stop and join the old listener outside switchNodeMutex_; otherwise it can deadlock against
+    // ProcessWorkerLost waiting on the same mutex. Keep the old manager alive until the listener stops.
     std::shared_ptr<client::ListenWorker> oldLocalListener;
     std::unique_ptr<client::MmapManager> oldMmapManager;
     {
@@ -742,6 +741,12 @@ WorkerFailover::StandbySwitchAttemptResult WorkerFailover::TrySwitchToLocalSameH
         }
         MarkWorkerAvailableLocked();
     }
+    if (oldLocalListener != nullptr) {
+        oldLocalListener->StopListenWorker(false);
+        oldLocalListener->JoinListenWorker();
+    }
+    oldLocalListener.reset();
+    oldMmapManager.reset();
     NotifySwitchToExpectedWorker(localAddress);
     LOG(INFO) << "[Switch] LOCAL_WORKER replaced with same-host worker at " << localAddress.ToString();
     return StandbySwitchAttemptResult::SWITCHED;
@@ -875,7 +880,8 @@ Status WorkerFailover::PreparePreferredLocalWorker(const HostPort &localAddress,
     }
     ConfigureUrmaDataPlaneFailureCallback(LOCAL_WORKER, localWorkerApi);
 
-    localMmapManager = std::make_unique<client::MmapManager>(localWorkerApi, false);
+    localMmapManager =
+        std::make_unique<client::MmapManager>(localWorkerApi, false, owner_.hostMemoryPinManager_);
     rc = localWorkerApi->PrepareForDecreaseShmRef(std::bind(&client::MmapManager::LookupUnitsAndMmapFd,
                                                             localMmapManager.get(), std::placeholders::_1,
                                                             std::placeholders::_2));
@@ -892,6 +898,8 @@ Status WorkerFailover::PreparePreferredLocalWorker(const HostPort &localAddress,
     localListenWorker->SetWorkerTimeoutHandle([this] { ProcessWorkerTimeout(); });
     localListenWorker->SetReleaseFdCallBack(
         [this](const std::vector<int64_t> &fds) { owner_.mmapManager_->ClearExpiredFds(fds); });
+    localListenWorker->SetVoluntaryScaleDownHandle(
+        [mmapManager = localMmapManager.get()] { mmapManager->MarkVoluntaryScaleDown(); });
     if (owner_.enableCrossNodeConnection_) {
         localListenWorker->SetSwitchWorkerHandle([this](uint32_t index, client::SwitchTriggerReason reason) {
             return SwitchWorkerNode(static_cast<WorkerNode>(index), reason);
@@ -908,10 +916,12 @@ Status WorkerFailover::PreparePreferredLocalWorker(const HostPort &localAddress,
 
 bool WorkerFailover::CommitPreferredLocalWorker(WorkerNode oldNode, const HostPort &localAddress,
                                                 const std::shared_ptr<ClientWorkerRemoteApi> &localWorkerApi,
-                                                std::unique_ptr<client::MmapManager> localMmapManager,
+                                                std::unique_ptr<client::MmapManager> &localMmapManager,
                                                 const std::shared_ptr<client::ListenWorker> &localListenWorker)
 {
-    // See TrySwitchToLocalSameHost for why the old listener must destruct outside the lock.
+    // Stop listeners outside switchNodeMutex_: joining a heartbeat thread while holding the mutex can deadlock
+    // against a recovery callback waiting on the same mutex. Keep each mmap manager alive until its listener stops
+    // because the voluntary scale-down callback captures the manager pointer.
     std::shared_ptr<client::ListenWorker> oldLocalListener;
     std::unique_ptr<client::MmapManager> oldMmapManager;
     {
@@ -932,6 +942,12 @@ bool WorkerFailover::CommitPreferredLocalWorker(WorkerNode oldNode, const HostPo
         }
         MarkWorkerAvailableLocked();
     }
+    if (oldLocalListener != nullptr) {
+        oldLocalListener->StopListenWorker(false);
+        oldLocalListener->JoinListenWorker();
+    }
+    oldLocalListener.reset();
+    oldMmapManager.reset();
     return true;
 }
 
@@ -958,8 +974,8 @@ bool WorkerFailover::RecoverPreferredLocalWorker()
         localListenWorker->StopListenWorker(true);
         return false;
     }
-    if (!CommitPreferredLocalWorker(oldNode, localAddress, localWorkerApi, std::move(localMmapManager),
-                                    localListenWorker)) {
+    if (!CommitPreferredLocalWorker(oldNode, localAddress, localWorkerApi, localMmapManager, localListenWorker)) {
+        localListenWorker->StopListenWorker(true);
         return false;
     }
 

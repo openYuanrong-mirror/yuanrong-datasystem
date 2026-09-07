@@ -261,6 +261,7 @@ ShmSession::ShmSession(HostPort workerAddr, std::shared_ptr<WorkerRpcClient> rpc
 Status ShmSession::Create(const HostPort &workerAddr, const std::shared_ptr<WorkerRpcClient> &rpcClient,
                           const TransportRequestContext &context, std::weak_ptr<ThreadPool> releasePool,
                           std::shared_ptr<std::atomic<bool>> scaleInDraining,
+                          const std::shared_ptr<HostMemoryPinManager> &hostMemoryPinManager,
                           std::shared_ptr<ShmSession> &session)
 {
     session.reset();
@@ -279,7 +280,8 @@ Status ShmSession::Create(const HostPort &workerAddr, const std::shared_ptr<Work
     auto fdChannel =
         std::make_shared<ShmFdChannel>(rpcClient, std::move(socketFd), isScmTcp, response.client_id());
     fdChannel->UpdateAuth(context);
-    auto mmapManager = std::make_shared<MmapManager>(fdChannel, response.enable_huge_tlb());
+    auto mmapManager =
+        std::make_shared<MmapManager>(fdChannel, response.enable_huge_tlb(), hostMemoryPinManager);
     auto candidate = std::shared_ptr<ShmSession>(
         new ShmSession(workerAddr, rpcClient, std::move(fdChannel), std::move(mmapManager), response.client_id(),
                        response.worker_start_id(), response.lock_id(), std::move(releasePool), context,
@@ -537,6 +539,9 @@ void ShmSession::Close(bool notifyWorker)
 void ShmSession::CloseForScaleIn()
 {
     scaleInDraining_->store(true, std::memory_order_release);
+    if (mmapManager_ != nullptr) {
+        mmapManager_->MarkVoluntaryScaleDown();
+    }
     Close(false);
     ScheduleDisconnect();
 }
@@ -707,8 +712,10 @@ void ShmSession::RunMaintenance()
 }
 
 ShmConnection::ShmConnection(HostPort workerAddr, std::shared_ptr<WorkerRpcClient> rpcClient,
-                             std::weak_ptr<ThreadPool> releasePool)
-    : workerAddr_(std::move(workerAddr)), rpcClient_(std::move(rpcClient)), releasePool_(std::move(releasePool))
+                             std::weak_ptr<ThreadPool> releasePool,
+                             std::shared_ptr<HostMemoryPinManager> hostMemoryPinManager)
+    : workerAddr_(std::move(workerAddr)), rpcClient_(std::move(rpcClient)), releasePool_(std::move(releasePool)),
+      hostMemoryPinManager_(std::move(hostMemoryPinManager))
 {
 }
 
@@ -801,7 +808,8 @@ Status ShmConnection::Acquire(const TransportRequestContext &context, std::share
     }
 
     std::shared_ptr<ShmSession> candidate;
-    Status result = ShmSession::Create(workerAddr_, rpcClient_, context, releasePool_, scaleInDraining_, candidate);
+    Status result = ShmSession::Create(workerAddr_, rpcClient_, context, releasePool_, scaleInDraining_,
+                                       hostMemoryPinManager_, candidate);
     return CompleteConnectionAttempt(attemptId, candidate, std::move(result), session);
 }
 

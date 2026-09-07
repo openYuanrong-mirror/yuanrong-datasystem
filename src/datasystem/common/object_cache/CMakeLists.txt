@@ -15,6 +15,7 @@ set(COMMON_BUFFER_DEPEND_LIBS
         ${SECUREC_LIBRARY}
         ${CLIENT_LIB}
         common_inject
+        common_cuda_host_memory
         common_log
         common_util
         share_memory_protos

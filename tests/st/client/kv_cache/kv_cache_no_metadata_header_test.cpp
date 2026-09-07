@@ -135,13 +135,10 @@ TEST_F(KVCacheNoMetadataHeaderTest, ExplicitRLatchKeepsNotSupportedSemantics)
 TEST_F(KVCacheNoMetadataHeaderTest, PinPendingCreateSetAndGetReturnCorrectData)
 {
     constexpr char pinInject[] = "ShmMmapTableEntry.PinHostMemory";
-    constexpr char allocInject[] = "Buffer.AllocatePageableMemory";
     DS_ASSERT_OK(inject::Set(pinInject, "1*pause()"));
     std::shared_ptr<KVClient> client;
     InitTestKVClient(0, client);
     Raii clearPin([] { (void)inject::Clear("ShmMmapTableEntry.PinHostMemory"); });
-    DS_ASSERT_OK(inject::Set(allocInject, "call()"));
-    Raii clearAlloc([] { (void)inject::Clear("Buffer.AllocatePageableMemory"); });
 
     const std::string key = "pin-pending-no-metadata";
     const std::string value(SHM_SIZE, 'p');
@@ -158,7 +155,6 @@ TEST_F(KVCacheNoMetadataHeaderTest, PinPendingCreateSetAndGetReturnCorrectData)
     ASSERT_EQ(getBuffer->GetSize(), static_cast<int64_t>(value.size()));
     ASSERT_EQ(std::memcmp(getBuffer->ImmutableData(), value.data(), value.size()), 0);
     ASSERT_EQ(getBuffer->RLatch().GetCode(), StatusCode::K_NOT_SUPPORTED);
-    ASSERT_GE(inject::GetExecuteCount(allocInject), 2u);
 }
 
 }  // namespace st

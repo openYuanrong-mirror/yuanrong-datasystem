@@ -37,6 +37,7 @@
 #include "re2/re2.h"
 
 #include "datasystem/utils/device_blob.h"
+#include "datasystem/utils/cuda_funcs.h"
 #include "datasystem/client/client_state_manager.h"
 #include "datasystem/client/worker_api/embedded_client_worker_api.h"
 #include "datasystem/client/worker_api/listen_worker.h"
@@ -463,6 +464,8 @@ public:
      * @return Status of the result.
      */
     Status PublishDeviceObject(std::shared_ptr<DeviceBuffer> buffer);
+
+    Status DsCudaMemcpyAsync(void *dst, const void *src, size_t size, DsCudaMemcpyKind kind, void *stream);
 
     /**
      * @brief Init/Shutdown complete handler.
@@ -974,6 +977,11 @@ private:
                                            std::vector<Optional<Buffer>> &buffers,
                                            std::vector<std::string> &warmupKeys);
 
+    Status WarmupSameNodeClientWorkerConnections(const std::string &keyPrefix, const std::string &value,
+                                                 const SetParam &setParam, TimeoutDuration &warmupBudget,
+                                                 std::vector<Optional<Buffer>> &buffers,
+                                                 std::vector<std::string> &warmupKeys, size_t &warmedCount);
+
     void CleanupWarmupObjects(const std::vector<std::string> &warmupKeys);
 
     Status Set(const std::string &key, const StringView &val, const SetParam &setParam,
@@ -1250,6 +1258,8 @@ private:
     std::unique_ptr<Signature> signature_{ nullptr };
     std::vector<std::shared_ptr<IClientWorkerApi>> workerApi_;
     std::atomic<WorkerNode> currentNode_{ LOCAL_WORKER };
+    // One serialized pin queue and mmap range registry for every Worker connection owned by this Client.
+    std::shared_ptr<client::HostMemoryPinManager> hostMemoryPinManager_;
     // Must stay declared before the dependencies it references (mmapManager_/transportLayer_/
     // pools/ref tables below): they are destroyed before boundMode_, whose destructor must
     // never dereference them. ShutDown drains work before member destruction begins.

@@ -49,6 +49,7 @@ ds_cc_library(
         "//src/datasystem/client/hetero_cache/device:object_cache_header",
         "//src/datasystem/common/device:comm_wrapper",
         "//src/datasystem/common/device:device_helper",
+        "//src/datasystem/common/device/nvidia:cuda_host_memory",
         "//src/datasystem/common/device/ascend:acl_device_manager",
         "//src/datasystem/common/device/ascend:acl_resource_manager",
         "//src/datasystem/common/log:common_log",

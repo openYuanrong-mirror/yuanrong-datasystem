@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "datasystem/client/object_cache/object_client_impl.h"
+#include "datasystem/common/device/nvidia/cuda_host_memory.h"
 #include "datasystem/common/log/access_recorder.h"
 #include "datasystem/common/log/trace.h"
 #include "datasystem/common/metrics/kv_metrics.h"
@@ -116,6 +117,16 @@ Status KVClient::InitEmbedded(const EmbeddedConfig &config)
     return rc;
 }
 
+void KVClient::RegisterCudaFuncs(const CudaFuncs &funcs)
+{
+    datasystem::RegisterCudaFuncs(funcs);
+}
+
+Status KVClient::DsCudaMemcpyAsync(void *dst, const void *src, size_t size, DsCudaMemcpyKind kind, void *stream)
+{
+    return impl_->DsCudaMemcpyAsync(dst, src, size, kind, stream);
+}
+
 Status KVClient::Create(const std::string &key, uint64_t size, const SetParam &param, std::shared_ptr<Buffer> &buffer)
 {
     ScopedClientRequestContext requestContext;
@@ -129,12 +140,6 @@ Status KVClient::Create(const std::string &key, uint64_t size, const SetParam &p
     createParam.cacheType = param.cacheType;
     createParam.existence = param.existence;
     Status rc = impl_->Create(key, size, createParam, buffer);
-    if (rc.IsOk()) {
-        rc = buffer->UsePageableMemoryIfCudaHostMemoryPinPending();
-        if (rc.IsError()) {
-            buffer.reset();
-        }
-    }
     METRIC_INC(metrics::KvMetricId::CLIENT_CREATE_REQUEST_TOTAL);
     METRIC_ERROR_IF(rc.IsError(), metrics::KvMetricId::CLIENT_CREATE_ERROR_TOTAL);
     if (rc.IsOk()) {
@@ -160,20 +165,6 @@ const SetParam &param, std::vector<std::shared_ptr<Buffer>> &buffers)
     createParam.cacheType = param.cacheType;
     createParam.existence = param.existence;
     Status rc = impl_->MCreate(keys, sizes, createParam, buffers);
-    if (rc.IsOk()) {
-        for (auto &buffer : buffers) {
-            if (buffer == nullptr || buffer->GetSize() == 0) {
-                continue;
-            }
-            rc = buffer->UsePageableMemoryIfCudaHostMemoryPinPending();
-            if (rc.IsError()) {
-                break;
-            }
-        }
-        if (rc.IsError()) {
-            buffers.clear();
-        }
-    }
     METRIC_INC(metrics::KvMetricId::CLIENT_CREATE_REQUEST_TOTAL);
     METRIC_ERROR_IF(rc.IsError(), metrics::KvMetricId::CLIENT_CREATE_ERROR_TOTAL);
     if (rc.IsOk()) {
@@ -377,10 +368,7 @@ Status KVClient::Get(const std::string &key, Optional<ReadOnlyBuffer> &readOnlyB
     size_t dataSize = rc.IsOk() ? buffers[0]->GetSize() : 0;
     if (rc.IsOk()) {
         auto bufferSharedPtr = std::make_shared<Buffer>(std::move(buffers[0].value()));
-        rc = bufferSharedPtr->CopyToPageableMemoryIfCudaHostMemoryPinPending();
-        if (rc.IsOk()) {
-            readOnlyBuffer = Optional<ReadOnlyBuffer>(ReadOnlyBuffer(bufferSharedPtr));
-        }
+        readOnlyBuffer = Optional<ReadOnlyBuffer>(ReadOnlyBuffer(bufferSharedPtr));
     }
     METRIC_INC(metrics::KvMetricId::CLIENT_GET_REQUEST_TOTAL);
     METRIC_ERROR_IF(rc.IsError(), metrics::KvMetricId::CLIENT_GET_ERROR_TOTAL);
@@ -434,10 +422,6 @@ Status KVClient::Get(const std::vector<std::string> &keys, std::vector<Optional<
             if (buffer) {
                 dataSize += buffer->GetSize();
                 auto bufferSharedPtr = std::make_shared<Buffer>(std::move(buffer.value()));
-                rc = bufferSharedPtr->CopyToPageableMemoryIfCudaHostMemoryPinPending();
-                if (rc.IsError()) {
-                    break;
-                }
                 result.emplace_back(ReadOnlyBuffer(bufferSharedPtr));
             } else {
                 result.emplace_back();
