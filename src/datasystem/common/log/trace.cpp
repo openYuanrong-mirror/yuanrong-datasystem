@@ -79,6 +79,7 @@ uint64_t FNV1aHash(const std::string &s)
 const int Trace::TRACEID_MAX_SIZE;
 const int Trace::TRACEID_PREFIX_SIZE;
 const int Trace::SHORT_UUID_SIZE;
+const int Trace::TRACEID_EXCEED_MAX_SIZE_LOG_INTERVAL;
 
 void TraceGuard::Reset()
 {
@@ -197,8 +198,9 @@ TraceGuard Trace::SetTraceNewID(const std::string &traceID, bool keep)
     SetRequestSampleDecision(false, false);
     auto copySize = traceID.size();
     if (traceID.size() > TRACEID_MAX_SIZE) {
-        LOG(WARNING) << FormatString("The traceID length %zu exceeds the maximum length %d.", traceID.size(),
-                                     TRACEID_MAX_SIZE);
+        LOG_EVERY_T(WARNING, TRACEID_EXCEED_MAX_SIZE_LOG_INTERVAL) << FormatString(
+            "The traceID %s length %zu exceeds the maximum length %d.",
+            traceID, traceID.size(), TRACEID_MAX_SIZE);
         copySize = TRACEID_MAX_SIZE;
     }
     int ret = strncpy_s(traceID_, TRACEID_MAX_SIZE + 1, traceID.c_str(), copySize);

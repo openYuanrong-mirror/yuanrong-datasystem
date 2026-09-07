@@ -397,6 +397,7 @@ public:
     static const int TRACEID_PREFIX_SIZE = 36;
     static const int SHORT_UUID_SIZE = 12;
     static const int TRACEID_MAX_SIZE = TRACEID_PREFIX_SIZE + SHORT_UUID_SIZE + 1;
+    static const int TRACEID_EXCEED_MAX_SIZE_LOG_INTERVAL = 60;
 
 private:
     Trace() = default;
