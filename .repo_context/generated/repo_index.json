@@ -1,6 +1,6 @@
 {
   "repo_root": ".",
-  "generated_at_utc": "2026-09-04T06:47:44+00:00",
+  "generated_at_utc": "2026-09-07T12:27:44+00:00",
   "root_files": [
     "README.md",
     "build.sh",
@@ -814,6 +814,8 @@
         "    - openai.yaml",
         "  - SKILL.md",
         "- ds-network-latency-analysis/",
+        "  - agents/",
+        "    - openai.yaml",
         "  - scripts/",
         "    - network_latency_analysis.py",
         "    - test_network_latency_analysis.py",
