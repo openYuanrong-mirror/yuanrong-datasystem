@@ -579,6 +579,66 @@ class TestConnIdentify(unittest.TestCase):
         conn = nla.BpfCorrelator._identify_conn([], cs_ts, "1.1.1.1", "2.2.2.2")
         self.assertIsNone(conn)
 
+    def test_identify_conn_from_server(self):
+        """client 节点无 bpf：server 侧事件回退识别连接（收包优先 / 发送兜底）。"""
+        CIP, SIP = "192.168.49.66", "192.168.210.192"
+        sr = datetime(2026, 9, 4, 17, 46, 53, 999665)
+
+        def ev(kind, ts, lport, pport, lip=SIP, pip=CIP):
+            arrow = "->" if kind == "tcp_send_in" else "<-"
+            line = ("17:46:54:000000 tcp  %s tid 1 cpu 1 size 100 %s:%s %s %s:%s\n"
+                    % (kind.replace("tcp_", "").replace("_", " "),
+                       lip, lport, arrow, pip, pport))
+            return nla.parse_bpf_line(line, sr.date())
+
+        # 1) 请求方向收包事件优先：取 ≥ ServerRecv−200us 中最早
+        evs = [ev("tcp_recv_in", 0, 31402, 53896),
+               ev("tcp_recv_in", 0, 31402, 53897),   # 另一条连接
+               ev("tcp_send_in", 0, 31402, 53896)]
+        # tcp recv in 两行 tod 相同，端口区分：模拟时间偏移不可行，改用 recv_que+recv_in
+        evs[0] = ev("tcp_recv_que", 0, 31402, 53896)
+        conn = nla.BpfCorrelator._identify_conn_from_server(evs, sr, CIP, SIP)
+        self.assertEqual(conn, (CIP, 53896, SIP, 31402))
+        # 2) 无收包事件（bpf 开始记录晚于收包）→ 响应方向 send 兜底
+        evs2 = [ev("tcp_send_in", 0, 31402, 53896),
+                ev("tcp_send_in", 0, 31402, 53897)]
+        conn2 = nla.BpfCorrelator._identify_conn_from_server(evs2, sr, CIP, SIP)
+        self.assertEqual(conn2, (CIP, 53896, SIP, 31402))
+        # 3) 其他 client IP 的事件不参与
+        evs3 = [ev("tcp_send_in", 0, 31402, 1111, pip="9.9.9.9")]
+        self.assertIsNone(
+            nla.BpfCorrelator._identify_conn_from_server(evs3, sr, CIP, SIP))
+
+    def test_identify_conn_from_nic(self):
+        """tcp 层探针丢失时：client 侧 nic 层事件（含完整五元组）兜底识别连接。"""
+        CIP, SIP = "192.168.49.66", "192.168.210.192"
+        cs = datetime(2026, 9, 4, 17, 46, 54, 100000)
+
+        def nic(ts_us, sport, dport, sip=CIP, dip=SIP, kind="dev_start_xmit"):
+            line = ("17:46:54:%06d %s: sip:%s, sport:%d -> dip:%s, dport:%d, "
+                    "seq:913492323, len:339, dev:eth0\n" % (ts_us, kind, sip, sport,
+                                                            dip, dport))
+            return nla.parse_bpf_line(line, cs.date())
+
+        # 1) 请求方向（cip→sip）dev_start_xmit ≥ ClientSend−200us 中最早；
+        #    另一条连接（sport 不同）与响应方向 rx 事件不干扰
+        evs = [nic(99000, 53895, 31402),                    # 容差（200us）前另一连接
+               nic(100050, 53896, 31402),                   # 目标连接
+               nic(100050, 53897, 31402, kind="net_dev_xmit"),  # 另一连接 xmit
+               nic(103457, 53896, 31402, sip=SIP, dip=CIP,
+                   kind="netif_receive_skb")]               # 响应方向 rx
+        conn = nla.BpfCorrelator._identify_conn_from_nic(evs, cs, CIP, SIP)
+        self.assertEqual(conn, (CIP, 53896, SIP, 31402))
+        # 2) 无窗口后事件 → 全窗内取离 ClientSend 最近
+        evs2 = [nic(98000, 53896, 31402)]
+        conn2 = nla.BpfCorrelator._identify_conn_from_nic(evs2, cs, CIP, SIP)
+        self.assertEqual(conn2, (CIP, 53896, SIP, 31402))
+        # 3) 无请求方向 nic 事件 → None
+        evs3 = [nic(100050, 53896, 31402, sip=SIP, dip=CIP,
+                    kind="netif_receive_skb")]
+        self.assertIsNone(
+            nla.BpfCorrelator._identify_conn_from_nic(evs3, cs, CIP, SIP))
+
 
 class TestKernelSegments(unittest.TestCase):
     def test_segments_and_flags(self):
@@ -688,7 +748,8 @@ class TestJsonOutput(unittest.TestCase):
         self.assertEqual(tr["client"]["ip"], "192.168.219.138")
         self.assertEqual(tr["server"]["ip"], "192.168.102.161")
         self.assertEqual(tr["conn"], {"client_ip": "192.168.219.138", "client_port": 37880,
-                                      "server_ip": "192.168.102.161", "server_port": 31501})
+                                      "server_ip": "192.168.102.161", "server_port": 31501,
+                                      "source": "client_tcp"})
         # 锚点：ISO 微秒精度
         self.assertEqual(tr["anchors"]["ClientSend"]["ts"],
                          "2026-08-21T21:31:21.060757")
@@ -1090,8 +1151,8 @@ class TestParallelScan(unittest.TestCase):
     def test_anchor_info_parallel_equals_serial(self):
         paths = self._make_logs()
         traces = ["tr-%d" % i for i in range(6)]
-        s_idx, s_lines = nla.collect_anchor_and_info(paths, [], traces, workers=1)
-        p_idx, p_lines = nla.collect_anchor_and_info(paths, [], traces, workers=3)
+        s_idx, s_lines, _ = nla.collect_anchor_and_info(paths, [], traces, workers=1)
+        p_idx, p_lines, _ = nla.collect_anchor_and_info(paths, [], traces, workers=3)
         self.assertEqual(sorted(s_idx.keys()), sorted(p_idx.keys()))
         for t in traces:
             self.assertEqual([x["msg"] for x in s_idx[t]["client"]],
@@ -1122,7 +1183,7 @@ class TestMergedScan(unittest.TestCase):
                 + self._info("2026-08-21T21:31:21.060800", "1.1.1.1", self.TRACE_SIMILAR,
                              "yyl9 ClientSend ts 999 tid 9\n")
                 + "noise without markers\n" * 50, encoding="utf-8")
-            idx, lines = nla.collect_anchor_and_info([clog], [], [self.TRACE_A])
+            idx, lines, _hp = nla.collect_anchor_and_info([clog], [], [self.TRACE_A])
             # 锚点桶：仅精确 trace 的锚点行
             self.assertEqual([i["msg"] for i in idx[self.TRACE_A]["client"]],
                              ["yyl9 ClientSend ts 111 tid 5"])
@@ -3555,6 +3616,463 @@ class TestCpuBusyEndToEnd(unittest.TestCase):
         self.assertIn("  21:31:21:065500 tcp  recv in", raw)
 
 
+class TestSoftirqParse(unittest.TestCase):
+    """softirq 探针事件行解析：high irq-to-softirq（raise→entry 慢）/
+    slow softirq!（entry→exit 慢）。"""
+
+    def test_parse_raise_delay(self):
+        ev = nla.parse_bpf_line(
+            "21:31:21:065200 high irq-to-softirq  vec=3 latency: 1500 usec (1 ms) "
+            "on CPU:50 comm:kvclient kstack:__do_softirq+0x1\n",
+            datetime(2026, 8, 21))
+        self.assertIsNotNone(ev)
+        self.assertEqual(ev["kind"], "softirq_raise_delay")
+        self.assertEqual(ev["vec"], 3)
+        self.assertEqual(ev["latency_us"], 1500)
+        self.assertEqual(ev["cpu"], 50)
+        self.assertEqual(ev["comm"], "kvclient")
+        self.assertIn("__do_softirq", ev["kstack"])
+
+    def test_parse_exit_delay(self):
+        ev = nla.parse_bpf_line(
+            "21:31:21:066800 slow softirq! cpu: 50   | Type: 3 | Latency: 2300    us, "
+            "timercnt:5/1\n",
+            datetime(2026, 8, 21))
+        self.assertIsNotNone(ev)
+        self.assertEqual(ev["kind"], "softirq_exit_delay")
+        self.assertEqual(ev["cpu"], 50)
+        self.assertEqual(ev["vec"], 3)
+        self.assertEqual(ev["latency_us"], 2300)
+        self.assertEqual(ev["timer_cnt"], 5)
+        self.assertEqual(ev["timer_large_cnt"], 1)
+
+    def test_vec_label(self):
+        self.assertEqual(nla.SOFTIRQ_VEC_LABELS[3], "NET_RX")
+
+
+class TestSoftirqEndToEnd(TestCpuBusyEndToEnd):
+    """收包慢（kernel_to_user 段异常）结合 softirq 探针信息定界。
+
+    - softirq_exit_delay（entry→exit >1ms）出现在业务 cpu 上：
+      软中断本身处理太慢，期间业务线程无法运行 → 抢占证据 + 高置信；
+    - softirq_raise_delay（raise→entry >1ms）出现在业务 cpu 上：
+      软中断发起后被其他任务抢占/延迟，收包协议栈处理被推迟。
+    """
+
+    def _build_with_softirq(self, raise_cpu=None, exit_cpu=None):
+        root = self._build(other_cpu=99)  # 其他连接放非业务 cpu，隔离抢占因素
+        bpf = root / "dscollect_log" / "bpf-master-192.168.219.1.log"
+        lines = []
+        if raise_cpu is not None:
+            lines.append(
+                "21:31:21:065200 high irq-to-softirq  vec=3 latency: 1500 usec "
+                "(1 ms) on CPU:%d comm:kvclient kstack:__do_softirq+0x1\n"
+                % raise_cpu)
+        if exit_cpu is not None:
+            lines.append(
+                "21:31:21:066800 slow softirq! cpu: %d   | Type: 3 | "
+                "Latency: 2300    us, timercnt:5/1\n" % exit_cpu)
+        # 追加后按时间重排，保持 bpf 文件时间有序（seek 模式前提）
+        lines = sorted(bpf.read_text().splitlines(True) + lines)
+        bpf.write_text("".join(lines), encoding="utf-8")
+        return root
+
+    def test_softirq_exit_slow_is_preempt_evidence(self):
+        root = self._build_with_softirq(exit_cpu=50)
+        self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
+        _disc, contexts, _tl = nla.analyze(str(root))
+        ctx = contexts[0]
+        self.assertEqual(ctx.conclusion["category"], "client_kernel_to_user_delay")
+        info = ctx.cpu_busy["client"]
+        # 软中断处理慢（2300us > 1ms）在业务 cpu 50 上 → 抢占证据 + 高置信
+        self.assertEqual(len(info["softirq_exit_on_cpu"]), 1)
+        self.assertEqual(info["softirq_exit_on_cpu"][0]["latency_us"], 2300)
+        self.assertTrue(info["preempt"])
+        self.assertTrue(ctx.cpu_busy_preempt)
+        joined = " | ".join(ctx.cpu_evidence)
+        self.assertIn("软中断本身处理", joined)
+        self.assertIn("2300", joined)
+        self.assertIn("NET_RX", joined)
+        joined_ev = " | ".join(ctx.conclusion["evidence"])
+        self.assertIn("◎", joined_ev)
+        self.assertEqual(ctx.conclusion["confidence"], "高")
+
+    def test_softirq_raise_delay_evidence(self):
+        root = self._build_with_softirq(raise_cpu=50)
+        self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
+        _disc, contexts, _tl = nla.analyze(str(root))
+        ctx = contexts[0]
+        info = ctx.cpu_busy["client"]
+        self.assertEqual(len(info["softirq_raise_on_cpu"]), 1)
+        joined = " | ".join(ctx.cpu_evidence)
+        self.assertIn("软中断发起后", joined)
+        self.assertIn("1500", joined)
+        self.assertIn("被其他任务抢占", joined)
+        # raise→entry 慢说明软中断被延迟（非业务线程被软中断占用），不算 preempt
+        self.assertFalse(info["preempt"])
+        self.assertEqual(ctx.conclusion["confidence"], "中")
+
+    def test_softirq_on_other_cpu_no_evidence(self):
+        root = self._build_with_softirq(raise_cpu=77, exit_cpu=77)
+        self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
+        _disc, contexts, _tl = nla.analyze(str(root))
+        ctx = contexts[0]
+        info = ctx.cpu_busy["client"]
+        self.assertEqual(info["softirq_raise_on_cpu"], [])
+        self.assertEqual(info["softirq_exit_on_cpu"], [])
+        self.assertFalse(info["preempt"])
+        joined = " | ".join(ctx.cpu_evidence)
+        self.assertNotIn("软中断本身处理", joined)
+        self.assertNotIn("软中断发起后", joined)
+        # 窗口内 softirq 事件仍进全景表（match5t=None，不限 cpu）
+        self.assertTrue(any(e["kind"] == "softirq_exit_delay"
+                            for e in ctx.bpf_window_events["client"]))
+
+    def test_softirq_render_json_raw(self):
+        import argparse
+        root = self._build_with_softirq(raise_cpu=50, exit_cpu=50)
+        self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
+        disc, contexts, trace_lines = nla.analyze(str(root))
+        ctx = contexts[0]
+        ns = argparse.Namespace(residual_threshold=1000)
+        # HTML：全景表含 softirq 行（事件名 + vec/latency 附加信息）+ 摘要结论
+        h = nla._trace_html(ctx, 1)
+        self.assertIn("softirq_exit_delay", h)
+        self.assertIn("softirq_raise_delay", h)
+        self.assertIn("NET_RX", h)
+        self.assertIn("2300", h)
+        self.assertIn("软中断本身处理", h)
+        # JSON：cpu_busy.softirq_* + 顶层 softirq_events（含 vec/latency_us 字段）
+        doc = json.loads(nla.generate_json(contexts, ns, str(root),
+                                           aux_stats=disc.aux_stats))
+        tr = doc["traces"][0]
+        cb = tr["cpu_busy"]["client"]
+        self.assertEqual(len(cb["softirq_exit_on_cpu"]), 1)
+        self.assertEqual(len(tr["softirq_events"]["client"]), 2)
+        kinds = {e["kind"] for e in tr["softirq_events"]["client"]}
+        self.assertEqual(kinds, {"softirq_raise_delay", "softirq_exit_delay"})
+        ev = next(e for e in tr["softirq_events"]["client"]
+                  if e["kind"] == "softirq_exit_delay")
+        self.assertEqual(ev["vec"], 3)
+        self.assertEqual(ev["latency_us"], 2300)
+        self.assertEqual(ev["timer_cnt"], 5)
+        # raw：softirq 原始行进全景节
+        raw = nla.generate_raw(contexts, ns, str(root), disc, trace_lines)
+        self.assertIn("high irq-to-softirq", raw)
+        self.assertIn("slow softirq!", raw)
+
+
+class TestSoftirqLocalization(TestCpuBusyEndToEnd):
+    """收包慢 softirq 定位：收包时间往前推，业务 cpu（或其 SMT 姊妹核）上的
+    raise→entry 延迟事件 → 直接定位到占用 cpu 的任务（comm + 完整调用栈）。
+
+    raise 事件放在 bpf 扫描窗口（cs−2ms）之外、收包点（NetifRx=064900）前
+    ~8ms → 只有 softirq 回溯扫描（50ms lookback）能抓到。
+    kstack 为 bpf 日志中 raise 行之后的无时间戳续行（symbol+offset）。
+    """
+
+    KSTACK_FRAMES = [
+        "        handle_softirqs+744",
+        "        __do_softirq+28",
+        "        ____do_softirq+24",
+        "        call_on_irq_stack+48",
+        "        do_softirq_own_stack+36",
+        "        __local_bh_enable_ip+164",
+        "        ubase_send_cmd+496",
+        "        ubase_cmd_send_inout_real+248",
+        "        ubctl_ubase_cmd_send+136",
+        "        ubctl_query_data+332",
+        "        ubctl_query_dl_pkt_stats_data+96",
+        "        ub_cmd_do+292",
+        "        ubctl_fw_rpc+388",
+        "        fwctl_cmd_rpc+292",
+        "        fwctl_fops_ioctl+356",
+        "        __arm64_sys_ioctl+180",
+        "        invoke_syscall+80",
+    ]
+
+    def _build_localization(self, ev_cpu=50, ts_us=57000, vec=3):
+        """raise 事件 ts=ts_us（默认 057000，NetifRx 前 7.9ms，bpf 扫描窗口外）。"""
+        root = self._build(other_cpu=99)  # 其他连接放远 cpu，隔离抢占因素
+        bpf = root / "dscollect_log" / "bpf-master-192.168.219.1.log"
+        raise_line = ("21:31:21:%06d high irq-to-softirq  vec=%d latency: 5044 "
+                      "usec (5 ms) on CPU:%d comm:ubctl kstack:\n"
+                      % (ts_us, vec, ev_cpu))
+        lines = sorted(bpf.read_text().splitlines(True) + [raise_line])
+        out = []
+        for ln in lines:
+            out.append(ln)
+            if "irq-to-softirq" in ln:  # kstack 续行紧跟 raise 行
+                out.extend(f + "\n" for f in self.KSTACK_FRAMES)
+        bpf.write_text("".join(out), encoding="utf-8")
+        return root
+
+    def test_localization_same_cpu(self):
+        root = self._build_localization(ev_cpu=50)
+        self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
+        _disc, contexts, _tl = nla.analyze(str(root))
+        ctx = contexts[0]
+        loc = ctx.softirq_localization.get("client")
+        self.assertIsNotNone(loc)
+        self.assertEqual(loc["comm"], "ubctl")
+        self.assertEqual(loc["latency_us"], 5044)
+        self.assertEqual(loc["vec"], 3)
+        self.assertEqual(loc["cpu"], 50)
+        self.assertFalse(loc["smt"])
+        # kstack 完整解析（多行续行，帧数一致，含关键帧）
+        frames = loc["kstack"].split("\n")
+        self.assertEqual(len(frames), len(self.KSTACK_FRAMES))
+        self.assertIn("ubctl_query_dl_pkt_stats_data", loc["kstack"])
+        self.assertIn("__arm64_sys_ioctl", loc["kstack"])
+        # 定位结论计入抢占证据 → 高置信
+        self.assertTrue(ctx.cpu_busy_preempt)
+        self.assertTrue(ctx.cpu_busy["client"]["preempt"])
+        self.assertEqual(ctx.conclusion["confidence"], "高")
+        joined = " | ".join(ctx.cpu_evidence)
+        self.assertIn("定位", joined)
+        self.assertIn("ubctl", joined)
+        self.assertIn("5044", joined)
+        self.assertIn("ubctl_query_dl_pkt_stats_data", joined)
+        # 建议给出下一步方向（分析该任务为何执行）
+        self.assertTrue(any("ubctl" in s for s in ctx.conclusion["suggestions"]))
+
+    def test_localization_smt_sibling(self):
+        # cpu 51 与业务 cpu 50 互为 SMT 姊妹核（相邻配对）→ 同样定位
+        root = self._build_localization(ev_cpu=51)
+        self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
+        _disc, contexts, _tl = nla.analyze(str(root))
+        ctx = contexts[0]
+        loc = ctx.softirq_localization.get("client")
+        self.assertIsNotNone(loc)
+        self.assertTrue(loc["smt"])
+        self.assertEqual(loc["cpu"], 51)
+        self.assertEqual(loc["anchor_cpu"], 50)
+        joined = " | ".join(ctx.cpu_evidence)
+        self.assertIn("SMT", joined)
+        self.assertTrue(ctx.cpu_busy_preempt)
+
+    def test_localization_negative_far_cpu(self):
+        # cpu 77 既非业务 cpu 也非其 SMT 姊妹核 → 不定位
+        root = self._build_localization(ev_cpu=77)
+        self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
+        _disc, contexts, _tl = nla.analyze(str(root))
+        ctx = contexts[0]
+        self.assertNotIn("client", ctx.softirq_localization)
+        self.assertFalse(ctx.cpu_busy_preempt)
+
+    def test_localization_negative_after_recv(self):
+        # raise 事件在收包点之后（065200 > NetifRx 064900）→ 不定位
+        #（窗口内，走既有证据 3 路径，不算抢占）
+        root = self._build_localization(ev_cpu=50, ts_us=65200)
+        self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
+        _disc, contexts, _tl = nla.analyze(str(root))
+        ctx = contexts[0]
+        self.assertNotIn("client", ctx.softirq_localization)
+        self.assertFalse(ctx.cpu_busy["client"]["preempt"])
+        self.assertEqual(ctx.conclusion["confidence"], "中")
+
+    def test_localization_render_json_raw(self):
+        import argparse
+        root = self._build_localization(ev_cpu=50)
+        self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
+        disc, contexts, trace_lines = nla.analyze(str(root))
+        ctx = contexts[0]
+        ns = argparse.Namespace(residual_threshold=1000)
+        # HTML：定位结论块 + 完整 kstack（<pre>，非截断）
+        h = nla._trace_html(ctx, 1)
+        self.assertIn("定位结论", h)
+        self.assertIn("ubctl", h)
+        self.assertIn("fwctl_fops_ioctl", h)
+        self.assertIn("<pre", h)
+        # JSON：cpu_busy.client.softirq_localization（comm/kstack/vec/smt）
+        doc = json.loads(nla.generate_json(contexts, ns, str(root),
+                                           aux_stats=disc.aux_stats))
+        loc = doc["traces"][0]["cpu_busy"]["client"]["softirq_localization"]
+        self.assertEqual(loc["comm"], "ubctl")
+        self.assertEqual(loc["latency_us"], 5044)
+        self.assertEqual(loc["vec_txt"], "3(NET_RX)")
+        self.assertFalse(loc["smt"])
+        self.assertIn("ubctl_query_dl_pkt_stats_data", loc["kstack"])
+        # raw：定位结论 + raise 原始行（含 kstack 续行）
+        raw = nla.generate_raw(contexts, ns, str(root), disc, trace_lines)
+        self.assertIn("定位", raw)
+        self.assertIn("irq-to-softirq", raw)
+        self.assertIn("ubctl_query_dl_pkt_stats_data", raw)
+
+
+class TestSoftirqWireLocalization(TestCpuBusyEndToEnd):
+    """接收侧线路段慢（wire_s2c_phys）的 softirq 定位（wire 模式）。
+
+    server 物理网卡 .064815 发出 → client 收包点 .070000（5185us）：
+    包到达后 NET_RX 软中断被任务占用（raise .064946 → entry .069990，
+    延迟 5044us，cpu 44），netif 收包推迟到 entry 之后 → "线路慢"实为
+    收包软中断被抢占。client kernel_to_user 段不异常（tcp recv .070100 →
+    ClientRecv .070200 = 100us）→ 只有 wire 回溯定位能命中。
+    """
+
+    KSTACK_FRAMES = [
+        "        handle_softirqs+744",
+        "        __do_softirq+28",
+        "        __local_bh_enable_ip+164",
+        "        ubase_send_cmd+496",
+        "        ubctl_query_data+332",
+        "        ubctl_query_dl_pkt_stats_data+96",
+        "        fwctl_fops_ioctl+356",
+        "        __arm64_sys_ioctl+180",
+    ]
+
+    def _build_wire(self, ev_cpu=44, entry_us=69990, lat_us=5044, vec=3,
+                    xmit_us=64815):
+        """raise 事件 entry=entry_us（默认 .069990，收包点 .070000 前 10us）；
+        server 物理网卡发出=xmit_us（默认 .064815 → wire 段 5185us）。"""
+        root = Path(tempfile.mkdtemp(prefix="softirq_wire_"))
+        cdir = root / "collected" / "kvclient-1-master_26"
+        wdir = root / "collected_worker_logs" / "kvworker-0-worker1"
+        bdir = root / "dscollect_log"
+        ldir = root / "latency_warn_log"
+        for d in (cdir, wdir, bdir, ldir):
+            d.mkdir(parents=True)
+
+        def info(ts, host, msg):
+            return ("%s | I | f.cpp:1 | %s | 1:2 | %s | u |  %s\n"
+                    % (ts, host, self.TRACE, msg))
+
+        (cdir / "ds_client_1.INFO.1.log").write_text(
+            info("2026-08-21T21:31:21.060757", self.CIP,
+                 "yyl9 ClientSend ts 88035205620370 tid 523 cpu 50")
+            + info("2026-08-21T21:31:21.070200", self.CIP,
+                   "yyl9 ClientRecv ts 88035221862010 tid 523 cpu 50")
+            + info("2026-08-21T21:31:21.070213", self.CIP, self._slow()),
+            encoding="utf-8")
+        (wdir / "kvcache.INFO.1.log").write_text(
+            info("2026-08-21T21:31:21.060950", self.SIP,
+                 "yyl3 ServerRecv ts 88038917594514 tid 275")
+            + info("2026-08-21T21:31:21.064740", self.SIP,
+                   "yyl10 ServerSend ts 88038917846674 tid 275"),
+            encoding="utf-8")
+
+        raise_block = [("21:31:21:%06d high irq-to-softirq  vec=%d latency: %d "
+                        "usec (5 ms) on CPU:%d comm:ubctl kstack:\n"
+                        % (entry_us, vec, lat_us, ev_cpu))]
+        raise_block += [f + "\n" for f in self.KSTACK_FRAMES]
+        client_bpf = (
+            ["21:31:21:060770 tcp  send in  tid 523 cpu 50 size 270 "
+             "%s:37880 -> %s:31501\n" % (self.CIP, self.SIP)]
+            + raise_block
+            + ["21:31:21:070000 netif_receive_skb: sip:%s, sport:31501 -> dip:%s, "
+               "dport:37880, seq:2222, len:120, dev:enp38s0f0np0\n"
+               % (self.SIP, self.CIP),
+               "21:31:21:070100 tcp  recv in  tid 479193 cpu 332 size 120 "
+               "%s:37880 <- %s:31501, copied_seq:358067377, rcv_nxt:358067377\n"
+               % (self.CIP, self.SIP)])
+        (bdir / "bpf-master-192.168.219.1.log").write_text(
+            "".join(client_bpf), encoding="utf-8")
+        (bdir / "bpf-worker1-192.168.102.1.log").write_text(
+            "21:31:21:060810 netif_receive_skb: sip:%s, sport:37880 -> dip:%s, "
+            "dport:31501, seq:1111, len:266, dev:enp38s0f0np0\n" % (self.CIP, self.SIP)
+            + "21:31:21:060820 tcp  recv que tid 594763 cpu 4 size 266 "
+              "tp_rcv_nxt:4187256525, %s:31501 <- %s:37880\n" % (self.SIP, self.CIP)
+            + "21:31:21:060900 tcp  recv in  tid 396241 cpu 4 size 266 "
+              "%s:31501 <- %s:37880, copied_seq:4187256525, rcv_nxt:4187256795\n"
+            % (self.SIP, self.CIP)
+            + "21:31:21:064810 tcp  send in  tid 594763 cpu 4 size 155 "
+              "%s:31501 -> %s:37880\n" % (self.SIP, self.CIP)
+            + "21:31:21:%06d net_dev_xmit: sip:%s, sport:31501 -> dip:%s, "
+              "dport:37880, seq:2222, len:120, dev:enp38s0f0np0, rc:0\n"
+              % (xmit_us, self.SIP, self.CIP),
+            encoding="utf-8")
+        (ldir / "master_192.168.219.1").write_text("", encoding="utf-8")
+        (ldir / "worker1_192.168.102.1").write_text("", encoding="utf-8")
+        return root
+
+    def test_wire_localization(self):
+        root = self._build_wire()
+        self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
+        _disc, contexts, _tl = nla.analyze(str(root))
+        ctx = contexts[0]
+        loc = ctx.softirq_localization.get("client")
+        self.assertIsNotNone(loc)
+        self.assertEqual(loc["mode"], "wire")
+        self.assertEqual(loc["wire_key"], "wire_s2c_phys")
+        self.assertAlmostEqual(loc["wire_dur_us"], 5185, delta=5)
+        self.assertEqual(loc["comm"], "ubctl")
+        self.assertEqual(loc["cpu"], 44)
+        self.assertEqual(loc["latency_us"], 5044)
+        self.assertEqual(loc["vec_txt"], "3(NET_RX)")
+        self.assertFalse(loc["smt"])
+        self.assertEqual(loc["n_candidates"], 1)
+        self.assertIn("ubctl_query_dl_pkt_stats_data", loc["kstack"])
+        # wire 模式下 kernel_to_user 段不异常 → cpu_busy 为最小信息（wire 段窗口）
+        info = ctx.cpu_busy["client"]
+        self.assertEqual(info["seg_key"], "wire_s2c_phys")
+        self.assertTrue(info["preempt"])
+        self.assertTrue(ctx.cpu_busy_preempt)
+        joined = " | ".join(ctx.cpu_evidence)
+        self.assertIn("【已定位】", joined)
+        self.assertIn("ubctl", joined)
+        self.assertIn("5044", joined)
+        # 结论建议指向占用任务
+        self.assertTrue(any("ubctl" in s for s in ctx.conclusion["suggestions"]))
+        # 传输类 + 网卡点位佐证 → 高置信
+        self.assertIn("s2c", ctx.conclusion["category"])
+        self.assertEqual(ctx.conclusion["confidence"], "高")
+
+    def test_wire_negative_non_netrx(self):
+        # 非 NET_RX（vec=7）不定位：收包软中断为 vec=3
+        root = self._build_wire(vec=7)
+        self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
+        _disc, contexts, _tl = nla.analyze(str(root))
+        ctx = contexts[0]
+        self.assertNotIn("client", ctx.softirq_localization)
+        self.assertFalse(ctx.cpu_busy_preempt)
+
+    def test_wire_negative_raise_before_xmit(self):
+        # raise 时间（entry .065000 − 6000us = .064400）早于 server 物理网卡
+        # 发出 .064815 → 更早一批包的软中断，非本次收包 → 不定位
+        root = self._build_wire(entry_us=65000, lat_us=6000)
+        self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
+        _disc, contexts, _tl = nla.analyze(str(root))
+        ctx = contexts[0]
+        self.assertNotIn("client", ctx.softirq_localization)
+
+    def test_wire_negative_short_wire(self):
+        # 线路段仅 185us（< 1000us）→ 未达 wire 定位门槛
+        root = self._build_wire(xmit_us=69815)
+        self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
+        _disc, contexts, _tl = nla.analyze(str(root))
+        ctx = contexts[0]
+        self.assertNotIn("client", ctx.softirq_localization)
+
+    def test_wire_render_json_raw(self):
+        import argparse
+        root = self._build_wire()
+        self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
+        disc, contexts, trace_lines = nla.analyze(str(root))
+        ctx = contexts[0]
+        ns = argparse.Namespace(residual_threshold=1000)
+        # HTML：定位结论块（wire 模式）+ 完整 kstack（<pre>）
+        h = nla._trace_html(ctx, 1)
+        self.assertIn("定位结论", h)
+        self.assertIn("ubctl", h)
+        self.assertIn("fwctl_fops_ioctl", h)
+        self.assertIn("<pre", h)
+        self.assertIn("NET_RX 软中断被任务", h)
+        self.assertIn("线路段慢实为收包软中断被抢占", h)
+        # JSON：cpu_busy.client.softirq_localization（mode=wire）
+        doc = json.loads(nla.generate_json(contexts, ns, str(root),
+                                           aux_stats=disc.aux_stats))
+        loc = doc["traces"][0]["cpu_busy"]["client"]["softirq_localization"]
+        self.assertEqual(loc["mode"], "wire")
+        self.assertEqual(loc["comm"], "ubctl")
+        self.assertEqual(loc["cpu"], 44)
+        self.assertIn("ubctl_query_dl_pkt_stats_data", loc["kstack"])
+        # raw：定位结论 + raise 原始行（含 kstack 续行）
+        raw = nla.generate_raw(contexts, ns, str(root), disc, trace_lines)
+        self.assertIn("定位", raw)
+        self.assertIn("irq-to-softirq", raw)
+        self.assertIn("ubctl_query_dl_pkt_stats_data", raw)
+
+
 class TestReportStyleAndPerf(unittest.TestCase):
     """报告风格重构（参考 ds-log-deep-analysis）+ 大表渲染性能优化。
 
@@ -3585,8 +4103,10 @@ class TestReportStyleAndPerf(unittest.TestCase):
     def test_events_table_wrapped_for_perf(self):
         out = nla._events_table([self._ev()], "t")
         self.assertIn('class="table-wrap"', out)   # 滚动容器（限高）
-        self.assertIn('class="ev-tbl"', out)       # table-layout:fixed
-        self.assertIn("<colgroup>", out)           # 固定列宽
+        self.assertIn('class="ev-tbl"', out)       # 事件表
+        # 列宽按内容自适应：无固定列宽/截断（连接端口、事件名称完整显示）
+        self.assertNotIn("<colgroup>", out)
+        self.assertNotIn("text-overflow", out)
 
     def test_window_events_table_highlight_and_owner(self):
         evs = [self._ev(match5t=True),
@@ -3634,9 +4154,11 @@ class TestReportStyleAndPerf(unittest.TestCase):
         self.assertIn("高置信结论", out)
         self.assertIn("toggleAllDetails", out)
         self.assertIn('class="toc"', out)
-        # 性能：视口外跳过渲染 + 大表固定布局 + 滚动容器限高
+        # 性能：视口外跳过渲染 + 滚动容器限高；
+        # 列宽按内容自适应（连接端口/事件名称等关键信息不截断）
         self.assertIn("content-visibility:auto", out)
-        self.assertIn("table-layout:fixed", out)
+        self.assertNotIn("table-layout:fixed", out)
+        self.assertNotIn("text-overflow:ellipsis", out)
         self.assertIn("max-height:520px", out)
         # trace 卡片头：索引 + trace id + 徽章 + 指标
         self.assertIn("card trace-card", out)
@@ -4024,6 +4546,1040 @@ class TestSlowSegEndToEnd(unittest.TestCase):
         first_sub = req_html.split("慢段时间窗事件")[0]
         self.assertIn("10.0.0.1:12345", first_sub)
         self.assertNotIn("10.0.0.1:9999", first_sub)
+
+
+BTHREAD_COMPLETED_SAMPLE = (
+    # 新格式：first scheduled 含 cpu_id；completed 含 execution/lifetime_time_us
+    "I0831 12:58:15.711692  6325 4294969346 task_group.cpp:551 start_foreground] [WZY] "
+    "bthread created: creator_tid=6325 bthread_id=19228568585221 "
+    "creation_time_ns=334720225044535 creation_mode=foreground "
+    "target_local_pending_tasks=0 target_remote_pending_tasks=0 "
+    "target_pending_tasks=0\n"
+    "I0831 12:58:15.711722  6325 19228568585221 task_group.cpp:398 task_runner] [WZY] "
+    "bthread first scheduled: worker_tid=6325 cpu_id=187 bthread_id=19228568585221 "
+    "fn=0xfffbec92df60 arg=0x280043c0 creation_time_ns=334720225044535 "
+    "first_run_time_ns=334720225072314 pending_time_us=27\n"
+    "I0831 12:58:15.711739  6325 19228568585221 task_group.cpp:422 task_runner] [WZY] "
+    "bthread completed: worker_tid=6325 cpu_id=187 bthread_id=19228568585221 "
+    "fn=0xfffbec92df60 arg=0x280043c0 completion_time_ns=334720225092094 "
+    "execution_time_us=19 lifetime_time_us=47\n"
+    "I0831 13:30:00.000000  6325 99 f.cpp:1 f] [WZY] "
+    "bthread completed: worker_tid=6325 cpu_id=1 bthread_id=99 "
+    "fn=0x1 arg=0x2 completion_time_ns=1 execution_time_us=5 lifetime_time_us=9\n"
+)
+
+
+class TestBthreadCompleted(unittest.TestCase):
+    """bthread completed 事件解析 + 新格式 first scheduled（含 cpu_id）。"""
+
+    def _write(self, text):
+        fd, path = tempfile.mkstemp(suffix=".log")
+        os.close(fd)
+        Path(path).write_text(text, encoding="utf-8")
+        self.addCleanup(os.unlink, path)
+        return path
+
+    def test_parse_completed_and_cpu_id(self):
+        path = self._write(BTHREAD_COMPLETED_SAMPLE)
+        wins = {"in": (datetime(2026, 8, 31, 12, 58, 15),
+                       datetime(2026, 8, 31, 12, 58, 16))}
+        evs = nla.scan_bthread_windows(path, wins)
+        self.assertEqual(len(evs["in"]), 3)   # 第 4 行窗口外
+        created, sched, done = evs["in"]
+        self.assertEqual(created["kind"], "created")
+        self.assertEqual(sched["kind"], "scheduled")
+        self.assertEqual(sched["cpu"], 187)          # 新格式 cpu_id
+        self.assertEqual(sched["pending_time_us"], 27)
+        self.assertEqual(done["kind"], "completed")
+        self.assertEqual(done["tid"], 6325)
+        self.assertEqual(done["bthread_id"], 19228568585221)
+        self.assertEqual(done["cpu"], 187)
+        self.assertEqual(done["execution_time_us"], 19)
+        self.assertEqual(done["lifetime_time_us"], 47)
+        self.assertIn("bthread completed", done["raw"])
+        # 旧格式（无 cpu_id）仍可解析
+        old = nla._parse_bthread_event(
+            "I0821 21:31:21.075000  523 111 f.cpp:1 task_runner] [WZY] "
+            "bthread first scheduled: worker_tid=523 bthread_id=100 fn=0x1 "
+            "arg=0x2 creation_time_ns=1 first_run_time_ns=2 pending_time_us=4900\n",
+            datetime(2026, 8, 21, 21, 31, 21, 75000))
+        self.assertEqual(old["kind"], "scheduled")
+        self.assertIsNone(old["cpu"])
+        self.assertEqual(old["pending_time_us"], 4900)
+
+    def test_bthread_evidence_completed_stats(self):
+        ctx = nla.TraceContext.__new__(nla.TraceContext)
+        ctx.bthread_events = {"client": [
+            {"ts": None, "kind": "created", "tid": 523, "bthread_id": 1,
+             "creation_mode": "foreground", "target_pending_tasks": 3,
+             "pending_time_us": None, "execution_time_us": None,
+             "lifetime_time_us": None, "cpu": None, "raw": "r1"},
+            {"ts": None, "kind": "scheduled", "tid": 523, "bthread_id": 1,
+             "creation_mode": None, "target_pending_tasks": None,
+             "pending_time_us": 4900, "execution_time_us": None,
+             "lifetime_time_us": None, "cpu": 3, "raw": "r2"},
+            {"ts": None, "kind": "completed", "tid": 523, "bthread_id": 1,
+             "creation_mode": None, "target_pending_tasks": None,
+             "pending_time_us": None, "execution_time_us": 2200,
+             "lifetime_time_us": 7100, "cpu": 3, "raw": "r3"},
+        ], "server": []}
+        ctx.anchors = {"ClientRecv": {"tid": 523}}
+        ctx.coro_evidence = []
+        nla._bthread_evidence(ctx)
+        joined = " | ".join(ctx.coro_evidence)
+        self.assertIn("完成 1 个", joined)
+        self.assertIn("execution_time_us 峰值 2200us", joined)
+        self.assertIn("lifetime_time_us 峰值 7100us", joined)
+        self.assertIn("pending_time_us 峰值 4900us", joined)
+        # JSON 新字段
+        j = nla._bthread_json(ctx.bthread_events["client"][2])
+        self.assertEqual(j["execution_time_us"], 2200)
+        self.assertEqual(j["lifetime_time_us"], 7100)
+        self.assertEqual(j["cpu"], 3)
+
+
+class TestDiscoveryTarGz(unittest.TestCase):
+    """超大日志 tar.gz 归档：发现阶段就地解压后按普通文件匹配。"""
+
+    def setUp(self):
+        import shutil
+        import tarfile
+        root = Path(tempfile.mkdtemp(prefix="targz_"))
+        self._root = root
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        bdir = root / "dscollect_log"
+        ldir = root / "latency_warn_log"
+        bdir.mkdir()
+        ldir.mkdir()
+        # bpf 日志打包成 tar.gz（内层文件名 bpf-<node>-<ip>.log）
+        bpf_text = ("21:31:21:060777 tcp  send in  tid 1 cpu 1 size 100 "
+                    "192.168.219.138:37880 -> 192.168.102.161:31501\n")
+        inner = bdir / "bpf-worker1-192.168.219.1.log"
+        inner.write_text(bpf_text, encoding="utf-8")
+        with tarfile.open(bdir / "bpf-worker1-192.168.219.1.log.tar.gz",
+                          "w:gz") as tf:
+            tf.add(inner, arcname=inner.name)
+        inner.unlink()
+        # 坏包不影响其余发现
+        (bdir / "broken.tar.gz").write_bytes(b"not a tar")
+        # irqoff / nic / brpc 为普通文件
+        (bdir / "irqoff_latency_192.168.219.1.log").write_text("", encoding="utf-8")
+        (bdir / "nic-192.168.219.1.log").write_text("", encoding="utf-8")
+        (bdir / "kvclient-1-master-brpc_client.log").write_text("", encoding="utf-8")
+        # latency_warn 也归档
+        warn_inner = ldir / "worker1_192.168.219.1"
+        warn_inner.write_text("", encoding="utf-8")
+        with tarfile.open(ldir / "worker1_192.168.219.1.tar.gz", "w:gz") as tf:
+            tf.add(warn_inner, arcname=warn_inner.name)
+        warn_inner.unlink()
+
+    def test_discover_and_scan(self):
+        disc = nla.LogDiscovery(str(self._root))
+        # tar.gz 已就地解压，bpf 按节点名注册且内容可扫描
+        self.assertIn("worker1", disc.bpf_by_node)
+        bpf_path = disc.bpf_by_node["worker1"]
+        self.assertEqual(bpf_path.name, "bpf-worker1-192.168.219.1.log")
+        self.assertTrue(bpf_path.is_file())
+        self.assertIn("worker1", disc.warn_by_node)
+        self.assertIn("worker1", disc.irqoff_by_node)
+        self.assertIn("worker1", disc.nic_by_node)
+        self.assertIn("kvclient-1-master", disc.brpc_by_pod)
+        # BpfScanner 可直接扫描解压后的文件
+        wins = [nla.TraceWindow("t0", "client", datetime(2026, 8, 21, 21, 31, 21, 0),
+                                datetime(2026, 8, 21, 21, 31, 21, 200000),
+                                "192.168.219.138", "192.168.102.161")]
+        res, _trunc = nla.BpfScanner(str(bpf_path), wins).scan()
+        self.assertEqual(len(res[("t0", "client")]), 1)
+
+
+class TestPigzExtract(unittest.TestCase):
+    """tar.gz 解压优先走 tar --use-compress-program="pigz -p N"（N=workers）。"""
+
+    def setUp(self):
+        import shutil
+        import tarfile
+        root = Path(tempfile.mkdtemp(prefix="pigz_"))
+        self._root = root
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        # tar.gz 放入 dscollect_log/（_extract_archives 只处理该子目录）
+        bdir = root / "dscollect_log"
+        bdir.mkdir()
+        inner = bdir / "bpf-worker1-192.168.219.1.log"
+        inner.write_text("hello\n", encoding="utf-8")
+        with tarfile.open(bdir / "bpf-worker1-192.168.219.1.log.tar.gz",
+                          "w:gz") as tf:
+            tf.add(inner, arcname=inner.name)
+        inner.unlink()
+
+    def test_pigz_command_matches_workers(self):
+        """pigz/tar 可用：调用 tar 且 -p 并行数与 workers 一致。"""
+        import subprocess
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0)
+
+        with mock.patch.object(nla.shutil, "which",
+                               lambda p: "/usr/bin/%s" % p), \
+             mock.patch.object(nla.subprocess, "run", fake_run):
+            nla.LogDiscovery._extract_archives(self._root / "dscollect_log", workers=8)
+        self.assertEqual(len(calls), 1)
+        cmd = " ".join(calls[0])
+        self.assertIn("--use-compress-program=pigz -p 8", cmd)
+        self.assertIn(str(self._root / "dscollect_log" /
+                          "bpf-worker1-192.168.219.1.log.tar.gz"), cmd)
+
+    def test_tar_failure_falls_back_to_tarfile(self):
+        """tar 命令失败（非零退出）：回退 Python tarfile 完成解压。"""
+        import subprocess
+
+        def fake_run(cmd, **kw):
+            return subprocess.CompletedProcess(cmd, 1)
+
+        with mock.patch.object(nla.shutil, "which",
+                               lambda p: "/usr/bin/%s" % p), \
+             mock.patch.object(nla.subprocess, "run", fake_run):
+            nla.LogDiscovery._extract_archives(self._root / "dscollect_log", workers=4)
+        out = self._root / "dscollect_log" / "bpf-worker1-192.168.219.1.log"
+        self.assertTrue(out.is_file())
+        self.assertEqual(out.read_text(encoding="utf-8"), "hello\n")
+
+    def test_no_pigz_uses_tarfile(self):
+        """pigz 不可用：不调用 tar 子进程，直接 Python tarfile 解压。"""
+        with mock.patch.object(nla.shutil, "which", lambda p: None), \
+             mock.patch.object(nla.subprocess, "run",
+                               lambda cmd, **kw: self.fail("不应调用 tar 子进程")):
+            nla.LogDiscovery._extract_archives(self._root / "dscollect_log", workers=4)
+        out = self._root / "dscollect_log" / "bpf-worker1-192.168.219.1.log"
+        self.assertTrue(out.is_file())
+        self.assertEqual(out.read_text(encoding="utf-8"), "hello\n")
+
+    def test_discovery_forwards_workers(self):
+        """LogDiscovery 把 workers 透传给 _extract_archives。"""
+        seen = []
+        real = nla.LogDiscovery._extract_archives
+
+        def spy(directory, workers=1):
+            seen.append(workers)
+            return real(directory, workers=workers)
+
+        with mock.patch.object(nla.LogDiscovery, "_extract_archives",
+                               staticmethod(spy)):
+            nla.LogDiscovery(str(self._root), workers=6)
+        self.assertIn(6, seen)
+
+
+class TestEnvNodeMapping(unittest.TestCase):
+    """env 文件（pod_ip → 宿主机 IP）+ 同 IP 多命名别名收敛。"""
+
+    def setUp(self):
+        import shutil
+        root = Path(tempfile.mkdtemp(prefix="envmap_"))
+        self._root = root
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        bdir = root / "dscollect_log"
+        ldir = root / "latency_warn_log"
+        wdir = root / "collected_worker_logs" / "worker_192.168.210.192"
+        for d in (bdir, ldir, wdir):
+            d.mkdir(parents=True)
+        # env：pod ip → 宿主机 IP
+        (wdir / "env").write_text("pod_ip=192.168.210.192\nJD_HOST_IP=192.168.0.59\n",
+                                  encoding="utf-8")
+        # 同一宿主机 IP 192.168.0.59：bpf 命名 worker12，warn 命名 worker16
+        (bdir / "bpf-worker12-192.168.0.59.log").write_text("", encoding="utf-8")
+        (bdir / "irqoff_latency_192.168.0.59.log").write_text("", encoding="utf-8")
+        (bdir / "nic-192.168.0.59.log").write_text("", encoding="utf-8")
+        (ldir / "worker16_192.168.0.59").write_text("", encoding="utf-8")
+
+    def test_env_and_alias(self):
+        disc = nla.LogDiscovery(str(self._root))
+        # env 映射：pod ip → 宿主机 ip
+        self.assertEqual(disc.host_by_podip.get("192.168.210.192"), "192.168.0.59")
+        # 同 IP 双命名：bpf 先注册为规范名 worker12，warn 的 worker16 收敛为别名
+        self.assertEqual(disc.node_by_ip.get("192.168.0.59"), "worker12")
+        self.assertEqual(disc.node_alias.get("worker16"), "worker12")
+        self.assertIn("worker12", disc.warn_by_node)   # warn 挂到规范名下
+        self.assertIn("worker12", disc.irqoff_by_node)
+        self.assertIn("worker12", disc.nic_by_node)
+        # pod 目录名 worker_<podIp> → env → 宿主机 → 规范节点名
+        self.assertEqual(disc.resolve_node("worker_192.168.210.192"), "worker12")
+        # 别名 pod 目录也能解析（子串匹配别名后映射回规范名）
+        self.assertEqual(disc.resolve_node("kvworker-0-worker16"), "worker12")
+        self.assertEqual(disc.node_names_for("worker12"), ("worker12", "worker16"))
+
+    def test_resolve_node_fallback(self):
+        disc = nla.LogDiscovery(str(self._root))
+        # 无 env 映射时回退子串匹配 / 不匹配返回 None
+        self.assertEqual(disc.resolve_node("bpf-worker12"), "worker12")
+        self.assertIsNone(disc.resolve_node("pod-on-other"))
+
+
+class TestBrpcFileMatching(unittest.TestCase):
+    """brpc 文件关联：节点名段匹配 + 唯一同角色文件兜底。"""
+
+    def _mk(self, name):
+        fd, path = tempfile.mkstemp(suffix=name)
+        os.close(fd)
+        self.addCleanup(os.unlink, path)
+        return Path(path)
+
+    def test_name_match_first(self):
+        p = self._mk("kvclient-1-master-brpc_client.log")
+        brpc = {"kvclient-1-master": p}
+        self.assertEqual(nla._brpc_files_for_pod(brpc, "kvclient-1-master_26"), [p])
+
+    def test_node_name_match(self):
+        # pod 目录名被简化成 worker_<podIp>，brpc pod 名含宿主机节点名段
+        p = self._mk("kvworker-0-worker19-brpc_server.log")
+        brpc = {"kvworker-0-worker19": p}
+        self.assertEqual(
+            nla._brpc_files_for_pod(brpc, "worker_192.168.210.192",
+                                    node_names=("worker19",)), [p])
+
+    def test_unique_role_fallback(self):
+        # 名称 / 节点名都匹配不上时，同角色文件全局唯一则兜底
+        p = self._mk("kvworker-0-worker19-brpc_server.log")
+        brpc = {"kvworker-0-worker19": p}
+        self.assertEqual(
+            nla._brpc_files_for_pod(brpc, "worker_10.0.0.9", role="server"), [p])
+        # 同角色文件不唯一时不猜
+        p2 = self._mk("other-0-worker2-brpc_server.log")
+        brpc2 = {"kvworker-0-worker19": p, "other-0-worker2": p2}
+        self.assertEqual(
+            nla._brpc_files_for_pod(brpc2, "worker_10.0.0.9", role="server"), [])
+        # 角色不符也不兜底
+        pc = self._mk("kvclient-1-master-brpc_client.log")
+        brpc3 = {"kvclient-1-master": pc}
+        self.assertEqual(
+            nla._brpc_files_for_pod(brpc3, "worker_10.0.0.9", role="server"), [])
+
+
+class TestHostIdLogExtraction(unittest.TestCase):
+    """日志正文 Host ID is/id is 行：podIP→宿主机 IP 映射（env 缺失时兜底）。
+
+    场景（/home/wcy/minilog 新布局）：
+      - client 目录 SDK_192.168.49.66 无 env，宿主机 IP 只在 ds_client 日志正文
+        "Host ID is 141.62.33.21 from env HOST_IP"；
+      - worker 目录 worker_192.168.210.192 的 env 已有映射，日志正文另有
+        "Host id is 141.62.32.59 from env JD_HOST_IP"（一致性来源）。
+    """
+
+    TRACE = "getBuffer-15-62-00000003;505d6e895e86"
+    CIP, SIP = "192.168.49.66", "192.168.210.192"
+    CHOST, SHOST = "141.62.33.21", "141.62.32.59"
+
+    def _make_root(self, with_env=False, with_client_bpf=True,
+                   with_server_bpf=True):
+        import shutil
+        root = Path(tempfile.mkdtemp(prefix="hostid_"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        cdir = root / "collected" / ("SDK_%s" % self.CIP)
+        wdir = root / "collected_worker_logs" / ("worker_%s" % self.SIP)
+        bdir = root / "dscollect_log"
+        for d in (cdir, wdir, bdir):
+            d.mkdir(parents=True)
+
+        def info(ts, host, msg):
+            return ("%s | I | f.cpp:1 | %s | 1:2 | %s | u |  %s\n"
+                    % (ts, host, self.TRACE, msg))
+
+        (cdir / "ds_client_62.INFO.log").write_text(
+            info("2026-09-04T17:46:54.100000", self.CIP,
+                 "yyl9 ClientSend ts 838951000000000 tid 245 cpu 246")
+            + info("2026-09-04T17:46:54.130000", self.CIP,
+                   "yyl9 ClientRecv ts 838951030000000 tid 245 cpu 246")
+            + info("2026-09-04T17:46:54.130013", self.CIP, SLOW_MSG.replace(
+                "getBuffer-25487-00004775;117c5c4a91c7", self.TRACE).replace(
+                "network_residual_us=15989", "network_residual_us=25000"))
+            + ("2026-09-04T17:46:45.365435 | I | service_discovery.cpp:74 | "
+               "%s | 62:62 |  |  |  Host ID is %s from env HOST_IP\n"
+               % (self.CIP, self.CHOST)),
+            encoding="utf-8")
+        (wdir / "kvcache.INFO.log").write_text(
+            info("2026-09-04T17:46:54.100500", self.SIP,
+                 "yyl3 ServerRecv ts 697732000005000 tid 226 cpu 28")
+            + info("2026-09-04T17:46:54.101000", self.SIP,
+                   "yyl10 ServerSend ts 697732000010000 tid 226 cpu 28")
+            + ("2026-09-04T17:44:35.408402 | I | ds_coordination_backend.cpp:621 | "
+               "%s | 9:9 | 9a407f3c | jingpai |  Host id is %s from env JD_HOST_IP\n"
+               % (self.SIP, self.SHOST)),
+            encoding="utf-8")
+        if with_env:
+            (wdir / "env").write_text(
+                "pod_ip=%s\nJD_HOST_IP=%s\n" % (self.SIP, self.SHOST),
+                encoding="utf-8")
+        if with_client_bpf:
+            (bdir / ("bpf-worker22-%s.log" % self.CHOST)).write_text(
+                "17:46:54:100050 tcp  send in  tid 245 cpu 50 size 270 "
+                "%s:53896 -> %s:31402\n" % (self.CIP, self.SIP),
+                encoding="utf-8")
+        if with_server_bpf:
+            (bdir / ("bpf-worker12-%s.log" % self.SHOST)).write_text(
+                "17:46:54:100550 tcp  recv in  tid 226 cpu 28 size 206 "
+                "%s:31402 <- %s:53896\n" % (self.SIP, self.CIP),
+                encoding="utf-8")
+        return root
+
+    def test_hostid_pairs_extracted(self):
+        """collect_anchor_and_info 一并提取日志正文 Host ID 映射对。"""
+        root = self._make_root()
+        disc = nla.LogDiscovery(str(root))
+        anchor_idx, info_idx, hostid_pairs = nla.collect_anchor_and_info(
+            disc.client_logs, disc.worker_logs, [self.TRACE])
+        got = dict(hostid_pairs)
+        self.assertEqual(got.get(self.CIP), self.CHOST)
+        self.assertEqual(got.get(self.SIP), self.SHOST)
+
+    def test_client_node_resolved_and_events_recovered(self):
+        """client 侧经日志正文 Host ID 解析到 worker22，bpf 事件恢复。"""
+        root = self._make_root()
+        disc, contexts, _tl = nla.analyze(str(root), window_pad_ms=2)
+        ctx = contexts[0]
+        self.assertEqual(ctx.client_node, "worker22")
+        self.assertEqual(ctx.server_node, "worker12")
+        # client 侧有 bpf 事件，连接从 client 侧 tcp send 识别（非回退）
+        evs = ctx.kernel_events.get("client") or []
+        self.assertTrue(evs, "client 侧 bpf 事件应恢复解析")
+        self.assertEqual(ctx.conn, (self.CIP, 53896, self.SIP, 31402))
+        joined = " | ".join(ctx.missing)
+        self.assertNotIn("无法映射到 bpf 节点", joined)
+        self.assertNotIn("回退识别", joined)
+        self.assertTrue(ctx.kernel_events.get("server"))
+
+    def test_env_wins_over_log(self):
+        """env 与日志正文同时存在且一致来源优先：env 值生效。"""
+        root = self._make_root(with_env=True)
+        # env 指向另一台宿主机（提供该节点 bpf），验证 env 优先
+        bdir = root / "dscollect_log"
+        (bdir / "bpf-worker30-9.9.9.9.log").write_text("", encoding="utf-8")
+        wenv = root / "collected_worker_logs" / ("worker_%s" % self.SIP) / "env"
+        wenv.write_text("pod_ip=%s\nJD_HOST_IP=9.9.9.9\n" % self.SIP,
+                        encoding="utf-8")
+        disc, contexts, _tl = nla.analyze(str(root), window_pad_ms=2)
+        self.assertEqual(contexts[0].server_node, "worker30")
+
+    def test_missing_host_bpf_hint(self):
+        """宿主机 IP 已知但该节点 bpf 未采集：missing 明确提示。"""
+        root = self._make_root(with_client_bpf=False)
+        disc, contexts, _tl = nla.analyze(str(root), window_pad_ms=2)
+        ctx = contexts[0]
+        self.assertIsNone(ctx.client_node)
+        joined = " | ".join(ctx.missing)
+        self.assertIn("宿主机 %s 的 bpf 日志未采集" % self.CHOST, joined)
+
+
+class TestPortPairConnInference(unittest.TestCase):
+    """server IP 未知但 server 服务端口固定：端口 + 双向时间配对推测连接。
+
+    场景（/home/wcy/minilog 79 条 client-only trace）：同 run 内完整 trace
+    识别出的连接提供已知 server 服务端口（31402）；client-only trace 的
+    client 侧事件按「请求发送邻近 ClientSend + 响应接收邻近 ClientRecv
+    同四元组配对」打分推测目标连接（实测并发扇出 ~20 连接时中位分差 340us）。
+    """
+
+    TRACE_A = "getBuffer-15-62-00099999;aaaabbbbcccc"
+    TRACE_B = "getBuffer-15-62-00022342;f395d0eb066e"
+    CIP, SIP_A, SIP_B = "192.168.49.66", "192.168.210.192", "192.168.49.64"
+    CHOST, SHOST_A = "141.62.33.21", "141.62.32.59"
+
+    def _make_root(self):
+        import shutil
+        root = Path(tempfile.mkdtemp(prefix="portpair_"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        cdir = root / "collected" / ("SDK_%s" % self.CIP)
+        wdir = root / "collected_worker_logs" / ("worker_%s" % self.SIP_A)
+        bdir = root / "dscollect_log"
+        for d in (cdir, wdir, bdir):
+            d.mkdir(parents=True)
+
+        def info(ts, host, trace, msg):
+            return ("%s | I | f.cpp:1 | %s | 1:2 | %s | u |  %s\n"
+                    % (ts, host, trace, msg))
+
+        def slow(trace, residual):
+            return SLOW_MSG.replace(
+                "getBuffer-25487-00004775;117c5c4a91c7", trace).replace(
+                "network_residual_us=15989", "network_residual_us=%d" % residual)
+
+        # trace A（完整：worker 日志已收集）+ trace B（client-only）
+        (cdir / "ds_client_62.INFO.log").write_text(
+            info("2026-09-04T17:46:54.100000", self.CIP, self.TRACE_B,
+                 "yyl9 ClientSend ts 838951000000000 tid 217 cpu 246")
+            + info("2026-09-04T17:46:54.130000", self.CIP, self.TRACE_B,
+                   "yyl9 ClientRecv ts 838951030000000 tid 217 cpu 246")
+            + info("2026-09-04T17:46:54.130013", self.CIP, self.TRACE_B,
+                   slow(self.TRACE_B, 25000))
+            + info("2026-09-04T17:46:54.200000", self.CIP, self.TRACE_A,
+                   "yyl9 ClientSend ts 838951200000000 tid 245 cpu 246")
+            + info("2026-09-04T17:46:54.230000", self.CIP, self.TRACE_A,
+                   "yyl9 ClientRecv ts 838951230000000 tid 245 cpu 246")
+            + info("2026-09-04T17:46:54.230013", self.CIP, self.TRACE_A,
+                   slow(self.TRACE_A, 15000))
+            + ("2026-09-04T17:46:45.365435 | I | service_discovery.cpp:74 | "
+               "%s | 62:62 |  |  |  Host ID is %s from env HOST_IP\n"
+               % (self.CIP, self.CHOST)),
+            encoding="utf-8")
+        # worker pod 日志：仅 trace A
+        (wdir / "kvcache.INFO.log").write_text(
+            info("2026-09-04T17:46:54.200500", self.SIP_A, self.TRACE_A,
+                 "yyl3 ServerRecv ts 697732200005000 tid 226 cpu 28")
+            + info("2026-09-04T17:46:54.201000", self.SIP_A, self.TRACE_A,
+                   "yyl10 ServerSend ts 697732200010000 tid 226 cpu 28"),
+            encoding="utf-8")
+        (wdir / "env").write_text(
+            "pod_ip=%s\nJD_HOST_IP=%s\n" % (self.SIP_A, self.SHOST_A),
+            encoding="utf-8")
+        # client 节点 bpf：A 的 tcp 事件（识别连接 → 已知 server 端口 31402）+
+        # B 的目标连接与两类干扰连接
+        (bdir / ("bpf-worker22-%s.log" % self.CHOST)).write_text(
+            # A：tcp send in（client_tcp 识别）
+            "17:46:54:200040 tcp  send in  tid 245 cpu 50 size 270 "
+            "%s:53896 -> %s:31402\n" % (self.CIP, self.SIP_A)
+            # B 目标连接：发送邻近 ClientSend、响应邻近 ClientRecv
+            + "17:46:54:100040 dev_start_xmit: sip:%s, sport:53900 -> "
+              "dip:%s, dport:31402, seq:1, len:338, dev:eth0\n"
+              % (self.CIP, self.SIP_B)
+            + "17:46:54:100042 net_dev_xmit: sip:%s, sport:53900 -> "
+              "dip:%s, dport:31402, seq:1, len:338, dev:eth0, rc:0\n"
+              % (self.CIP, self.SIP_B)
+            + "17:46:54:129970 netif_receive_skb: sip:%s, sport:31402 -> "
+              "dip:%s, dport:53900, seq:2, len:200, dev:eth9\n"
+              % (self.SIP_B, self.CIP)
+            # B 干扰1：同端口更早发送，但响应远离 ClientRecv（不配对）
+            + "17:46:54:100010 dev_start_xmit: sip:%s, sport:53901 -> "
+              "dip:192.168.49.65, dport:31402, seq:1, len:100, dev:eth0\n"
+              % self.CIP
+            + "17:46:54:130500 netif_receive_skb: sip:192.168.49.65, "
+              "sport:31402 -> dip:%s, dport:53901, seq:2, len:100, dev:eth9\n"
+              % self.CIP
+            # B 干扰2：非 server 端口（31501），时间完美但端口不符
+            + "17:46:54:100005 dev_start_xmit: sip:%s, sport:53902 -> "
+              "dip:192.168.49.66, dport:31501, seq:1, len:100, dev:eth0\n"
+              % self.CIP
+            + "17:46:54:129990 netif_receive_skb: sip:192.168.49.66, "
+              "sport:31501 -> dip:%s, dport:53902, seq:2, len:100, dev:eth9\n"
+              % self.CIP,
+            encoding="utf-8")
+        # server 节点 bpf：A 的 server 侧 tcp 事件
+        (bdir / ("bpf-worker12-%s.log" % self.SHOST_A)).write_text(
+            "17:46:54:200550 tcp  recv in  tid 226 cpu 28 size 206 "
+            "%s:31402 <- %s:53896\n" % (self.SIP_A, self.CIP),
+            encoding="utf-8")
+        return root
+
+    def test_port_pair_inference(self):
+        root = self._make_root()
+        disc, contexts, _tl = nla.analyze(str(root), window_pad_ms=2)
+        ctxB, ctxA = contexts[0], contexts[1]   # B residual 更大排前
+        # A：完整关联，识别连接提供已知 server 端口
+        self.assertEqual(ctxA.conn, (self.CIP, 53896, self.SIP_A, 31402))
+        self.assertEqual(ctxA.conn_source, "client_tcp")
+        # B：端口 + 双向时间配对推测（排除更早的同端口干扰与非端口干扰）
+        self.assertEqual(ctxB.conn, (self.CIP, 53900, self.SIP_B, 31402))
+        self.assertEqual(ctxB.conn_source, "client_port")
+        joined = " | ".join(ctxB.missing)
+        self.assertIn("服务端口", joined)
+        self.assertIn("配对", joined)
+        # 里程碑来自目标连接（准确路径，非时间邻近兜底）
+        self.assertEqual(ctxB.milestones.get("ClientDevStartXmit"),
+                         datetime(2026, 9, 4, 17, 46, 54, 100040))
+        self.assertNotIn("时间邻近推测", joined)
+        # 五元组过滤：仅目标连接 3 条事件
+        self.assertEqual(len(ctxB.filtered_events["client"]), 3)
+        # 置信度封顶"中"
+        self.assertIn(ctxB.conclusion["confidence"], ("中", "低"))
+
+
+class TestClientOnlyCorrelation(unittest.TestCase):
+    """server pod 日志未收集（server IP 未知）时：client 侧 bpf 照常关联。
+
+    场景（/home/wcy/minilog 79/81 条 trace 的实况）：只有 client 日志 + client
+    节点 bpf；无 worker pod 日志 → server IP 未知。期望：client 侧窗口匹配 +
+    全景照常输出；连接五元组标注"未能识别"；client 侧里程碑按时间邻近推测
+    （多连接有混淆风险，注明）；client 段产出；置信度封顶"中"。
+    """
+
+    TRACE = "getBuffer-15-62-00022655;3fbfde650c53"
+    CIP, CHOST = "192.168.49.66", "141.62.33.21"
+
+    def _make_root(self):
+        import shutil
+        root = Path(tempfile.mkdtemp(prefix="conly_"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        cdir = root / "collected" / ("SDK_%s" % self.CIP)
+        bdir = root / "dscollect_log"
+        cdir.mkdir(parents=True)
+        bdir.mkdir(parents=True)
+
+        def info(ts, host, msg):
+            return ("%s | I | f.cpp:1 | %s | 1:2 | %s | u |  %s\n"
+                    % (ts, host, self.TRACE, msg))
+
+        # worker pod 日志目录不存在（server IP 未知）
+        (cdir / "ds_client_62.INFO.log").write_text(
+            info("2026-09-04T17:46:54.100000", self.CIP,
+                 "yyl9 ClientSend ts 838951000000000 tid 245 cpu 246")
+            + info("2026-09-04T17:46:54.130000", self.CIP,
+                   "yyl9 ClientRecv ts 838951030000000 tid 245 cpu 246")
+            + info("2026-09-04T17:46:54.130013", self.CIP, SLOW_MSG.replace(
+                "getBuffer-25487-00004775;117c5c4a91c7", self.TRACE).replace(
+                "network_residual_us=15989", "network_residual_us=25000"))
+            + ("2026-09-04T17:46:45.365435 | I | service_discovery.cpp:74 | "
+               "%s | 62:62 |  |  |  Host ID is %s from env HOST_IP\n"
+               % (self.CIP, self.CHOST)),
+            encoding="utf-8")
+        # client 节点 bpf：tcp 探针存活，该 pod 同时连向两个 server
+        (bdir / ("bpf-worker22-%s.log" % self.CHOST)).write_text(
+            # 目标流量（时间邻近）
+            "17:46:54:100040 tcp  send in  tid 245 cpu 50 size 270 "
+            "%s:53896 -> 192.168.210.192:31402\n" % self.CIP
+            + "17:46:54:100050 dev_start_xmit: sip:%s, sport:53896 -> "
+            "dip:192.168.210.192, dport:31402, seq:913492323, len:339, dev:eth0\n"
+            % self.CIP
+            + "17:46:54:100052 net_dev_xmit: sip:%s, sport:53896 -> "
+            "dip:192.168.210.192, dport:31402, seq:913492323, len:339, "
+            "dev:enp37s0f0np0, rc:0\n" % self.CIP
+            + "17:46:54:103457 netif_receive_skb: sip:192.168.210.192, "
+            "sport:31402 -> dip:%s, dport:53896, seq:1728523522, len:208, "
+            "dev:eth9\n" % self.CIP
+            # 其他 server 的流量（时间上更早，验证"最早 tcp send"推测会被它抢先）
+            + "17:46:54:100030 tcp  send in  tid 245 cpu 50 size 120 "
+            "%s:41734 -> 192.168.49.64:31402\n" % self.CIP,
+            encoding="utf-8")
+        return root
+
+    def test_client_only_flow(self):
+        root = self._make_root()
+        disc, contexts, _tl = nla.analyze(str(root), window_pad_ms=2)
+        ctx = contexts[0]
+        self.assertEqual(ctx.client_node, "worker22")
+        self.assertIsNone(ctx.server_ip)
+        # client 侧 bpf 明细照常匹配（核心断言）
+        self.assertEqual(len(ctx.kernel_events["client"]), 5)
+        self.assertTrue(ctx.filtered_events["client"])
+        self.assertTrue(ctx.bpf_window_events["client"])
+        # 连接五元组未能识别 + 注明原因
+        self.assertIsNone(ctx.conn)
+        joined = " | ".join(ctx.missing)
+        self.assertIn("worker pod 日志未收集", joined)
+        self.assertIn("未能识别", joined)
+        # client 侧里程碑按时间邻近推测（窗口内该 pod 最早事件，含混淆风险注明）
+        self.assertIn("时间邻近推测", joined)
+        self.assertIn("ClientTcpSendIn", ctx.milestones)   # 最早 tcp send（另一 server 连接）
+        self.assertIn("ClientDevStartXmit", ctx.milestones)
+        # client 段产出 + 置信度封顶"中"
+        self.assertTrue(ctx.kernel_segments)
+        self.assertIn(ctx.conclusion["confidence"], ("中", "低"))
+        self.assertNotEqual(ctx.conclusion["category"], "unknown")
+
+    def test_client_only_render(self):
+        import argparse
+        root = self._make_root()
+        disc, contexts, _tl = nla.analyze(str(root), window_pad_ms=2)
+        ns = argparse.Namespace(residual_threshold=1000)
+        out = nla.generate_report(contexts, ns, str(root))
+        # 事件表输出 + 推测 badge
+        self.assertIn("client 节点 bpf 事件", out)
+        self.assertIn("推测", out)
+        data = json.loads(nla.generate_json(contexts, ns, str(root)))
+        self.assertIsNone(data["traces"][0]["conn"])
+        self.assertTrue(data["traces"][0]["kernel_events"]["client"])
+
+
+class TestNicConnFallbackE2E(unittest.TestCase):
+    """client 侧 tcp 层探针丢失（仅 nic 层事件）时：nic 五元组兜底识别连接。
+
+    场景（/home/wcy/minilog worker22 实测）：client 节点 bpf 无 tcp 层事件，
+    仅 dev_start_xmit/net_dev_xmit/netif_receive_skb（raw 内含完整五元组）。
+    期望：连接从 client 侧 nic 事件识别（不依赖 server 回退），事件经推测
+    五元组匹配并以"推测"badge 同表标注。
+    """
+
+    TRACE = "getBuffer-15-62-00022655;3fbfde650c53"
+    CIP, SIP = "192.168.49.66", "192.168.210.192"
+    CHOST, SHOST = "141.62.33.21", "141.62.32.59"
+
+    def _make_root(self):
+        import shutil
+        root = Path(tempfile.mkdtemp(prefix="nicfb_"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        cdir = root / "collected" / ("SDK_%s" % self.CIP)
+        wdir = root / "collected_worker_logs" / ("worker_%s" % self.SIP)
+        bdir = root / "dscollect_log"
+        for d in (cdir, wdir, bdir):
+            d.mkdir(parents=True)
+
+        def info(ts, host, msg):
+            return ("%s | I | f.cpp:1 | %s | 1:2 | %s | u |  %s\n"
+                    % (ts, host, self.TRACE, msg))
+
+        (cdir / "ds_client_62.INFO.log").write_text(
+            info("2026-09-04T17:46:54.100000", self.CIP,
+                 "yyl9 ClientSend ts 838951000000000 tid 245 cpu 246")
+            + info("2026-09-04T17:46:54.130000", self.CIP,
+                   "yyl9 ClientRecv ts 838951030000000 tid 245 cpu 246")
+            + info("2026-09-04T17:46:54.130013", self.CIP, SLOW_MSG.replace(
+                "getBuffer-25487-00004775;117c5c4a91c7", self.TRACE).replace(
+                "network_residual_us=15989", "network_residual_us=25000"))
+            + ("2026-09-04T17:46:45.365435 | I | service_discovery.cpp:74 | "
+               "%s | 62:62 |  |  |  Host ID is %s from env HOST_IP\n"
+               % (self.CIP, self.CHOST)),
+            encoding="utf-8")
+        (wdir / "kvcache.INFO.log").write_text(
+            info("2026-09-04T17:46:54.100500", self.SIP,
+                 "yyl3 ServerRecv ts 697732000005000 tid 226 cpu 28")
+            + info("2026-09-04T17:46:54.101000", self.SIP,
+                   "yyl10 ServerSend ts 697732000010000 tid 226 cpu 28"),
+            encoding="utf-8")
+        (wdir / "env").write_text(
+            "pod_ip=%s\nJD_HOST_IP=%s\n" % (self.SIP, self.SHOST), encoding="utf-8")
+        # client 节点 bpf：仅 nic 层事件（tcp 探针丢失），含请求/响应双向
+        (bdir / ("bpf-worker22-%s.log" % self.CHOST)).write_text(
+            "17:46:54:100050 dev_start_xmit: sip:%s, sport:53896 -> dip:%s, "
+            "dport:31402, seq:913492323, len:339, dev:eth0\n"
+            "17:46:54:100052 net_dev_xmit: sip:%s, sport:53896 -> dip:%s, "
+            "dport:31402, seq:913492323, len:339, dev:enp37s0f0np0, rc:0\n"
+            "17:46:54:103457 netif_receive_skb: sip:%s, sport:31402 -> dip:%s, "
+            "dport:53896, seq:1728523522, len:208, dev:eth9\n"
+            % (self.CIP, self.SIP, self.CIP, self.SIP, self.SIP, self.CIP),
+            encoding="utf-8")
+        # server 节点 bpf：tcp 层事件正常
+        (bdir / ("bpf-worker12-%s.log" % self.SHOST)).write_text(
+            "17:46:54:100550 tcp  recv in  tid 226 cpu 28 size 206 "
+            "%s:31402 <- %s:53896\n" % (self.SIP, self.CIP),
+            encoding="utf-8")
+        return root
+
+    def test_nic_fallback_full_flow(self):
+        root = self._make_root()
+        disc, contexts, _tl = nla.analyze(str(root), window_pad_ms=2)
+        ctx = contexts[0]
+        # 连接从 client 侧 nic 事件识别（非 server 回退）
+        self.assertEqual(ctx.conn, (self.CIP, 53896, self.SIP, 31402))
+        self.assertEqual(ctx.conn_source, "client_nic")
+        joined = " | ".join(ctx.missing)
+        self.assertIn("tcp 层 bpf 事件丢失", joined)
+        self.assertIn("已按 nic 层事件推测连接五元组", joined)
+        self.assertNotIn("回退识别", joined)   # 未走 server 回退
+        # client 侧 nic 事件经推测五元组匹配保留
+        self.assertEqual(len(ctx.filtered_events["client"]), 3)
+        self.assertEqual(len(ctx.filtered_events["server"]), 1)
+        # HTML：事件同表展示 + "推测"badge
+        import argparse
+        ns = argparse.Namespace(residual_threshold=1000)
+        out = nla.generate_report(contexts, ns, str(root))
+        self.assertIn("inf-badge", out)
+        self.assertIn("推测", out)
+        # JSON：conn.source 标注识别来源
+        data = json.loads(nla.generate_json(contexts, ns, str(root)))
+        self.assertEqual(data["traces"][0]["conn"]["source"], "client_nic")
+        # raw：bpf 内核日志段落头标注推测关联
+        raw = nla.generate_raw(contexts, ns, str(root), disc, {})
+        self.assertIn("推测关联：连接五元组经 nic 层事件推测识别", raw)
+
+    def test_client_tcp_present_uses_tcp(self):
+        """client 侧 tcp 事件存在时优先 tcp，conn_source=client_tcp。"""
+        root = self._make_root()
+        bdir = root / "dscollect_log"
+        with open(bdir / ("bpf-worker22-%s.log" % self.CHOST), "a",
+                  encoding="utf-8") as f:
+            f.write("17:46:54:100040 tcp  send in  tid 245 cpu 50 size 270 "
+                    "%s:53896 -> %s:31402\n" % (self.CIP, self.SIP))
+        disc, contexts, _tl = nla.analyze(str(root), window_pad_ms=2)
+        ctx = contexts[0]
+        self.assertEqual(ctx.conn, (self.CIP, 53896, self.SIP, 31402))
+        self.assertEqual(ctx.conn_source, "client_tcp")
+        self.assertNotIn("推测连接五元组", " | ".join(ctx.missing))
+
+
+class TestNewLayoutEndToEnd(unittest.TestCase):
+    """新采集布局端到端：tar.gz bpf + worker_<podIp> 目录 + env + brpc 兜底。
+
+    场景（server 侧收包后取包慢）：
+      - client pod 目录 SDK_192.168.49.66（无 bpf，client 侧降级）；
+      - worker pod 目录 worker_192.168.210.192，env 映射宿主机 192.168.0.59
+        → bpf tar.gz 解压后按节点 worker12 扫描，server 内核事件恢复关联；
+      - brpc_server 文件 pod 名与目录名无关 → 唯一同角色兜底关联。
+    """
+
+    TRACE = "getBuffer-15-62-00000001;312c2e895e84"
+    CIP, SIP = "192.168.49.66", "192.168.210.192"
+
+    def setUp(self):
+        import shutil
+        import tarfile
+        root = Path(tempfile.mkdtemp(prefix="newlayout_"))
+        self._root = root
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        cdir = root / "collected" / "SDK_192.168.49.66"
+        wdir = root / "collected_worker_logs" / "worker_192.168.210.192"
+        bdir = root / "dscollect_log"
+        for d in (cdir, wdir, bdir):
+            d.mkdir(parents=True)
+
+        def info(ts, host, msg):
+            return ("%s | I | f.cpp:1 | %s | 1:2 | %s | u |  %s\n"
+                    % (ts, host, self.TRACE, msg))
+
+        (cdir / "ds_client_62.INFO.log").write_text(
+            info("2026-09-04T17:46:54.100000", self.CIP,
+                 "yyl9 ClientSend ts 838951000000000 tid 245 cpu 246")
+            + info("2026-09-04T17:46:54.130000", self.CIP,
+                   "yyl9 ClientRecv ts 838951030000000 tid 245 cpu 246")
+            + info("2026-09-04T17:46:54.130013", self.CIP, SLOW_MSG.replace(
+                "getBuffer-25487-00004775;117c5c4a91c7", self.TRACE).replace(
+                "network_residual_us=15989", "network_residual_us=25000")),
+            encoding="utf-8")
+        (wdir / "kvcache.INFO.log").write_text(
+            info("2026-09-04T17:46:54.100500", self.SIP,
+                 "yyl3 ServerRecv ts 697732000005000 tid 226 cpu 28")
+            + info("2026-09-04T17:46:54.101000", self.SIP,
+                   "yyl10 ServerSend ts 697732000010000 tid 226 cpu 28"),
+            encoding="utf-8")
+        (wdir / "env").write_text(
+            "pod_ip=192.168.210.192\nJD_HOST_IP=192.168.0.59\n", encoding="utf-8")
+
+        # bpf 日志（宿主机 192.168.0.59，含 server pod 收发事件）打包 tar.gz
+        bpf_text = (
+            "17:46:54:100100 netif_receive_skb: sip:%s, sport:53896 -> dip:%s, "
+            "dport:31402, seq:1, len:206, dev:eth0\n" % (self.CIP, self.SIP)
+            + "17:46:54:100110 tcp  recv in  tid 226 cpu 28 size 206 "
+              "%s:31402 <- %s:53896\n" % (self.SIP, self.CIP)
+            + "17:46:54:100120 tcp  send in  tid 226 cpu 28 size 155 "
+              "%s:31402 -> %s:53896\n" % (self.SIP, self.CIP))
+        inner = bdir / "bpf-worker12-192.168.0.59.log"
+        inner.write_text(bpf_text, encoding="utf-8")
+        with tarfile.open(bdir / "bpf-worker12-192.168.0.59.log.tar.gz",
+                          "w:gz") as tf:
+            tf.add(inner, arcname=inner.name)
+        inner.unlink()
+        # brpc_server：pod 名与 worker 目录名无关（走唯一角色兜底）
+        (bdir / "kvworker-0-worker19-brpc_server.log").write_text(
+            "I0904 17:46:54.100900  226 1 f.cpp:1 task_runner] [WZY] "
+            "bthread first scheduled: worker_tid=226 cpu_id=28 bthread_id=100 "
+            "fn=0x1 arg=0x2 creation_time_ns=1 first_run_time_ns=2 "
+            "pending_time_us=3800\n"
+            "I0904 17:46:54.101100  226 1 f.cpp:1 task_runner] [WZY] "
+            "bthread completed: worker_tid=226 cpu_id=28 bthread_id=100 "
+            "fn=0x1 arg=0x2 completion_time_ns=3 execution_time_us=180 "
+            "lifetime_time_us=3980\n",
+            encoding="utf-8")
+
+    def test_server_side_bpf_recovered(self):
+        disc, contexts, _tl = nla.analyze(str(self._root), window_pad_ms=2)
+        ctx = contexts[0]
+        # env + tar.gz：server pod → 宿主机 worker12 → bpf 事件恢复关联
+        self.assertEqual(ctx.server_node, "worker12")
+        evs = ctx.kernel_events.get("server") or []
+        self.assertTrue(evs, "server 侧 bpf 事件应恢复解析")
+        kinds = {e["kind"] for e in evs}
+        self.assertIn("tcp_recv_in", kinds)
+        # client 节点无 bpf（SDK 直连）→ server 侧回退识别连接（收包事件优先）
+        self.assertEqual(ctx.conn, (self.CIP, 53896, self.SIP, 31402))
+        # 回退成功后，"无法映射"告警改写为回退说明
+        self.assertIn("已从 server 侧 bpf 事件回退识别连接五元组",
+                      " | ".join(ctx.missing))
+        self.assertTrue(ctx.filtered_events["server"])
+        self.assertIn("ServerTcpSendIn", ctx.milestones)
+        # brpc 兜底关联：server 侧 bthread 事件（窗口内、tid 226）
+        bev = ctx.bthread_events.get("server") or []
+        self.assertEqual(len(bev), 2)
+        self.assertEqual(bev[1]["kind"], "completed")
+        self.assertEqual(bev[1]["execution_time_us"], 180)
+        joined = " | ".join(ctx.coro_evidence)
+        self.assertIn("execution_time_us 峰值 180us", joined)
+        # client 侧无 bpf 文件 → 降级为空，不报错
+        self.assertFalse(ctx.kernel_events.get("client"))
+
+
+class TestSoftirqLocBanner(TestSoftirqWireLocalization):
+    """softirq 定位结论的醒目呈现。
+
+    - trace 头部红色 badge（根因已定位，未展开卡片即可见）；
+    - trace 卡顶部红色高亮横幅（根因已定位 —— 收包慢直接定界，
+      含占用任务/cpu/延迟/完整调用栈），位于定界结论块之前；
+    - 概览索引中带"已定位"标记；
+    - 未命中定位时不渲染横幅/badge。
+    """
+
+    def _report(self, **kw):
+        import argparse
+        root = self._build_wire(**kw)
+        self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
+        _disc, contexts, _tl = nla.analyze(str(root))
+        ns = argparse.Namespace(residual_threshold=1000)
+        return contexts[0], nla.generate_report(contexts, ns, str(root))
+
+    def test_banner_and_badge(self):
+        _ctx, h = self._report()
+        # trace 头部 badge（在 trace-body 之前，未展开即可见）
+        self.assertIn('class="badge b-loc"', h)
+        self.assertLess(h.find('class="badge b-loc"'), h.find('class="trace-body"'))
+        # trace 卡顶部红色高亮横幅，位于定界结论块之前
+        self.assertIn('class="loc-banner"', h)
+        self.assertLess(h.find('class="loc-banner"'), h.find('class="concl"'))
+        self.assertIn("根因已定位", h)
+        self.assertIn("收包慢直接定界", h)
+        self.assertIn("ubctl", h)
+        self.assertIn("5044", h)
+        # 横幅内含完整调用栈
+        self.assertIn("ubctl_query_dl_pkt_stats_data", h)
+        # 概览索引（第一个 trace 卡之前）带"已定位"标记
+        self.assertIn('class="badge b-loc"', h[:h.find('class="card trace-card"')])
+
+    def test_banner_absent_without_localization(self):
+        # vec=7（非 NET_RX）→ 不定位 → 无横幅/badge
+        _ctx, h = self._report(vec=7)
+        self.assertNotIn('class="loc-banner"', h)
+        self.assertNotIn('class="badge b-loc"', h)
+
+
+class TestDirAgnosticDiscovery(unittest.TestCase):
+    """目录名无关的日志发现：按文件名模式 + 内容嗅探分类。
+
+    采集目录名（collected/collected_worker_logs/dscollect_log/
+    latency_warn_log 及 pod 目录名）后续可能变化，发现逻辑不依赖目录名：
+    - 已知文件名模式：ds_client*（client）/ kvcache*（worker）/
+      bpf-<node>-<ip>.log / irqoff_latency_<ip>.log / nic-<ip>.log /
+      *-brpc*.log / <node>_<ip>（warn）/ env / *.tar.gz；
+    - 未知名 *.log 按内容嗅探：ClientSend/ClientRecv/慢请求行 → client，
+      ServerRecv/ServerSend → worker，无标记 → 跳过。
+    """
+
+    def _write(self, path, text=""):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    def test_arbitrary_dir_names(self):
+        import shutil
+        root = Path(tempfile.mkdtemp(prefix="diragn_"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        # 任意命名的目录（全部非标准目录名）
+        self._write(root / "app_client" / "podA" / "ds_client_1.INFO.1.log",
+                    "2026-08-22T10:00:00.100000 | I | a.cc:1 | 10.0.0.1 | 1:100 | "
+                    "t1;a |  |  yyl1 ClientSend ts 100000000000 tid 100 cpu 1\n")
+        self._write(root / "app_worker" / "podB" / "kvcache.INFO.1.log",
+                    "2026-08-22T10:00:00.110000 | I | b.cc:1 | 10.0.0.2 | 2:200 | "
+                    "t1;a |  |  yyl1 ServerRecv ts 100000110000 tid 200 cpu 2\n")
+        self._write(root / "kern" / "bpf-master-1.2.3.4.log")
+        self._write(root / "kern" / "bpf-worker1-5.6.7.8.log")
+        self._write(root / "warns" / "master_1.2.3.4")
+        self._write(root / "warns" / "worker1_5.6.7.8")
+        self._write(root / "app_worker" / "podB" / "env",
+                    "pod_ip=10.0.0.2\nJD_HOST_IP=5.6.7.8\n")
+        self._write(root / "app_worker" / "podB" /
+                    "kvworker-0-worker1-brpc_client.log")
+        disc = nla.LogDiscovery(str(root))
+        self.assertEqual([p.name for p in disc.client_logs],
+                         ["ds_client_1.INFO.1.log"])
+        self.assertEqual([p.name for p in disc.worker_logs],
+                         ["kvcache.INFO.1.log"])
+        self.assertIn("master", disc.bpf_by_node)
+        self.assertIn("worker1", disc.bpf_by_node)
+        self.assertIn("master", disc.warn_by_node)
+        self.assertIn("worker1", disc.warn_by_node)
+        self.assertEqual(disc.host_by_podip.get("10.0.0.2"), "5.6.7.8")
+        self.assertIn("kvworker-0-worker1", disc.brpc_by_pod)
+
+    def test_content_sniff_unknown_log_names(self):
+        import shutil
+        root = Path(tempfile.mkdtemp(prefix="sniff_"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        # 未知名 *.log：按内容嗅探判定角色
+        self._write(root / "x" / "aaa.log",
+                    "2026-08-22T10:00:00.100000 | I | a.cc:1 | 10.0.0.1 | 1:1 | "
+                    "t1;a |  |  yyl1 ClientSend ts 100000000000 tid 1 cpu 1\n"
+                    "2026-08-22T10:00:00.200000 | I | a.cc:1 | 10.0.0.1 | 1:1 | "
+                    "t1;a |  |  yyl1 ClientRecv ts 100000200000 tid 1 cpu 1\n")
+        self._write(root / "y" / "bbb.log",
+                    "2026-08-22T10:00:00.110000 | I | b.cc:1 | 10.0.0.2 | 2:2 | "
+                    "t1;a |  |  yyl1 ServerRecv ts 100000110000 tid 2 cpu 2\n")
+        self._write(root / "z" / "ccc.log", "nothing relevant here\n")
+        self._write(root / "z" / "ddd.log",
+                    "2026-08-22T10:00:00.300000 | I | a.cc:1 | 10.0.0.1 | 1:1 | "
+                    "t1;a |  |  [BRPC_RPC_FRAMEWORK_SLOW] xxx\n")
+        # 工具自身的 --raw 输出（含锚点/慢请求行，开头为 "="*80 分隔线）
+        # 不应被再次当作 client 日志吸入（输出落在日志根目录时的自污染防护）
+        self._write(root / "z" / "self_output.log",
+                    "=" * 80 + "\n"
+                    "#1 trace=t1;a  residual=5000us\n"
+                    "结论：xxx\n"
+                    "2026-08-22T10:00:00.100000 | I | a.cc:1 | 10.0.0.1 | 1:1 | "
+                    "t1;a |  |  yyl1 ClientSend ts 100000000000 tid 1 cpu 1\n")
+        disc = nla.LogDiscovery(str(root))
+        self.assertEqual([p.name for p in disc.client_logs],
+                         ["aaa.log", "ddd.log"])
+        self.assertEqual([p.name for p in disc.worker_logs], ["bbb.log"])
+
+    def test_end_to_end_renamed_dirs(self):
+        # 标准 wire 布局 + 顶层目录全部重命名 → 全链路分析不受影响
+        fixture = TestSoftirqWireLocalization()
+        root = fixture._build_wire()
+        self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
+        for old, new in (("collected", "clientlogs_x"),
+                         ("collected_worker_logs", "workerlogs_y"),
+                         ("dscollect_log", "kern_z"),
+                         ("latency_warn_log", "warns_w")):
+            (root / old).rename(root / new)
+        _disc, contexts, _tl = nla.analyze(str(root))
+        self.assertEqual(len(contexts), 1)
+        ctx = contexts[0]
+        # softirq wire 定位照常命中（目录名无关）
+        loc = ctx.softirq_localization.get("client")
+        self.assertIsNotNone(loc)
+        self.assertEqual(loc["comm"], "ubctl")
+        self.assertEqual(loc["cpu"], 44)
+        self.assertEqual(loc["latency_us"], 5044)
+
+
+class TestNodeProbeFallback(TestSoftirqWireLocalization):
+    """pod 目录名不可识别（无节点子串/IP/env/Host ID）时的 bpf 探测兜底。
+
+    目录名全改后 resolve_node 失败：pod IP 作为 local_ip 只出现在 pod
+    所在节点的 bpf 日志（对端节点上它是 peer_ip）——用 trace 窗口探测
+    各节点 bpf 文件，命中 local_ip==podIP 的节点回填为该侧节点，
+    client/server 两侧独立探测，bpf 关联与 softirq 定位照常。
+    """
+
+    def test_probe_resolves_nodes(self):
+        root = self._build_wire()
+        self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True)
+                        if root.exists() else None)
+        # pod 目录改成无节点子串、无 IP 的任意名 → resolve_node 失败
+        (root / "collected" / "kvclient-1-master_26").rename(
+            root / "collected" / "目录甲")
+        (root / "collected_worker_logs" / "kvworker-0-worker1").rename(
+            root / "collected_worker_logs" / "目录乙")
+        _disc, contexts, _tl = nla.analyze(str(root))
+        ctx = contexts[0]
+        # 节点经 bpf 探测识别（client→master / server→worker1）
+        self.assertEqual(ctx.client_node, "master")
+        self.assertEqual(ctx.server_node, "worker1")
+        # bpf 关联照常（两侧窗口事件非空）
+        self.assertTrue(ctx.kernel_events["client"])
+        self.assertTrue(ctx.kernel_events["server"])
+        # softirq wire 定位照常命中（目录名无关）
+        loc = ctx.softirq_localization.get("client")
+        self.assertIsNotNone(loc)
+        self.assertEqual(loc["comm"], "ubctl")
+
+    def test_probe_negative_wrong_node_ip_absent(self):
+        # bpf 日志窗口内无 local_ip==podIP 的事件 → 探测失败，节点保持
+        # None（不误绑到别的节点），走既有 missing 诊断路径
+        root = self._build_wire()
+        self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True)
+                        if root.exists() else None)
+        (root / "collected" / "kvclient-1-master_26").rename(
+            root / "collected" / "目录甲")
+        # master 的 bpf 日志清空（只剩无 IP 的调度事件）→ client 探测无命中
+        (root / "dscollect_log" / "bpf-master-192.168.219.1.log").write_text(
+            "21:31:21:060770 sched_switch prev_comm=x next_comm=y\n",
+            encoding="utf-8")
+        _disc, contexts, _tl = nla.analyze(str(root))
+        ctx = contexts[0]
+        self.assertIsNone(ctx.client_node)
+        self.assertFalse(ctx.kernel_events["client"])
 
 
 if __name__ == "__main__":

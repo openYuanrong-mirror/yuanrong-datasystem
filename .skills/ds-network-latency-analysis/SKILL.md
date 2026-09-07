@@ -8,14 +8,38 @@ description: >
   (latency_warn_log), rebuilds the per-request full-path timeline (user space →
   TCP stack → NIC driver, incl. net_dev_start_xmit / net_dev_xmit /
   netif_receive_skb / __tcp_retransmit_skb probes), and produces a localization
-  conclusion with an interactive HTML report. Also correlates three optional
-  auxiliary logs from dscollect_log: irqoff latency (>1ms, interrupt-off
-  culprit stacks), sar NIC utilization (ethtool + per-second samples), and
-  brpc bthread creation/scheduling logs (coroutine queueing evidence). For
+  conclusion with an interactive HTML report. Supports in-place extraction of
+  tar.gz bpf log archives (pigz-parallel via tar --use-compress-program="pigz -p N",
+  N matching --workers, with Python tarfile fallback) and multi-layer pod-to-node
+  mapping for node association when pod dirs are simplified to worker_<podIp>:
+  env files (pod_ip= / *HOST_IP=), in-log "Host ID is <ip> from env ..." lines
+  (fallback when env is missing, e.g. SDK direct-connection pods), directory-IP
+  lookup, and node-name substring matching.
+  Also correlates three optional auxiliary logs from dscollect_log: irqoff
+  latency (>1ms, interrupt-off culprit stacks), sar NIC utilization (ethtool +
+  per-second samples), and brpc bthread creation/scheduling/completion logs
+  (coroutine queueing and execution evidence). When the client node has no bpf
+  logs (e.g. SDK direct-connection node not collected), falls back to
+  identifying the connection 5-tuple from server-side events. For
   kernel-to-user receive delays, renders a problem-window bpf event panorama
   (problem 5-tuple highlighted amid interleaved other-connection traffic) and
   detects softirq preemption of the business thread's cpu by other requests'
-  receive processing.
+  receive processing, including softirq probe events (softirq_raise→entry /
+  softirq_entry→exit latency >1ms with vec, kstack and timercnt) for further
+  receive-latency localization. When a slow-softirq log's cpu matches the
+  receiving cpu or its SMT sibling (cpu^1) within a 50ms lookback window
+  before the receive point, directly identifies the preempting task (comm)
+  and renders its full kstack as a definitive localization conclusion
+  (kernel_to_user and wire modes), prominently displayed via a red
+  root-cause banner at the top of the trace card plus a head badge and a
+  TOC marker; the next step is analyzing why that task ran on that cpu.
+  Log discovery is directory-name agnostic: it scans the whole tree and
+  classifies files by name patterns (ds_client*/kvcache*/bpf-*/irqoff_*/
+  nic-*/-brpc*/node_ip/env/tar.gz) with content sniffing fallback for
+  unknown *.log files. When pod directory names are unrecognizable (no
+  node substring/IP, no env/Host ID), a bpf probe fallback resolves the
+  node: the pod IP appears as local_ip only in the bpf log of the node
+  hosting the pod (client/server sides probed independently).
   Triggers: network_residual_us, network timeout analysis, RPC segment latency,
   bpf kernel event correlation, scheduling latency, latency_warn, nic driver
   latency, tcp retransmit, irqoff, interrupt disabled, 关中断, sar NIC
@@ -34,20 +58,71 @@ description: >
 
 ---
 
-## 输入日志目录约定
+## 输入日志发现（目录名无关）
+
+**发现逻辑只认文件，不依赖目录名**——采集目录名（`collected/`、
+`collected_worker_logs/`、`dscollect_log/`、`latency_warn_log/` 及 pod 目录名）
+后续变化不影响分析。对日志根目录**全树递归扫描**，按文件名模式分类：
+
+| 文件名模式 | 类型 |
+|---|---|
+| `ds_client*.log` | client 应用日志（glog） |
+| `kvcache*.log` | worker 应用日志（glog） |
+| `bpf-<nodeName>-<nodeIp>.log` | bpftrace 内核日志 |
+| `irqoff_latency_<nodeIp>.log` | [可选] 关中断 >1ms 日志（块 + 调用栈） |
+| `nic-<nodeIp>.log` | [可选] ethtool 属性 + sar 每秒网卡采样 |
+| `<podName>-brpc*.log` | [可选] brpc bthread 创建/首次调度/完成日志（可在任意目录） |
+| `<nodeName>_<nodeIp>`（无扩展名） | 调度时延告警 |
+| `env` | [可选] pod_ip= / *HOST_IP= 映射 |
+| `*.tar.gz` / `*.tgz` | [可选] 归档（任意目录，发现阶段就地解压后重扫） |
+
+**未知名 `*.log` 内容嗅探兜底**：读文件头 1MB，含 `ClientSend ts `/`ClientRecv ts `
+/`[BRPC_RPC_FRAMEWORK_SLOW]` 标记 → client；含 `ServerRecv ts `/`ServerSend ts `
+→ worker；无标记 → 跳过。工具自身的 `--raw` 汇总输出（首行 80 个 `=` 分隔线）
+被排除，防止输出落在日志根目录时自污染。
+
+典型目录布局（仅为示例，目录名可任意变化）：
 
 ```
 <log_root>/
 ├── collected/                  # client 日志，podName 为子目录名（内含 nodeName）
 │   └── <podName>/ds_client_*.INFO.*.log
 ├── collected_worker_logs/      # worker 日志，podName 为子目录名（内含 nodeName）
-│   └── <podName>/kvcache.INFO.*.log
+│   ├── <podName>/kvcache.INFO.*.log
+│   └── <podName>/env                # [可选] pod_ip= / *HOST_IP= 映射（pod 目录名
+│                                    #   简化为 worker_<podIp> 时，靠它定位宿主机节点）
 ├── dscollect_log/              # bpftrace 内核日志，bpf-$nodeName-$nodeIp.log
+│   ├── bpf-*.log.tar.gz             # [可选] 超大 bpf 日志归档（发现阶段就地解压）
 │   ├── irqoff_latency_$nodeIp.log   # [可选] 关中断 >1ms 日志（块 + 调用栈）
 │   ├── nic-$nodeIp.log              # [可选] ethtool 属性 + sar 每秒网卡采样
-│   └── <podName>-brpc_client.log    # [可选] brpc bthread 创建/首次调度日志
+│   ├── <podName>-brpc_client.log    # [可选] brpc bthread 创建/首次调度/完成日志
+│   └── <podName>-brpc_server.log    # [可选] server 侧 brpc bthread 日志
 └── latency_warn_log/           # 调度时延告警，文件名 $nodeName_$nodeIp
 ```
+
+**tar.gz 归档**：任意目录下的 `*.tar.gz`（超大 bpf 日志归档）在发现阶段
+**就地解压**后按普通文件匹配。pigz/tar 可用时优先并行解压：
+`tar -x -C <dir> --use-compress-program="pigz -p N" -f <archive>`，**N 与
+`--workers` 参数一致**（默认 min(16, CPU核数)）；pigz/tar 不可用或命令失败时
+自动回退 Python tarfile。解压失败（坏包/权限）告警跳过，不影响其余日志发现。
+
+**env 节点映射**：任意目录下的 `env` 文件含 `pod_ip=...` 与
+`JD_HOST_IP=...`（或其它 `*HOST_IP=` 键）时建立 podIP→宿主机 IP 映射——pod 目录名
+被采集脚本简化成 `worker_<podIp>`（不含 nodeName）时，靠该映射经
+`bpf-<node>-<nodeIp>` 文件名反查宿主机 bpf/辅助日志节点。
+
+**日志正文 Host ID 映射（env 缺失时兜底）**：client/worker 应用日志正文中的
+启动期一次性行——`Host ID is <ip> from env HOST_IP`（client，service_discovery.cpp）
+/ `Host id is <ip> from env JD_HOST_IP`（worker，ds_coordination_backend.cpp）——
+在阶段 2 合并扫描时一并提取（pod IP 取日志所在目录名），env 已有映射时不覆盖。
+典型场景：`collected/SDK_<podIp>/` 无 env 文件，宿主机 IP 只在 ds_client 日志正文。
+
+**bpf 探测节点兜底（目录名不可识别时）**：pod 目录名无节点子串/IP、又无
+env/Host ID 行时（目录名被完全改掉），用 trace 时间窗（前后各扩 2s）探测
+各节点 bpf 文件——**pod IP 作为 local_ip 只会出现在 pod 所在节点的 bpf
+日志**（对端节点上它是 peer_ip），命中 local_ip==podIP 的节点即回填为该侧
+节点，client/server 两侧独立探测，后续 bpf/告警/辅助日志关联照常。只认
+local_ip 天然排除对端节点误绑；探测命中按 pod IP 缓存，每 pod 只探测一次。
 
 三类辅助日志均为**可选输入**（`[可选]` 标注）：文件缺失时自动降级跳过，
 不影响既有结论（详见"辅助日志关联分析"一节）。
@@ -65,7 +140,7 @@ python3 <skill_dir>/scripts/network_latency_analysis.py <log_root> \
 
 | 参数 | 必填 | 说明 |
 |---|---|---|
-| `log_root` | 是 | 日志根目录（含上述 4 个子目录） |
+| `log_root` | 是 | 日志根目录（全树扫描按文件名/内容识别，不依赖目录名） |
 | `--residual-threshold` | 否 | `network_residual_us` 判定阈值(us)，默认 1000 |
 | `--top` | 否 | 只分析残余时延最大的前 N 条（默认全部） |
 | `--trace` | 否 | 只分析指定 trace（子串匹配，可多次指定） |
@@ -113,7 +188,8 @@ python3 <skill_dir>/scripts/network_latency_analysis.py <log_root> \
       "slow":        {"ts": "…", "log_path": "…", "pod_dir": "…", "fields": {…原样 kv…}},
       "client":      {"pod_dir": "…", "node": "master", "ip": "…"},
       "server":      {"pod_dir": "…", "node": "worker13", "ip": "…"},
-      "conn":        {"client_ip": "…", "client_port": 37880, "server_ip": "…", "server_port": 31501},
+      "conn":        {"client_ip": "…", "client_port": 37880, "server_ip": "…", "server_port": 31501,
+                     "source": "client_tcp|client_nic|server_tcp|client_port"},
       "anchors":     {"ClientSend": {"ts": "…", "tid": "…", "cpu": "…", "bid": "…", "host": "…", "raw": "…"}, …},  // 按锚点 ts 升序
       "milestones":  {"ClientSend": "…", "ClientTcpSendIn": "…", …},  // 全路径时间线点位（按时间序；缺失点位不在其中）
       "point_order": ["ClientSend", "ClientTcpSendIn", …],            // 全路径点位序（16 点，判定缺失点位的依据）
@@ -154,8 +230,12 @@ python3 <skill_dir>/scripts/network_latency_analysis.py <log_root> \
                           "server": […]},  // 窗口内 sar 采样（hms 为 24h 制）
       "bthread_events":  {"client": [{"ts": "…", "kind": "scheduled", "tid": 523, "bthread_id": 3693671876360,
                                       "pending_time_us": 4900, "target_pending_tasks": null,
-                                      "creation_mode": null, "raw": "原始行"}],
-                          "server": […]},  // 窗口内 bthread 事件（按锚点 tid 过滤）
+                                      "creation_mode": null, "execution_time_us": null,
+                                      "lifetime_time_us": null, "cpu": 187, "raw": "原始行"},
+                                     {"ts": "…", "kind": "completed", "tid": 523, "bthread_id": …,
+                                      "execution_time_us": 19, "lifetime_time_us": 47, …}],
+                          "server": […]},  // 窗口内 bthread 事件（按锚点 tid 过滤；
+                                           // kind: created/scheduled/completed）
       "cpu_busy":        {"client": {"seg_key": "client_kernel_to_user", "seg_desc": "…",
                                      "seg_dur_us": 15798, "window_start": "…", "window_end": "…",
                                      "anchor_name": "ClientRecv", "anchor_tid": "523", "anchor_cpu": 50,
@@ -165,11 +245,28 @@ python3 <skill_dir>/scripts/network_latency_analysis.py <log_root> \
                                      "other_on_cpu": [{…事件，match5t: false…}],
                                      "switches_on_cpu": [{…sched_switch 事件…}],
                                      "switched_out": [{…}],
+                                     "softirq_raise_on_cpu": [{…softirq_raise_delay 事件…}],
+                                     "softirq_exit_on_cpu": [{…softirq_exit_delay 事件…}],
                                      "preempt": true,
+                                     "softirq_localization": {"mode": "kernel_to_user|wire",
+                                                              "comm": "ubctl", "kstack": "…完整调用栈…",
+                                                              "latency_us": 5044, "vec": 3, "vec_txt": "3(NET_RX)",
+                                                              "cpu": 44, "anchor_cpu": 50, "smt": false,
+                                                              "ts": "…", "recv_ts": "…", "n_candidates": 1},
                                      "window_events": [{"ts": "…", "kind": "tcp_recv_in", "cpu": 50,
                                                         "match5t": true, "raw": "原始行"}, …]}},
                                      // 问题窗口全景 + cpu 侵占分析（kernel_to_user 段异常的侧才有；
-                                     // window_events 为窗口内全部连接的内核事件，软中断抢占定界明细）
+                                     // window_events 为窗口内全部连接的内核事件，软中断抢占定界明细；
+                                     // softirq_localization 为收包慢直接定位结论（命中时才有，
+                                     // wire 模式下 kernel_to_user 段不异常也会补最小 cpu_busy 信息）
+      "softirq_events":  {"client": [{"ts": "…", "kind": "softirq_exit_delay", "cpu": 50,
+                                      "vec": 3, "latency_us": 2300, "timer_cnt": 5,
+                                      "timer_large_cnt": 1, "raw": "原始行"},
+                                     {"ts": "…", "kind": "softirq_raise_delay", "cpu": 50,
+                                      "vec": 3, "latency_us": 1500, "comm": "…",
+                                      "kstack": "…", "raw": "原始行"}]},
+                                     // 问题窗口内 softirq 探针事件（raise→entry / entry→exit
+                                     // >1ms；kernel_to_user 段异常的侧才有，收包慢定界明细）
       "slow_seg_window": {"seg_key": "client_user_to_kernel", "seg_desc": "…",
                           "category": "…", "window_start": "…", "window_end": "…",
                           "dur_us": 15798,
@@ -265,9 +362,38 @@ python3 <skill_dir>/scripts/network_latency_analysis.py <log_root> \
    锚点行，计算三段宏观耗时（CS→SR、SR→SS、SS→CR），并从锚点行取 pod IP、
    从文件夹名解析 nodeName。
 3. **内核日志关联**：在 client/server 节点的 bpf 日志中按
-   `[ClientSend−pad, ClientRecv+pad]` 时间窗 + 双 pod IP 过滤；以 ClientSend 后最近的
-   `tcp send in` 识别连接四元组（clientIP:ephemeralPort ↔ serverIP:servicePort），
-   重建内核级时间线（`tcp send/recv in/out/que`、`sock_def_readable` 等事件）；
+   `[ClientSend−pad, ClientRecv+pad]` 时间窗 + 双 pod IP 过滤；连接四元组识别
+   （clientIP:ephemeralPort ↔ serverIP:servicePort）按优先级：
+   - **client tcp**（确证）：ClientSend 后最近的 `tcp send in`；
+   - **client nic**（推测）：tcp 层探针丢失时，用 client 侧请求方向
+     （src=clientIP → dst=serverIP）`dev_start_xmit`/`net_dev_xmit`（raw 含完整
+     五元组，取 ClientSend−200us 后最早）推测识别，missing 注明"tcp 层 bpf
+     事件丢失，已按 nic 层事件推测连接五元组"，client 侧事件表加"推测"badge；
+   - **server tcp**（回退）：client 节点无 bpf 日志时（如 SDK 直连节点未采集），
+     用 server 侧窗口事件识别（请求方向收包事件 `tcp recv_que/in`（local=server,
+     peer=client，时间 ≥ ServerRecv−200us 中最早）优先，其次响应方向发送事件
+     `tcp send_in`），missing 注明"已从 server 侧回退识别连接，client 侧内核
+     事件缺失"；
+   - **client port**（端口+时间配对推测）：server pod IP 未知（worker pod 日志
+     未收集）但已知 server 服务端口时（server 角色端口固定，由同 run 内完整
+     trace 识别出的连接提供，按 client IP 归组），在 client 侧窗口事件中筛选
+     目标端口的请求发送事件（邻近 ClientSend）与响应接收事件（邻近
+     ClientRecv），按 client 临时端口配对成连接，取
+     「|req−ClientSend| + |rsp−ClientRecv|」总分最小者（同端口的干扰连接因
+     响应时间远离 ClientRecv 而被排除，非目标端口连接直接排除）；missing 注明
+     "已按已知服务端口 + 双向时间配对推测连接五元组"，事件表加"推测"badge，
+     置信度封顶"中"。
+
+   **server pod IP 未知时**（worker pod 日志未收集）：不再跳过内核关联——client 侧
+   窗口按 client pod IP 单侧匹配照常扫描，事件明细/全景照常输出；连接五元组优先
+   走上方 **client port** 端口+时间配对推测（server IP 一并从请求事件 dst IP 推出，
+   五元组过滤/里程碑/唤醒链照常走准确路径）；推测不出时标注"未能识别"，
+   client 侧里程碑（ClientTcpSendIn/DevStartXmit/NetDevXmit/NetifRx/
+   TcpRecvFirst/Last）按时间邻近推测（窗口内该 pod 最早同向事件，多连接时有混淆
+   风险，missing 注明），client 段照常产出，结论置信度封顶"中"。
+
+   随后重建内核级时间线（`tcp send/recv in/out/que`、
+   `sock_def_readable` 等事件）；
    网卡层点位（`dev_start_xmit`/`net_dev_xmit`/`netif_receive_skb`/`__tcp_retransmit_skb`）
    按方向四元组双向匹配接入同一时间线。
 4. **调度证据**：解析两节点 latency_warn 告警（`resched_latency_warn Triggered`
@@ -547,18 +673,29 @@ rxkB/s、txkB/s、%ifutil）。用于佐证或**排除**网卡带宽瓶颈。
 - **证据句**：窗口内峰值 %ifutil ≥ 50 → "网卡利用率高"佐证；< 10 → 排除性
   证据（"峰值仅 X%，排除网卡带宽打满"）。
 
-### brpc 协程日志（<podName>-brpc_client.log）
+### brpc 协程日志（<podName>-brpc_client.log / <podName>-brpc_server.log）
 
-bthread 创建与首次调度日志，统计问题时刻线程上有多少协程在排队。用于佐证
-"协议栈收包后业务执行晚"的协程调度排队问题（`pending_time_us` = 创建到首次
-执行）。
+bthread 创建 / 首次调度 / 执行完成日志，统计问题时刻线程上有多少协程在排队、
+协程内业务执行多慢。用于佐证"协议栈收包后业务执行晚"的协程调度排队问题
+（`pending_time_us` = 创建到首次执行），并区分"排队慢"与"业务本身慢"
+（`execution_time_us` = 协程内执行耗时）。
+
+**文件关联**（pod 目录名 → brpc 文件，优先级递减）：
+1. pod 名精确/前后缀匹配（目录名沿用 pod 名）；
+2. brpc 文件 pod 名以宿主机节点名为独立段（目录名被简化成 `worker_<podIp>` 时，
+   经 env 映射出节点名仍可关联）；
+3. 同角色文件全局唯一时兜底（文件名含 `-brpc_client` / `-brpc_server` 且该角色
+   文件只有一个；多个时不猜）。
 
 **格式**（glog 行，无年份，按 trace 窗口日期 ±1 年容错组合）：
 
 ```
 I0824 22:32:23.661136  6267 4294969346 task_group.cpp:520 start_foreground] [WZY] bthread created: creator_tid=6267 bthread_id=3693671876360 creation_time_ns=... creation_mode=foreground target_local_pending_tasks=0 target_remote_pending_tasks=0 target_pending_tasks=0
-I0824 22:32:23.661172  6267 3693671876360 task_group.cpp:383 task_runner] [WZY] bthread first scheduled: worker_tid=6267 bthread_id=3693671876360 fn=... arg=... creation_time_ns=... first_run_time_ns=... pending_time_us=37
+I0824 22:32:23.661172  6267 3693671876360 task_group.cpp:383 task_runner] [WZY] bthread first scheduled: worker_tid=6267 cpu_id=92 bthread_id=3693671876360 fn=... arg=... creation_time_ns=... first_run_time_ns=... pending_time_us=37
+I0824 22:32:23.661190  6267 3693671876360 task_group.cpp:422 task_runner] [WZY] bthread completed: worker_tid=6267 cpu_id=92 bthread_id=3693671876360 fn=... arg=... completion_time_ns=... execution_time_us=33 lifetime_time_us=60
 ```
+
+（`cpu_id` 为可选字段，新格式 first scheduled / completed 行含；旧格式无则置 null。）
 
 **分析输出**（仅问题窗口内统计，不做全周期统计——日志量大）：
 
@@ -566,10 +703,12 @@ I0824 22:32:23.661172  6267 3693671876360 task_group.cpp:383 task_runner] [WZY] 
   raw 段）：窗口同 irqoff（"收包→用户态取包"段），事件按**锚点 tid 过滤**
   （client 侧 ClientRecv tid / server 侧 ServerRecv tid），窗口外行只做
   行首快速预判即跳过。
-- **证据句**（JSON `coro_evidence`）：该线程在窗口内的 created / scheduled
-  数、`pending_time_us` max/avg、`target_pending_tasks` max、>1ms 的 top5
-  记录 → "线程 tid=N 窗口内创建 X 个协程、Y 次首次调度，最长排队 T…"
-  ——佐证"协议栈已收包但协程很晚才执行"。
+- **证据句**（JSON `coro_evidence`）：该线程在窗口内的 created / scheduled /
+  completed 数、`pending_time_us` max/avg、`execution_time_us` 峰值、
+  `lifetime_time_us` 峰值、`target_pending_tasks` max →
+  "线程 tid=N 窗口内创建 X 个协程、Y 次首次调度，最长排队 T…"
+  ——佐证"协议栈已收包但协程很晚才执行"；`execution_time_us` 峰值高则
+  提示业务本身慢（非"处理开始晚"），`lifetime_time_us` = 创建→完成全生命周期。
 - **置信度**：定界为 `client/server_kernel_to_user_delay` 或
   `coroutine_schedule_delay` 且有协程排队证据时提升为"高"。
 
@@ -580,7 +719,7 @@ I0824 22:32:23.661172  6267 3693671876360 task_group.cpp:383 task_runner] [WZY] 
 | HTML 概览 | "关中断统计（全采集周期）"卡（分桶直方图/进程 top10/SVG 散点/Top20）、"网卡利用率统计（sar）"卡 |
 | HTML trace 卡 | "关中断记录（问题窗口内）"（表 + 调用栈折叠）、"sar 网卡采样（问题窗口内）"表、"bthread 协程事件（问题窗口内）"折叠块 |
 | JSON 顶层 | `irqoff_stats: {node: {total, hardirq_n, softirq_n, max_us, total_us, by_comm, by_cpu, buckets, series}}`、`nic_stats: {node: {dev: {n_samples, max_ifutil, avg_ifutil, peak_hms, max_rxpck, Speed, Duplex, "Link detected"}}}` |
-| JSON trace 级 | `irqoff_events: {client/server: [{ts, irq, cpu, comm, pid, latency_us, raw}]}`、`nic_samples: {…: [{hms, dev, rxpck, txpck, rxkB, txkB, ifutil}]}`、`bthread_events: {…: [{ts, kind, tid, bthread_id, pending_time_us, target_pending_tasks, creation_mode, raw}]}` |
+| JSON trace 级 | `irqoff_events: {client/server: [{ts, irq, cpu, comm, pid, latency_us, raw}]}`、`nic_samples: {…: [{hms, dev, rxpck, txpck, rxkB, txkB, ifutil}]}`、`bthread_events: {…: [{ts, kind(created/scheduled/completed), tid, bthread_id, pending_time_us, target_pending_tasks, creation_mode, execution_time_us, lifetime_time_us, cpu, raw}]}` |
 | `--raw` | 每 trace 追加"关中断记录 / sar 网卡采样 / bthread 协程事件"三段（标注来源文件与条数，irqoff 含原始调用栈块） |
 
 ---
@@ -690,24 +829,76 @@ kernel_to_user`）超阈值异常时，自动针对该侧触发两项分析：
     处理其他请求）；
   - 业务线程在业务 cpu 上被 `sched_switch` 切出（`prev_pid == tid`，
     被其他任务直接抢占）；
+  - 业务 cpu 上出现 **softirq 处理超长**事件（`softirq_exit_delay`，
+    entry→exit >1ms，软中断执行期间业务线程无法在该 cpu 运行，见第 3 节）；
 - **排除性结论**：业务 cpu 上无其他连接事件时，明确输出"软中断处理其他
-    请求的抢占可能性低"，并给出窗口内其他连接事件的 cpu 分布供参考。
+  请求的抢占可能性低"，并给出窗口内其他连接事件的 cpu 分布供参考。
+
+### 3. softirq 探针定界（收包慢的进一步定位）
+
+bpftrace 增加 softirq 三点位（`softirq_raise` → `softirq_entry` →
+`softirq_exit`），超过 1ms 时在 bpf 日志打印两类事件行，工具解析后结合
+问题窗口做网卡收包慢定界（仅 kernel_to_user 段异常的侧触发）：
+
+| 事件行（bpf 日志原始格式） | kind | 定界含义 |
+|---|---|---|
+| `HH:MM:SS:uuuuuu high irq-to-softirq  vec=N latency: X usec (Y ms) on CPU:C comm:NAME kstack:STACK` | `softirq_raise_delay` | **raise→entry >1ms**：软中断发起到开始执行期间被其他任务抢占/延迟，收包协议栈处理（NetifRx→TcpRecv）被推迟（kstack 为当时调用栈） |
+| `HH:MM:SS:uuuuuu slow softirq! cpu: C \| Type: N \| Latency: X us, timercnt:a/b` | `softirq_exit_delay` | **entry→exit >1ms**：软中断本身处理时间太长，执行期间业务线程无法在该 cpu 运行（软中断不可被调度抢占） |
+
+- **关联方式**：事件时间戳落在问题窗口内且 `cpu` 等于业务线程所在 cpu
+  时生成"◎"证据（其他 cpu 上的 softirq 事件仍进全景表但不构成证据）；
+- **vec 含义**：向量号→名称映射（`3(NET_RX)` 收包 / `1(TIMER)` 定时器 /
+  `7(SCHED)` 调度等）；`softirq_exit_delay` 附带 `timercnt`（窗口内 timer
+  软中断次数/超长次数），可用于判断是否 TIMER 软中断拖长 NET_RX 处理；
+- **置信度影响**：`softirq_exit_delay` 在业务 cpu 上 → 计入抢占证据
+  （`cpu_busy_preempt`，可提升高置信）；`softirq_raise_delay` 仅作证据句
+  （软中断被延迟≠业务线程被软中断占用），不改变 preempt 判定；
+- **输入可选**：bpf 日志无 softirq 探针行时静默降级，不影响既有分析。
+
+### 4. softirq 定位结论（收包慢直接定界）
+
+在探针定界基础上更进一步：若收包慢时间段内、**收包时间往前回溯 50ms**
+（`SOFTIRQ_LOOKBACK_MS`）窗口内存在 softirq 慢日志（`softirq_raise_delay`），
+且事件 cpu 与**收包 cpu 相同或为其 SMT 姊妹核**（如 0/1 互为 SMT 核对应
+一个物理核，`cpu^1` 相邻配对），则**直接定位**抢占 cpu 的任务（`comm`）并
+呈现其完整调用栈（`kstack`）——收包慢问题即定界，下一步只需分析为什么
+会有这个任务执行。分两种模式：
+
+| 模式 | 触发条件 | 回溯匹配规则 |
+|---|---|---|
+| `kernel_to_user` | 该侧"内核收包 → 用户态取包"段异常 | 收包点（NetifRx 里程碑，缺则窗口起点）前 50ms 内，cpu = 业务 cpu 或其 SMT 姊妹核的 `softirq_raise_delay` 事件；优先 NET_RX（vec=3），其次延迟最大 |
+| `wire` | 该侧接收线路段（`wire_s2c_phys`/`wire_c2s_phys`）异常 | "线路慢"实为收包软中断被占用：仅 NET_RX（vec=3），entry 不晚于收包点（该 softirq 即执行本次收包的上下文），raise 时间不早于对端物理网卡发出（排除更早一批包的软中断）；取 entry 最紧邻收包点者 |
+
+- **定位输出**：`comm`（占用 cpu 的任务名）+ 完整 `kstack`（多行续行已
+  解析合并）+ `latency_us`（raise→entry 延迟）+ `vec_txt` + 事件 cpu 与
+  业务 cpu（`anchor_cpu`）+ 是否 SMT 姊妹核（`smt`）；
+- **醒目呈现**：命中时 trace 卡**顶部红色高亮横幅**（`loc-banner`，
+  "根因已定位 —— 收包慢直接定界"，含占用任务/cpu/延迟/模式 + 完整调用栈，
+  无需展开下方明细）+ trace 头部红色 badge（"根因已定位"，未展开卡片即可见）
+  + 概览索引"已定位"标记 + 证据链"【已定位】"条目红色加粗；
+- **结论呈现**：命中时证据链追加"【已定位】…收包慢根因"（含占用任务、
+  cpu、延迟、raise/entry 时刻与完整调用栈），结论建议直接指向占用任务
+  （分析其调度来源/绑核与亲和性配置/触发路径），置信度提升为"高"；
+- **wire 模式补充**：该侧 kernel_to_user 段不异常时无既有 cpu_busy 信息，
+  工具会补最小信息（窗口即 wire 段区间）使渲染/JSON 走同一通道；
+- **负例**：回溯窗内无匹配事件 / cpu 不匹配 / vec 不符 → 不生成定位
+  结论，不影响既有分析。
 
 ### 证据与结论影响
 
 | 项 | 说明 |
 |---|---|
-| 证据句 | `◎` 前缀写入结论证据链（JSON `conclusion.evidence`）：窗口/事件统计、业务 cpu 上其他连接事件数（含 top3 连接）、线程被切出次数与切向 |
-| 置信度 | 定界为 `client/server_kernel_to_user_delay` 或 `coroutine_schedule_delay` 且存在抢占证据（`cpu_busy_preempt`）时提升为"高" |
-| 排查建议 | 抢占成立时追加：调整网卡 RSS/中断亲和性将收包分散到非业务 cpu、业务线程绑核 / isolcpus 隔离 |
+| 证据句 | `◎` 前缀写入结论证据链（JSON `conclusion.evidence`）：窗口/事件统计、业务 cpu 上其他连接事件数（含 top3 连接）、线程被切出次数与切向、softirq 发起延迟/处理超长（含 vec 与最大延迟）；softirq 定位命中时追加"【已定位】…收包慢根因"（含占用任务 comm/cpu/延迟/完整调用栈） |
+| 置信度 | 定界为 `client/server_kernel_to_user_delay` 或 `coroutine_schedule_delay` 且存在抢占证据（`cpu_busy_preempt`）时提升为"高"；softirq 定位命中（传输类定界 + 网卡点位佐证）亦为"高" |
+| 排查建议 | 抢占成立时追加：调整网卡 RSS/中断亲和性将收包分散到非业务 cpu、业务线程绑核 / isolcpus 隔离；softirq 定位命中时建议指向占用任务（分析其调度来源/绑核与亲和性配置/触发路径，必要时限制其运行或将收包软中断迁移到其他 cpu） |
 
 ### 输出位置
 
 | 输出 | 内容 |
 |---|---|
-| HTML trace 卡 | "问题窗口 bpf 事件全景与 CPU 侵占分析"块：摘要卡（窗口/业务线程/事件统计/cpu 结论）+ 全景事件表（黄底 = 问题五元组行，红色 cpu = 业务线程所在 cpu） |
-| JSON trace 级 | `cpu_busy: {client/server: {seg_key, seg_desc, seg_dur_us, window_start, window_end, anchor_name, anchor_tid, anchor_cpu, conn, n_mine, n_other, other_conns, other_by_cpu, other_on_cpu, switches_on_cpu, switched_out, preempt, window_events[]}}`（`window_events` 每条含 `match5t` 标注，全量不截断） |
-| `--raw` | 每 trace 追加"问题窗口 bpf 事件全景"段（标注窗口区间/来源文件/条数，问题连接行 `▶` 前缀，穿插展示其他请求原始日志行） |
+| HTML trace 卡 | **根因已定位醒目呈现**（命中时）：trace 卡顶部红色高亮横幅（loc-banner，含占用任务/cpu/延迟/完整调用栈）+ trace 头部"根因已定位"badge + 概览索引"已定位"标记；"问题窗口 bpf 事件全景与 CPU 侵占分析"块：摘要卡（窗口/业务线程/事件统计/cpu 结论/softirq 结论）+ 全景事件表（黄底 = 问题五元组行，红色 cpu = 业务线程所在 cpu，softirq 行附加列含 vec/延迟/kstack）+ softirq 定位结论块（命中时：定位说明 + 占用任务 comm + raise→entry 延迟 + 完整调用栈，wire 模式区分展示"线路段慢实为收包软中断被抢占"） |
+| JSON trace 级 | `cpu_busy: {client/server: {seg_key, seg_desc, seg_dur_us, window_start, window_end, anchor_name, anchor_tid, anchor_cpu, conn, n_mine, n_other, other_conns, other_by_cpu, other_on_cpu, switches_on_cpu, switched_out, softirq_raise_on_cpu[], softirq_exit_on_cpu[], preempt, softirq_localization?, window_events[]}}`（`window_events` 每条含 `match5t` 标注，全量不截断；`softirq_localization` 含 mode/comm/kstack/latency_us/vec_txt/cpu/anchor_cpu/smt 等）；另有顶层 `softirq_events: {side: [...]}`（问题窗口内全部 softirq 事件，含 vec/latency_us/kstack/timer_cnt 字段） |
+| `--raw` | 每 trace 追加"问题窗口 bpf 事件全景"段（标注窗口区间/来源文件/条数，问题连接行 `▶` 前缀，穿插展示其他请求原始日志行）+ softirq 定位结论段（命中时含占用任务与完整调用栈，wire 模式含线路段区间说明） |
 
 ---
 
@@ -795,9 +986,10 @@ kernel_to_user`）超阈值异常时，自动针对该侧触发两项分析：
 `Settings for <dev>:` + `Speed:/Duplex:/Link detected:` 属性 +
 `HH:MM:SS AM|PM IFACE rxpck/s txpck/s rxkB/s txkB/s rxcmp/s txcmp/s rxmcst/s %ifutil`。
 
-**brpc 协程日志**（<podName>-brpc_client.log，可选；glog 格式）：
+**brpc 协程日志**（<podName>-brpc_client.log / -brpc_server.log，可选；glog 格式）：
 `IMMDD HH:MM:SS.usec tid N ... start_foreground] [WZY] bthread created: creator_tid=... bthread_id=... creation_mode=... target_pending_tasks=...` /
-`... task_runner] [WZY] bthread first scheduled: worker_tid=... bthread_id=... pending_time_us=...`。
+`... task_runner] [WZY] bthread first scheduled: worker_tid=... cpu_id=N bthread_id=... pending_time_us=...` /
+`... task_runner] [WZY] bthread completed: worker_tid=... cpu_id=N bthread_id=... execution_time_us=... lifetime_time_us=...`。
 
 ---
 
@@ -806,8 +998,14 @@ kernel_to_user`）超阈值异常时，自动针对该侧触发两项分析：
 1. **时钟域**：跨节点耗时一律用日志行 wall clock 相减；BRPC 单调时钟 ts
    （ClientSend= 等）仅用于锚点行的精确匹配，不可跨节点相减。若节点间存在时钟
    偏差，跨节点段耗时仅供参考（报告中有提示）。
-2. **node 关联**：podIP 与 nodeIP 通常不同网段，只能通过 pod 文件夹名包含
-   nodeName 做子串匹配（最长匹配优先，避免 worker1 误配 worker13）。
+2. **node 关联**：podIP 与 nodeIP 通常不同网段，映射优先级为
+   **env 文件（pod_ip= / *HOST_IP=）→ 日志正文 Host ID is/id is 行 →
+   目录名 IP 直查 node_by_ip → 节点名子串匹配**（最长匹配优先，避免 worker1
+   误配 worker13；同一 IP 多命名时别名收敛到先注册的规范名）。宿主机 IP 已知
+   但该节点无 bpf 文件时，missing 明确提示"宿主机 X 的 bpf 日志未采集"
+   （区别于完全无法映射）。client pod 目录无法映射到 bpf 节点且 server 侧
+   回退识别连接成功时，仅 client 侧内核事件缺失，server 侧分析照常
+   （missing 中注明回退）。
 3. **并发连接**：一个 trace 可能含多次 RPC（如 metadata 查询 + 数据查询），
    分析对象仅为 SLOW 行对应的那次 RPC（按 ts 值匹配锚点，而非仅按 trace_id）。
 4. **证据缺失降级**：worker 日志未收集 / bpf 无匹配事件 / 无调度告警时，
@@ -893,3 +1091,12 @@ ClientSend .060757
 ClientRecv .077001
 结论：client 收包后唤醒/用户态取包慢（置信度：高）
 ```
+
+对 `/home/wcy/minilog` 实际日志（141.62 网段三节点 bpf 共 5.5GB、tar.gz 归档 +
+已解压双份、worker 目录名 `worker_<podIp>`、client 为 `SDK_<podIp>` 目录无 env
+文件）验证通过：client 51/51 经**日志正文 Host ID 行**（`Host ID is 141.62.33.21
+from env HOST_IP`）解析到宿主机 worker22 节点；server 侧经 env 映射定位 worker12
+（141.62.32.59）；命中的 trace 双侧 bpf 事件恢复（client 9 + server 13 条），
+连接五元组 192.168.49.66:53896 ↔ 192.168.210.192:31402 从 client 侧 tcp send
+正常识别，定界"server 收包后唤醒/调度慢"（高置信）。其余 50 条问题请求因对应
+worker pod 的 kvcache 日志未收集，正确标注"证据不足"（提示补充采集）。

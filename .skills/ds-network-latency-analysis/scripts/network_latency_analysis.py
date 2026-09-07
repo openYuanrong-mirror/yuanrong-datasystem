@@ -30,7 +30,10 @@ import heapq
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tarfile
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -214,6 +217,38 @@ BPF_SCHED_SWITCH_RE = re.compile(
 )
 BPF_TCPWAKEUP_OUT_RE = re.compile(r"^tcpwakeup out tid (?P<tid>\d+) cpu (?P<cpu>\d+)")
 
+# softirq 探针（收包慢定界）：raise→entry 慢（软中断发起后被抢占/延迟）/
+# entry→exit 慢（软中断本身处理太长）。printf 字段含 %-4d/%-8d 填充，用 \s* 容错
+BPF_SOFTIRQ_RAISE_RE = re.compile(
+    r"^high irq-to-softirq\s+vec=(?P<vec>\d+)\s+latency:\s*(?P<lat>\d+)\s*usec"
+    r"\s*\(\s*\d+\s*ms\)\s*on CPU:(?P<cpu>\d+)\s+comm:(?P<comm>\S+)"
+    r"\s+kstack:(?P<kstack>.*)$"
+)
+BPF_SOFTIRQ_EXIT_RE = re.compile(
+    r"^slow softirq!\s*cpu:\s*(?P<cpu>\d+)\s*\|\s*Type:\s*(?P<vec>\d+)\s*\|"
+    r"\s*Latency:\s*(?P<lat>\d+)\s*us,\s*timercnt:(?P<tc>\d+)/(?P<tlc>\d+)"
+)
+# Linux softirq 向量号 → 名称（NET_RX 收包 / TIMER 定时器等）
+SOFTIRQ_VEC_LABELS = {0: "HI", 1: "TIMER", 2: "NET_TX", 3: "NET_RX", 4: "BLOCK",
+                      5: "IRQ_POLL", 6: "TASKLET", 7: "SCHED", 8: "HRTIMER",
+                      9: "RCU"}
+# softirq 定位回溯窗：收包点（NetifRx）往前找 raise→entry 延迟事件的范围
+SOFTIRQ_LOOKBACK_MS = 50
+# 接收侧线路段（wire_*_phys）≥ 该值才做 wire 模式 softirq 回溯定位（us）
+SOFTIRQ_WIRE_MIN_US = 1000
+# kstack 续行（raise 行之后的无时间戳行）：8 空格 + symbol+offset
+KSTACK_FRAME_RE = re.compile(rb"^\s+[\w.:@$/\-]+\+\d+\s*$")
+
+
+def _append_kstack_frame(ev, raw_line):
+    """把 kstack 续行追加到 softirq_raise_delay 事件（kstack 与 raw 同步）。"""
+    text = raw_line.decode("utf-8", "replace")
+    frame = text.strip()
+    if not frame:
+        return
+    ev["kstack"] = (ev["kstack"] + "\n" + frame) if ev.get("kstack") else frame
+    ev["raw"] = ev.get("raw", "") + text
+
 # 网卡层观测点位（net.bt）：src→dst 方向四元组 + seq/len/dev（net_dev_xmit 另有 rc）
 BPF_NIC_RE = re.compile(
     r"^(?P<ev>dev_start_xmit|net_dev_xmit|netif_receive_skb):\s+"
@@ -246,10 +281,22 @@ WARN_FILE_RE = re.compile(r"^(?P<name>.+)_(?P<ip>\d+\.\d+\.\d+\.\d+)$")
 # 辅助日志（均在 dscollect_log/ 下，可选输入，缺失自动降级）：
 #   irqoff_latency_<nodeIp>.log  关中断超过 1ms 的记录（块 + 调用栈）
 #   nic-<nodeIp>.log             ethtool 属性 + sar 每秒网卡利用率采样
-#   <podName>-brpc*.log          bRPC bthread 协程创建/首次调度日志（glog 格式）
+#   <podName>-brpc*.log          bRPC bthread 协程创建/首次调度/完成日志（glog 格式）
+# 超大日志归档成 *.tar.gz（如 bpf-<nodeName>-<nodeIp>.log.tar.gz），
+# 发现阶段就地解压（等价 tar zxvf *.tar.gz .）后按普通文件匹配
 IRQOFF_FILE_RE = re.compile(r"^irqoff_latency_(?P<ip>\d+\.\d+\.\d+\.\d+)\.log$")
 NIC_FILE_RE = re.compile(r"^nic-(?P<ip>\d+\.\d+\.\d+\.\d+)\.log$")
 BRPC_FILE_RE = re.compile(r"^(?P<pod>.+?)-brpc.*\.log$")
+TAR_SUFFIXES = (".tar.gz", ".tgz")
+# 应用日志按文件名识别（目录名不参与分类——采集目录名后续可能变化）：
+#   ds_client*（client）/ kvcache*（worker）；未知名 *.log 按内容嗅探兜底
+CLIENT_LOG_RE = re.compile(r"^ds_client.*\.log$")
+WORKER_LOG_RE = re.compile(r"^kvcache.*\.log$")
+SNIFF_BYTES = 1 << 20  # 未知名日志角色嗅探读取的文件头大小（1MB）
+# 节点探测兜底：pod IP → 宿主机节点的 bpf 探测窗口前后余量(s)——
+# 目录名不可识别（无节点子串/IP/env/Host ID）时，用 trace 窗口探测
+# 各节点 bpf 文件（pod IP 作为 local_ip 只出现在 pod 所在节点的 bpf 日志）
+NODE_PROBE_PAD_S = 2
 
 # irqoff 块结构：hardirq:/softirq: 切换中断类型，cpu: N 切换 cpu，
 # COMMAND 行开一条新记录（其后调用栈行附加到该记录，直到下一条切换/记录行）
@@ -276,15 +323,23 @@ NIC_HIGH_IFUTIL_PCT = 50.0
 NIC_LOW_IFUTIL_PCT = 10.0
 
 # bRPC bthread 日志（glog：I0824 22:32:23.661136  tid  bid  file:line fn] msg）
+# 三类事件：created（创建排队）/ first scheduled（首次调度，新格式含 cpu_id）/
+#           completed（执行完成，含 execution_time_us / lifetime_time_us）
 BTHREAD_CREATED_RE = re.compile(
     r"bthread created:\s*creator_tid=(?P<ctid>\d+)\s+bthread_id=(?P<bid>\d+)\s+"
     r"creation_time_ns=(?P<ctns>\d+)\s+creation_mode=(?P<mode>\w+)\s+"
     r"target_local_pending_tasks=(?P<lp>\d+)\s+target_remote_pending_tasks=(?P<rp>\d+)\s+"
     r"target_pending_tasks=(?P<tp>\d+)")
 BTHREAD_SCHED_RE = re.compile(
-    r"bthread first scheduled:\s*worker_tid=(?P<wtid>\d+)\s+bthread_id=(?P<bid>\d+)\s+"
+    r"bthread first scheduled:\s*worker_tid=(?P<wtid>\d+)\s+"
+    r"(?:cpu_id=(?P<cpu>\d+)\s+)?bthread_id=(?P<bid>\d+)\s+"
     r"fn=(?P<fn>\S+)\s+arg=(?P<arg>\S+)\s+creation_time_ns=(?P<ctns>\d+)\s+"
     r"first_run_time_ns=(?P<frns>\d+)\s+pending_time_us=(?P<ptu>\d+)")
+BTHREAD_COMPLETED_RE = re.compile(
+    r"bthread completed:\s*worker_tid=(?P<wtid>\d+)\s+cpu_id=(?P<cpu>\d+)\s+"
+    r"bthread_id=(?P<bid>\d+)\s+fn=(?P<fn>\S+)\s+arg=(?P<arg>\S+)\s+"
+    r"completion_time_ns=(?P<cmtns>\d+)\s+execution_time_us=(?P<etu>\d+)\s+"
+    r"lifetime_time_us=(?P<ltu>\d+)")
 
 # 辅助日志与 trace 的关联窗口：本侧"收包→用户态取包"段前后余量(ms)
 AUX_RECV_PAD_MS = 2
@@ -393,7 +448,8 @@ def _scan_file_job(job):
            verbose, source)
     mode "slow"：返回 ("slow", path_str, None, [SlowRecord...], None)
     mode "anchor_info"：返回 ("anchor_info", path_str, source,
-                              {trace: [锚点 info dict...]}, [(trace, line)...])
+                              {trace: [锚点 info dict...]}, [(trace, line)...],
+                              [(pod_ip, host_ip)...])
     """
     (path_str, markers, mode, trace_ids, threshold_us, only_traces,
      verbose, source) = job
@@ -420,11 +476,19 @@ def _scan_file_job(job):
             recs.append(SlowRecord(trace_id, info["ts"], kv, str(p),
                                    p.parent.name))
         return ("slow", path_str, None, recs, None)
-    # anchor_info 模式：锚点行 + 问题 trace 的全部 INFO 行一并收集
+    # anchor_info 模式：锚点行 + 问题 trace 的全部 INFO 行一并收集；
+    # 另提取日志正文 Host ID 行（pod→宿主机映射，不参与 trace 过滤）
     wanted = set(trace_ids or ())
     anchors = {}
     info_pairs = []
+    hostid_pairs = []
     for p, line in iter_marker_lines([path], markers, verbose=verbose):
+        hm = HOSTID_LINE_RE.search(line)
+        if hm:
+            pm = re.search(r"\d+\.\d+\.\d+\.\d+", p.parent.name)
+            if pm:
+                hostid_pairs.append((pm.group(0), hm.group("host")))
+            continue
         info = parse_info_line(line)
         if not info:
             continue
@@ -438,7 +502,7 @@ def _scan_file_job(job):
             info["_pod_dir"] = p.parent.name
             anchors.setdefault(t, []).append(info)
         info_pairs.append((t, line.rstrip("\n")))
-    return ("anchor_info", path_str, source, anchors, info_pairs)
+    return ("anchor_info", path_str, source, anchors, info_pairs, hostid_pairs)
 
 
 def run_parallel(jobs, workers, func=None):
@@ -458,16 +522,19 @@ def run_parallel(jobs, workers, func=None):
 def _bpf_scan_job(job):
     """进程池 worker：单节点 bpf 文件窗口扫描。
 
-    job = (path_str, windows, full_scan, max_sched_events, verbose, slack_us)
-    返回 (results, truncated, window_results, window_truncated, diag)
-    （均可 pickle）。
+    job = (path_str, windows, full_scan, max_sched_events, verbose, slack_us
+           [, softirq_only])
+    返回 (results, truncated, window_results, window_truncated,
+          lookback_results, diag)（均可 pickle）。
     """
-    path_str, windows, full_scan, max_sched_events, verbose, slack_us = job
+    path_str, windows, full_scan, max_sched_events, verbose, slack_us = job[:6]
+    softirq_only = job[6] if len(job) > 6 else False
     scanner = BpfScanner(path_str, windows, full_scan=full_scan,
                          max_sched_events=max_sched_events, verbose=verbose,
-                         slack_us=slack_us)
+                         slack_us=slack_us, softirq_only=softirq_only)
     res, trunc = scanner.scan()
-    return res, trunc, scanner.window_results, scanner.window_truncated, scanner.diag
+    return (res, trunc, scanner.window_results, scanner.window_truncated,
+            scanner.lookback_results, scanner.diag)
 
 
 # ── Parsers (unit-testable pure functions) ───────────────────────────────────
@@ -624,6 +691,26 @@ def parse_bpf_line(line, day):
             ev["tid"] = int(tm2.group("tid"))
             ev["cpu"] = int(tm2.group("cpu"))
             return ev
+
+    # softirq 探针（>1ms 才打印，量小）：raise→entry 慢 / entry→exit 慢
+    sim = BPF_SOFTIRQ_RAISE_RE.match(rest)
+    if sim:
+        ev["kind"] = "softirq_raise_delay"
+        ev["vec"] = int(sim.group("vec"))
+        ev["latency_us"] = int(sim.group("lat"))
+        ev["cpu"] = int(sim.group("cpu"))
+        ev["comm"] = sim.group("comm")
+        ev["kstack"] = sim.group("kstack").strip()
+        return ev
+    sem = BPF_SOFTIRQ_EXIT_RE.match(rest)
+    if sem:
+        ev["kind"] = "softirq_exit_delay"
+        ev["cpu"] = int(sem.group("cpu"))
+        ev["vec"] = int(sem.group("vec"))
+        ev["latency_us"] = int(sem.group("lat"))
+        ev["timer_cnt"] = int(sem.group("tc"))
+        ev["timer_large_cnt"] = int(sem.group("tlc"))
+        return ev
 
     ev["kind"] = "other"
     return ev
@@ -956,7 +1043,15 @@ def _nic_dev_stats(d):
 
 
 def _parse_bthread_event(line, dt):
-    """brpc bthread 日志行 → 事件 dict（不匹配返回 None）。"""
+    """brpc bthread 日志行 → 事件 dict（不匹配返回 None）。
+
+    三类事件（kind）：
+      created    协程创建并入队（tid=creator_tid，含 target_pending_tasks 积压）
+      scheduled  协程首次被 worker 线程调度（tid=worker_tid，含 pending_time_us
+                 排队耗时；新格式带 cpu_id）
+      completed  协程执行完成（tid=worker_tid，含 execution_time_us 执行耗时 /
+                 lifetime_time_us 生命周期 = 创建→完成）
+    """
     if "bthread created:" in line:
         m = BTHREAD_CREATED_RE.search(line)
         if not m:
@@ -965,16 +1060,30 @@ def _parse_bthread_event(line, dt):
                 "bthread_id": int(m.group("bid")),
                 "creation_mode": m.group("mode"),
                 "target_pending_tasks": int(m.group("tp")),
-                "pending_time_us": None, "raw": line.rstrip("\n")}
+                "pending_time_us": None, "execution_time_us": None,
+                "lifetime_time_us": None, "cpu": None, "raw": line.rstrip("\n")}
     if "bthread first scheduled:" in line:
         m = BTHREAD_SCHED_RE.search(line)
         if not m:
             return None
+        cpu = int(m.group("cpu")) if m.group("cpu") else None
         return {"ts": dt, "kind": "scheduled", "tid": int(m.group("wtid")),
                 "bthread_id": int(m.group("bid")),
                 "creation_mode": None, "target_pending_tasks": None,
                 "pending_time_us": int(m.group("ptu")),
-                "raw": line.rstrip("\n")}
+                "execution_time_us": None, "lifetime_time_us": None,
+                "cpu": cpu, "raw": line.rstrip("\n")}
+    if "bthread completed:" in line:
+        m = BTHREAD_COMPLETED_RE.search(line)
+        if not m:
+            return None
+        return {"ts": dt, "kind": "completed", "tid": int(m.group("wtid")),
+                "bthread_id": int(m.group("bid")),
+                "creation_mode": None, "target_pending_tasks": None,
+                "pending_time_us": None,
+                "execution_time_us": int(m.group("etu")),
+                "lifetime_time_us": int(m.group("ltu")),
+                "cpu": int(m.group("cpu")), "raw": line.rstrip("\n")}
     return None
 
 
@@ -1045,6 +1154,10 @@ class TraceContext:
         self.client_pod_dir = slow.pod_dir
         self.client_node = None
         self.server_node = None
+        self.client_node_note = None  # client 无法映射时的诊断（如宿主机 IP 已知但 bpf 未采集）
+        self.server_node_note = None  # server 同上
+        self.conn_source = None  # 连接五元组识别来源：client_tcp（确证）/ client_nic（推测）/ server_tcp（回退）/ client_port（端口+时间配对推测）
+        self.client_only = False  # server IP 未知（worker 日志未收集）：client 侧单侧关联
         self.client_ip = None
         self.server_ip = None
         self.conn = None           # (client_ip, cport, server_ip, sport)
@@ -1076,6 +1189,8 @@ class TraceContext:
         self.cpu_busy = {}          # side -> 问题窗口 cpu 侵占分析结果 dict
         self.cpu_evidence = []      # cpu 侵占证据（list[str]）
         self.cpu_busy_preempt = False  # 业务线程所在 cpu 上发现其他请求处理
+        self.softirq_lookback = {}    # side -> 收包点前 softirq 回溯窗口事件
+        self.softirq_localization = {}  # side -> 收包慢定位结论（comm/kstack/...）
         # 慢段窗口：瓶颈段时间窗内该侧全部连接的 bpf 事件（高亮问题五元组 +
         # 过滤选择），bpf 事件明细"慢段时间窗事件"子项数据源
         self.slow_seg = {}
@@ -1084,13 +1199,16 @@ class TraceContext:
 # ── Phase 0: log discovery ────────────────────────────────────────────────────
 
 class LogDiscovery:
-    def __init__(self, root):
+    def __init__(self, root, workers=1):
         self.root = Path(root)
+        self.workers = workers  # tar.gz pigz 并行解压线程数（与 --workers 一致）
         self.client_logs = []
         self.worker_logs = []
         self.bpf_by_node = {}      # nodeName -> path
         self.warn_by_node = {}     # nodeName -> path
-        self.node_by_ip = {}       # nodeIp -> nodeName（bpf/warn 文件名建立）
+        self.node_by_ip = {}       # nodeIp -> nodeName（bpf/warn 文件名建立，规范名）
+        self.node_alias = {}       # 别名节点名 -> 规范名（同一 IP 出现多个命名时）
+        self.host_by_podip = {}    # podIp -> 宿主机 IP（collected*_logs/<pod>/env）
         self.irqoff_by_node = {}   # nodeName -> path（关中断日志）
         self.irqoff_by_ip = {}     # nodeIp -> path（IP 未能映射到节点时保留，供全局统计）
         self.nic_by_node = {}      # nodeName -> path（sar 网卡利用率日志）
@@ -1099,46 +1217,169 @@ class LogDiscovery:
         self.aux_stats = {"irqoff": {}, "nic": {}}  # 辅助日志全周期统计
         self._discover()
 
+    @staticmethod
+    def _extract_via_tar(f, directory, workers):
+        """tar + pigz 并行解压（等价 tar -x -C <dir> --use-compress-program="pigz -p N"）。
+
+        返回是否成功；tar/pigz 不可用或命令失败时由调用方回退 Python tarfile。
+        """
+        cmd = ["tar", "-x", "-C", str(directory),
+               "--use-compress-program=pigz -p %d" % max(1, workers),
+               "-f", str(f)]
+        return subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL).returncode == 0
+
+    @staticmethod
+    def _extract_archives(directory, workers=1):
+        """就地解压目录下的 *.tar.gz（超大日志归档，等价 tar zxvf *.tar.gz .）。
+
+        pigz/tar 可用时优先并行解压（--use-compress-program="pigz -p N"，
+        N 与 --workers 一致）；否则/失败时回退 Python tarfile。
+        解压失败（坏包/权限）时告警并跳过，不影响其余日志发现。
+        """
+        use_pigz = bool(shutil.which("pigz")) and bool(shutil.which("tar"))
+        for f in sorted(directory.iterdir()):
+            if not f.is_file() or not f.name.endswith(TAR_SUFFIXES):
+                continue
+            if use_pigz and LogDiscovery._extract_via_tar(f, directory, workers):
+                continue
+            try:
+                with tarfile.open(f, "r:*") as tf:
+                    try:
+                        tf.extractall(directory, filter="data")
+                    except TypeError:  # 旧版 Python 无 filter 参数
+                        tf.extractall(directory)
+            except (tarfile.TarError, OSError) as exc:
+                print("warning: 解压失败 %s: %s" % (f, exc), file=sys.stderr)
+
+    def _scan_env_file(self, path):
+        """解析 collected*_logs/<pod>/env：pod_ip / 宿主机 IP 映射。
+
+        env 由采集脚本生成（如 pod_ip=192.168.210.192 / JD_HOST_IP=192.168.0.59），
+        pod 目录名被简化成 worker_<podIp> 时，靠它定位宿主机节点。
+        """
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return
+        pod_ip = host_ip = None
+        for line in text.splitlines():
+            line = line.strip()
+            if "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key, val = key.strip(), val.strip()
+            if key == "pod_ip":
+                pod_ip = val
+            elif key.endswith("HOST_IP") and re.fullmatch(r"\d+\.\d+\.\d+\.\d+", val):
+                host_ip = val
+        if pod_ip and host_ip:
+            self.host_by_podip[pod_ip] = host_ip
+
+    def _register_node_name(self, ip, name):
+        """注册 ip → 节点名：先注册者为规范名，后到的同名 IP 命名记为别名。
+
+        同一节点 IP 可能被不同采集脚本命名（如 bpf-worker12-192.168.0.59.log
+        与 worker16_192.168.0.59），别名统一收敛到规范名，避免同节点被拆成
+        两个节点导致 bpf/告警/辅助日志关联不上。
+        """
+        canon = self.node_by_ip.get(ip)
+        if canon is None:
+            self.node_by_ip[ip] = name
+            return name
+        if name != canon:
+            self.node_alias[name] = canon
+        return canon
+
+    @staticmethod
+    def _sniff_log_role(path):
+        """未知名 *.log 的角色嗅探（目录名不可靠时的内容识别）。
+
+        读文件头 SNIFF_BYTES，按锚点/慢请求标记判定：ClientSend/ClientRecv
+        → client，ServerRecv/ServerSend → worker，[BRPC_RPC_FRAMEWORK_SLOW]
+        → client（慢请求行仅在 client 侧日志出现）；无标记 → None（跳过）。
+        工具自身的 --raw 汇总输出（首行为 80 个 "=" 分隔线，含锚点行）
+        被排除，防止输出落在日志根目录时自污染。
+        """
+        try:
+            with open(path, "rb") as fh:
+                head = fh.read(SNIFF_BYTES)
+        except OSError:
+            return None
+        stripped = head.lstrip()
+        if stripped.startswith(b"=" * 40):
+            return None  # 本工具 --raw 输出（"="*80 分隔线开头）
+        if b"ClientSend ts " in head or b"ClientRecv ts " in head:
+            return "client"
+        if b"ServerRecv ts " in head or b"ServerSend ts " in head:
+            return "worker"
+        if b"[BRPC_RPC_FRAMEWORK_SLOW]" in head:
+            return "client"
+        return None
+
     def _discover(self):
+        """全树扫描，按文件名模式 + 内容嗅探分类（不依赖目录名）。
+
+        采集目录名（collected/collected_worker_logs/dscollect_log/
+        latency_warn_log 及 pod 目录名）可能变化，发现逻辑只认文件：
+          - 已知模式：bpf-<node>-<ip>.log / irqoff_latency_<ip>.log /
+            nic-<ip>.log / *-brpc*.log / <node>_<ip>（warn）/ env /
+            ds_client*（client）/ kvcache*（worker）；
+          - 未知名 *.log 内容嗅探兜底；
+          - *.tar.gz 任意目录就地解压后重扫。
+        """
         root = self.root
         if not root.is_dir():
             raise FileNotFoundError("log root not found: %s" % root)
-        for d in ("collected", "collected_worker_logs"):
-            base = root / d
-            if base.is_dir():
-                target = self.client_logs if d == "collected" else self.worker_logs
-                for f in sorted(base.rglob("*.log")):
-                    if f.is_file():
-                        target.append(f)
-        dsdir = root / "dscollect_log"
+        # 1) 任意目录下的 *.tar.gz 就地解压（解压出的文件进入第 2 步重扫）
+        archive_dirs = sorted({f.parent for f in root.rglob("*")
+                               if f.is_file()
+                               and f.name.endswith(TAR_SUFFIXES)})
+        for d in archive_dirs:
+            self._extract_archives(d, self.workers)
+        # 2) 全树分类
         irqoff_pending, nic_pending = [], []
-        if dsdir.is_dir():
-            for f in sorted(dsdir.iterdir()):
-                if not f.is_file():
-                    continue
-                m = BPF_FILE_RE.match(f.name)
-                if m:
-                    self.bpf_by_node[m.group("name")] = f
-                    self.node_by_ip.setdefault(m.group("ip"), m.group("name"))
-                    continue
-                m = IRQOFF_FILE_RE.match(f.name)
-                if m:
-                    irqoff_pending.append((m.group("ip"), f))
-                    continue
-                m = NIC_FILE_RE.match(f.name)
-                if m:
-                    nic_pending.append((m.group("ip"), f))
-                    continue
-                m = BRPC_FILE_RE.match(f.name)
-                if m:
-                    self.brpc_by_pod.setdefault(m.group("pod"), f)
-        lwdir = root / "latency_warn_log"
-        if lwdir.is_dir():
-            for f in sorted(lwdir.iterdir()):
-                m = WARN_FILE_RE.match(f.name)
-                if m and f.is_file():
-                    self.warn_by_node[m.group("name")] = f
-                    self.node_by_ip.setdefault(m.group("ip"), m.group("name"))
+        for f in sorted(root.rglob("*")):
+            if not f.is_file() or f.name.endswith(TAR_SUFFIXES):
+                continue
+            name = f.name
+            if name == "env":
+                self._scan_env_file(f)
+                continue
+            m = BPF_FILE_RE.match(name)
+            if m:
+                canon = self._register_node_name(m.group("ip"), m.group("name"))
+                self.bpf_by_node[canon] = f
+                continue
+            m = IRQOFF_FILE_RE.match(name)
+            if m:
+                irqoff_pending.append((m.group("ip"), f))
+                continue
+            m = NIC_FILE_RE.match(name)
+            if m:
+                nic_pending.append((m.group("ip"), f))
+                continue
+            m = BRPC_FILE_RE.match(name)
+            if m:
+                self.brpc_by_pod.setdefault(m.group("pod"), f)
+                continue
+            m = WARN_FILE_RE.match(name)
+            if m:
+                canon = self._register_node_name(m.group("ip"), m.group("name"))
+                self.warn_by_node.setdefault(canon, f)
+                continue
+            if CLIENT_LOG_RE.match(name):
+                self.client_logs.append(f)
+                continue
+            if WORKER_LOG_RE.match(name):
+                self.worker_logs.append(f)
+                continue
+            if name.endswith(".log"):
+                role = self._sniff_log_role(f)
+                if role == "client":
+                    self.client_logs.append(f)
+                elif role == "worker":
+                    self.worker_logs.append(f)
         # irqoff/nic 文件名只含 nodeIp，经 node_by_ip 反查节点（bpf/warn 先建好映射）
         for ip, f in irqoff_pending:
             node = self.node_by_ip.get(ip)
@@ -1154,8 +1395,42 @@ class LogDiscovery:
                 self.nic_by_ip[ip] = f
 
     def resolve_node(self, pod_dir_name):
-        return match_node(pod_dir_name, list(self.bpf_by_node.keys())
-                          + list(self.warn_by_node.keys()))
+        """pod 目录名 → 节点名（规范名）。
+
+        优先 env 映射：目录名中的 IP（pod IP）→ 宿主机 IP → 节点
+        （pod 目录名被简化成 worker_<podIp> 时仍可定位宿主机节点）；
+        其次目录名中 IP 本身即节点 IP；最后回退节点名子串匹配（含别名）。
+        """
+        names = (list(self.bpf_by_node.keys()) + list(self.warn_by_node.keys())
+                 + list(self.node_alias.keys()))
+        if pod_dir_name:
+            m = re.search(r"\d+\.\d+\.\d+\.\d+", pod_dir_name)
+            if m:
+                ip = m.group(0)
+                for tip in (self.host_by_podip.get(ip), ip):
+                    if tip:
+                        node = self.node_by_ip.get(tip)
+                        if node:
+                            return node
+        node = match_node(pod_dir_name, names)
+        return self.node_alias.get(node, node) if node else None
+
+    def node_names_for(self, node):
+        """节点的全部命名（规范名 + 别名），brpc 文件 pod 名匹配用。"""
+        if not node:
+            return ()
+        return (node,) + tuple(a for a, c in self.node_alias.items() if c == node)
+
+    def host_ip_of(self, pod_dir_name):
+        """pod 目录名对应 pod IP 的宿主机 IP（env/日志正文映射），无则 None。
+
+        resolve_node 失败时用于诊断：宿主机 IP 已知但 node_by_ip 无该 IP
+        → 宿主机 bpf 日志未采集；未知 → 目录名既无 env 也无 Host ID 行。
+        """
+        if not pod_dir_name:
+            return None
+        m = re.search(r"\d+\.\d+\.\d+\.\d+", pod_dir_name)
+        return self.host_by_podip.get(m.group(0)) if m else None
 
 
 # ── Phase 1: client log scan for slow records ─────────────────────────────────
@@ -1182,6 +1457,14 @@ def scan_slow_records(client_logs, threshold_us, only_traces=None, verbose=False
 # 替代对每行做 O(traces) 次子串比较的旧实现（大日志下不可行）。
 ANCHOR_MARKERS = [b"ClientSend ts ", b"ClientRecv ts ",
                   b"ServerRecv ts ", b"ServerSend ts "]
+
+# 日志正文 pod→宿主机映射行（启动期一次性，极稀疏）：
+#   client: "Host ID is 141.62.33.21 from env HOST_IP"（service_discovery.cpp）
+#   worker: "Host id is 141.62.32.59 from env JD_HOST_IP"（ds_coordination_backend）
+# 用于 env 文件缺失时兜底建立 host_by_podip（如 SDK_<podIp> 目录无 env）。
+HOSTID_LINE_RE = re.compile(
+    r"Host [Ii][Dd] is (?P<host>\d+\.\d+\.\d+\.\d+) from env")
+HOSTID_MARKERS = [b"Host ID is", b"Host id is"]
 
 
 def collect_anchor_lines(client_logs, worker_logs, trace_ids, verbose=False):
@@ -1214,29 +1497,35 @@ def collect_anchor_and_info(client_logs, worker_logs, trace_ids, verbose=False,
     """单遍扫描 client+worker 日志，同时收集：
       1. 问题 trace 的 4 类锚点行（等价 collect_anchor_lines 的输出结构）；
       2. 问题 trace 的全部 INFO 行（等价 collect_trace_info_lines 的输出，
-         含业务中间行，供 --raw 使用）。
+         含业务中间行，供 --raw 使用）；
+      3. 日志正文 Host ID 行的 (pod_ip, host_ip) 映射对（env 缺失时兜底，
+         如 SDK_<podIp> 目录无 env 文件）。
 
-    markers = ANCHOR_MARKERS + trace_id 字节串：锚点行本身含 trace_id，
-    业务行以 trace_id 命中——一遍 IO 完成原阶段2+阶段7 两遍扫描的工作。
-    workers>1 时按文件并行。返回 (anchor_idx, info_idx)。
+    markers = ANCHOR_MARKERS + HOSTID_MARKERS + trace_id 字节串：锚点行本身含
+    trace_id，业务行以 trace_id 命中——一遍 IO 完成原阶段2+阶段7 两遍扫描的工作。
+    workers>1 时按文件并行。返回 (anchor_idx, info_idx, hostid_pairs)。
     """
     wanted = set(trace_ids)
-    markers = list(ANCHOR_MARKERS) + [t.encode("utf-8") for t in wanted]
+    markers = (list(ANCHOR_MARKERS) + list(HOSTID_MARKERS)
+               + [t.encode("utf-8") for t in wanted])
     anchor_idx = {t: {"client": [], "worker": []} for t in wanted}
     info_idx = {t: [] for t in wanted}
+    hostid_pairs = []
     jobs = [(str(p), markers, "anchor_info", tuple(wanted), None, None,
              verbose, "client") for p in client_logs] \
         + [(str(p), markers, "anchor_info", tuple(wanted), None, None,
             verbose, "worker") for p in worker_logs]
-    for _, path_str, source, anchors, info_pairs in run_parallel(jobs, workers):
+    for _, path_str, source, anchors, info_pairs, f_hostids in \
+            run_parallel(jobs, workers):
         for t, infos in anchors.items():
             anchor_idx[t][source].extend(infos)
         for t, line in info_pairs:
             info_idx[t].append((source, path_str, line))
+        hostid_pairs.extend(f_hostids)
     for t in wanted:
         anchor_idx[t]["client"].sort(key=lambda x: x["ts"])
         anchor_idx[t]["worker"].sort(key=lambda x: x["ts"])
-    return anchor_idx, info_idx
+    return anchor_idx, info_idx, hostid_pairs
 
 
 def collect_trace_info_lines(client_logs, worker_logs, trace_ids, verbose=False):
@@ -1402,12 +1691,19 @@ def _fmt_tod(us):
 
 
 class TraceWindow:
-    """单个 trace 在单侧节点上的一个当日时间窗（跨午夜已拆分）。"""
+    """单个 trace 在单侧节点上的一个当日时间窗（跨午夜已拆分）。
+
+    data_start_dt：softirq 回溯区与正常数据区的分界（收包慢定位用）。
+    [start_us, data_start_us) 为回溯区——只收 softirq_raise_delay 事件
+    （softirq_lookback 桶），不进正常关联/窗口全景；缺省无回溯区。
+    """
 
     __slots__ = ("trace_id", "side", "cip", "sip", "base_date",
-                 "start_us", "end_us", "start_tod", "end_tod")
+                 "start_us", "end_us", "start_tod", "end_tod",
+                 "data_start_us")
 
-    def __init__(self, trace_id, side, start_dt, end_dt, cip, sip):
+    def __init__(self, trace_id, side, start_dt, end_dt, cip, sip,
+                 data_start_dt=None):
         self.trace_id = trace_id
         self.side = side
         self.cip = cip
@@ -1417,9 +1713,12 @@ class TraceWindow:
         self.end_us = tod_us(end_dt)
         self.start_tod = us_to_tod(self.start_us)
         self.end_tod = us_to_tod(self.end_us)
+        self.data_start_us = (tod_us(data_start_dt)
+                              if data_start_dt is not None else self.start_us)
 
 
-def split_window_at_midnight(trace_id, side, start_dt, end_dt, cip, sip):
+def split_window_at_midnight(trace_id, side, start_dt, end_dt, cip, sip,
+                              data_start_dt=None):
     """跨午夜的窗口按自然日拆分（bpf 行无日期，需按段绑定日期）。"""
     out = []
     day = start_dt.date()
@@ -1429,7 +1728,15 @@ def split_window_at_midnight(trace_id, side, start_dt, end_dt, cip, sip):
         seg_start = max(start_dt, day_start)
         seg_end = min(end_dt, next_day - timedelta(microseconds=1))
         if seg_end >= seg_start:
-            out.append(TraceWindow(trace_id, side, seg_start, seg_end, cip, sip))
+            if data_start_dt is None:
+                ds = None
+            elif seg_end <= data_start_dt:
+                # 拆分出的前一日段整个落在回溯区（data_start 在次日）
+                ds = seg_end
+            else:
+                ds = max(seg_start, data_start_dt)
+            out.append(TraceWindow(trace_id, side, seg_start, seg_end, cip, sip,
+                                   data_start_dt=ds))
         if seg_end >= end_dt:
             break
         day += timedelta(days=1)
@@ -1508,7 +1815,8 @@ class BpfScanner:
     def __init__(self, path, windows, full_scan=False,
                  max_sched_events=DEFAULT_MAX_SCHED_EVENTS, verbose=False,
                  slack_us=SEEK_SLACK_US,
-                 max_window_net_events=DEFAULT_MAX_WINDOW_NET_EVENTS):
+                 max_window_net_events=DEFAULT_MAX_WINDOW_NET_EVENTS,
+                 softirq_only=False):
         self.path = Path(path)
         self.windows = windows
         self.full_scan = full_scan
@@ -1516,11 +1824,17 @@ class BpfScanner:
         self.verbose = verbose
         self.slack_us = slack_us
         self.max_window_net_events = max_window_net_events
+        # softirq 定位回溯扫描：只收 softirq 探针事件（其余 kind 直接丢弃）
+        self.softirq_only = softirq_only
         # 窗口全景：窗口内全部连接类事件（tcp/nic/sock，不限 IP），供
         # "问题窗口 bpf 事件全景 + cpu 侵占分析"使用（其他请求穿插展示）
         self.window_results = {}      # (trace_id, side) -> [events]
         self.window_counts = {}       # (trace_id, side) -> n（配额）
         self.window_truncated = set()
+        # softirq 回溯区：窗口起点前 SOFTIRQ_LOOKBACK_MS 内的
+        # softirq_raise_delay 事件（收包慢定位：占用 cpu 任务 + kstack）
+        self.lookback_results = {}    # (trace_id, side) -> [events]
+        self.lookback_counts = {}     # (trace_id, side) -> n（配额）
         self.clusters = merge_window_clusters(windows, slack_us=slack_us)
         self.cluster_starts = [c.start_tod for c in self.clusters]
         self.diag = {"n_read": 0, "n_tod_match": 0, "n_ip_match": 0,
@@ -1545,10 +1859,14 @@ class BpfScanner:
                 self.window_results.clear()
                 self.window_counts.clear()
                 self.window_truncated.clear()
+                self.lookback_results.clear()
+                self.lookback_counts.clear()
                 self._scan_stream(results, counts, truncated)
         for lst in results.values():
             lst.sort(key=lambda e: e["ts"])
         for lst in self.window_results.values():
+            lst.sort(key=lambda e: e["ts"])
+        for lst in self.lookback_results.values():
             lst.sort(key=lambda e: e["ts"])
         if self.verbose:
             n = sum(len(v) for v in results.values())
@@ -1600,8 +1918,14 @@ class BpfScanner:
     def _scan_stream(self, results, counts, truncated):
         starts = self.cluster_starts
         clusters = self.clusters
+        pending = None   # 最近解析的 softirq_raise_delay 事件（kstack 续行挂载）
         with open(self.path, "rb") as fh:
             for raw in fh:
+                if pending is not None:
+                    if KSTACK_FRAME_RE.match(raw):
+                        _append_kstack_frame(pending, raw)
+                        continue
+                    pending = None
                 if len(raw) < 16:
                     continue
                 self.diag["n_read"] += 1
@@ -1614,8 +1938,10 @@ class BpfScanner:
                     continue
                 if not cl.tod_in_window(tod):
                     continue  # 簇内缝隙行（窗口外）不进解析
-                self._handle_line(raw.decode("utf-8", "replace"),
-                                  cl, results, counts, truncated)
+                ev = self._handle_line(raw.decode("utf-8", "replace"),
+                                       cl, results, counts, truncated)
+                if ev is not None:
+                    pending = ev
 
     # -- seek 模式：二分定位窗口簇，只读簇内字节 -------------------------------
     def _scan_seek(self, results, counts, truncated):
@@ -1632,7 +1958,13 @@ class BpfScanner:
                 off = self._find_offset(fh, size, target - 1)
                 fh.seek(off)
                 prev_us = None
+                pending = None   # softirq_raise_delay 事件（kstack 续行挂载）
                 for raw in fh:
+                    if pending is not None:
+                        if KSTACK_FRAME_RE.match(raw):
+                            _append_kstack_frame(pending, raw)
+                            continue
+                        pending = None
                     if len(raw) < 16:
                         continue
                     head = raw[:15]
@@ -1651,11 +1983,18 @@ class BpfScanner:
                     if prev_us is not None and t + 1000000 < prev_us:
                         raise _UnsortedBpfLog()  # >1s 乱序
                     prev_us = t
-                    self._handle_line(raw.decode("utf-8", "replace"),
-                                      cl, results, counts, truncated)
+                    ev = self._handle_line(raw.decode("utf-8", "replace"),
+                                           cl, results, counts, truncated)
+                    if ev is not None:
+                        pending = ev
 
     def _find_offset(self, fh, size, target_us):
-        """二分查找第一条 tod > target_us 的行的字节偏移（要求文件大体有序）。"""
+        """二分查找第一条 tod > target_us 的行的字节偏移（要求文件大体有序）。
+
+        无时间戳行（bpftrace BEGIN 头 / softirq kstack 续行）不能证明已过
+        目标时间，按"往前回退"处理（hi=mid），保证不跳过更早的有效行——
+        代价最多是多读几行，由调用方的 lo_b / 窗口预过滤丢弃。
+        """
         lo, hi = 0, size
         while lo < hi:
             mid = (lo + hi) // 2
@@ -1670,7 +2009,9 @@ class BpfScanner:
                 hi = mid
                 continue
             t = _parse_tod_us(line[:15])
-            if t is None or t <= target_us:
+            if t is None:
+                hi = mid
+            elif t <= target_us:
                 lo = fh.tell()
             else:
                 hi = mid
@@ -1678,9 +2019,16 @@ class BpfScanner:
 
     # -- 事件归属（与旧 _filter_window 语义一致） ------------------------------
     def _handle_line(self, line, cluster, results, counts, truncated):
+        """解析一行 bpf 日志并按窗口归属。
+
+        返回 softirq_raise_delay 事件 dict（供读循环挂载 kstack 续行），
+        其余返回 None。
+        """
         ev = parse_bpf_line(line, cluster.windows[0].base_date)
         if ev is None or ev["kind"] == "other":
-            return
+            return None
+        if self.softirq_only and not ev["kind"].startswith("softirq"):
+            return None
         ts = ev["ts"]
         t_us = (ts.hour * 3600 + ts.minute * 60 + ts.second) * 1000000 + ts.microsecond
         kind = ev["kind"]
@@ -1689,12 +2037,30 @@ class BpfScanner:
             if not (w.start_us <= t_us <= w.end_us):
                 continue
             diag["n_tod_match"] += 1
+            if t_us < w.data_start_us:
+                # softirq 回溯区（窗口起点前 SOFTIRQ_LOOKBACK_MS）：只收
+                # softirq_raise_delay 事件（收包慢定位），不进正常关联/全景
+                if kind == "softirq_raise_delay":
+                    lkey = (w.trace_id, w.side)
+                    if self.lookback_counts.get(lkey, 0) < self.max_sched_events:
+                        self.lookback_counts[lkey] = \
+                            self.lookback_counts.get(lkey, 0) + 1
+                        # 共享同一 dict：kstack 续行在读循环中追加，同步到已存事件
+                        e2 = ev
+                        e2["ts"] = datetime.combine(w.base_date, ts.time())
+                        self.lookback_results.setdefault(lkey, []).append(e2)
+                continue
             attach = False
             if kind.startswith("tcp") or kind == "sock_readable":
-                # tcp_retransmit 也以 tcp_ 开头，走 local/peer IP 双向匹配
+                # tcp_retransmit 也以 tcp_ 开头，走 local/peer IP 双向匹配；
+                # sip=None（server IP 未知）时按 client pod IP 单侧匹配
                 lip, pip = ev.get("local_ip"), ev.get("peer_ip")
-                if lip and pip and ((lip == w.cip and pip == w.sip)
-                                    or (lip == w.sip and pip == w.cip)):
+                if lip and pip and w.sip is None:
+                    if lip == w.cip or pip == w.cip:
+                        attach = True
+                        diag["n_ip_match"] += 1
+                elif lip and pip and ((lip == w.cip and pip == w.sip)
+                                      or (lip == w.sip and pip == w.cip)):
                     attach = True
                     diag["n_ip_match"] += 1
                 elif lip and pip and len(diag["sample_ips"]) < 8:
@@ -1704,10 +2070,15 @@ class BpfScanner:
                         self._seen_ips.add(key)
                         diag["sample_ips"].append(key)
             elif kind.startswith("nic_"):
-                # 网卡事件：src→dst IP 双向匹配（与 tcp 同法，仅 IP 不限端口）
+                # 网卡事件：src→dst IP 双向匹配（与 tcp 同法，仅 IP 不限端口）；
+                # sip=None 时按 client pod IP 单侧匹配
                 s, d = ev.get("src_ip"), ev.get("dst_ip")
-                if s and d and ((s == w.cip and d == w.sip)
-                                or (s == w.sip and d == w.cip)):
+                if s and d and w.sip is None:
+                    if s == w.cip or d == w.cip:
+                        attach = True
+                        diag["n_ip_match"] += 1
+                elif s and d and ((s == w.cip and d == w.sip)
+                                  or (s == w.sip and d == w.cip)):
                     attach = True
                     diag["n_ip_match"] += 1
                 elif s and d and len(diag["sample_ips"]) < 8:
@@ -1723,22 +2094,60 @@ class BpfScanner:
                     continue
                 counts[key] = counts.get(key, 0) + 1
                 attach = True
-            # 窗口全景：连接类事件（tcp/nic/sock，不限 IP）全部保留（配额内），
-            # 供问题窗口"其他请求穿插"全景展示与 cpu 侵占分析使用
+            # 窗口全景：连接类事件（tcp/nic/sock，不限 IP）+ softirq 探针事件
+            # 全部保留（配额内），供问题窗口"其他请求穿插"全景展示与
+            # cpu 侵占 / 软中断延迟分析使用
             if kind.startswith("tcp") or kind == "sock_readable" \
-                    or kind.startswith("nic_"):
+                    or kind.startswith("nic_") or kind.startswith("softirq"):
                 wkey = (w.trace_id, w.side)
                 if self.window_counts.get(wkey, 0) >= self.max_window_net_events:
                     self.window_truncated.add(wkey)
                 else:
                     self.window_counts[wkey] = self.window_counts.get(wkey, 0) + 1
-                    we2 = dict(ev)
+                    # softirq_raise_delay 共享同一 dict：kstack 续行在读循环
+                    # 中追加，同步到已存事件
+                    we2 = ev if kind == "softirq_raise_delay" else dict(ev)
                     we2["ts"] = datetime.combine(w.base_date, ts.time())
                     self.window_results.setdefault(wkey, []).append(we2)
             if attach:
-                e2 = dict(ev)
+                e2 = ev if kind == "softirq_raise_delay" else dict(ev)
                 e2["ts"] = datetime.combine(w.base_date, ts.time())
                 results.setdefault((w.trace_id, w.side), []).append(e2)
+        return ev if kind == "softirq_raise_delay" else None
+
+
+def _probe_node_by_podip(disc, pod_ip, start_dt, end_dt, cache, bpf_off):
+    """节点解析失败时的 bpf 探测兜底：pod IP → 宿主机节点名。
+
+    pod 目录名不可识别（无节点子串/IP）且无 env/Host ID 行时，
+    resolve_node 失败——用 trace 时间窗（前后各扩 NODE_PROBE_PAD_S 秒）
+    探测各节点 bpf 文件：pod IP 作为 local_ip 只会出现在 pod 所在
+    节点的 bpf 日志（对端节点上它是 peer_ip），命中即该节点为
+    pod 宿主机节点。只认 local_ip，天然排除对端节点误绑。
+
+    cache：pod IP → 节点名。只缓存命中结果（未命中不缓存——不同
+    trace 的时间窗不同，后续 trace 窗口可能命中）。
+    """
+    if not pod_ip:
+        return None
+    hit = cache.get(pod_ip)
+    if hit:
+        return hit
+    pad = timedelta(seconds=NODE_PROBE_PAD_S)
+    wins = split_window_at_midnight(-1, "probe",
+                                    start_dt + bpf_off - pad,
+                                    end_dt + bpf_off + pad, pod_ip, None)
+    for node in sorted(disc.bpf_by_node):
+        try:
+            scanner = BpfScanner(disc.bpf_by_node[node], wins)
+            results, _trunc = scanner.scan()
+        except OSError:
+            continue
+        if any(e.get("local_ip") == pod_ip
+               for e in results.get((-1, "probe"), [])):
+            cache[pod_ip] = node
+            return node
+    return None
 
 
 class BpfCorrelator:
@@ -1769,6 +2178,158 @@ class BpfCorrelator:
         if not best:
             return None
         return (cip, best["local_port"], sip, best["peer_port"])
+
+    @staticmethod
+    def _identify_conn_from_server(server_events, server_recv_ts, cip, sip):
+        """client 节点无 bpf 日志（如 SDK 直连节点未采集）时，从 server 侧事件识别连接。
+
+        优先用请求方向收包事件（tcp_recv_que/in，local=server & peer=client，
+        时间 ≥ ServerRecv−200us 中最早）；无则退回响应方向发送事件
+        （tcp_send_in，ServerSend 后），取离 ServerRecv 最近的一条。
+        """
+        eps = timedelta(microseconds=200)
+        for kinds in (("tcp_recv_que", "tcp_recv_in"), ("tcp_send_in",)):
+            cands = [e for e in server_events
+                     if e["kind"] in kinds
+                     and e.get("local_ip") == sip and e.get("peer_ip") == cip]
+            if not cands:
+                continue
+            after = [e for e in cands if e["ts"] >= server_recv_ts - eps]
+            if after:
+                best = min(after, key=lambda e: e["ts"])
+            else:
+                best = min(cands, key=lambda e: abs(
+                    (e["ts"] - server_recv_ts).total_seconds()))
+            return (cip, best["peer_port"], sip, best["local_port"])
+        return None
+
+    @staticmethod
+    def _identify_conn_from_nic(client_events, client_send_ts, cip, sip):
+        """client 侧 tcp 层探针丢失时，用 nic 层发送事件（raw 含完整五元组）
+        推测连接：请求方向（src=cip → dst=sip）的 dev_start_xmit/net_dev_xmit，
+        取 ClientSend−200us 之后最早一条；无则全窗内取离 ClientSend 最近。
+        """
+        eps = timedelta(microseconds=200)
+        cands = [e for e in client_events
+                 if e["kind"] in ("nic_dev_xmit_start", "nic_dev_xmit")
+                 and e.get("src_ip") == cip and e.get("dst_ip") == sip]
+        if not cands:
+            return None
+        after = [e for e in cands if e["ts"] >= client_send_ts - eps]
+        if after:
+            best = min(after, key=lambda e: e["ts"])
+        else:
+            best = min(cands, key=lambda e: abs(
+                (e["ts"] - client_send_ts).total_seconds()))
+        return (cip, best["src_port"], sip, best["dst_port"])
+
+    @staticmethod
+    def _infer_conn_by_port_and_time(client_events, cs_ts, cr_ts, cip,
+                                     known_ports):
+        """server IP 未知但 server 服务端口固定（已知）时：端口 + 双向时间配对
+        推测连接五元组。
+
+        已知服务端口来自同 run 内完整 trace 识别出的连接（server 角色端口
+        固定）。在 client 侧窗口事件中筛选目标端口 p 的请求发送事件（邻近
+        ClientSend）与响应接收事件（邻近 ClientRecv），按 client 临时端口
+        配对成连接，取「|req−ClientSend| + |rsp−ClientRecv|」总分最小的
+        连接（同端口的干扰连接因响应时间远离 ClientRecv 而被排除）。
+        """
+        reqs = {}  # (sport, dip) -> (偏差秒, 事件)  请求发送邻近 ClientSend
+        rsps = {}  # sport -> (偏差秒, 事件)          响应接收邻近 ClientRecv
+        for e in client_events:
+            kind = e["kind"]
+            if kind in ("nic_dev_xmit_start", "nic_dev_xmit"):
+                if e.get("src_ip") != cip:
+                    continue
+                sport, dip, dport = e.get("src_port"), e.get("dst_ip"), \
+                    e.get("dst_port")
+            elif kind == "tcp_send_in":
+                if e.get("local_ip") != cip:
+                    continue
+                sport, dip, dport = e.get("local_port"), e.get("peer_ip"), \
+                    e.get("peer_port")
+            elif kind == "nic_rx_skb":
+                if e.get("dst_ip") != cip:
+                    continue
+                sport, dip, dport = e.get("dst_port"), e.get("src_ip"), \
+                    e.get("src_port")
+            elif kind == "tcp_recv_in":
+                if e.get("local_ip") != cip:
+                    continue
+                sport, dip, dport = e.get("local_port"), e.get("peer_ip"), \
+                    e.get("peer_port")
+            else:
+                continue
+            if not sport or dport not in known_ports:
+                continue
+            if kind in ("nic_dev_xmit_start", "nic_dev_xmit", "tcp_send_in"):
+                key = (sport, dip)
+                dev = abs((e["ts"] - cs_ts).total_seconds())
+                if key not in reqs or dev < reqs[key][0]:
+                    reqs[key] = (dev, e)
+            else:
+                dev = abs((e["ts"] - cr_ts).total_seconds())
+                if sport not in rsps or dev < rsps[sport][0]:
+                    rsps[sport] = (dev, e)
+        best = None  # (总分秒, conn)
+        for (sport, dip), (req_dev, req_ev) in reqs.items():
+            rsp = rsps.get(sport)
+            if rsp is None or req_ev["ts"] > rsp[1]["ts"]:
+                continue  # 无响应配对，或响应先于请求（不构成一次调用）
+            score = req_dev + rsp[0]
+            if best is None or score < best[0]:
+                best = (score, (cip, sport, dip, req_ev.get(
+                    "dst_port") or req_ev.get("peer_port")))
+        return best[1] if best else None
+
+    @staticmethod
+    def _fill_milestones_inferred(ctx, cs, cr):
+        """server IP 未知时：client 侧里程碑按时间邻近推测填充。
+
+        取窗口内该 client pod 最早的同向事件（多连接有混淆风险——若窗口内
+        该 pod 同时连向多个服务，"最早 tcp send"可能属于其他请求的连接），
+        因此全部标注推测，置信度封顶"中"。
+        - ClientTcpSendIn / ClientTcpRecvFirst / ClientTcpRecvLast : tcp 层（local=cip）
+        - ClientDevStartXmit / ClientNetDevXmit / ClientNetifRx    : nic 层（src/dst=cip）
+        """
+        ms = ctx.milestones
+        eps = timedelta(microseconds=200)
+        lo, hi = cs["ts"] - eps, cr["ts"] + eps
+        evs = [e for e in ctx.kernel_events["client"] if lo <= e["ts"] <= hi]
+        cip = ctx.client_ip
+        tcp_sends = [e for e in evs if e["kind"] == "tcp_send_in"
+                     and e.get("local_ip") == cip]
+        tcp_recvs = [e for e in evs if e["kind"] == "tcp_recv_in"
+                     and e.get("local_ip") == cip]
+        xmit_starts = [e for e in evs if e["kind"] == "nic_dev_xmit_start"
+                       and e.get("src_ip") == cip]
+        xmits = [e for e in evs if e["kind"] == "nic_dev_xmit"
+                 and e.get("src_ip") == cip]
+        rx_skbs = [e for e in evs if e["kind"] == "nic_rx_skb"
+                   and e.get("dst_ip") == cip]
+        filled_keys = []
+        if tcp_sends:
+            ms["ClientTcpSendIn"] = min(e["ts"] for e in tcp_sends)
+            filled_keys.append("ClientTcpSendIn")
+        if tcp_recvs:
+            ms["ClientTcpRecvFirst"] = min(e["ts"] for e in tcp_recvs)
+            ms["ClientTcpRecvLast"] = max(e["ts"] for e in tcp_recvs)
+            filled_keys += ["ClientTcpRecvFirst", "ClientTcpRecvLast"]
+        if xmit_starts:
+            ms["ClientDevStartXmit"] = min(e["ts"] for e in xmit_starts)
+            filled_keys.append("ClientDevStartXmit")
+        if xmits:
+            ms["ClientNetDevXmit"] = min(e["ts"] for e in xmits)
+            filled_keys.append("ClientNetDevXmit")
+        if rx_skbs:
+            ms["ClientNetifRx"] = min(e["ts"] for e in rx_skbs)
+            filled_keys.append("ClientNetifRx")
+        if filled_keys:
+            ctx.missing.append(
+                "client 侧里程碑（%s）按时间邻近推测（server IP 未知，"
+                "取窗口内该 pod 最早同向事件；窗口内该 pod 连向多个服务时"
+                "可能混入其他请求连接的事件）" % ", ".join(sorted(filled_keys)))
 
     @staticmethod
     def _fill_milestone(ms, ev, cip, cport, sip, sport, side):
@@ -2215,38 +2776,136 @@ def _server_preceding_coroutine_evidence(ctx):
     _preceding_coroutine_evidence(ctx, "server")
 
 
-def correlate_kernel(ctx, kernel_results, window_net_results=None):
+def correlate_kernel(ctx, kernel_results, window_net_results=None,
+                     known_server_ports=None, softirq_lookback_results=None):
     """把预扫描的 bpf 窗口事件关联到 ctx（替代旧的整文件解析+过滤）。
 
     window_net_results：BpfScanner 的窗口全景桶（窗口内全部连接的
     tcp/nic/sock 事件，不限 IP），用于构建问题窗口全景视图。
+    known_server_ports：{client_ip: {server 服务端口}}——同 run 内完整 trace
+    识别出的连接提供（server 角色端口固定），供 client-only trace 的
+    「端口 + 双向时间配对」连接推测使用。
+    softirq_lookback_results：BpfScanner 的 softirq 回溯桶（窗口起点前
+    SOFTIRQ_LOOKBACK_MS 内的 softirq_raise_delay 事件），供收包慢
+    softirq 定位使用（_cpu_busy_analysis）。
     """
     cs = ctx.anchors.get("ClientSend")
     cr = ctx.anchors.get("ClientRecv")
     if not cs or not cr:
         ctx.missing.append("缺少 ClientSend/ClientRecv 锚点，跳过内核日志关联")
         return
+    # softirq 回溯区事件（收包慢定位）：尽早填充，client-only 提前返回
+    # 路径下 _cpu_busy_analysis 也能使用
+    for side in ("client", "server"):
+        evs = (softirq_lookback_results or {}).get((ctx.idx, side))
+        if evs:
+            ctx.softirq_lookback[side] = [dict(e) for e in evs]
+    client_msg_idx = None
     if not ctx.client_node:
-        ctx.missing.append("client pod 目录 %s 无法映射到 bpf 节点" % ctx.client_pod_dir)
+        if ctx.client_node_note:
+            ctx.missing.append(
+                "client pod 目录 %s 无法映射到 bpf 节点（宿主机 %s 的 bpf 日志未采集）"
+                % (ctx.client_pod_dir, ctx.client_node_note))
+        else:
+            ctx.missing.append("client pod 目录 %s 无法映射到 bpf 节点" % ctx.client_pod_dir)
+        client_msg_idx = len(ctx.missing) - 1
     if ctx.server_pod_dir and not ctx.server_node:
-        ctx.missing.append("worker pod 目录 %s 无法映射到 bpf 节点" % ctx.server_pod_dir)
+        if ctx.server_node_note:
+            ctx.missing.append(
+                "worker pod 目录 %s 无法映射到 bpf 节点（宿主机 %s 的 bpf 日志未采集）"
+                % (ctx.server_pod_dir, ctx.server_node_note))
+        else:
+            ctx.missing.append("worker pod 目录 %s 无法映射到 bpf 节点" % ctx.server_pod_dir)
     cip, sip = ctx.client_ip, ctx.server_ip
-    if not cip or not sip:
-        ctx.missing.append("缺少 client/server pod IP，跳过内核日志关联")
+    if not cip:
+        ctx.missing.append("缺少 client pod IP，跳过内核日志关联")
         return
-
     # 数据层统一按时间排序：HTML 事件表 / JSON / raw 汇总输出顺序一致，
     # 且 _fill_milestone 的"first 出现即定格"语义变为"时间最早"（更准确）
     ctx.kernel_events["client"] = sorted(
         kernel_results.get((ctx.idx, "client"), []), key=lambda e: e["ts"])
     ctx.kernel_events["server"] = sorted(
         kernel_results.get((ctx.idx, "server"), []), key=lambda e: e["ts"])
+    if not sip:
+        # worker pod 日志未收集 → server pod IP 未知：client 侧照常关联
+        # （窗口已按 client pod IP 单侧匹配）。已知该 client 连过的 server
+        # 服务端口（同 run 完整 trace 识别出的连接提供，server 角色端口固定）
+        # 时，按「端口 + ClientSend/ClientRecv 双向时间配对」推测连接五元组
+        ctx.client_only = True
+        ports = (known_server_ports or {}).get(cip) or set()
+        inferred = (BpfCorrelator._infer_conn_by_port_and_time(
+            ctx.kernel_events["client"], cs["ts"], cr["ts"], cip, ports)
+            if ports else None)
+        if inferred:
+            ctx.conn = inferred
+            ctx.conn_source = "client_port"
+            ctx.missing.append(
+                "worker pod 日志未收集，server pod IP 未知：已按已知服务端口 %s + "
+                "ClientSend/ClientRecv 双向时间配对推测连接五元组 %s:%d ↔ %s:%d"
+                % ("/".join(str(p) for p in sorted(ports)),
+                   inferred[0], inferred[1], inferred[2], inferred[3]))
+            sip = inferred[2]
+            # 落入主流程：五元组过滤 / 里程碑 / 唤醒链照常（server 侧无事件）
+        else:
+            ctx.missing.append(
+                "worker pod 日志未收集，server pod IP 未知：连接五元组未能识别，"
+                "client 侧事件已按 client pod IP + 时间窗匹配")
+            BpfCorrelator._fill_milestones_inferred(ctx, cs, cr)
+            ctx.filtered_events = {"client": list(ctx.kernel_events["client"]),
+                                   "server": []}
+            net_evs = (window_net_results or {}).get((ctx.idx, "client"), [])
+            merged = sorted((dict(e) for e in net_evs), key=lambda e: e["ts"])
+            for e in merged:
+                e["match5t"] = None if not (e.get("local_ip") or e.get("src_ip")) \
+                    else False
+            ctx.bpf_window_events["client"] = merged
+            return
 
-    # identify connection 4-tuple from client-side tcp send-in after ClientSend
-    ctx.conn = BpfCorrelator._identify_conn(ctx.kernel_events["client"], cs["ts"], cip, sip)
+    # identify connection 4-tuple: client tcp send-in 优先；
+    # tcp 层探针丢失时按 client 侧 nic 层发送事件推测（raw 含完整五元组）；
+    # client 节点无 bpf 时最后回退 server 侧事件识别
+    # （client_port 推测已在上方 client-only 分支完成，不重复识别）
+    if ctx.conn is None:
+        ctx.conn = BpfCorrelator._identify_conn(ctx.kernel_events["client"], cs["ts"], cip, sip)
+        ctx.conn_source = "client_tcp" if ctx.conn else None
+    nic_inferred = False
     if not ctx.conn:
-        ctx.missing.append("client 节点 bpf 日志未找到 ClientSend 后 %s→%s 的 tcp send 事件"
-                           % (cip, sip))
+        ctx.conn = BpfCorrelator._identify_conn_from_nic(
+            ctx.kernel_events["client"], cs["ts"], cip, sip)
+        nic_inferred = ctx.conn is not None
+        if nic_inferred:
+            ctx.conn_source = "client_nic"
+            ctx.missing.append(
+                "client 侧 tcp 层 bpf 事件丢失（探针可能未启用），"
+                "已按 nic 层事件推测连接五元组 %s:%d ↔ %s:%d"
+                % ctx.conn)
+    fallback_used = False
+    if not ctx.conn:
+        # client 节点无 bpf 日志（如 SDK 直连节点未采集）时，回退用 server 侧
+        # 窗口事件识别连接（请求方向收包事件优先，其次响应方向发送事件）
+        sr = ctx.anchors.get("ServerRecv")
+        if sr:
+            ctx.conn = BpfCorrelator._identify_conn_from_server(
+                ctx.kernel_events["server"], sr["ts"], cip, sip)
+            fallback_used = ctx.conn is not None
+            if fallback_used:
+                ctx.conn_source = "server_tcp"
+    if fallback_used:
+        # 回退成功：把"无法映射"告警改写为回退说明，避免误解为分析中断；
+        # 宿主机 bpf 未采集诊断（若有）随回退说明一并保留
+        if client_msg_idx is not None:
+            hint = ("（宿主机 %s 的 bpf 日志未采集）" % ctx.client_node_note
+                    if ctx.client_node_note else "")
+            ctx.missing[client_msg_idx] = (
+                "client pod 目录 %s 无法映射到 bpf 节点%s（已从 server 侧 bpf 事件"
+                "回退识别连接五元组，client 侧内核事件缺失）"
+                % (ctx.client_pod_dir, hint))
+        else:
+            ctx.missing.append("client 侧未找到 ClientSend 后的 tcp send 事件，"
+                               "已从 server 侧 bpf 事件回退识别连接")
+    if not ctx.conn:
+        ctx.missing.append("client 节点 bpf 日志未找到 ClientSend 后 %s→%s 的 tcp send / nic 发送事件"
+                           "（server 侧回退识别连接亦失败）" % (cip, sip))
         return
     _, cport, _, sport = ctx.conn
 
@@ -2584,16 +3243,37 @@ def _side_recv_window(ctx, side):
     return (cs["ts"], cr["ts"])
 
 
-def _brpc_files_for_pod(brpc_by_pod, pod_dir):
-    """pod 目录名（去 _N 后缀）→ 匹配的 brpc bthread 日志文件列表。"""
+def _brpc_files_for_pod(brpc_by_pod, pod_dir, node_names=(), role=None):
+    """pod 目录名（去 _N 后缀）→ 匹配的 brpc bthread 日志文件列表。
+
+    匹配优先级：
+    1. pod 名精确/前后缀匹配（目录名沿用 pod 名的场景）；
+    2. brpc 文件 pod 名以宿主机节点名为独立段（目录名被简化成
+       worker_<podIp> 时，经 env 映射出节点名仍可关联）；
+    3. 同角色文件全局唯一时兜底（文件名含 -brpc_client / -brpc_server，
+       且该角色文件只有一个；多个时不猜，返回空）。
+    """
     base = re.sub(r"_\d+$", "", pod_dir or "")
-    if not base:
-        return []
     out = []
-    for pod, path in sorted(brpc_by_pod.items()):
-        if pod == base or base.startswith(pod + "-") or pod.startswith(base + "-"):
-            out.append(path)
-    return out
+    if base:
+        for pod, path in sorted(brpc_by_pod.items()):
+            if pod == base or base.startswith(pod + "-") or pod.startswith(base + "-"):
+                out.append(path)
+        if out:
+            return out
+    if node_names:
+        toks = {n for n in node_names if n}
+        for pod, path in sorted(brpc_by_pod.items()):
+            if toks & set(pod.split("-")):
+                out.append(path)
+        if out:
+            return out
+    if role:
+        cands = [p for _pod, p in sorted(brpc_by_pod.items())
+                 if ("brpc_%s" % role) in p.name]
+        if len(cands) == 1:
+            return cands
+    return []
 
 
 def _nic_window_samples(ctx, devs, pad):
@@ -2668,7 +3348,14 @@ def _nic_util_evidence(ctx):
 
 
 def _bthread_evidence(ctx):
-    """bthread 证据：收包窗口内协程创建/排队统计，佐证"协议栈收包后业务执行晚"。"""
+    """bthread 证据：收包窗口内协程创建/排队/执行统计，佐证"协议栈收包后业务执行晚"。
+
+    解读（dscollect/*brpc_*.log 三类事件）：
+      created    数量 / target_pending_tasks 积压 → 协程创建排队压力；
+      scheduled  pending_time_us 峰值 → 协程等待 worker 线程调度的耗时；
+      completed  execution_time_us 峰值 → 协程内业务执行耗时（高则业务本身慢，
+                 非"收包后处理开始晚"）；lifetime_time_us = 创建→完成全生命周期。
+    """
     for side in ("client", "server"):
         evs = ctx.bthread_events.get(side) or []
         if not evs:
@@ -2677,23 +3364,37 @@ def _bthread_evidence(ctx):
         tid = (anchor or {}).get("tid")
         created = [e for e in evs if e["kind"] == "created"]
         sched = [e for e in evs if e["kind"] == "scheduled"]
+        completed = [e for e in evs if e["kind"] == "completed"]
         ptus = [e["pending_time_us"] for e in sched
                 if e.get("pending_time_us") is not None]
         tpts = [e["target_pending_tasks"] for e in created
                 if e.get("target_pending_tasks") is not None]
+        etus = [e["execution_time_us"] for e in completed
+                if e.get("execution_time_us") is not None]
+        ltus = [e["lifetime_time_us"] for e in completed
+                if e.get("lifetime_time_us") is not None]
         seg = []
         if created:
             seg.append("创建 %d 个协程" % len(created))
         if sched:
             seg.append("首次调度 %d 个" % len(sched))
+        if completed:
+            seg.append("完成 %d 个" % len(completed))
         if ptus:
             seg.append("pending_time_us 峰值 %dus" % max(ptus))
+        if etus:
+            seg.append("execution_time_us 峰值 %dus" % max(etus))
+        if ltus:
+            seg.append("lifetime_time_us 峰值 %dus" % max(ltus))
         if tpts:
             seg.append("target_pending_tasks 峰值 %d" % max(tpts))
         tid_txt = ("线程 tid=%s " % tid) if tid is not None else ""
+        interp = ("协程等待 worker 线程执行，佐证协议栈收包后业务执行晚"
+                  if (ptus and max(ptus) > 100) or (tpts and max(tpts) > 0)
+                  else "协程调度/执行统计（无显著排队）")
         ctx.coro_evidence.append(
-            "%s 侧%s收包窗口内 bthread 活动：%s —— 协程等待 worker 线程执行，"
-            "佐证协议栈收包后业务执行晚" % (side, tid_txt, "，".join(seg)))
+            "%s 侧%s收包窗口内 bthread 活动：%s —— %s"
+            % (side, tid_txt, "，".join(seg), interp))
 
 
 def _ev_conn_str(e):
@@ -2706,6 +3407,15 @@ def _ev_conn_str(e):
         return "%s:%s -> %s:%s" % (e["src_ip"], e.get("src_port"),
                                    e["dst_ip"], e.get("dst_port"))
     return "?"
+
+
+def _softirq_vec_txt(ev):
+    """softirq 事件 → "3(NET_RX)" 形式文本（vec 号 + 名称）。"""
+    vec = ev.get("vec")
+    if vec is None:
+        return "?"
+    label = SOFTIRQ_VEC_LABELS.get(vec)
+    return "%d(%s)" % (vec, label) if label else str(vec)
 
 
 def _cpu_busy_analysis(ctx):
@@ -2766,6 +3476,8 @@ def _cpu_busy_analysis(ctx):
             if e.get("cpu") is not None:
                 other_by_cpu[e["cpu"]] = other_by_cpu.get(e["cpu"], 0) + 1
         other_on_cpu, switches_on_cpu, switched_out = [], [], []
+        softirq_raise_on, softirq_exit_on = [], []
+        softirq_evs = [e for e in win_evs if e["kind"].startswith("softirq")]
         if cpu_val is not None:
             other_on_cpu = [e for e in others if e.get("cpu") == cpu_val]
             switches_on_cpu = [e for e in win_evs if e["kind"] == "sched_switch"
@@ -2773,7 +3485,51 @@ def _cpu_busy_analysis(ctx):
             switched_out = [e for e in switches_on_cpu
                             if anchor_tid_i is not None
                             and e.get("prev_pid") == anchor_tid_i]
-        preempt = bool(other_on_cpu or switched_out)
+            softirq_raise_on = [e for e in softirq_evs
+                                if e["kind"] == "softirq_raise_delay"
+                                and e.get("cpu") == cpu_val]
+            softirq_exit_on = [e for e in softirq_evs
+                               if e["kind"] == "softirq_exit_delay"
+                               and e.get("cpu") == cpu_val]
+        # softirq 定位：收包时间往前推，业务 cpu（或其 SMT 姊妹核，相邻
+        # 配对 cpu^1 共享物理核）上的 raise→entry 延迟事件 → 占用 cpu 的
+        # 任务（comm）+ 当时调用栈（kstack），收包慢直接定界
+        softirq_loc = None
+        if cpu_val is not None:
+            recv_ts = netif or win_start  # 收包点：NetifRx 里程碑（缺则窗口起点）
+            lookback = timedelta(milliseconds=SOFTIRQ_LOOKBACK_MS)
+            cand, seen = [], set()
+            pool = list((ctx.softirq_lookback or {}).get(side) or []) + \
+                [e for e in win_evs if e["kind"] == "softirq_raise_delay"]
+            for e in pool:
+                dkey = (e["ts"], e["raw"][:64])  # 回溯窗与问题窗重叠区去重
+                if dkey in seen:
+                    continue
+                seen.add(dkey)
+                ec = e.get("cpu")
+                if ec is None or (ec != cpu_val and ec != (cpu_val ^ 1)):
+                    continue  # 仅业务 cpu 或其 SMT 姊妹核
+                if not (recv_ts - lookback <= e["ts"] <= recv_ts):
+                    continue  # 收包时间往前推（entry 不晚于收包点）
+                cand.append(e)
+            if cand:
+                # 优先 NET_RX（收包软中断本身被延迟），其次延迟最大
+                cand.sort(key=lambda e: (e.get("vec") != 3, -e["latency_us"]))
+                best = cand[0]
+                softirq_loc = {
+                    "comm": best.get("comm"), "kstack": best.get("kstack") or "",
+                    "latency_us": best["latency_us"], "vec": best.get("vec"),
+                    "vec_txt": _softirq_vec_txt(best), "cpu": best["cpu"],
+                    "anchor_cpu": cpu_val, "smt": best["cpu"] != cpu_val,
+                    "ts": best["ts"], "recv_ts": recv_ts,
+                    "n_candidates": len(cand), "events": cand,
+                }
+                ctx.softirq_localization[side] = softirq_loc
+        # 软中断 entry→exit 慢出现在业务 cpu 上：软中断执行期间业务线程
+        # 无法在该 cpu 运行（软中断不可被调度抢占）→ 计入抢占证据；
+        # softirq 定位命中（收包 cpu 被任务占用）同理计入
+        preempt = bool(other_on_cpu or switched_out or softirq_exit_on
+                       or softirq_loc)
         if preempt:
             ctx.cpu_busy_preempt = True
 
@@ -2827,6 +3583,45 @@ def _cpu_busy_analysis(ctx):
                 "（切至 %s 等）—— 线程被其他任务直接抢占"
                 % (side, anchor_tid, cpu_val, len(switched_out),
                    "、".join(comms[:3])))
+        # 证据 3：softirq raise→entry 慢（软中断发起后被抢占/延迟）
+        if softirq_raise_on:
+            worst = max(softirq_raise_on, key=lambda e: e["latency_us"])
+            vec_txt = _softirq_vec_txt(worst)
+            ctx.cpu_evidence.append(
+                "%s 节点问题窗口内业务 cpu %s 上检测到 %d 次软中断发起延迟"
+                "（softirq_raise→softirq_entry >1ms，vec=%s，最大 %d us）—— "
+                "软中断发起后被其他任务抢占/延迟，收包协议栈处理"
+                "（NetifRx→TcpRecv）被推迟%s"
+                % (side, cpu_val, len(softirq_raise_on), vec_txt,
+                   worst["latency_us"],
+                   ("，当时 kstack：%s" % worst["kstack"])
+                   if worst.get("kstack") else ""))
+        # 证据 4：softirq entry→exit 慢（软中断本身处理太长）
+        if softirq_exit_on:
+            worst = max(softirq_exit_on, key=lambda e: e["latency_us"])
+            vec_txt = _softirq_vec_txt(worst)
+            ctx.cpu_evidence.append(
+                "%s 节点问题窗口内业务 cpu %s 上检测到 %d 次软中断处理超长"
+                "（softirq_entry→softirq_exit >1ms，vec=%s，最大 %d us，"
+                "timercnt %s/%s）—— 软中断本身处理时间太长，执行期间业务线程"
+                "无法在该 cpu 运行（软中断不可被调度抢占）"
+                % (side, cpu_val, len(softirq_exit_on), vec_txt,
+                   worst["latency_us"], worst.get("timer_cnt"),
+                   worst.get("timer_large_cnt")))
+        # 证据 5（定位结论）：收包 cpu（或 SMT 姊妹核）上任务占用 cpu，
+        # softirq raise→entry 被推迟 → 收包慢根因 + 占用任务的调用栈
+        if softirq_loc:
+            cpu_txt = ("%s（%s 的 SMT 姊妹核，共享物理核）"
+                       % (softirq_loc["cpu"], cpu_val) if softirq_loc["smt"]
+                       else str(cpu_val))
+            ctx.cpu_evidence.append(
+                "【已定位】%s 侧收包慢根因：收包 cpu %s 上任务 %s 占用 cpu，"
+                "vec=%s 软中断发起后 %d us 才开始执行（softirq_raise→"
+                "softirq_entry），期间收包软中断被推迟、收包处理（NetifRx→"
+                "TcpRecv）延后；占用 cpu 的任务当时调用栈（下一步分析该任务"
+                "为何在该 cpu 执行）：\n%s"
+                % (side, cpu_txt, softirq_loc["comm"], softirq_loc["vec_txt"],
+                   softirq_loc["latency_us"], softirq_loc["kstack"] or "（无栈）"))
 
         ctx.cpu_busy[side] = {
             "seg_key": seg_key, "seg_desc": seg.get("desc"),
@@ -2838,7 +3633,105 @@ def _cpu_busy_analysis(ctx):
             "other_conns": other_conns, "other_by_cpu": other_by_cpu,
             "other_on_cpu": other_on_cpu, "switches_on_cpu": switches_on_cpu,
             "switched_out": switched_out, "preempt": preempt,
+            "softirq_events": softirq_evs,
+            "softirq_raise_on_cpu": softirq_raise_on,
+            "softirq_exit_on_cpu": softirq_exit_on,
+            "softirq_localization": softirq_loc,
         }
+
+
+def _softirq_wire_localization(ctx):
+    """接收侧线路段慢的 softirq 定位（wire 模式："线路慢"实为收包软中断被占用）。
+
+    物理网卡收到包后 NET_RX 软中断被其他任务占用（raise→entry 延迟 >1ms），
+    netif_receive_skb（收包点）被推迟到 softirq entry 之后，表现为
+    wire_*_phys 段（对端物理网卡发出 → 本侧物理网卡收到）耗时长。
+    从收包点往前回溯 SOFTIRQ_LOOKBACK_MS：
+      - 仅 NET_RX（vec=3，收包软中断）；
+      - entry 时间不晚于收包点（该 softirq 即执行本次收包的上下文，
+        其 cpu 即收包 cpu——netif 事件无 cpu 字段，raise 事件的 entry
+        紧邻收包点即为同一 softirq）；
+      - raise 时间（entry − latency）不早于对端物理网卡发出（否则是
+        更早一批包的软中断，与本次收包无关）。
+    命中 → 直接定位占用 cpu 的任务（comm + 完整调用栈），收包慢定界；
+    结果写入 ctx.softirq_localization[side]（mode="wire"）与最小
+    ctx.cpu_busy[side] 信息（kernel_to_user 段不异常时无既有信息）。
+    """
+    for side, wire_key, recv_ms in (
+            ("client", "wire_s2c_phys", "ClientNetifRx"),
+            ("server", "wire_c2s_phys", "ServerNetifRx")):
+        if (ctx.softirq_localization or {}).get(side):
+            continue  # kernel_to_user 场景已定位
+        seg = next((s for s in ctx.kernel_segments if s["key"] == wire_key), None)
+        recv_ts = ctx.milestones.get(recv_ms)
+        if not seg or not recv_ts or seg["dur_us"] < SOFTIRQ_WIRE_MIN_US:
+            continue
+        seg_start = seg.get("_start_ts")   # 对端物理网卡发出
+        if seg_start is None or recv_ts < seg_start:
+            continue
+        lookback = timedelta(milliseconds=SOFTIRQ_LOOKBACK_MS)
+        pool = list((ctx.softirq_lookback or {}).get(side) or [])
+        pool += [e for e in (ctx.bpf_window_events.get(side) or [])
+                 if e["kind"] == "softirq_raise_delay"]
+        cand, seen = [], set()
+        for e in pool:
+            dkey = (e["ts"], e["raw"][:64])  # 回溯窗与问题窗重叠区去重
+            if dkey in seen:
+                continue
+            seen.add(dkey)
+            if e.get("vec") != 3:
+                continue  # 仅 NET_RX（收包软中断）
+            if not (recv_ts - lookback <= e["ts"] <= recv_ts):
+                continue  # entry 不晚于收包点
+            raise_ts = e["ts"] - timedelta(microseconds=e["latency_us"])
+            if raise_ts < seg_start - timedelta(microseconds=200):
+                continue  # raise 早于对端发出 → 更早一批包的软中断
+            cand.append(e)
+        if not cand:
+            continue
+        # entry 最紧邻收包点的 NET_RX softirq 即执行本次收包的上下文
+        cand.sort(key=lambda e: (recv_ts - e["ts"], -e["latency_us"]))
+        best = cand[0]
+        raise_ts = best["ts"] - timedelta(microseconds=best["latency_us"])
+        loc = {
+            "mode": "wire", "wire_key": wire_key,
+            "wire_dur_us": seg["dur_us"], "wire_start": seg_start,
+            "comm": best.get("comm"), "kstack": best.get("kstack") or "",
+            "latency_us": best["latency_us"], "vec": best.get("vec"),
+            "vec_txt": _softirq_vec_txt(best), "cpu": best["cpu"],
+            "anchor_cpu": None, "smt": False,
+            "ts": best["ts"], "recv_ts": recv_ts,
+            "n_candidates": len(cand), "events": cand,
+        }
+        ctx.softirq_localization[side] = loc
+        ctx.cpu_busy_preempt = True
+        info = ctx.cpu_busy.get(side)
+        if info is None:
+            # kernel_to_user 段不异常 → 无既有 cpu_busy 信息，补最小信息
+            # （渲染/JSON 走同一 cpu_busy 通道，窗口即 wire 段区间）
+            info = {
+                "seg_key": wire_key, "seg_desc": seg.get("desc"),
+                "seg_dur_us": seg.get("dur_us"),
+                "window_start": seg_start, "window_end": recv_ts,
+                "anchor_name": recv_ms, "anchor_tid": None, "anchor_cpu": None,
+                "conn": None, "n_mine": 0, "n_other": 0,
+                "other_conns": {}, "other_by_cpu": {},
+                "other_on_cpu": [], "switches_on_cpu": [], "switched_out": [],
+                "softirq_raise_on_cpu": [], "softirq_exit_on_cpu": [],
+                "events": [], "preempt": True,
+            }
+            ctx.cpu_busy[side] = info
+        info["softirq_localization"] = loc
+        info["preempt"] = True
+        ctx.cpu_evidence.append(
+            "【已定位】%s 侧收包慢根因：对端物理网卡发出（%s）→ 本侧收包点（%s）"
+            "历时 %s，其中 NET_RX 软中断被任务 %s 占用 cpu %s 达 %d us"
+            "（softirq_raise %s → softirq_entry %s），收包处理被推迟；"
+            "占用任务当时调用栈（下一步分析该任务为何在该 cpu 执行）：\n%s"
+            % (side, fmt_dt(seg_start), fmt_dt(recv_ts), fmt_us(seg["dur_us"]),
+               loc["comm"], loc["cpu"], loc["latency_us"],
+               fmt_dt(raise_ts), fmt_dt(best["ts"]),
+               loc["kstack"] or "（无栈）"))
 
 
 # 瓶颈段 key → 涉及侧（client/server/双侧）。未列出的 key 默认双侧展示。
@@ -3117,7 +4010,15 @@ def _window_event_row(ev, cpu_val=None):
                                    ev["dst_ip"], ev.get("dst_port"))
     else:
         addr = ""
-    if "comm" in ev:
+    if ev.get("kind") == "softirq_raise_delay":
+        extra = "vec=%s raise→entry=%dus comm=%s kstack=%s" % (
+            _softirq_vec_txt(ev), ev.get("latency_us", 0),
+            ev.get("comm", "-"), ev.get("kstack") or "-")
+    elif ev.get("kind") == "softirq_exit_delay":
+        extra = "vec=%s entry→exit=%dus timercnt:%s/%s" % (
+            _softirq_vec_txt(ev), ev.get("latency_us", 0),
+            ev.get("timer_cnt"), ev.get("timer_large_cnt"))
+    elif "comm" in ev:
         extra = "comm=%s pid=%s" % (ev.get("comm"), ev.get("pid"))
     elif "prev_comm" in ev:
         extra = "prev=%s/%s next=%s/%s" % (ev.get("prev_comm"),
@@ -3147,11 +4048,8 @@ def _window_event_row(ev, cpu_val=None):
                html.escape(extra), owner))
 
 
-# 全景事件表列宽（table-layout:fixed，避免大表逐 cell 测宽的布局开销）
-_EV_TBL_COLS = ('<colgroup><col style="width:150px"><col style="width:135px">'
-                '<col style="width:70px"><col style="width:60px">'
-                '<col style="width:270px"><col><col style="width:78px">'
-                "</colgroup>")
+# 事件表：列宽按内容自适应（连接端口/事件名称等关键信息不截断），
+# 超宽由 .table-wrap 横向滚动；视口外行由 CSS content-visibility 跳过渲染
 
 
 def _window_events_table(evs, title, cpu_val=None, note=None, with_filter=False):
@@ -3177,10 +4075,10 @@ def _window_events_table(evs, title, cpu_val=None, note=None, with_filter=False)
                     % (total, EVENTS_TABLE_MAX_ROWS))
     note_html = '<p class="muted">%s</p>' % note if note else ""
     tbl = ('<div class="table-wrap">'
-           '<table class="ev-tbl">%s'
+           '<table class="ev-tbl">'
            "<tr><th>时间</th><th>事件</th><th>tid</th><th>cpu</th>"
            "<th>连接</th><th>附加</th><th>归属</th></tr>%s%s</table></div>"
-           % (_EV_TBL_COLS, rows, cap_note))
+           % (rows, cap_note))
     if not with_filter:
         return '<h3>%s</h3>%s%s' % (html.escape(title), note_html, tbl)
     n_mine = sum(1 for e in shown if e.get("match5t"))
@@ -3211,9 +4109,14 @@ def _side_events_html(ctx, side):
     """
     node = ctx.client_node if side == "client" else ctx.server_node
     wevs = (ctx.bpf_window_events or {}).get(side) or []
+    # 连接五元组经 nic 层推测识别（client_nic）或 server IP 未知（client_only，
+    # 事件按 client pod IP 单侧匹配）时，client 侧匹配事件标注"推测"badge
+    inferred = side == "client" and (
+        getattr(ctx, "conn_source", None) == "client_nic"
+        or getattr(ctx, "client_only", False))
     if not wevs:
         return _events_table((ctx.filtered_events or {}).get(side) or [],
-                             "%s 节点 bpf 事件" % side)
+                             "%s 节点 bpf 事件" % side, inferred=inferred)
     parts = []
     # 子项1：问题请求相关事件（仅问题连接五元组 + 关键线程调度）
     req_evs = _problem_request_events(ctx, side)
@@ -3222,7 +4125,8 @@ def _side_events_html(ctx, side):
             "<details open><summary>问题请求相关事件（仅问题连接五元组 + "
             "关键线程调度，%d 条）</summary>%s</details>"
             % (len(req_evs),
-               _events_table(req_evs, "%s 侧问题请求相关事件" % side)))
+               _events_table(req_evs, "%s 侧问题请求相关事件" % side,
+                             inferred=inferred)))
     # 子项2：慢段时间窗事件（瓶颈段窗口内全部连接，高亮 + 过滤选择）
     sw = getattr(ctx, "slow_seg", None) or {}
     sw_side = (sw.get("sides") or {}).get(side)
@@ -3271,6 +4175,32 @@ def _cpu_busy_html(ctx):
         node = ctx.client_node if side == "client" else ctx.server_node
         cpu_val = info["anchor_cpu"]
         evs = info["events"]
+        # wire 模式且无既有窗口数据（kernel_to_user 段不异常）：只渲染定位结论，
+        # 不渲染空的问题窗口全景表
+        loc0 = info.get("softirq_localization") or {}
+        if loc0.get("mode") == "wire" and not evs and cpu_val is None:
+            loc = loc0
+            parts.append(
+                '<h4>%s 节点（%s）：定位结论 —— 收包 softirq 被任务占用'
+                "（softirq 回溯，线路段慢实为收包软中断被抢占）</h4>"
+                '<div class="loc-banner">'
+                '<div class="loc-title">根因已定位 —— 收包慢直接定界</div>'
+                "<div>对端物理网卡发出（%s）→ 收包点（%s）历时 "
+                "<b>%s</b>：包到达后 NET_RX 软中断被任务 <b>%s</b> 占用 cpu %s "
+                "达 %d us（softirq_raise %s → softirq_entry %s），收包处理被推迟"
+                "—— 收包慢已定位到该任务；其当时调用栈如下（下一步分析该任务"
+                "为何在该 cpu 执行）：</div>"
+                '<pre style="background:#0d1117;color:#e6edf3;padding:12px;'
+                'border-radius:6px;overflow-x:auto;font-size:12px;'
+                'line-height:1.6">%s</pre></div>'
+                % (side, node or "?", fmt_dt(loc["wire_start"]),
+                   fmt_dt(loc["recv_ts"]), fmt_us(loc["wire_dur_us"]),
+                   html.escape(loc["comm"] or "?"), loc["cpu"],
+                   loc["latency_us"], fmt_dt(
+                       loc["ts"] - timedelta(microseconds=loc["latency_us"])),
+                   fmt_dt(loc["ts"]),
+                   html.escape(loc["kstack"] or "（无调用栈）")))
+            continue
         # 摘要卡
         sum_rows = [
             "问题窗口：%s ~ %s（%s，%s）"
@@ -3300,6 +4230,36 @@ def _cpu_busy_html(ctx):
             if info["switches_on_cpu"]:
                 sum_rows.append("业务 cpu 上 sched_switch %d 次"
                                 % len(info["switches_on_cpu"]))
+            if info.get("softirq_raise_on_cpu"):
+                worst = max(info["softirq_raise_on_cpu"],
+                            key=lambda e: e["latency_us"])
+                sum_rows.append(
+                    '<span style="color:#cf222e">业务 cpu %s 上软中断发起延迟 '
+                    "%d 次（raise→entry >1ms，最大 %d us，vec=%s）—— "
+                    "软中断被其他任务抢占/延迟，收包协议栈处理被推迟</span>"
+                    % (cpu_val, len(info["softirq_raise_on_cpu"]),
+                       worst["latency_us"], _softirq_vec_txt(worst)))
+            if info.get("softirq_exit_on_cpu"):
+                worst = max(info["softirq_exit_on_cpu"],
+                            key=lambda e: e["latency_us"])
+                sum_rows.append(
+                    '<span style="color:#cf222e">业务 cpu %s 上软中断本身处理超长 '
+                    "%d 次（entry→exit >1ms，最大 %d us，vec=%s）—— "
+                    "软中断执行期间业务线程无法在该 cpu 运行</span>"
+                    % (cpu_val, len(info["softirq_exit_on_cpu"]),
+                       worst["latency_us"], _softirq_vec_txt(worst)))
+            loc = info.get("softirq_localization")
+            if loc:
+                cpu_txt = ("%s（%s 的 SMT 姊妹核，共享物理核）" % (loc["cpu"], cpu_val)
+                           if loc["smt"] else str(loc["cpu"]))
+                sum_rows.append(
+                    '<span style="color:#cf222e;font-weight:600">'
+                    "【已定位】%s 侧收包慢根因：收包 cpu %s 上任务 %s 占用 cpu，"
+                    "vec=%s 软中断发起后 %d us 才开始执行（softirq_raise→"
+                    "softirq_entry），期间收包软中断被推迟、收包处理被延后；"
+                    "下一步分析该任务为何在该 cpu 执行</span>"
+                    % (side, cpu_txt, html.escape(loc["comm"] or "?"),
+                       loc["vec_txt"], loc["latency_us"]))
         # 事件表（问题五元组高亮 + 业务 cpu 标注）
         shown = evs[:EVENTS_TABLE_MAX_ROWS]
         rows = "".join(_window_event_row(e, cpu_val) for e in shown)
@@ -3311,13 +4271,49 @@ def _cpu_busy_html(ctx):
         parts.append(
             "<h4>%s 节点（%s）：问题窗口 bpf 事件全景</h4>"
             '<div class="winsum">%s</div>'
-            '<div class="table-wrap"><table class="ev-tbl">%s'
+            '<div class="table-wrap"><table class="ev-tbl">'
             '<tr><th>时间</th><th>事件</th><th>tid</th><th>cpu</th>'
             "<th>连接</th><th>附加</th><th>归属</th></tr>%s%s</table></div>"
             '<p class="muted">黄底行 = 问题连接五元组事件（%s）；'
             "红色 cpu = 业务线程所在 cpu</p>"
-            % (side, node or "?", "<br>".join(sum_rows), _EV_TBL_COLS,
+            % (side, node or "?", "<br>".join(sum_rows),
                rows, cap_note, html.escape(info.get("conn") or "?")))
+        # 定位结论块（收包 cpu 被任务占用）：完整 kstack 用 <pre> 展示不截断
+        loc = info.get("softirq_localization")
+        if loc:
+            cpu_txt = ("%s（%s 的 SMT 姊妹核，共享物理核）"
+                       % (loc["cpu"], cpu_val) if loc["smt"]
+                       else str(loc["cpu"]))
+            if loc.get("mode") == "wire":
+                head_txt = (
+                    "对端物理网卡发出（%s）→ 收包点（%s）历时 <b>%s</b>："
+                    "包到达后 NET_RX 软中断被任务 <b>%s</b> 占用 cpu %s 达 %d us"
+                    "（softirq_raise→softirq_entry），收包处理被推迟"
+                    % (fmt_dt(loc["wire_start"]), fmt_dt(loc["recv_ts"]),
+                       fmt_us(loc["wire_dur_us"]),
+                       html.escape(loc["comm"] or "?"), loc["cpu"],
+                       loc["latency_us"]))
+                title_txt = ("定位结论 —— 收包 softirq 被任务占用"
+                             "（线路段慢实为收包软中断被抢占）")
+            else:
+                head_txt = (
+                    "收包点 %s 前 %d ms 内，cpu %s 上任务 <b>%s</b> 占用 cpu"
+                    "（vec=%s 软中断 raise→entry 延迟 %d us，候选 %d 个）"
+                    % (fmt_dt(loc["recv_ts"]), SOFTIRQ_LOOKBACK_MS, cpu_txt,
+                       html.escape(loc["comm"] or "?"), loc["vec_txt"],
+                       loc["latency_us"], loc["n_candidates"]))
+                title_txt = "定位结论 —— 收包 cpu 被任务占用（softirq 回溯）"
+            parts.append(
+                '<h4>%s 节点（%s）：%s</h4>'
+                '<div class="loc-banner">'
+                '<div class="loc-title">根因已定位 —— 收包慢直接定界</div>'
+                "<div>%s —— 收包慢已定位到该任务；其当时调用栈如下"
+                "（下一步分析该任务为何在该 cpu 执行）：</div>"
+                '<pre style="background:#0d1117;color:#e6edf3;padding:12px;'
+                'border-radius:6px;overflow-x:auto;font-size:12px;'
+                'line-height:1.6">%s</pre></div>'
+                % (side, node or "?", title_txt, head_txt,
+                   html.escape(loc["kstack"] or "（无调用栈）")))
     if not parts:
         return ""
     return ("<h3>问题窗口 bpf 事件全景与 CPU 侵占分析"
@@ -3583,6 +4579,10 @@ class ConclusionEngine:
             confidence = "中"
         else:
             confidence = "低"
+        # server IP 未知（client 单侧关联）：里程碑为时间邻近推测，
+        # 多连接时有混淆风险 → 置信度封顶"中"
+        if getattr(ctx, "client_only", False) and confidence == "高":
+            confidence = "中"
         for note in ctx.missing:
             evidence.append("⚠ " + note)
 
@@ -3598,6 +4598,30 @@ class ConclusionEngine:
                 "业务线程所在 cpu 的收包软中断正在处理其他请求（见问题窗口全景）："
                 "考虑调整网卡 RSS/中断亲和性将收包分散到非业务 cpu，"
                 "或为业务线程绑定独立 cpu / 调整 CPU 隔离（isolcpus）配置")
+        # softirq 定位命中（收包 cpu/SMT 姊妹核被任务占用）：直接给出
+        # 占用任务与下一步方向（分析该任务为何在该 cpu 执行）
+        for side in ("client", "server"):
+            loc = (getattr(ctx, "softirq_localization", None) or {}).get(side)
+            if loc:
+                smt_txt = ("（该 cpu 为业务 cpu %s 的 SMT 姊妹核，共享物理核）"
+                           % loc["anchor_cpu"]) if loc["smt"] else ""
+                if loc.get("mode") == "wire":
+                    suggestions.append(
+                        "已定位到占用收包 cpu 的任务 %s（cpu %s，NET_RX 软中断 "
+                        "raise→entry 延迟 %d us，调用栈见定位结论）：物理网卡间"
+                        "线路段慢实为收包软中断被该任务占用，下一步分析该任务"
+                        "为何在该 cpu 执行（调度来源 / 绑核与亲和性配置 / 触发路径），"
+                        "必要时限制其运行或将收包软中断迁移到其他 cpu"
+                        % (loc["comm"], loc["cpu"], loc["latency_us"]))
+                else:
+                    suggestions.append(
+                        "已定位到占用收包 cpu 的任务 %s（cpu %s%s，vec=%s 软中断 "
+                        "raise→entry 延迟 %d us，调用栈见定位结论）：下一步分析该任务"
+                        "为何在该 cpu 执行（调度来源 / 绑核与亲和性配置 / 触发路径），"
+                        "必要时限制其运行或将收包软中断迁移到其他 cpu"
+                        % (loc["comm"], loc["cpu"], smt_txt, loc["vec_txt"],
+                           loc["latency_us"]))
+                break
 
         ctx.conclusion = {
             "category": category,
@@ -3660,16 +4684,19 @@ th,td{border-bottom:1px solid #eee;padding:7px 10px;text-align:left;vertical-ali
 th{background:#1a1a2e;color:#fff;font-weight:600}
 tr:hover td{background:#f0f4ff}
 .num{text-align:right;font-variant-numeric:tabular-nums}
-/* 大表性能优化：固定列宽 + 滚动容器 + 视口外行跳过渲染 */
+/* 大表性能优化：滚动容器 + 视口外行跳过渲染 */
 .table-wrap{max-height:520px;overflow:auto;border:1px solid #e0e0e0;
  border-radius:8px;margin:8px 0;background:#fff}
 .table-wrap table{margin:0}
 .table-wrap th,.table-wrap td{white-space:nowrap}
-.ev-tbl{table-layout:fixed}
-.ev-tbl td{overflow:hidden;text-overflow:ellipsis}
+/* 列宽按内容自适应（连接端口/事件名称等关键信息不截断），
+   超宽由 .table-wrap 横向滚动；视口外行仍由 content-visibility 跳过渲染 */
 .ev-tbl tr{content-visibility:auto;contain-intrinsic-size:auto 28px}
 tr.hl5t td{background:#fff3bf!important}
 tr.hl5t:hover td{background:#ffe98a!important}
+.inf-badge{display:inline-block;padding:0 6px;border-radius:8px;font-size:11px;
+  line-height:16px;background:#ffe0b2;color:#8d5000;border:1px solid #f0b060;
+  vertical-align:middle;margin-left:4px;font-weight:600}
 .cpuflag{color:#cf222e;font-weight:700}
 /* 慢段时间窗事件过滤工具条（事件过多时的过滤选择） */
 .evf-bar{display:flex;align-items:center;gap:8px;margin:8px 0;flex-wrap:wrap}
@@ -3710,6 +4737,14 @@ summary:hover{color:#5470c6}
 details{margin:6px 0}
 .winsum{background:#f8f9fa;border:1px solid #e0e0e0;border-radius:8px;
  padding:10px 14px;margin:8px 0;font-size:13px;line-height:1.8}
+/* softirq 定位结论醒目呈现：trace 头 badge + 卡顶红色高亮横幅 */
+.b-loc{background:#c62828;color:#fff}
+.loc-banner{border:2px solid #c62828;border-left:6px solid #c62828;
+ background:#fff5f5;padding:12px 16px;margin:12px 0;border-radius:8px;
+ line-height:1.8}
+.loc-banner .loc-title{color:#c62828;font-weight:700;font-size:15px;
+ margin-bottom:6px}
+.loc-banner pre{max-height:280px;margin:8px 0 0}
 """
 
 
@@ -3781,12 +4816,14 @@ def _timeline_html(ms, segments):
     return '<div class="tl">%s</div>%s' % (bar_html, pt_tbl)
 
 
-def _events_table(events, title):
+def _events_table(events, title, inferred=False):
     if not events:
         return '<p class="muted">%s：无匹配事件</p>' % html.escape(title)
     total = len(events)
     if total > EVENTS_TABLE_MAX_ROWS:
         events = events[:EVENTS_TABLE_MAX_ROWS]
+    badge = ' <span class="inf-badge" title="连接五元组经推测识别，本事件为推测关联">推测</span>' \
+        if inferred else ""
     rows = []
     for ev in events:
         addr = ""
@@ -3809,21 +4846,62 @@ def _events_table(events, title):
         elif ev["kind"] == "tcp_retransmit":
             extra = "seq=%s tx_seq=%s snd_una=%s snd_nxt=%s" % (
                 ev.get("seq"), ev.get("tx_seq"), ev.get("snd_una"), ev.get("snd_nxt"))
-        rows.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
-                    % (fmt_dt(ev["ts"]), html.escape(str(ev["kind"])),
+        rows.append("<tr><td>%s</td><td>%s%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
+                    % (fmt_dt(ev["ts"]), html.escape(str(ev["kind"])), badge,
                        ev.get("tid", "-"), ev.get("cpu", "-"), html.escape(addr),
                        html.escape(extra)))
     cap_note = ""
     if total > EVENTS_TABLE_MAX_ROWS:
         cap_note = ('<tr><td colspan="6" class="muted">共 %d 条，仅列前 %d 条</td></tr>'
                     % (total, EVENTS_TABLE_MAX_ROWS))
-    return ('<h3>%s</h3><div class="table-wrap"><table class="ev-tbl">'
-            '<colgroup><col style="width:150px"><col style="width:135px">'
-            '<col style="width:70px"><col style="width:60px">'
-            '<col style="width:270px"><col></colgroup>'
+    title_note = (' <span class="inf-badge">推测关联</span>' if inferred else "")
+    return ('<h3>%s%s</h3><div class="table-wrap"><table class="ev-tbl">'
             '<tr><th>时间</th><th>事件</th><th>tid</th><th>cpu</th>'
             '<th>连接</th><th>附加</th></tr>%s%s</table></div>'
-            % (html.escape(title), "".join(rows), cap_note))
+            % (html.escape(title), title_note, "".join(rows), cap_note))
+
+
+def _ctx_softirq_locs(ctx):
+    """trace 的 softirq 定位结论：{side: loc}（命中侧才有）。"""
+    out = {}
+    cpu_busy = getattr(ctx, "cpu_busy", None) or {}
+    for side in ("client", "server"):
+        info = cpu_busy.get(side) or {}
+        loc = info.get("softirq_localization")
+        if loc:
+            out[side] = loc
+    return out
+
+
+def _loc_banner_html(ctx):
+    """根因已定位横幅：softirq 定位命中时在 trace 卡顶部醒目呈现。
+
+    红色高亮块（.loc-banner）：占用任务 / cpu / raise→entry 延迟 /
+    定位模式 + 完整调用栈——不展开下方明细即可直接看到根因。
+    """
+    locs = _ctx_softirq_locs(ctx)
+    if not locs:
+        return ""
+    items = []
+    for side, loc in locs.items():
+        mode_txt = ("线路段慢实为收包软中断被抢占"
+                    if loc.get("mode") == "wire"
+                    else "收包 cpu 被任务占用（softirq 回溯）")
+        smt_txt = ("（%s 的 SMT 姊妹核，共享物理核）" % loc["anchor_cpu"]
+                   if loc.get("smt") else "")
+        items.append(
+            "%s 侧：cpu %s%s 上任务 <b>%s</b> 占用 cpu，vec=%s 软中断 "
+            "raise→entry 延迟 <b>%d us</b>（%s）"
+            % (side, loc["cpu"], smt_txt, html.escape(loc["comm"] or "?"),
+               loc["vec_txt"], loc["latency_us"], mode_txt))
+    kstack = locs[next(iter(locs))].get("kstack") or "（无调用栈）"
+    return (
+        '<div class="loc-banner">'
+        '<div class="loc-title">根因已定位 —— 收包慢直接定界</div>'
+        '<div>%s</div>'
+        "<div>占用任务当时完整调用栈（下一步分析该任务为何在该 cpu 执行）：</div>"
+        "<pre>%s</pre></div>"
+        % ("<br>".join(items), html.escape(kstack)))
 
 
 def _trace_html(ctx, idx):
@@ -3931,9 +5009,11 @@ def _trace_html(ctx, idx):
 <span class="trace-id">%(trace)s</span>
 <span class="badge %(conf_cls)s">置信度：%(conf)s</span>
 <span class="badge b-abn">%(label)s</span>
+%(locbadge)s
 <span class="trace-meta">residual=%(residual)s us　e2e=%(e2e)s us</span>
 </div>
 <div class="trace-body">
+%(locbanner)s
 <div class="concl"><b>定界结论：%(label)s</b><ul>%(evid)s</ul>%(sugg)s</div>
 <table>%(meta)s</table>
 <h3>RPC 宏观分段</h3><table><tr><th>阶段</th><th>耗时</th><th>判定</th></tr>%(macro)s</table>
@@ -3959,7 +5039,14 @@ def _trace_html(ctx, idx):
         "conf": c.get("confidence", "-"), "label": html.escape(c.get("label", "-")),
         "residual": f.get("network_residual_us", "-"),
         "e2e": f.get("e2e_us", "-"),
-        "evid": "".join("<li>%s</li>" % html.escape(e) for e in c.get("evidence", [])),
+        "locbadge": ('<span class="badge b-loc">根因已定位</span>'
+                     if _ctx_softirq_locs(ctx) else ""),
+        "locbanner": _loc_banner_html(ctx),
+        "evid": "".join(
+            "<li>%s</li>" % (
+                '<span style="color:#c62828;font-weight:600">%s</span>'
+                % html.escape(e) if e.startswith("【已定位】") else html.escape(e))
+            for e in c.get("evidence", [])),
         "sugg": "<b>建议：</b><ul>%s</ul>" % "".join(
             "<li>%s</li>" % html.escape(s) for s in c.get("suggestions", [])),
         "meta": meta_html, "macro": macro_rows, "segs": seg_rows or
@@ -3990,11 +5077,14 @@ def generate_report(contexts, args, log_root, aux_stats=None):
         idx_note = ('<p class="muted">共 %d 条 trace，仅列前 %d 条；'
                     '建议使用 --top N 缩小分析范围。</p>' % (total, INDEX_MAX_TRACES))
         contexts = contexts[:INDEX_MAX_TRACES]
-    idx_links = "".join('<li><a href="#trace%d">%s　residual=%sus　%s</a></li>'
-                        % (i + 1, html.escape(ctx.trace_id),
-                           ctx.slow.fields.get("network_residual_us", "-"),
-                           html.escape(ctx.conclusion.get("label", "-")))
-                        for i, ctx in enumerate(contexts))
+    idx_links = "".join(
+        '<li><a href="#trace%d">%s　residual=%sus　%s%s</a></li>'
+        % (i + 1, html.escape(ctx.trace_id),
+           ctx.slow.fields.get("network_residual_us", "-"),
+           html.escape(ctx.conclusion.get("label", "-")),
+           '　<span class="badge b-loc">已定位</span>'
+           if _ctx_softirq_locs(ctx) else "")
+        for i, ctx in enumerate(contexts))
     body = "".join(_trace_html(ctx, i + 1) for i, ctx in enumerate(contexts))
     aux_cards = _irqoff_overview_html(aux_stats) + _nic_overview_html(aux_stats)
     # 汇总统计卡（参考 skill summary-cards 风格）
@@ -4102,7 +5192,8 @@ def _event_json(ev):
     for k in ("tid", "cpu", "size", "pid", "comm", "target_cpu",
               "prev_comm", "prev_pid", "next_comm", "next_pid",
               "copied_seq", "rcv_nxt", "wakeup_n",
-              "seq", "len", "dev", "rc", "tx_seq", "snd_una", "snd_nxt"):
+              "seq", "len", "dev", "rc", "tx_seq", "snd_una", "snd_nxt",
+              "vec", "latency_us", "kstack", "timer_cnt", "timer_large_cnt"):
         if k in ev:
             d[k] = ev[k]
     if ev.get("local_ip"):
@@ -4141,10 +5232,39 @@ def _bthread_json(e):
     """brpc bthread 事件 → JSON dict。"""
     return {"ts": e["ts"].isoformat() if e.get("ts") else None,
             "kind": e.get("kind"), "tid": e.get("tid"),
-            "bthread_id": e.get("bthread_id"),
+            "bthread_id": e.get("bthread_id"), "cpu": e.get("cpu"),
             "pending_time_us": e.get("pending_time_us"),
+            "execution_time_us": e.get("execution_time_us"),
+            "lifetime_time_us": e.get("lifetime_time_us"),
             "target_pending_tasks": e.get("target_pending_tasks"),
             "creation_mode": e.get("creation_mode"), "raw": e.get("raw")}
+
+
+def _softirq_loc_json(loc):
+    """收包慢 softirq 定位结论 → JSON dict（无定位时 None）。
+
+    含占用 cpu 任务的 comm 与完整 kstack（多帧 \n 连接，不截断），
+    以及定位依据（vec/延迟/收包点/候选数/回溯窗口内全部候选事件）。
+    """
+    if not loc:
+        return None
+    return {
+        "mode": loc.get("mode") or "kernel_to_user",
+        "wire_key": loc.get("wire_key"),
+        "wire_dur_us": loc.get("wire_dur_us"),
+        "wire_start": loc["wire_start"].isoformat()
+        if loc.get("wire_start") else None,
+        "comm": loc.get("comm"), "kstack": loc.get("kstack") or "",
+        "latency_us": loc.get("latency_us"), "vec": loc.get("vec"),
+        "vec_txt": loc.get("vec_txt"), "cpu": loc.get("cpu"),
+        "anchor_cpu": loc.get("anchor_cpu"), "smt": bool(loc.get("smt")),
+        "ts": loc["ts"].isoformat() if loc.get("ts") else None,
+        "recv_ts": loc["recv_ts"].isoformat() if loc.get("recv_ts") else None,
+        "lookback_ms": SOFTIRQ_LOOKBACK_MS,
+        "n_candidates": loc.get("n_candidates"),
+        "events": [dict(_event_json(e), kstack=e.get("kstack") or "")
+                   for e in loc.get("events") or []],
+    }
 
 
 def _cpu_busy_json(info):
@@ -4152,6 +5272,7 @@ def _cpu_busy_json(info):
 
     window_events 为问题窗口内全部连接的内核事件（match5t：true 问题连接 /
     false 其他连接 / null 无 IP 调度类事件），软中断抢占定界的原始明细。
+    softirq_localization 为收包慢定位结论（占用 cpu 任务 comm + 完整 kstack）。
     """
     def evj(e):
         d = _event_json(e)
@@ -4171,6 +5292,11 @@ def _cpu_busy_json(info):
         "other_on_cpu": [evj(e) for e in info.get("other_on_cpu") or []],
         "switches_on_cpu": [evj(e) for e in info.get("switches_on_cpu") or []],
         "switched_out": [evj(e) for e in info.get("switched_out") or []],
+        "softirq_raise_on_cpu": [evj(e) for e in
+                                 info.get("softirq_raise_on_cpu") or []],
+        "softirq_exit_on_cpu": [evj(e) for e in
+                                info.get("softirq_exit_on_cpu") or []],
+        "softirq_localization": _softirq_loc_json(info.get("softirq_localization")),
         "preempt": bool(info.get("preempt")),
         "window_events": [evj(e) for e in info.get("events") or []],
     }
@@ -4252,7 +5378,8 @@ def generate_json(contexts, args, log_root, aux_stats=None):
             "server": {"pod_dir": getattr(ctx, "server_pod_dir", None),
                        "node": ctx.server_node, "ip": ctx.server_ip},
             "conn": ({"client_ip": ctx.conn[0], "client_port": ctx.conn[1],
-                      "server_ip": ctx.conn[2], "server_port": ctx.conn[3]}
+                      "server_ip": ctx.conn[2], "server_port": ctx.conn[3],
+                      "source": getattr(ctx, "conn_source", None)}
                      if ctx.conn else None),
             "anchors": {k: {"ts": a["ts"].isoformat(), "tid": a.get("tid"),
                             "cpu": a.get("cpu"), "bid": a.get("bid"),
@@ -4293,6 +5420,12 @@ def generate_json(contexts, args, log_root, aux_stats=None):
                             for side, ss in ctx.nic_samples.items()},
             "bthread_events": {side: [_bthread_json(e) for e in evs]
                                for side, evs in ctx.bthread_events.items()},
+            # 问题窗口内 softirq 探针事件（raise→entry / entry→exit >1ms，
+            # kernel_to_user 段异常的侧才有；收包慢的软中断定界明细）
+            "softirq_events": {side: [_event_json(e) for e in
+                                      info.get("softirq_events") or []]
+                               for side, info in
+                               (getattr(ctx, "cpu_busy", None) or {}).items()},
             # 问题窗口全景 + cpu 侵占分析（kernel_to_user 段异常的侧才有）
             "cpu_busy": {side: _cpu_busy_json(info)
                          for side, info in (getattr(ctx, "cpu_busy", None) or {}).items()},
@@ -4412,6 +5545,40 @@ def generate_raw(contexts, args, log_root, disc, trace_lines):
             out.extend("    " + e["raw"] for e in info["egress_chain"])
             out.append("  接收侧链路（%s 节点，seq=%s）：" % (info["ingress_side"], info["seq"]))
             out.extend("    " + e["raw"] for e in info["ingress_chain"])
+
+        # 收包慢 softirq 定位结论（收包 cpu/SMT 姊妹核被任务占用）：
+        # 占用任务 comm + 完整 kstack + raise 原始行（含续行）
+        for side in ("client", "server"):
+            loc = (getattr(ctx, "softirq_localization", None) or {}).get(side)
+            if not loc:
+                continue
+            smt_txt = ("（该 cpu 为业务 cpu %s 的 SMT 姊妹核，共享物理核）"
+                       % loc["anchor_cpu"]) if loc["smt"] else ""
+            out.append("")
+            out.append("---- 收包慢定位结论（%s 节点，softirq 回溯）----" % side)
+            if loc.get("mode") == "wire":
+                out.append("  对端物理网卡发出 %s → 收包点 %s 历时 %s"
+                           "（线路段慢实为收包软中断被占用）"
+                           % (fmt_dt(loc["wire_start"]), fmt_dt(loc["recv_ts"]),
+                              fmt_us(loc["wire_dur_us"])))
+                out.append("  包到达后 NET_RX 软中断被任务 %s 占用 cpu %s 达 %d us"
+                           "（raise %s → entry %s），收包处理被推迟"
+                           "—— 收包慢已定位到该任务；当时调用栈："
+                           % (loc["comm"], loc["cpu"], loc["latency_us"],
+                              fmt_dt(loc["ts"]
+                                     - timedelta(microseconds=loc["latency_us"])),
+                              fmt_dt(loc["ts"])))
+            else:
+                out.append("  收包点 %s 前 %d ms 内，cpu %s%s 上任务 %s 占用 cpu"
+                           "（vec=%s 软中断 raise→entry 延迟 %d us，候选 %d 个）"
+                           "—— 收包慢已定位到该任务；当时调用栈："
+                           % (fmt_dt(loc["recv_ts"]), SOFTIRQ_LOOKBACK_MS,
+                              loc["cpu"], smt_txt, loc["comm"], loc["vec_txt"],
+                              loc["latency_us"], loc["n_candidates"]))
+            out.extend("    " + fr for fr in (loc.get("kstack") or "").splitlines())
+            out.append("  raise 原始行（bpf 日志，含 kstack 续行）：")
+            for e in loc.get("events") or []:
+                out.extend("    " + ln for ln in e["raw"].splitlines())
         out.append("=" * 80)
 
         # 前序协程执行轨迹（触发 >1ms 协程排队时收集，当前锚点 ▶ 标记）
@@ -4445,8 +5612,15 @@ def generate_raw(contexts, args, log_root, disc, trace_lines):
             if len(evs_all) > len(evs_filt):
                 filt_note = "（共 %d 条，过滤后 %d 条匹配当前连接五元组）" % (
                     len(evs_all), len(evs_filt))
-            out.append("---- bpf 内核日志（%s 节点 %s，时间窗内）：%s（%d 条）%s----"
-                       % (side, node or "?", src, len(evs_filt), filt_note))
+            inf_note = ""
+            if side == "client" and getattr(ctx, "conn_source", None) == "client_nic":
+                inf_note = "【推测关联：连接五元组经 nic 层事件推测识别（tcp 层探针丢失）】"
+            elif side == "client" and getattr(ctx, "conn_source", None) == "client_port":
+                inf_note = "【推测关联：server IP 未知（worker 日志未收集），已按已知服务端口 + ClientSend/ClientRecv 双向时间配对推测连接】"
+            elif side == "client" and getattr(ctx, "client_only", False):
+                inf_note = "【推测关联：server IP 未知（worker 日志未收集），已按 client pod IP + 时间窗匹配】"
+            out.append("---- bpf 内核日志（%s 节点 %s，时间窗内）：%s（%d 条）%s%s----"
+                       % (side, node or "?", src, len(evs_filt), filt_note, inf_note))
             out.extend(e["raw"] for e in evs_filt)
 
         # 调度时延告警（窗口内）
@@ -4599,7 +5773,7 @@ def analyze(log_root, residual_threshold=DEFAULT_RESIDUAL_THRESHOLD_US,
     INFO 行，阶段2+7 合并扫描的副产物，供 --raw 使用）。
     """
     t_start = time.monotonic()
-    disc = LogDiscovery(log_root)
+    disc = LogDiscovery(log_root, workers=workers)
     if not disc.client_logs:
         raise FileNotFoundError("在 %s/collected 下未找到 client 日志" % log_root)
 
@@ -4615,11 +5789,15 @@ def analyze(log_root, residual_threshold=DEFAULT_RESIDUAL_THRESHOLD_US,
 
     trace_ids = list(dict.fromkeys(r.trace_id for r in records))
     t0 = time.monotonic()
-    anchor_idx, trace_lines = collect_anchor_and_info(
+    anchor_idx, trace_lines, hostid_pairs = collect_anchor_and_info(
         disc.client_logs, disc.worker_logs, trace_ids,
         verbose=verbose, workers=workers)
     _stage("阶段2 锚点+INFO 合并扫描: %d 个 client + %d 个 worker 日志, %.1fs"
            % (len(disc.client_logs), len(disc.worker_logs), time.monotonic() - t0))
+
+    # 日志正文 Host ID 映射回填（env 优先，正文兜底；SDK_<podIp> 无 env 时靠它）
+    for pod_ip, host_ip in hostid_pairs:
+        disc.host_by_podip.setdefault(pod_ip, host_ip)
 
     # 锚点全部前置构建（bpf/warn 窗口依赖 cs/cr 锚点与节点解析）；
     # 用 ctx 索引做窗口键，精确处理同一 trace_id 出现多条 SLOW 记录的情况
@@ -4637,35 +5815,61 @@ def analyze(log_root, residual_threshold=DEFAULT_RESIDUAL_THRESHOLD_US,
     pad = timedelta(milliseconds=window_pad_ms)
     bpf_off = timedelta(milliseconds=bpf_time_offset_ms)
     node_windows = {}
+    node_probe_cache = {}   # pod IP → 节点名（bpf 探测命中缓存）
     for ctx in contexts:
         cs, cr = ctx.anchors.get("ClientSend"), ctx.anchors.get("ClientRecv")
         if not (cs and cr):
             continue
         ctx.client_node = disc.resolve_node(ctx.client_pod_dir)
+        if not ctx.client_node:
+            # 目录名不可识别且无 env/Host ID：bpf 探测兜底（pod IP 作为
+            # local_ip 只出现在 pod 所在节点的 bpf 日志，client/server 独立探测）
+            ctx.client_node = _probe_node_by_podip(
+                disc, ctx.client_ip, cs["ts"], cr["ts"],
+                node_probe_cache, bpf_off)
+        if not ctx.client_node:
+            ctx.client_node_note = disc.host_ip_of(ctx.client_pod_dir)
         if ctx.server_pod_dir:
             ctx.server_node = disc.resolve_node(ctx.server_pod_dir)
-        if not (ctx.client_ip and ctx.server_ip):
+            if not ctx.server_node and ctx.server_ip:
+                ctx.server_node = _probe_node_by_podip(
+                    disc, ctx.server_ip, cs["ts"], cr["ts"],
+                    node_probe_cache, bpf_off)
+            if not ctx.server_node:
+                ctx.server_node_note = disc.host_ip_of(ctx.server_pod_dir)
+        if not ctx.client_ip:
             continue
         win = (cs["ts"] + bpf_off - pad, cr["ts"] + bpf_off + pad)
+        # 窗口起点前扩 SOFTIRQ_LOOKBACK_MS 作为 softirq 回溯区（收包慢定位：
+        # 收包时间往前推，业务 cpu / SMT 姊妹核上的 raise→entry 延迟事件），
+        # 回溯区内只收 softirq_raise_delay 事件（data_start_dt 为分界）
+        lb = timedelta(milliseconds=SOFTIRQ_LOOKBACK_MS)
+        # server IP 未知（worker pod 日志未收集）时仅构建 client 侧窗口：
+        # BpfScanner 对 sip=None 的窗口按 client pod IP 单侧匹配
         for side, node in (("client", ctx.client_node), ("server", ctx.server_node)):
+            if side == "server" and not ctx.server_ip:
+                continue
             if node:
                 node_windows.setdefault(node, []).extend(
-                    split_window_at_midnight(ctx.idx, side, win[0], win[1],
-                                             ctx.client_ip, ctx.server_ip))
+                    split_window_at_midnight(ctx.idx, side, win[0] - lb, win[1],
+                                             ctx.client_ip, ctx.server_ip,
+                                             data_start_dt=win[0]))
 
     t0 = time.monotonic()
     kernel_results, truncated_keys = {}, set()
     window_net_results, window_net_truncated = {}, set()
+    softirq_lookback_results = {}
     slack_us = int(seek_slack_s * 1000 * 1000)
     bpf_nodes = [n for n in sorted(node_windows) if disc.bpf_by_node.get(n)]
     bpf_jobs = [(str(disc.bpf_by_node[n]), list(node_windows[n]), bpf_full_scan,
                  max_sched_events, verbose, slack_us) for n in bpf_nodes]
     bpf_out = run_parallel(bpf_jobs, workers, func=_bpf_scan_job)
-    for node, (res, trunc, wres, wtrunc, diag) in zip(bpf_nodes, bpf_out):
+    for node, (res, trunc, wres, wtrunc, lres, diag) in zip(bpf_nodes, bpf_out):
         kernel_results.update(res)
         truncated_keys |= trunc
         window_net_results.update(wres)
         window_net_truncated |= wtrunc
+        softirq_lookback_results.update(lres)
         _bpf_zero_event_diag(node, node_windows[node], res, diag)
     _stage("阶段3 bpf 窗口扫描: %d 个节点文件, %d 组窗口事件, %.1fs"
            % (len(node_windows), len(kernel_results), time.monotonic() - t0))
@@ -4720,7 +5924,8 @@ def analyze(log_root, residual_threshold=DEFAULT_RESIDUAL_THRESHOLD_US,
                 continue
             if node:
                 node_irqoff_wins.setdefault(node, {})[(ctx.idx, side)] = win
-            for bp in _brpc_files_for_pod(disc.brpc_by_pod, pod):
+            for bp in _brpc_files_for_pod(disc.brpc_by_pod, pod,
+                                          disc.node_names_for(node), role=side):
                 node_brpc_wins.setdefault(bp, {})[(ctx.idx, side)] = win
     node_irqoff_blocks, node_nic_devs, node_brpc_events = {}, {}, {}
     for node, path in disc.irqoff_by_node.items():
@@ -4745,14 +5950,43 @@ def analyze(log_root, residual_threshold=DEFAULT_RESIDUAL_THRESHOLD_US,
               len(disc.nic_by_node) + len(disc.nic_by_ip),
               len(node_brpc_wins), time.monotonic() - t0))
 
+    # 预识别已知 server 服务端口：完整 trace（client+server IP 均已知）的
+    # 连接识别结果提供"该 client 连过的 server 服务端口"集合（server 角色
+    # 端口固定），供 client-only trace 的「端口 + 双向时间配对」连接推测
+    known_server_ports = {}
     for ctx in contexts:
-        correlate_kernel(ctx, kernel_results, window_net_results)
+        if not (ctx.client_ip and ctx.server_ip):
+            continue
+        cs = ctx.anchors.get("ClientSend")
+        if not cs:
+            continue
+        cev = sorted(kernel_results.get((ctx.idx, "client"), []),
+                     key=lambda e: e["ts"])
+        conn = BpfCorrelator._identify_conn(
+            cev, cs["ts"], ctx.client_ip, ctx.server_ip)
+        if not conn:
+            conn = BpfCorrelator._identify_conn_from_nic(
+                cev, cs["ts"], ctx.client_ip, ctx.server_ip)
+        if not conn:
+            sr = ctx.anchors.get("ServerRecv")
+            if sr:
+                sev = sorted(kernel_results.get((ctx.idx, "server"), []),
+                             key=lambda e: e["ts"])
+                conn = BpfCorrelator._identify_conn_from_server(
+                    sev, sr["ts"], ctx.client_ip, ctx.server_ip)
+        if conn:
+            known_server_ports.setdefault(ctx.client_ip, set()).add(conn[3])
+
+    for ctx in contexts:
+        correlate_kernel(ctx, kernel_results, window_net_results,
+                         known_server_ports, softirq_lookback_results)
         build_kernel_segments(ctx)
         _server_pickup_segments(ctx)
         _coroutine_evidence(ctx)
         _nic_segments(ctx)
         _phys_wire_evidence(ctx)  # 物理网卡间线路定界（seq 关联双侧物理网卡点位）
         _cpu_busy_analysis(ctx)   # 问题窗口全景 + cpu 侵占分析（软中断抢占定界）
+        _softirq_wire_localization(ctx)  # 线路段慢实为收包软中断被占用的定位（wire 模式）
         # 辅助日志关联：irqoff 块 / sar 窗口样本 / bthread 事件（按锚点 tid 过滤）
         for side in ("client", "server"):
             node = ctx.client_node if side == "client" else ctx.server_node
@@ -4771,7 +6005,8 @@ def analyze(log_root, residual_threshold=DEFAULT_RESIDUAL_THRESHOLD_US,
                     tid_i = int(tid)
                 except (TypeError, ValueError):
                     tid_i = None
-            for bp in _brpc_files_for_pod(disc.brpc_by_pod, pod):
+            for bp in _brpc_files_for_pod(disc.brpc_by_pod, pod,
+                                          disc.node_names_for(node), role=side):
                 evs = node_brpc_events.get(bp, {}).get(key, [])
                 if tid_i is not None:
                     evs = [e for e in evs if e.get("tid") == tid_i]
@@ -4795,7 +6030,8 @@ def analyze(log_root, residual_threshold=DEFAULT_RESIDUAL_THRESHOLD_US,
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description="网络/调度时延定位分析：network_residual_us 超时请求的定位定界")
-    ap.add_argument("log_root", help="日志根目录（含 collected/ 等 4 个子目录）")
+    ap.add_argument("log_root",
+                    help="日志根目录（按文件名/内容自动识别日志类型，不依赖目录名）")
     ap.add_argument("--residual-threshold", type=int, default=DEFAULT_RESIDUAL_THRESHOLD_US,
                     help="network_residual_us 判定阈值(us)，默认 %(default)s")
     ap.add_argument("--top", type=int, default=None, help="只分析残余时延最大的前 N 条")

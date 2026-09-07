@@ -1,0 +1,4 @@
+interface:
+  display_name: "网络/调度时延定位分析"
+  short_description: "分析 network_residual_us 超时的 RPC 请求，关联 client/worker 日志与 bpftrace 内核日志、调度告警日志，给出网络/调度问题定位定界结论，生成交互式 HTML 报告"
+  default_prompt: "Use $ds-network-latency-analysis to analyze network residual latency and scheduling issues from collected node/pod logs."
