@@ -83,9 +83,9 @@ DS_DEFINE_int32(logbufsecs, DEFAULT_LOG_BUF_SECS, "Buffer log messages for at mo
 DS_DEFINE_int32(logfile_mode, 0640, "Log file mode/permissions.");
 DS_DEFINE_uint32(max_log_size, DEFAULT_MAX_LOG_SIZE_MB,
                  "approx. maximum log file size (in MB). A value of 0 will be silently overridden to 1.");
-DS_DEFINE_bool(logtostderr, GetBoolFromEnv("GOOGLE_LOGTOSTDERR", false),
+DS_DEFINE_bool(logtostderr, false,
                "log messages go to stderr instead of logfiles.  This flag obsoletes");
-DS_DEFINE_bool(alsologtostderr, GetBoolFromEnv("GOOGLE_ALSOLOGTOSTDERR", false),
+DS_DEFINE_bool(alsologtostderr, false,
                "log messages go to stderr in addition to logfiles");
 DS_DEFINE_uint32(stderrthreshold, 2,
                  "log messages at or above this level are copied to stderr in "

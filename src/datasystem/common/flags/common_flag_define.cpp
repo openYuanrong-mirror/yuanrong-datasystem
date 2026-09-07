@@ -31,7 +31,7 @@ DS_DEFINE_string(l2_cache_type, "none",
 DS_DEFINE_string(distributed_disk_path, "",
                  "Root path of distributed disk storage. This flag takes effect only when l2_cache_type is "
                  "'distributed_disk'.");
-DS_DEFINE_string(log_dir, GetStringFromEnv("GOOGLE_LOG_DIR", ""),
+DS_DEFINE_string(log_dir, "",
                  "If specified, logfiles are written into this directory instead of the default logging directory.");
 DS_DEFINE_string(monitor_config_file, "~/datasystem/config/datasystem.config",
                  "Path of the flag configuration file. The application code dynamically modifies the configuration by "
