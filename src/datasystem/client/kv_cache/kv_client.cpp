@@ -62,7 +62,7 @@ KVClient::~KVClient()
 Status KVClient::ShutDown()
 {
     ScopedClientRequestContext requestContext;
-    TraceGuard traceGuard = Trace::Instance().SetRequestTraceUUID();
+    TraceGuard traceGuard = Trace::Instance().SetTraceUUID();
     if (impl_) {
         bool needRollbackState;
         auto rc = impl_->ShutDown(needRollbackState);
@@ -82,7 +82,7 @@ Status KVClient::Init()
 Status KVClient::Init(const KVClientConfig &clientConfig)
 {
     ScopedClientRequestContext requestContext;
-    TraceGuard traceGuard = Trace::Instance().SetRequestTraceUUID();
+    TraceGuard traceGuard = Trace::Instance().SetTraceUUID();
     bool needRollbackState;
     auto rc = impl_->Init(needRollbackState, true, &clientConfig);
     impl_->CompleteHandler(rc.IsError(), needRollbackState);
@@ -106,7 +106,7 @@ KVClient &KVClient::EmbeddedInstance()
 Status KVClient::InitEmbedded(const EmbeddedConfig &config)
 {
     ScopedClientRequestContext requestContext;
-    TraceGuard traceGuard = Trace::Instance().SetRequestTraceUUID();
+    TraceGuard traceGuard = Trace::Instance().SetTraceUUID();
     bool needRollbackState;
     auto &instance = KVClient::EmbeddedInstance();
     auto rc = instance.impl_->InitEmbedded(config, needRollbackState);
@@ -283,14 +283,14 @@ std::string KVClient::Set(const StringView &val, const SetParam &setParam)
 Status KVClient::UpdateToken(SensitiveValue token)
 {
     ScopedClientRequestContext requestContext;
-    TraceGuard traceGuard = Trace::Instance().SetRequestTraceUUID();
+    TraceGuard traceGuard = Trace::Instance().SetTraceUUID();
     return impl_->UpdateToken(token);
 }
 
 Status KVClient::UpdateAkSk(const std::string accesskey, SensitiveValue secretkey)
 {
     ScopedClientRequestContext requestContext;
-    TraceGuard traceGuard = Trace::Instance().SetRequestTraceUUID();
+    TraceGuard traceGuard = Trace::Instance().SetTraceUUID();
     return impl_->UpdateAkSk(accesskey, secretkey);
 }
 

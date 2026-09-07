@@ -36,7 +36,7 @@ using datasystem::object_cache::ObjectClientImpl;
 
 JNIEXPORT jlong JNICALL Java_org_yuanrong_datasystem_kv_KVClient_init(JNIEnv *env, jclass, jobject jConnectOpts)
 {
-    TraceGuard traceGuard = Trace::Instance().SetRequestTraceUUID();
+    TraceGuard traceGuard = Trace::Instance().SetTraceUUID();
     VLOG(LOG_LEVEL) << "JNICALL StateClient.init";
     ConnectOptions connectOpts = ToCppConnectOptions(env, jConnectOpts);
     if (env->ExceptionOccurred()) {
@@ -150,7 +150,7 @@ JNIEXPORT void JNICALL Java_org_yuanrong_datasystem_kv_KVClient_freeKVClientPtr(
 JNIEXPORT void JNICALL Java_com_datasystem_kv_KVClient_updateTokenNative(JNIEnv *env, jclass,
     jlong handle, jbyteArray tokenBytes)
 {
-    TraceGuard traceGuard = Trace::Instance().SetRequestTraceUUID();
+    TraceGuard traceGuard = Trace::Instance().SetTraceUUID();
     VLOG(LOG_LEVEL) << "JNICALL ObjectClient.updateToken";
     auto client = reinterpret_cast<std::shared_ptr<ObjectClientImpl> *>(handle);
     SensitiveValue token = ToSensitiveValue(env, tokenBytes);
@@ -160,7 +160,7 @@ JNIEXPORT void JNICALL Java_com_datasystem_kv_KVClient_updateTokenNative(JNIEnv 
 JNIEXPORT void JNICALL Java_com_datasystem_kv_KVClient_updateAkSkNative(JNIEnv *env, jclass,
     jlong handle, jstring accessKeyJO, jbyteArray secretKeyBytes)
 {
-    TraceGuard traceGuard = Trace::Instance().SetRequestTraceUUID();
+    TraceGuard traceGuard = Trace::Instance().SetTraceUUID();
     VLOG(LOG_LEVEL) << "JNICALL ObjectClient.updateAkSk";
     auto client = reinterpret_cast<std::shared_ptr<ObjectClientImpl> *>(handle);
     std::string accessKey = ToString(env, accessKeyJO);

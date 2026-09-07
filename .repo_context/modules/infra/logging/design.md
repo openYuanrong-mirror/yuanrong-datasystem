@@ -271,7 +271,10 @@
   - client log file split behavior is decided before logger sink creation by `log_only_write_info_file` and the
     client-only `DATASYSTEM_LOG_ONLY_WRITE_INFO_FILE` override; workers use their own gflag/config value and do not
     sync this setting through register responses;
-  - public SDK entrypoints and language bindings explicitly create request traces with `Trace::SetRequestTraceUUID()`;
+  - public SDK data-plane entrypoints and their language bindings explicitly create request traces with
+    `Trace::SetRequestTraceUUID()`; lifecycle/control-plane entrypoints (Init/ShutDown/Connect/UpdateToken/
+    UpdateAkSk/Close/DeleteStream/PreRegisterDeviceMemory) and
+    PerfClient diagnostics use `Trace::SetTraceUUID()` so their logs are never request-sampled (issue #1174);
   - worker, master, and async callsites restore trace IDs or full `TraceContext` snapshots at request boundaries.
 - Upstream and downstream dependencies:
   - upstream callers include public C/C++/Java wrappers and runtime code that emits logs or sets trace state;

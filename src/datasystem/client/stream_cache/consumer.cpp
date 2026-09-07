@@ -68,7 +68,7 @@ Status Consumer::Close()
 {
     RETURN_IF_NOT_OK_PRINT_ERROR_MSG(impl_->CheckAndSetInUse(), "Close");
     Raii unsetRaii([this]() { impl_->UnsetInUse(); });
-    TraceGuard traceGuard = Trace::Instance().SetRequestTraceUUID();
+    TraceGuard traceGuard = Trace::Instance().SetTraceUUID();
     auto access = AccessRecorder::Stream(AccessRecorderKey::DS_STREAM_CLOSE_CONSUMER);
     auto rc = impl_->Close();
     access.StreamName(impl_->GetStreamName()).ConsumerId(impl_->GetConsumerId()).Result(rc).Record();

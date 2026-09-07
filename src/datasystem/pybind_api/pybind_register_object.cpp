@@ -143,7 +143,7 @@ PybindDefineRegisterer g_pybind_define_f_Client("ObjectClient", PRIORITY_LOW, []
 
         .def("init",
              [](ObjectClient &client) {
-                 TraceGuard traceGuard = Trace::Instance().SetRequestTraceUUID();
+                 TraceGuard traceGuard = Trace::Instance().SetTraceUUID();
                  return client.Init();
              })
 

@@ -79,7 +79,7 @@ HeteroClient::~HeteroClient()
 
 Status HeteroClient::ShutDown()
 {
-    TraceGuard traceGuard = Trace::Instance().SetRequestTraceUUID();
+    TraceGuard traceGuard = Trace::Instance().SetTraceUUID();
     if (impl_) {
         bool needRollbackState;
         auto access = AccessRecorder::Object(AccessRecorderKey::DS_HETERO_CLIENT_SHUTDOWN);
@@ -93,7 +93,7 @@ Status HeteroClient::ShutDown()
 
 Status HeteroClient::Init()
 {
-    TraceGuard traceGuard = Trace::Instance().SetRequestTraceUUID();
+    TraceGuard traceGuard = Trace::Instance().SetTraceUUID();
     auto access = AccessRecorder::Object(AccessRecorderKey::DS_HETERO_CLIENT_INIT);
     bool needRollbackState;
     auto rc = impl_->Init(needRollbackState, true);
@@ -114,7 +114,7 @@ Status HeteroClient::MGetH2D(const std::vector<std::string> &keys, const std::ve
 Status HeteroClient::PreRegisterDeviceMemory(const std::vector<void *> &devPtrs, const std::vector<uint64_t> &sizes)
 {
     RETURN_IF_NOT_OK(HeteroClient::IsCompileWithHetero());
-    TraceGuard traceGuard = Trace::Instance().SetRequestTraceUUID();
+    TraceGuard traceGuard = Trace::Instance().SetTraceUUID();
     const uint64_t totalSize = CalculateDataSize(sizes);
     LOG(INFO) << "[RH2D][PreRegisterDeviceMemory][Client] called, count=" << devPtrs.size()
               << ", totalBytes=" << totalSize;
@@ -279,7 +279,7 @@ Status HeteroClient::DevMGet(const std::vector<std::string> &keys, std::vector<D
 
 Status HeteroClient::HealthCheck(ServerState &state)
 {
-    TraceGuard traceGuard = Trace::Instance().SetRequestTraceUUID();
+    TraceGuard traceGuard = Trace::Instance().SetTraceUUID();
     auto rc = impl_->HealthCheck(state);
     return rc;
 }

@@ -80,7 +80,7 @@ JNIEXPORT void JNICALL Java_org_yuanrong_datasystem_stream_ConsumerImpl_ack(JNIE
 
 JNIEXPORT void JNICALL Java_org_yuanrong_datasystem_stream_ConsumerImpl_close(JNIEnv *env, jclass, jlong consumerPtr)
 {
-    TraceGuard traceGuard = Trace::Instance().SetRequestTraceUUID();
+    TraceGuard traceGuard = Trace::Instance().SetTraceUUID();
     VLOG(LOG_LEVEL) << "JNICALL ConsumerImpl.close";
     auto consumer = reinterpret_cast<std::shared_ptr<Consumer> *>(consumerPtr);
     JNI_CHECK_RESULT(env, (*consumer)->Close(), (void)0);

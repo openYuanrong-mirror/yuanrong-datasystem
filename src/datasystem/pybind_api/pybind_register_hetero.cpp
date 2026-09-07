@@ -197,7 +197,7 @@ PybindDefineRegisterer g_pybind_define_f_HeteroClient("HeteroClient", PRIORITY_L
         .def("init",
              [](HeteroClient &client) {
                  py::gil_scoped_release release;
-                 TraceGuard traceGuard = Trace::Instance().SetRequestTraceUUID();
+                 TraceGuard traceGuard = Trace::Instance().SetTraceUUID();
                  return client.Init();
              })
 
@@ -239,7 +239,7 @@ PybindDefineRegisterer g_pybind_define_f_HeteroClient("HeteroClient", PRIORITY_L
                      ptrs.emplace_back(reinterpret_cast<void *>(devPtr));
                  }
                  py::gil_scoped_release release;
-                 TraceGuard traceGuard = Trace::Instance().SetRequestTraceUUID();
+                 TraceGuard traceGuard = Trace::Instance().SetTraceUUID();
                  return client.PreRegisterDeviceMemory(ptrs, sizes);
              })
 

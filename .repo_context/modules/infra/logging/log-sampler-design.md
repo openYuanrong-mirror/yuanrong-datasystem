@@ -211,6 +211,14 @@ global contention, CAS, and queues on the logging hot path is more important tha
   sampled in; otherwise they use independent `access_sample_rate` sampling. This does not compute conditional correction, so
   final access retention can exceed `access_sample_rate`; the benefit is minimum state and minimum hot-path logic.
 - **Background logs bypass this sampler** — logs without request context follow existing logging behavior.
+- **Lifecycle and control-plane APIs are not request-sampled** — SDK lifecycle/credential/session-teardown entrypoints
+  (Init/ShutDown/Connect/UpdateToken/UpdateAkSk/Close/DeleteStream/PreRegisterDeviceMemory) and PerfClient
+  diagnostics use plain `SetTraceUUID()` traces. Their RPCs
+  carry `LOG_SAMPLE_NONE`, so client and worker handler logs for these low-frequency, troubleshooting-critical
+  operations are always emitted (issue #1174). Only data-plane request APIs participate in request sampling.
+  Top-level invocation only: when nested inside an active data-plane request trace, `SetTraceUUID()` returns an
+  INVALID guard and the call inherits the outer request sampling decision (e.g. credential rotation from a
+  data-plane callback); if lifecycle logs still appear sampled, check for nested invocation first.
 - **Cross-process consistency scope** — request-level sampling decisions propagate through existing
   `MetaPb.log_sample_state` as complete request-log sampled-in/reject state. Existing sampled-in decisions override local
   `request_sample_rate`; reject directly drops only ordinary INFO/VLOG. local `request_sample_rate=1.0` does not create
