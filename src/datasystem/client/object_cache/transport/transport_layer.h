@@ -85,6 +85,19 @@ public:
     /** @brief Initialize transport runtime resources before data-plane connections are created. */
     Status Init();
 
+    /**
+     * @brief Get a weak reference to the data-plane manager owned by this layer.
+     * Returned as a weak_ptr rather than a shared_ptr so the "callers only observe it weakly" contract is
+     * expressed by the type: the only legitimate use is registering standby drain hooks, and a caller that
+     * extended the manager's lifetime past a client shutdown would let the heartbeat thread reach a manager
+     * that has already been shut down (ShutDown() resets transportLayer_ before draining those threads).
+     * Expiry is the signal to fall back to the legacy drain behaviour.
+     */
+    std::weak_ptr<DataPlaneManager> GetDataPlaneManager() const
+    {
+        return manager_;
+    }
+
     /** @brief Reject a new client-local UB write when every process-local UB port is confirmed BAD. */
     Status CheckLocalUbSenderAdmission() const;
 

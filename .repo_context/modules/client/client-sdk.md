@@ -855,6 +855,72 @@ handler. Clearing the Router handler synchronously excludes later callback acces
   - `bazel run --define enable_urma_mock=true //tests/perf/client:peer_ub_admission_timeout_bench -- --threads=16 --reports-per-thread=30000`
   - the admission tool executes the real `PeerUbAdmission::ReportOutcome` state-machine path and reports its state,
     epoch, recovery-probe outcome, and process CPU time; it is not a bRPC or physical-UB CPU measurement.
+
+## Read-path transport failure handling
+
+- `K_URMA_NEED_CONNECT` (1006) means the worker no longer recognizes the client's UB connection
+  (`UrmaManager::CheckUrmaConnectionStable`). It is returned by the metadata `QueryAndGet` **precheck**, which guards
+  only UB data requests: `worker_query_and_get_impl.cpp` returns `K_OK` when `data_request` has no `ub` field, so a TCP
+  inline retry of the same request is always served. Failure latency is single-digit microseconds, not queueing.
+- Retry handling per path:
+  - metadata `QueryAndGet`: `ObjectMetadataClient::PrepareQueryRetry` drops the stale UB data plane
+    (`DataPlaneManager::ResetStaleUbDataPlane` with the serving transporter as identity guard), starts a read-path
+    rebuild cooldown, and retries the request over TCP inline.
+  - replica / direct read: `DataPlaneExecutor::PrepareRetry` calls `ResetDataPlane` and retries.
+  - writes: `TransportLayer::RebuildPlaneOnSetFailure` calls `ResetDataPlane` and retries.
+- **Invariant: the read-path rebuild cooldown must stay private to the read path.** `GetOrCreate` /
+  `AcquireDataPlaneLease` / `EnsureTransporterLocked` are shared by Set, Create, direct H2D leases and replica reads,
+  and those callers treat `K_NOT_READY` as terminal (`RETURN_IF_NOT_OK`, or `transporter == nullptr` → return status).
+  A gate placed in the shared entry point converts self-healing paths into hard failures. Enforce the cooldown only in
+  `ObjectMetadataClient::PrepareUbInlineRequest`, before `GetOrCreate`.
+- The 1006 branch releases the prepared UB receive buffers **immediately** (`DisableInlineData`): the precheck rejects
+  the request before the worker writes anything, so there is nothing to quarantine. Delayed release is not used.
+- The worker-entry precheck resolves a missing client-id key through the peer address
+  (`fast_transport_manager_wrapper.cpp` passes `remote.request_address()` as `fallbackAddress`): a handshake that
+  registered before the client id was known lives under the address. The fallback is consulted **only** when the
+  request key has no connection at all, so an address-keyed hit never masks a stale instance id. A connection reached
+  through the fallback reports `K_URMA_NEED_CONNECT` (never `K_URMA_TRY_AGAIN`) when it is circuit-broken, because
+  `K_URMA_TRY_AGAIN` is outside both the worker-side remap and the read path's self-heal and would hard-fail a read.
+
+## Standby connection drain gating
+
+- After the preferred same-node worker recovers, the client keeps the old standby control connection until its data
+  plane has been idle for `FLAGS_standby_drain_data_plane_quiet_ms` (default 30000). The gate exists because the
+  standby worker can still be the **meta owner** of objects: metadata-owner reads are routed to it through per-address
+  stubs and never touch `workerApi_[REMOTE]`, so an idle control connection says nothing about the data plane. Tearing
+  the connection down makes the worker delete this client's URMA connection in `RefreshMeta`, and the next routed read
+  fails the entry precheck with `K_URMA_NEED_CONNECT` (1006).
+- Predicate: `ListenWorker::CanDisconnectStandby()`. Voluntary scale-down drains immediately (legacy behaviour);
+  otherwise the registered drain handle decides. `FLAGS_standby_drain_data_plane_quiet_ms = 0` restores the legacy
+  "drain as soon as the control connection looks idle" behaviour. The teardown path calls the same predicate again
+  (`ShutdownStandbyConnection`) instead of restating its conditions: the teardown runs on the shared async-switch
+  thread and can start seconds after the decision, during which read traffic can resume on the endpoint.
+- Ordering: the teardown resets the client's own data-plane entry **before** sending `Disconnect`, so the client never
+  keeps a transporter for a connection the peer is about to drop.
+- Last-use recording is sampled: `MarkDataPlaneUse` refreshes `lastDataPlaneUseMs` at most once per
+  `DATA_PLANE_USE_REFRESH_INTERVAL_MS` (100 ms) so the read hot path does not dirty the entry on every request, and it
+  records the transporter kind that **actually served** the request, so a UB candidate served by the cached TCP
+  fallback does not hold the drain back. `IsEndpointDataPlaneQuiet` discounts the sampling bound, so the effective wait
+  is the configured window plus up to one interval and never shorter than it. The flag is a dynamic uint32 with no
+  non-zero lower bound, so the compensation is unconditional.
+
+## Read-path UB rebuild coordination
+
+- `DataPlaneManager::AdmitUbRead` evaluates two read-path-private gates from a single entry lookup: the rebuild
+  cooldown (`FLAGS_ub_rebuild_cooldown_ms`, default 1000; armed by any read-path UB handshake failure, not only 1006)
+  and a per-endpoint rebuild slot. It returns `PROCEED` (a usable data plane), `REBUILD` (this request owns the slot and
+  must release it through `DataPlaneManager::UbRebuildSlotGuard`), or `DEGRADE` (serve this request over TCP inline
+  instead of queueing).
+- The slot exists because a wave of readers can all pass the cooldown before the first handshake fails and arms it:
+  without coordination every queued reader pays for its own doomed handshake. Exactly one request rebuilds; waiters
+  never block and no lock is held across the RPC. Both gates stay private to the read path — writers, direct H2D
+  leases and replica reads keep their `GetOrCreate` behaviour.
+- A `REBUILD` verdict carries a release obligation: the caller must destroy its `DataPlaneManager::UbRebuildSlotGuard`
+  when the handshake attempt ends. A slot that is never released leaves `ubRebuildSlotOwner` non-zero and silently
+  degrades every later reader of that endpoint to TCP until the entry is reconciled or torn down. The guard is nested
+  in `DataPlaneManager` and declared in `data_plane_manager.h` next to `AdmitUbRead` for that reason.
+- Resuming UB after the cooldown elapses is part of the contract: the read path must not give UB up permanently.
+
 ## Open Questions
 
 - Should service discovery be documented as a C++-only advanced entrypoint for now, since Python constructors do not currently expose it directly?

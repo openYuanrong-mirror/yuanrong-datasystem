@@ -204,6 +204,99 @@ public:
      */
     void ResetTransporter(const HostPort &workerAddr, AccessTransportKind kind);
 
+    /**
+     * @brief Drop a UB data plane that the peer no longer recognizes.
+     * @param[in] workerAddr Target worker address.
+     * @param[in] stale Drop only when the entry still holds this transporter; nullptr drops unconditionally.
+     *                   Guards against discarding a data plane that a concurrent writer has just rebuilt.
+     */
+    virtual void ResetStaleUbDataPlane(const HostPort &workerAddr, const std::shared_ptr<IDataTransporter> &stale);
+
+    /**
+     * @brief Suppress read-path UB rebuild attempts for an endpoint until the cooldown elapses.
+     * Read path only: the cooldown is never enforced in GetOrCreate, so writers, direct leases and
+     * replica reads keep their own behaviour.
+     */
+    virtual void MarkUbRebuildCooldown(const HostPort &workerAddr);
+
+    /**
+     * @brief True while the read path must skip UB rebuild attempts for workerAddr.
+     * AdmitUbRead() applies the same predicate (WorkerTransportEntry::UbRebuildCoolingDown) from the entry it
+     * already holds, so admission pays only one lookup; this accessor is the observable form of the cooldown
+     * (diagnostics and tests). Not virtual: nothing overrides it, and a test seam without consumers only
+     * suggests that the production path can diverge.
+     */
+    bool IsUbRebuildCoolingDown(const HostPort &workerAddr) const;
+
+    /** @brief How a read-path request should obtain the UB data plane for an endpoint. */
+    enum class UbReadAdmission {
+        PROCEED,  ///< The UB data plane is already usable; no rebuild slot is held by this request.
+        REBUILD,  ///< This request owns the per-endpoint rebuild slot and must release it when the handshake ends.
+        DEGRADE,  ///< Skip the handshake and serve this request over TCP instead of queueing for it.
+    };
+
+    /**
+     * @brief Decide how a read-path request should obtain the UB data plane, and coordinate rebuilds.
+     * Two read-path-private gates are evaluated from one entry lookup:
+     * - the rebuild cooldown (see MarkUbRebuildCooldown), which skips a handshake the peer is likely to
+     *   reject again;
+     * - a per-endpoint rebuild slot, because a wave of concurrent readers can all pass the cooldown before
+     *   the first handshake fails and arms it, so without coordination every queued request pays for its own
+     *   doomed handshake (N x handshake latency, and N failed handshakes when the peer keeps rejecting).
+     * This grants the slot to exactly one request; the others are told to DEGRADE and serve the request over
+     * TCP inline. Waiters never block and no lock is held across the RPC.
+     *
+     * Read path only: GetOrCreate enforces no gate of its own, so the coordination stays private to readers
+     * and leaves writers, direct leases and replica reads untouched.
+     *
+     * @param[in] workerAddr Target worker address.
+     * @param[out] slotOwner Non-zero when the return value is REBUILD; pass it to ReleaseUbRebuildSlot().
+     * @param[out] degradedByCooldown Optional; set to true when DEGRADE was decided by the cooldown rather
+     *             than by another reader holding the slot. Only used for diagnostics.
+     * @return The admission decision for this request.
+     */
+    UbReadAdmission AdmitUbRead(const HostPort &workerAddr, uint64_t &slotOwner, bool *degradedByCooldown = nullptr);
+
+    /**
+     * @brief Release a per-endpoint UB rebuild slot granted by AdmitUbRead().
+     * @param[in] workerAddr Target worker address.
+     * @param[in] slotOwner Owner id returned by the matching AdmitUbRead() call; 0 releases nothing.
+     */
+    void ReleaseUbRebuildSlot(const HostPort &workerAddr, uint64_t slotOwner);
+
+    /**
+     * @brief RAII owner of a per-endpoint UB rebuild slot granted by AdmitUbRead().
+     * Nested in DataPlaneManager and declared next to the API that hands the slot out, because "take a slot,
+     * release it" is the obligation that comes with UbReadAdmission::REBUILD: a request that never releases
+     * leaves ubRebuildSlotOwner non-zero, so every later reader of that endpoint degrades to TCP silently
+     * until the entry is reconciled or torn down. Keeping the type on this class makes the obligation
+     * discoverable from AdmitUbRead() instead of hiding it in the .cpp of one caller.
+     * @param[in] manager Manager that granted the slot; may be null when slotOwner is 0.
+     * @param[in] address Endpoint the slot belongs to.
+     * @param[in] slotOwner Owner id returned by AdmitUbRead(); 0 releases nothing.
+     */
+    class UbRebuildSlotGuard {
+    public:
+        UbRebuildSlotGuard(std::shared_ptr<DataPlaneManager> manager, HostPort address, uint64_t slotOwner);
+        ~UbRebuildSlotGuard();
+
+        UbRebuildSlotGuard(const UbRebuildSlotGuard &) = delete;
+        UbRebuildSlotGuard &operator=(const UbRebuildSlotGuard &) = delete;
+
+    private:
+        std::shared_ptr<DataPlaneManager> manager_;
+        const HostPort address_;
+        uint64_t slotOwner_;
+    };
+
+    /**
+     * @brief Check whether an endpoint's data plane has been unused for at least quietMs.
+     * @param[in] workerAddr Target worker address.
+     * @param[in] quietMs Idle window in milliseconds; 0 means "do not check".
+     * @return True when the endpoint has no entry, no recorded non-TCP use, or has been quiet for quietMs.
+     */
+    bool IsEndpointDataPlaneQuiet(const HostPort &workerAddr, uint64_t quietMs);
+
     /** @brief Permanently reject SHM rebuilds for the current endpoint entry after scale-in is observed. */
     void MarkShmDraining(const HostPort &workerAddr);
 
@@ -241,6 +334,7 @@ protected:
 private:
     friend class ObjectMetadataClient;
     friend class DataPlaneManagerAdmissionTestPeer;
+    friend class DataPlaneManagerQuietTestPeer;
 
     struct EndpointAdmissionSnapshot {
         EndpointAdmissionSnapshot(uint64_t version, std::shared_ptr<const std::unordered_set<std::string>> workers,
@@ -269,12 +363,34 @@ private:
         void ResetDataPlane();
         void ResetTransporter(AccessTransportKind expectedKind);
 
+        /**
+         * @brief Single source of the read-path rebuild-cooldown predicate.
+         * Both AdmitUbRead() (which already holds the entry) and the diagnostic accessor
+         * IsUbRebuildCoolingDown() evaluate the cooldown through this, so the observable form cannot drift
+         * from the one that actually gates reads.
+         * @param[in] nowMs Current steady-clock milliseconds.
+         */
+        bool UbRebuildCoolingDown(int64_t nowMs) const
+        {
+            return nowMs < ubRebuildAllowedAfterMs.load(std::memory_order_relaxed);
+        }
+
         bthread::RWLock mutex;
         std::shared_ptr<WorkerRpcClient> rpcClient;
         std::shared_ptr<IDataTransporter> shmTransporter;
         std::shared_ptr<IDataTransporter> fallbackTransporter;
         AccessTransportKind fallbackKind = AccessTransportKind::TCP;
         bool shmDraining = false;
+        // Steady-clock ms before which the read path skips UB rebuild attempts (see MarkUbRebuildCooldown).
+        std::atomic<int64_t> ubRebuildAllowedAfterMs{ 0 };
+        // Read-path per-endpoint UB rebuild slot: id of the request that currently owns the right to run a UB
+        // handshake for this endpoint, or 0 when the slot is free. Passing the owner id back on release keeps
+        // the release a no-op if this entry was dropped and recreated while the handshake was in flight.
+        // Read path only — GetOrCreate never consults it, so writers and direct leases are unaffected.
+        std::atomic<uint64_t> ubRebuildSlotOwner{ 0 };
+        // Approximate last time a non-TCP data plane was selected for this endpoint (steady-clock ms).
+        // Relaxed atomic: a monotonic best-effort signal for standby drain decisions, not a precise counter.
+        std::atomic<int64_t> lastDataPlaneUseMs{ 0 };
         // Access under the EntryMap accessor so location admission is ordered with reconcile deletion.
         uint64_t locationAdmissionVersion = 0;
     };
@@ -327,9 +443,20 @@ private:
                                        const std::string &message) noexcept;
     void ApplyUbPortHealthCapabilityCheck(const cluster::RemoteUbQueryTicket &ticket, Status &rc) const;
 
+    /**
+     * @brief Record that a non-TCP data plane actually served a request for this endpoint, for drain decisions.
+     * @param[in] entry Endpoint entry that served the data plane.
+     * @param[in] kind Kind of the transporter that served the request — the actual one (out->Kind()), not the
+     *                 requested one: a UB candidate served by the cached TCP fallback must not hold the standby
+     *                 drain back, since a worker-side URMA deletion cannot invalidate a TCP transporter.
+     */
+    void MarkDataPlaneUse(const std::shared_ptr<WorkerTransportEntry> &entry, AccessTransportKind kind);
+
     Status BuildUbTransporter(const HostPort &workerAddr, const std::shared_ptr<WorkerRpcClient> &rpcClient,
                               TransportPhaseLatencyRecorder *recorder, std::shared_ptr<IDataTransporter> &out);
 
+    // Monotonic ids handed out to read-path UB rebuild slots; 0 is reserved for "slot free".
+    std::atomic<uint64_t> nextUbRebuildSlotId_{ 1 };
     EntryMap entries_;
     std::shared_ptr<const EndpointAdmissionSnapshot> endpointAdmissionSnapshot_;
     bthread::Mutex probeMutex_;

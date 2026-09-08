@@ -462,5 +462,61 @@ TEST(UrmaConnectionInflightTest, NegativeDeadlineRejectedImmediately)
     EXPECT_EQ(UrmaConnectionTestAccess::Inflight(*conn), 0u);
 }
 
+// Fallback key resolution in the worker-entry precheck: a handshake registered before the client id was known
+// lives under the peer address, so the precheck is given that address as a fallback for the client-id key.
+TEST(UrmaConnectionFallbackTest, ResolvesMissingClientIdKeyThroughPeerAddress)
+{
+    ScopedConnectionEntry entry("fallback-resolves");
+    UrmaConnectionTestAccess::Put(entry.Key(), MakeConnection());
+    auto &manager = UrmaManager::Instance();
+
+    // Without the fallback the client-id key is a miss — the K_URMA_NEED_CONNECT the read path heals over TCP.
+    EXPECT_EQ(manager.CheckUrmaConnectionStable("client-id-unknown", "peer-X").GetCode(), K_URMA_NEED_CONNECT);
+    // With the peer address the same request is admitted instead of rejected.
+    EXPECT_TRUE(manager.CheckUrmaConnectionStable("client-id-unknown", "peer-X", entry.Key()).IsOk());
+}
+
+TEST(UrmaConnectionFallbackTest, FallbackThatCannotDifferIsNotConsulted)
+{
+    ScopedConnectionEntry entry("fallback-inert");
+    UrmaConnectionTestAccess::Put(entry.Key(), MakeConnection());
+    auto &manager = UrmaManager::Instance();
+
+    // An empty fallback, and one equal to the request key, both short-circuit on the guard. That is what makes
+    // it safe for the caller to pass "" when the key is already the peer address.
+    EXPECT_EQ(manager.CheckUrmaConnectionStable("client-id-unknown", "peer-X", "").GetCode(), K_URMA_NEED_CONNECT);
+    EXPECT_EQ(manager.CheckUrmaConnectionStable("client-id-unknown", "peer-X", "client-id-unknown").GetCode(),
+              K_URMA_NEED_CONNECT);
+}
+
+TEST(UrmaConnectionFallbackTest, StaleInstanceIdStaysVisibleWhenRequestKeyHasConnection)
+{
+    ScopedConnectionEntry entry("fallback-stale");
+    UrmaConnectionTestAccess::Put(entry.Key(), MakeConnection("peer-new"));
+    auto &manager = UrmaManager::Instance();
+
+    // The fallback only covers a missing connection: a stale instance id under the request key is a real
+    // inconsistency and must stay visible rather than being masked by an address-keyed hit.
+    EXPECT_EQ(manager.CheckUrmaConnectionStable(entry.Key(), "peer-old", "peer-address").GetCode(),
+              K_URMA_NEED_CONNECT);
+}
+
+TEST(UrmaConnectionFallbackTest, ConnectionReachedThroughFallbackNeverReportsTryAgain)
+{
+    ScopedConnectionEntry entry("fallback-broken");
+    auto connection = MakeConnection();
+    TripBreaker(connection);
+    UrmaConnectionTestAccess::Put(entry.Key(), connection);
+    auto &manager = UrmaManager::Instance();
+
+    // Primary key, circuit-broken, reconnect cooldown not elapsed: unchanged behaviour.
+    EXPECT_EQ(manager.CheckUrmaConnectionStable(entry.Key(), "peer-X").GetCode(), K_URMA_TRY_AGAIN);
+    // The same broken connection reached through the fallback address must not report K_URMA_TRY_AGAIN: that
+    // code is outside both the worker-side remap and the read path's K_URMA_NEED_CONNECT self-heal, so it
+    // would hard-fail a read that the no-fallback path turns into a recoverable "needs connect".
+    EXPECT_EQ(manager.CheckUrmaConnectionStable("client-id-unknown", "peer-X", entry.Key()).GetCode(),
+              K_URMA_NEED_CONNECT);
+}
+
 }  // namespace
 }  // namespace datasystem

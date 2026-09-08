@@ -555,9 +555,13 @@ public:
      * @brief Check if the connection is stable.
      * @param[in] hostAddress The dst port address.
      * @param[in] instanceId The unqiue instance uuid from dst port.
+     * @param[in] fallbackAddress Optional peer address used only when hostAddress has no connection at all.
+     *                            Mirrors AcquireSendLane's address fallback; never applied to the stale
+     *                            instance-id path so a real inconsistency stays visible.
      * @return Status of the connection.
      */
-    Status CheckUrmaConnectionStable(const std::string &hostAddress, const std::string &instanceId = "");
+    Status CheckUrmaConnectionStable(const std::string &hostAddress, const std::string &instanceId = "",
+                                     const std::string &fallbackAddress = "");
 
     /**
      * @brief Get local transport unique instance id.

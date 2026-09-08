@@ -52,6 +52,9 @@ bool IsAmbiguousMetadataOwnerRouteFailure(StatusCode code)
     return code == K_RPC_DEADLINE_EXCEEDED || code == K_RPC_UNAVAILABLE || code == K_CLIENT_WORKER_DISCONNECT;
 }
 
+// Matches the per-file diagnostic log throttle used by the other transport components.
+constexpr int TRANSPORT_DIAG_LOG_RATE = 100;
+
 bool IsMetadataOwnerRouteFailure(StatusCode code)
 {
     return IsConfirmedMetadataOwnerRouteFailure(code) || IsAmbiguousMetadataOwnerRouteFailure(code);
@@ -178,12 +181,47 @@ Status ObjectMetadataClient::PrepareUbInlineRequest(const HostPort &address, con
     }
 
     RETURN_RUNTIME_ERROR_IF_NULL(manager_);
+    // A single entry lookup covers both read-path gates:
+    // - the rebuild cooldown: skip a handshake the peer rejected a moment ago, and finish over TCP inline;
+    // - the per-endpoint rebuild slot: a wave of readers can all pass the cooldown before the first handshake
+    //   fails and arms it, so without a slot every queued request pays for its own handshake (N x handshake
+    //   latency, and N doomed handshakes when the peer keeps rejecting). Only the request that wins the slot
+    //   rebuilds; the others serve this request over TCP inline instead of queueing. Waiters never block, and
+    //   no lock is held across the RPC.
+    // Both gates stay private to the read path, so writers, direct leases and replica reads keep their own
+    // behaviour. Both need the entry, and a lookup costs a HostPort::ToString() plus a hash probe, so they
+    // share the single one made inside AdmitUbRead().
+    uint64_t slotOwner = 0;
+    bool degradedByCooldown = false;
+    if (manager_->AdmitUbRead(address, slotOwner, &degradedByCooldown) == DataPlaneManager::UbReadAdmission::DEGRADE) {
+        VLOG(1) << "[TransportGet][Metadata] Disable UB inline data because "
+                << (degradedByCooldown ? "the data plane is cooling down" : "a UB rebuild is already in flight") << ": "
+                << address.ToString();
+        context.mode = InlineTransportMode::TCP;
+        return Status::OK();
+    }
     // Establish UB first so a connection miss does not consume receive-buffer capacity.
     std::shared_ptr<IDataTransporter> transporter;
-    Status connectionRc = manager_->GetOrCreate(address, TransportHint::UB_CANDIDATE, transporter, recorder);
+    Status connectionRc;
+    {
+        // Release the slot as soon as the handshake attempt ends; the buffer allocation below must not
+        // extend the window in which other readers are degraded. Only construct the guard when there is a
+        // slot to release: the steady state (PROCEED) holds none, and building it anyway would cost a
+        // shared_ptr copy plus a HostPort copy on every read.
+        std::optional<DataPlaneManager::UbRebuildSlotGuard> slotGuard;
+        if (slotOwner != 0) {
+            slotGuard.emplace(manager_, address, slotOwner);
+        }
+        connectionRc = manager_->GetOrCreate(address, TransportHint::UB_CANDIDATE, transporter, recorder);
+    }
     if (connectionRc.IsError()) {
         VLOG(1) << "[TransportGet][Metadata] Disable UB inline data because the connection is unavailable: "
                 << connectionRc.ToString();
+        // A failed handshake is not a K_URMA_NEED_CONNECT response, so it never reaches the cooldown marked
+        // in PrepareQueryRetry, and GetOrCreate deliberately enforces no gate of its own. Bound read-path
+        // handshake attempts here (still read-path private) so a peer that keeps rejecting the handshake
+        // degrades to TCP instead of re-attempting the handshake on every request.
+        manager_->MarkUbRebuildCooldown(address);
         context.mode = InlineTransportMode::TCP;
         return Status::OK();
     }
@@ -291,6 +329,9 @@ Status ObjectMetadataClient::InvokeInlineQueryAndGet(const HostPort &address, Qu
                 && (transporter != context.shmTransporter || !context.shmSession->IsAlive())) {
                 RETURN_STATUS(K_NOT_READY, "QueryAndGet shared-memory session changed before dispatch");
             }
+            if (context.mode == InlineTransportMode::UB) {
+                context.ubTransporter = transporter;
+            }
             invoked = true;
             return rpcClient->InvokeQueryAndGet(request, response, payloads, &rpcDispatched);
         },
@@ -350,22 +391,43 @@ Status ObjectMetadataClient::PrepareQueryRetry(const HostPort &address, const Ob
                                                int64_t &backoffMs, int32_t &routeDegradationRetries,
                                                TransportPhaseLatencyRecorder *recorder)
 {
-    const bool fallbackUbInlineToTcp =
-        rpcDispatched && context.mode == InlineTransportMode::UB && rc.GetCode() == K_URMA_NEED_CONNECT;
+    // Keep this branch ahead of the quarantine computation below. Quarantine rewrites context.mode to NONE
+    // (DisableInlineData), so evaluating this condition afterwards would silently make it depend on
+    // NeedDelayReleaseShmUnit(K_URMA_NEED_CONNECT) staying false: the day 1006 joins that set, quarantine
+    // would run first and this branch would become dead code with no assertion or log to notice. Ordering
+    // the check first makes the reachability explicit, and is equivalent today because quarantine is
+    // already false for 1006. This branch also releases the buffers itself, which is the semantically
+    // right action for a precheck rejection (no data was written) instead of a delayed release.
+    if (rc.GetCode() == K_URMA_NEED_CONNECT && context.mode == InlineTransportMode::UB) {
+        // The worker no longer recognizes this client's UB connection. Drop the stale data plane so a
+        // later request re-handshakes, and finish this request over TCP inline instead of failing it.
+        // The worker precheck only guards UB data requests, so the TCP retry is served normally.
+        // No delayed buffer release is needed here: the precheck rejects the request before the worker
+        // writes any data, so DisableInlineData() below releases the buffers immediately. (That mirrors
+        // NeedDelayReleaseShmUnit(K_URMA_NEED_CONNECT) == false today, but unlike before this branch no
+        // longer depends on it — see the note above the condition.)
+        manager_->ResetStaleUbDataPlane(address, context.ubTransporter);
+        manager_->MarkUbRebuildCooldown(address);
+        const std::string ubInstanceId = context.transportInstanceId;
+        // The retry rebuilds the request from the context, so marking TCP is enough: BuildQueryRequest
+        // then emits a TCP inline request and the loop drops stale payloads.
+        context.DisableInlineData();
+        context.mode = InlineTransportMode::TCP;
+        // Count every occurrence outside the throttle: LOG_EVERY_N only evaluates its stream on output, so
+        // counting inside it would report the number of *logged* lines (1 per N events) instead of the real
+        // failure volume. LOG_FIRST_AND_EVERY_N is used because it keeps thread-safe throttle state, unlike
+        // LOG_EVERY_N whose non-atomic static counter races across concurrent QueryAndGet calls.
+        const auto occurrences = urmaNeedConnectTotal_.fetch_add(1, std::memory_order_relaxed) + 1;
+        LOG_FIRST_AND_EVERY_N(WARNING, TRANSPORT_DIAG_LOG_RATE)
+            << "[TransportGet][Metadata] Rebuild UB data plane and retry over TCP, meta owner: " << address.ToString()
+            << ", urma instance: " << ubInstanceId << ", occurrences: " << occurrences << ", status: " << rc.ToString();
+        return Status::OK();
+    }
     const bool quarantineUbBuffers =
         rpcDispatched && context.mode == InlineTransportMode::UB && NeedDelayReleaseShmUnit(rc);
     if (quarantineUbBuffers) {
         DelayReleaseUbBuffers(context, rc, "rpc_status");
         context.DisableInlineData();
-    }
-    if (fallbackUbInlineToTcp) {
-        manager_->ResetDataPlane(address);
-        context.DisableInlineData();
-        context.mode = InlineTransportMode::TCP;
-        VLOG(1) << "[TransportGet][Metadata] UB connection requires rebuild after dispatch; retry QueryAndGet "
-                   "through TCP, meta owner: "
-                << address.ToString() << ", status: " << rc.ToString();
-        return Status::OK();
     }
     const bool routeFailure = IsMetadataOwnerRouteFailure(rc.GetCode());
     // UNAVAILABLE invalidates the channel, not necessarily the owner. Read-only non-SHM queries

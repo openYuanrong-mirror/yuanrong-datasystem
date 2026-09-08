@@ -73,6 +73,7 @@ ds_cc_library(
     deps = [
         "//include/datasystem/utils:utils_headers",
         ":client_worker_common_api",
+        "//src/datasystem/common/flags:dynamic_flag_config_header",
         "//src/datasystem/common/inject:common_inject",
     ],
     alwayslink = True,

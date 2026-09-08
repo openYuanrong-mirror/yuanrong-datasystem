@@ -1173,7 +1173,7 @@ TEST_F(WorkerOcRemoteGetAdmissionTest, BlockingRemoteGetAdmissionFailureFallsBac
     Raii restoreFallback([savedFallback] { FLAGS_enable_transport_fallback = savedFallback; });
     FLAGS_enable_transport_fallback = true;
     BINEXPECT_CALL(&datasystem::IsUrmaEnabled, ()).WillRepeatedly(Return(true));
-    BINEXPECT_CALL(&datasystem::CheckTransportConnectionStable, (_, _)).Times(0);
+    BINEXPECT_CALL(&datasystem::CheckTransportConnectionStable, (_, _, _)).Times(0);
     BINEXPECT_CALL(&datasystem::UrmaWritePayload, (_, _, _, _, _, _, _, _, _, _, _, _, _, _)).Times(0);
     auto akSkManager = std::make_shared<AkSkManager>();
     WorkerWorkerOCServiceImpl remoteService(
@@ -1205,7 +1205,7 @@ TEST_F(WorkerOcRemoteGetAdmissionTest, BlockingRemoteGetAdmissionFailureReturnsU
     Raii restoreFallback([savedFallback] { FLAGS_enable_transport_fallback = savedFallback; });
     FLAGS_enable_transport_fallback = false;
     BINEXPECT_CALL(&datasystem::IsUrmaEnabled, ()).WillRepeatedly(Return(true));
-    BINEXPECT_CALL(&datasystem::CheckTransportConnectionStable, (_, _)).Times(0);
+    BINEXPECT_CALL(&datasystem::CheckTransportConnectionStable, (_, _, _)).Times(0);
     BINEXPECT_CALL(&datasystem::UrmaWritePayload, (_, _, _, _, _, _, _, _, _, _, _, _, _, _)).Times(0);
     auto akSkManager = std::make_shared<AkSkManager>();
     WorkerWorkerOCServiceImpl remoteService(

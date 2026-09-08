@@ -1085,7 +1085,7 @@ Status WorkerWorkerOCServiceImpl::CheckConnectionStable(const GetObjectRemoteReq
     const bool isClientUrmaRequest = isUrmaRequest && !req.urma_info().client_id().empty();
     const std::string &remoteConnectionId =
         isClientUrmaRequest ? req.urma_info().client_id() : requestAddressStr;
-    auto rc = CheckTransportConnectionStable(remoteConnectionId, req.urma_instance_id());
+    auto rc = CheckTransportConnectionStable(remoteConnectionId, req.urma_instance_id(), requestAddressStr);
     if (rc.IsError() && rc.GetCode() == K_URMA_NEED_CONNECT) {
         std::string remoteWorkerId = "UNKNOWN";
         cluster::MemberEndpoint remoteEndpoint;

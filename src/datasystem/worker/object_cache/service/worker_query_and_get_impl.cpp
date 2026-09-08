@@ -285,8 +285,16 @@ Status WorkerQueryAndGetImpl::ValidateRequest(const QueryAndGetReqPb &request) c
                              "QueryAndGet UB buffer count does not match object key count");
     const auto &remote = ub.buffer_infos(0);
     HostPort remoteAddress(remote.request_address().host(), remote.request_address().port());
-    const std::string connectionId = remote.client_id().empty() ? remoteAddress.ToString() : remote.client_id();
-    RETURN_IF_NOT_OK(CheckTransportConnectionStable(connectionId, ub.urma_instance_id()));
+    const bool hasClientId = !remote.client_id().empty();
+    const std::string remoteAddressStr = remoteAddress.ToString();
+    const std::string connectionId = hasClientId ? remote.client_id() : remoteAddressStr;
+    // A handshake registered before the client id was known lives under the peer address; fall back to it so
+    // a usable connection is not rejected with K_URMA_NEED_CONNECT. Only materialise that fallback when it
+    // can differ from the request key: with no client id the key already is the peer address, so passing it
+    // again would build a string that CheckUrmaConnectionStable's `fallbackAddress != hostAddress` guard
+    // discards. This is the per-request hot path, so skip the extra allocation.
+    const std::string fallbackAddress = hasClientId ? remoteAddressStr : std::string();
+    RETURN_IF_NOT_OK(CheckTransportConnectionStable(connectionId, ub.urma_instance_id(), fallbackAddress));
     return Status::OK();
 }
 

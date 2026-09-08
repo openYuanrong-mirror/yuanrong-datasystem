@@ -708,6 +708,10 @@ Status ObjectClientImpl::InitTransportLayer()
         transportSignature_, asyncGetRPCPool_, fastTransportMemSize_, BuildTransportLayerOptions());
     RETURN_IF_NOT_OK(transportLayer->Init());
     transportLayer_ = std::move(transportLayer);
+    // Cache the data-plane manager once here (transportLayer_ is built exactly once and never replaced while
+    // the client lives). MakeDataPlaneDrainHandle() reads this member from the async-switch threads, which
+    // outlive transportLayer_ during ShutDown(), so they must not dereference transportLayer_ itself.
+    dataPlaneManagerWeak_ = transportLayer_->GetDataPlaneManager();
     for (size_t i = 0; i < workerApi_.size(); ++i) {
         failover_->ConfigureUrmaDataPlaneFailureCallback(static_cast<WorkerNode>(i), workerApi_[i]);
     }
@@ -1035,6 +1039,12 @@ Status ObjectClientImpl::InitClientRuntimeAt(WorkerNode node, bool initWithWorke
     StartPerfThread();
     StartMetricsThread();
     InitParallelFor();
+    // Publish the data-plane setup *after* InitTransportLayer() has either built the manager or been skipped
+    // (SHM-only clients). The async switch-back path acquires this before calling ArmStandbyDataPlaneDrain(),
+    // so a switch-back fired by the first heartbeat (which can race with this late-init path, since
+    // InitListenWorkerAt() starts the heartbeat thread before InitTransportLayer() runs) is deferred until the
+    // manager is visible — preventing both a data race on dataPlaneManagerWeak_ and an empty-manager capture.
+    dataPlaneManagerPublished_.store(true, std::memory_order_release);
     return Status::OK();
 }
 
@@ -1074,6 +1084,53 @@ Status ObjectClientImpl::InitListenWorkerAt(WorkerNode node, bool isLocalWorker)
     listenWorker_[node]->SetIsLocalWorker(isLocalWorker);
     RETURN_IF_NOT_OK(listenWorker_[node]->StartListenWorker());
     return Status::OK();
+}
+
+client::ListenWorker::DataPlaneDrainHandle ObjectClientImpl::MakeDataPlaneDrainHandle(const HostPort &workerAddr) const
+{
+    // Read the cached weak_ptr instead of dereferencing transportLayer_: ShutDown() resets transportLayer_
+    // *before* draining the async-switch threads (worker_failover) that call this method, so a check-then-use
+    // on transportLayer_ here would be a use-after-free. dataPlaneManagerWeak_ is written once during
+    // InitTransportLayer(); the switch-back path only reaches this method after acquiring
+    // dataPlaneManagerPublished_ (release/acquire), so the write happens-before this read. An empty manager
+    // here is therefore always legitimate — SHM-only client (no data plane) or a client that is going away —
+    // both of which mean "no data plane": allow the drain (legacy behaviour).
+    std::weak_ptr<client::DataPlaneManager> weakManager = dataPlaneManagerWeak_;
+    return { [weakManager, workerAddr](uint64_t quietMs) {
+                auto manager = weakManager.lock();
+                return manager == nullptr || manager->IsEndpointDataPlaneQuiet(workerAddr, quietMs);
+            },
+             [weakManager, workerAddr]() {
+                 auto manager = weakManager.lock();
+                 if (manager != nullptr) {
+                     manager->ResetDataPlane(workerAddr);
+                 }
+             } };
+}
+
+void ObjectClientImpl::ArmStandbyDataPlaneDrain(WorkerNode node)
+{
+    // Gate the publication here rather than at each call site: three switch paths arm this drain, and only
+    // the async switch-back one (GetPreferredLocalWorkerToRecover) checks the flag before calling. The
+    // heartbeat-driven paths (SwitchToStandbyWorkerImpl -> TrySwitchToLocalSameHost) and
+    // SubmitUnavailableWorkerSwitch reach this point directly while InitListenWorkerAt() is already running
+    // the heartbeat thread, i.e. possibly before InitTransportLayer() writes dataPlaneManagerWeak_. Reading
+    // that non-atomic member in MakeDataPlaneDrainHandle() concurrently with its writer is a data race, and
+    // even without tearing it can capture an empty manager permanently — exactly what the publication flag
+    // exists to prevent. Not arming the handle means the legacy behaviour (drain as soon as the control
+    // connection looks idle), which is the safe default while the runtime is still coming up.
+    if (!dataPlaneManagerPublished_.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (static_cast<size_t>(node) >= listenWorker_.size() || static_cast<size_t>(node) >= workerApi_.size()) {
+        return;
+    }
+    const auto &listener = listenWorker_[node];
+    const auto &api = workerApi_[node];
+    if (listener == nullptr || api == nullptr) {
+        return;
+    }
+    listener->SetDataPlaneDrainHandle(MakeDataPlaneDrainHandle(api->hostPort_));
 }
 
 Status ObjectClientImpl::InitPreferredRemoteFallback(const HostPort &remoteAddress, bool enableHeartbeat,

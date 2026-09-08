@@ -751,6 +751,9 @@ WorkerFailover::StandbySwitchAttemptResult WorkerFailover::TrySwitchToLocalSameH
         owner_.memoryRefCount_.SetSupportMultiShmRefCount(localWorkerApi->workerSupportMultiShmRefCount_);
         owner_.currentNode_ = LOCAL_WORKER;
         if (current != LOCAL_WORKER && owner_.listenWorker_[current] != nullptr) {
+            // The standby connection is about to become drainable; gate that on its data plane being idle
+            // so metadata-owner reads routed to this worker are not broken by an early Disconnect.
+            owner_.ArmStandbyDataPlaneDrain(current);
             owner_.listenWorker_[current]->SetSwitched();
         }
         MarkWorkerAvailableLocked();
@@ -821,6 +824,7 @@ bool WorkerFailover::TrySwitchBackToLocalWorker()
             }
             LOG(INFO) << "[Switch] Restore local worker success.";
             if (currentListenWorker != nullptr) {
+                owner_.ArmStandbyDataPlaneDrain(current);
                 currentListenWorker->SetSwitched();
             }
             owner_.currentNode_ = LOCAL_WORKER;
@@ -866,6 +870,15 @@ bool WorkerFailover::GetPreferredLocalWorkerToRecover(WorkerNode &oldNode, HostP
     if (discoveryBackoff_.IsBlocked(now)) {
         constexpr int logIntervalS = 10;
         LOG_EVERY_T(INFO, logIntervalS) << "[Switch] Discovery probe deferred by coordinator backoff";
+        return false;
+    }
+
+    // The remote-fallback listener's first successful heartbeat can fire before the client runtime finishes
+    // initializing: InitClientRuntimeAt() starts InitListenWorkerAt() (which launches the heartbeat thread)
+    // *before* InitTransportLayer() in the late-init (local-cache + URMA/cross-node) path. Defer the switch-back
+    // until the data-plane manager is published, so ArmStandbyDataPlaneDrain() never captures an empty manager
+    // (and never races on the member). A later heartbeat retries once the runtime is fully initialized.
+    if (!owner_.dataPlaneManagerPublished_.load(std::memory_order_acquire)) {
         return false;
     }
 
@@ -975,6 +988,7 @@ bool WorkerFailover::CommitPreferredLocalWorker(WorkerNode oldNode, const HostPo
         owner_.memoryRefCount_.SetSupportMultiShmRefCount(localWorkerApi->workerSupportMultiShmRefCount_);
         owner_.currentNode_ = LOCAL_WORKER;
         if (owner_.listenWorker_[oldNode] != nullptr) {
+            owner_.ArmStandbyDataPlaneDrain(oldNode);
             owner_.listenWorker_[oldNode]->SetSwitched();
         }
         MarkWorkerAvailableLocked();

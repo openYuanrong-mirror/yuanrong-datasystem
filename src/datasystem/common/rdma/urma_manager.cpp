@@ -3301,14 +3301,30 @@ Status UrmaManager::StrToEid(const std::string &eid, urma_eid_t &out)
     return Status::OK();
 }
 
-Status UrmaManager::CheckUrmaConnectionStable(const std::string &hostAddress, const std::string &instanceId)
+Status UrmaManager::CheckUrmaConnectionStable(const std::string &hostAddress, const std::string &instanceId,
+                                              const std::string &fallbackAddress)
 {
     std::shared_lock<std::shared_timed_mutex> lock(remoteMapMutex_);
     TbbUrmaConnectionMap::const_accessor constAccessor;
-    auto res = urmaConnectionMap_.find(constAccessor, hostAddress);
-    if (!res) {
+    bool found = urmaConnectionMap_.find(constAccessor, hostAddress);
+    bool resolvedByFallback = false;
+    if (!found && !fallbackAddress.empty() && fallbackAddress != hostAddress) {
+        // AcquireSendLane resolves a missing client-id key through the peer address; mirror that so a
+        // connection registered under the address is not reported as missing. Deliberately restricted to
+        // the "no existing connection" branch: an address-keyed hit must never mask a stale instance id,
+        // which is a real inconsistency and must stay visible.
+        found = urmaConnectionMap_.find(constAccessor, fallbackAddress);
+        resolvedByFallback = found;
+        if (found) {
+            LOG_FIRST_AND_EVERY_N(INFO, K_URMA_WARNING_LOG_EVERY_N)
+                << "[URMA] Connection resolved by fallback address, connection key: " << hostAddress
+                << ", fallback: " << fallbackAddress;
+        }
+    }
+    if (!found) {
         LOG_FIRST_AND_EVERY_N(WARNING, K_URMA_WARNING_LOG_EVERY_N)
             << "[URMA_NEED_CONNECT] No existing connection for remoteAddress: " << hostAddress
+            << ", fallbackAddress: " << (fallbackAddress.empty() ? "NONE" : fallbackAddress)
             << ", remoteInstanceId=" << (instanceId.empty() ? "UNKNOWN" : instanceId) << ", requires creation.";
         RETURN_STATUS(K_URMA_NEED_CONNECT, "No existing connection requires creation.");
     }
@@ -3318,7 +3334,12 @@ Status UrmaManager::CheckUrmaConnectionStable(const std::string &hostAddress, co
                      instanceId.empty() ? "UNKNOWN" : instanceId.c_str()));
     if (constAccessor->second->IsCircuitBroken()) {
         if (instanceId.empty() || instanceId == constAccessor->second->GetUrmaJfrInfo().uniqueInstanceId) {
-            CHECK_FAIL_RETURN_STATUS(constAccessor->second->CanReconnect(), K_URMA_TRY_AGAIN,
+            // A connection resolved through the fallback address is not the one the request key owns, and
+            // K_URMA_TRY_AGAIN is outside both the worker-side remap and the read path's
+            // K_URMA_NEED_CONNECT self-heal, so reporting it here would turn a recoverable miss into a hard
+            // read failure. Report "needs connect" instead — the same code this state produces when no
+            // fallback was consulted — so callers can rebuild the data plane.
+            CHECK_FAIL_RETURN_STATUS(resolvedByFallback || constAccessor->second->CanReconnect(), K_URMA_TRY_AGAIN,
                                      "Peer circuit-broken; reconnect cooldown has not elapsed");
         }
         LOG_FIRST_AND_EVERY_N(WARNING, K_URMA_WARNING_LOG_EVERY_N)
