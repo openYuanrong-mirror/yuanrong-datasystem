@@ -26,6 +26,11 @@
 
 namespace datasystem {
 namespace client {
+MmapManager::MmapManager(std::shared_ptr<IClientWorkerCommonApi> clientWorker, bool enableEmbeddedClient)
+    : MmapManager(std::move(clientWorker), enableEmbeddedClient, std::make_shared<HostMemoryPinManager>())
+{
+}
+
 MmapManager::MmapManager(std::shared_ptr<IClientWorkerCommonApi> clientWorker, bool enableEmbeddedClient,
                          std::shared_ptr<HostMemoryPinManager> pinManager)
     : clientWorker_(std::move(clientWorker)), enableEmbeddedClient_(enableEmbeddedClient)
