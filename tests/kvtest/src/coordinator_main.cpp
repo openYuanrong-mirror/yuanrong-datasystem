@@ -19,9 +19,15 @@
 #define BUILD_COMMIT "unknown"
 #endif
 
-#include "datasystem/common/signal/signal.h"
 #include "datasystem/coordinator_server.h"
 #include "datasystem/utils/status.h"
+
+// Forward-declared (not included) because common/signal/signal.h is an
+// internal header not shipped in the SDK; the symbol is exported by
+// libdatasystem_coordinator.so (no -fvisibility=hidden on that target).
+namespace datasystem {
+bool IsTermSignalReceived();
+}  // namespace datasystem
 
 using namespace datasystem;
 

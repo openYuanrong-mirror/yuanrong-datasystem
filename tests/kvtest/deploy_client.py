@@ -44,11 +44,18 @@ def _print_timings(action, timings):
 
 
 class Deployer:
-    def __init__(self, deploy_path, config_template_path):
+    def __init__(self, deploy_path, config_template_path=None):
         with open(deploy_path) as f:
             self.deploy = json.load(f)
-        with open(config_template_path) as f:
-            self.config_template = json.load(f)
+        # config_template is optional: install does not need it, only start /
+        # deploy / gen-config do. When None, self.config_template is {} and
+        # any caller that needs it (start_node via generate_config) will
+        # raise a clear error on missing keys rather than silently using {}.
+        if config_template_path:
+            with open(config_template_path) as f:
+                self.config_template = json.load(f)
+        else:
+            self.config_template = {}
 
         self.base_dir = os.path.dirname(os.path.abspath(__file__))
         self.nodes = self.deploy.get('nodes', [])
@@ -400,30 +407,32 @@ class Deployer:
         key = self._host_key(node)
         return self._host_locks.setdefault(key, threading.Lock())
 
-    def deploy_node(self, node):
+    def install_node(self, node):
+        """Install binary + .so + procmon + launcher to a node (no start).
+
+        Idempotent: re-running overwrites files but does not touch any
+        running process. Split out of the legacy ``deploy_node`` so a
+        large cluster can finish all uploads before any process starts,
+        avoiding the upload-order-spreads-start-time skew on 2000+ nodes.
+        Returns ``(ok, elapsed)`` where ``elapsed`` is the upload wall-clock
+        (binary + lib + scripts); no per-step timing is exposed.
+        """
         target = self._exec_target(node)
         instance_id = node['instance_id']
         transport = self._transport(node)
         tag = f'  [{target}:{instance_id}]'
 
-        log_info(f'Deploying to {target} (instance_id={instance_id}, transport={transport})...')
+        log_info(f'Installing to {target} (instance_id={instance_id}, transport={transport})...')
 
-        config = self.generate_config(node)
-        role = config.get('role', 'writer')
-
-        with tempfile.NamedTemporaryFile(
-            mode='w', suffix='.json', prefix=f'config_{instance_id}_',
-            delete=False
-        ) as tf:
-            json.dump(config, tf, indent=2)
-            tmp_config = tf.name
-
+        t0 = time.monotonic()
         try:
             # Step 1: Create remote directory
             log_info(f'{tag} mkdir {self.remote_work_dir}')
             self.run_on(node, f'mkdir -p {self.remote_work_dir}')
 
-            # Step 2: Upload binary (under host lock to avoid concurrent races)
+            # Step 2: Upload binary + .so (under host lock to avoid concurrent
+            # scp races on the same target file when multiple instances share
+            # a host).
             remote_binary = f'{self.remote_work_dir}/kvtest'
             remote_sdk = node.get('remote_sdk_dir', self.deploy.get('remote_sdk_dir', ''))
             with self._get_host_lock(node):
@@ -442,15 +451,10 @@ class Deployer:
                             self.scp_to(node, local_lib_dir, remote_lib)
                             remote_sdk = remote_lib
 
-            # Step 4: Upload config
-            remote_config = f'{self.remote_work_dir}/config_{instance_id}.json'
-            log_info(f'{tag} uploading config (role={role}, peers={len(config.get("peers", []))})')
-            self.scp_to(node, tmp_config, remote_config)
-
-            # Step 5: chmod
+            # Step 3: chmod
             self.run_on(node, f'chmod +x {self.remote_work_dir}/kvtest')
 
-            # Step 6: Upload procmon
+            # Step 4: Upload procmon (one-time; start phase does not re-upload)
             if self.enable_procmon:
                 script_dir = os.path.dirname(os.path.abspath(__file__))
                 procmon_src = os.path.join(script_dir, 'procmon.py')
@@ -458,46 +462,78 @@ class Deployer:
                     procmon_src = os.path.join(script_dir, 'tools', 'procmon.py')
                 self.scp_to(node, procmon_src, f'{self.remote_work_dir}/procmon.py')
 
-            # Step 6b: Upload standalone_launcher.py (fork+setsid via Python
+            # Step 5: Upload standalone_launcher.py (fork+setsid via Python
             # syscall, not the `setsid` binary which may be missing on minimal
-            # images). Used below to launch kvtest detached from the caller's
-            # session so kubectl exec / ssh returns promptly instead of
-            # hanging for the full subprocess timeout on a nohup-backgrounded
-            # process. If upload fails, the legacy nohup path is used.
+            # images). Used by start phase to launch kvtest detached from the
+            # caller's session so kubectl exec / ssh returns promptly instead
+            # of hanging for the full subprocess timeout on a nohup-backgrounded
+            # process. If upload fails, start phase falls back to nohup.
             script_dir = os.path.dirname(os.path.abspath(__file__))
             launcher_src = os.path.join(script_dir, 'standalone_launcher.py')
             if not os.path.exists(launcher_src):
                 launcher_src = os.path.join(script_dir, 'tools',
                                             'standalone_launcher.py')
-            launcher_uploaded = False
             if os.path.exists(launcher_src):
                 try:
                     self.scp_to(node, launcher_src,
                                 f'{self.remote_work_dir}/standalone_launcher.py')
-                    launcher_uploaded = True
                 except Exception as e:
                     log_info(f'{tag} WARNING: launcher upload failed: {e}; '
-                             f'will fall back to nohup path')
+                             f'start phase will fall back to nohup path')
 
-            # Step 7: Start process
-            # Third-party libs are statically linked into the binary.
-            # libdatasystem.so is provided by the container SDK (remote_sdk).
-            if remote_sdk:
-                ld_path = remote_sdk
-            else:
-                ld_path = ''
+            log_info(f'  {target} -> OK')
+            return True, time.monotonic() - t0
+        except Exception as e:
+            log_info(f'  {target} -> FAILED: {e}')
+            return False, time.monotonic() - t0
 
-            # Add custom environment variables from config
-            custom_env = {k: v for k, v in config.get('env', {}).items() if k}
-            # Inject this node's address into the host-id env var (named by
-            # host_id_env_name) so the SDK resolves a non-empty hostId and
-            # ServiceDiscovery prefers same-host workers. Without this the
-            # SDK's hostId_ stays empty, HasHostAffinity() is false, and
-            # worker selection falls back to uniform-random across the whole
-            # cluster (cross-node binding + load skew).
+    def start_node(self, node):
+        """Start kvtest on a node (assumes install_node already ran).
+
+        Generates and uploads the per-node config, then launches the binary
+        via standalone_launcher.py (nohup fallback). Does NOT upload the
+        binary, .so, procmon.py, or launcher.py — install phase owns those.
+        Returns ``(ok, start_elapsed)`` where ``start_elapsed`` is the
+        launcher-reported Popen→ready elapsed when available (excludes
+        kubectl exec / ssh overhead), else the outer wall-clock.
+        """
+        target = self._exec_target(node)
+        instance_id = node['instance_id']
+        tag = f'  [{target}:{instance_id}]'
+
+        config = self.generate_config(node)
+        role = config.get('role', 'writer')
+
+        with tempfile.NamedTemporaryFile(
+            mode='w', suffix='.json', prefix=f'config_{instance_id}_',
+            delete=False
+        ) as tf:
+            json.dump(config, tf, indent=2)
+            tmp_config = tf.name
+
+        try:
+            # Upload config (small file; filename contains instance_id so
+            # same-host instances do not collide — no host_lock needed).
+            remote_config = f'{self.remote_work_dir}/config_{instance_id}.json'
+            log_info(f'{tag} uploading config (role={role}, peers={len(config.get("peers", []))})')
+            self.scp_to(node, tmp_config, remote_config)
+
+            # Resolve SDK lib path (set by install phase on the node).
+            remote_sdk = node.get('remote_sdk_dir', self.deploy.get('remote_sdk_dir', ''))
+            if not remote_sdk:
+                # Match install_node's fallback: if .so was uploaded to lib/
+                local_lib_dir = os.path.join(self.base_dir, 'output', 'lib')
+                if os.path.isdir(local_lib_dir):
+                    import glob as _glob
+                    if _glob.glob(os.path.join(local_lib_dir, '*.so*')):
+                        remote_sdk = f'{self.remote_work_dir}/lib'
+            ld_path = remote_sdk if remote_sdk else ''
+
+            # Custom env vars: HOST_IP injection + SDK tuning.
             # Uses status.hostIP (k8s node InternalIP), NOT nodeName (hostname)
             # — hostname would break coordinator/etcd registration which
             # expects an IP address.
+            custom_env = {k: v for k, v in config.get('env', {}).items() if k}
             host_id_env = config.get('host_id_env_name') or 'HOST_IP'
             if host_id_env and host_id_env not in custom_env:
                 host_ip = node.get('host_ip', '')
@@ -507,25 +543,49 @@ class Deployer:
                         f'(node {node.get("host", "?")}) has no status.hostIP; '
                         f'cannot inject a valid node IP — check k8s node status')
                 custom_env[host_id_env] = host_ip
-
             # SDK reads DATASYSTEM_UB_GET_DATA_SIZE_BYTES at client init (default 32MB);
             # kvtest workloads fit in 10MB. Overridable via config 'env'.
             if 'DATASYSTEM_UB_GET_DATA_SIZE_BYTES' not in custom_env:
                 custom_env['DATASYSTEM_UB_GET_DATA_SIZE_BYTES'] = '10485760'
 
-            # Time only the actual launch. Verify (pgrep) and procmon attach
-            # are intentionally excluded — caller reads start_elapsed.
+            # Pre-flight: binary must exist (install must have run). Skip the
+            # node with a clear error instead of attempting a doomed launch.
+            check_bin = self.run_on(
+                node, f'test -x {self.remote_work_dir}/kvtest', check=False, timeout=10)
+            if check_bin.returncode != 0:
+                log_info(f'{tag} FAILED: kvtest binary not found or not executable '
+                         f'at {self.remote_work_dir}/kvtest; run install first')
+                return False, 0.0
+
+            # Skip if already running (idempotent start; matches coordinator
+            # cmd_start skip-alive semantics).
+            already = self.run_on(node, 'pgrep -x kvtest', check=False, timeout=10)
+            if already.returncode == 0 and already.stdout.strip():
+                log_info(f'{tag} already running (pid={already.stdout.strip().split(chr(10))[0]}), skip')
+                return True, 0.0
+
+            # Launch via standalone_launcher.py (fork+setsid via Python syscall).
+            # The launcher parent prints "{pid} {elapsed}" to stdout and exits
+            # when the binary is ready, so kubectl exec / ssh returns promptly
+            # instead of hanging on the SPDY pipe held by a nohup-backgrounded
+            # binary. Falls back to nohup only if the launcher script is absent
+            # (install phase upload failed) — detected per-node via test -f.
             log_info(f'{tag} starting kvclient (role={role})...')
             t_start = time.monotonic()
+            pid = None
+            launch_elapsed = None
+            launcher_check = self.run_on(
+                node, f'test -f {self.remote_work_dir}/standalone_launcher.py',
+                check=False, timeout=5)
+            use_launcher = launcher_check.returncode == 0
             try:
-                pid = None
-                if launcher_uploaded:
-                    # Launcher path: fork+setsid via Python syscall. Custom
-                    # env vars (HOST_IP etc.) are set in the shell prefix so
-                    # the launcher inherits them via os.environ; LD_LIBRARY_PATH
+                if use_launcher:
+                    # Custom env vars (HOST_IP etc.) are set in the shell prefix
+                    # so the launcher inherits them via os.environ; LD_LIBRARY_PATH
                     # is handled by the launcher's --lib-path arg. No --port:
-                    # kvtest client doesn't listen, launcher prints PID
-                    # immediately after fork.
+                    # kvtest client doesn't listen; the launcher grace-polls
+                    # proc.poll() for --no-signal-grace seconds to catch early
+                    # exits (bad gflags, missing .so) before reporting success.
                     env_prefix = ''
                     if custom_env:
                         env_prefix = ' '.join(
@@ -549,8 +609,19 @@ class Deployer:
                         out = result.stdout.strip()
                         if out:
                             last_line = out.splitlines()[-1].strip()
-                            if last_line.isdigit():
-                                pid = last_line
+                            parts = last_line.split()
+                            if parts and parts[0].isdigit():
+                                pid = parts[0]
+                                if len(parts) > 1:
+                                    try:
+                                        launch_elapsed = float(parts[1])
+                                    except ValueError:
+                                        pass
+                    # Surface launcher stderr (warnings/errors) even when
+                    # the process returned 0, so the operator knows if the
+                    # launcher reported a not-ready-timeout or early exit.
+                    if result and result.stderr and result.stderr.strip():
+                        log_info(f'{tag} launcher: {result.stderr.strip()}')
                 else:
                     # Fallback: legacy nohup-and-timeout path (used when
                     # launcher upload failed). Kubectl exec / ssh may hang
@@ -570,22 +641,26 @@ class Deployer:
                         f"echo $!")
                     self.run_on(node, start_cmd, check=False,
                                 timeout=10, allow_timeout=True)
-                start_elapsed = time.monotonic() - t_start
+                # Use launcher-reported elapsed (Popen → ready, excludes
+                # kubectl exec / ssh overhead) when available; fall back to
+                # outer measurement for the nohup path.
+                start_elapsed = (launch_elapsed if launch_elapsed is not None
+                                 else time.monotonic() - t_start)
             except Exception as e:
                 log_info(f'  {target} -> FAILED: {e}')
                 return False, time.monotonic() - t_start
 
-            # Step 8: Verify/report process started
+            # Verify/report process started.
             # Launcher path: PID was already printed to stdout by the
             # launcher (fork + exec; PID survives exec). Report it directly.
-            # Fallback path (launcher upload failed or returned no PID):
+            # Fallback path (launcher absent or returned no PID):
             # use pgrep to verify and report.
             if pid:
                 log_info(f'{tag} process started (pid={pid})')
             else:
                 time.sleep(1)
                 verify = self.run_on(
-                    node, f'pgrep -x kvtest',
+                    node, 'pgrep -x kvtest',
                     check=False)
                 if verify.returncode == 0 and verify.stdout.strip():
                     pid = verify.stdout.strip().split('\n')[0]
@@ -600,8 +675,9 @@ class Deployer:
                     else:
                         log_info(f'{tag} stdout empty — binary may have crashed before any output')
 
-            # Step 9: Start procmon (--background: parent prints PID and exits,
-            # kubectl exec / ssh returns immediately without timeout hack)
+            # Attach procmon (assumes procmon.py was uploaded by install phase;
+            # do NOT re-upload per the agreed scope). --background: parent
+            # prints PID and exits, kubectl exec / ssh returns immediately.
             if self.enable_procmon and pid:
                 procmon_cmd = (
                     f"cd {self.remote_work_dir} && "
@@ -622,36 +698,99 @@ class Deployer:
         finally:
             os.unlink(tmp_config)
 
-    def do_deploy(self):
+    def deploy_node(self, node):
+        """Legacy single-call install + start (kept for backward compat).
+
+        Equivalent to ``install_node`` followed by ``start_node`` on the same
+        node. New callers should use ``do_install`` + ``do_start`` so uploads
+        complete cluster-wide before any process starts.
+        """
+        ok, _ = self.install_node(node)
+        if not ok:
+            return False, 0.0
+        return self.start_node(node)
+
+    def do_install(self):
+        """Install binary + .so + procmon + launcher on all nodes (no start).
+
+        Pre-loads every node so a subsequent ``do_start`` can launch all
+        processes near-simultaneously instead of being skewed by upload
+        ordering. Critical for 2000+ node clusters where the ~100MB binary
+        would otherwise spread start times across minutes.
+        """
         if not os.path.isfile(self.binary_path):
             log_info(f'ERROR: binary not found: {self.binary_path}')
             log_info('  Run "build.sh" first to compile and package.')
             sys.exit(1)
 
         log_info(f'Version: {self.version}')
+        log_info(f'\nInstalling on {len(self.nodes)} node(s)...')
 
         timings = []
 
-        def _deploy_with_timing(node):
+        def _install_with_timing(node):
             target = self._exec_target(node)
             try:
-                ok, start_elapsed = self.deploy_node(node)
+                ok, elapsed = self.install_node(node)
             except Exception as e:
                 log_info(f'  {target} -> FAILED: {e}')
-                ok, start_elapsed = False, 0.0
-            timings.append((target, start_elapsed, bool(ok)))
+                ok, elapsed = False, 0.0
+            timings.append((target, elapsed, bool(ok)))
             return ok
 
         results = []
         with ThreadPoolExecutor(max_workers=len(self.nodes) or 1) as pool:
-            futures = {pool.submit(_deploy_with_timing, n): n for n in self.nodes}
+            futures = {pool.submit(_install_with_timing, n): n for n in self.nodes}
             for future in as_completed(futures):
                 results.append(future.result())
 
         ok = sum(1 for r in results if r)
         total = len(results)
-        log_info(f'\nDeploy result: {ok}/{total} succeeded')
+        log_info(f'\nInstall result: {ok}/{total} succeeded')
+        _print_timings('install', timings)
+
+    def do_start(self):
+        """Start kvtest on all nodes (assumes install completed).
+
+        Launches all nodes concurrently; with uploads already done in
+        ``do_install``, all processes enter Popen within milliseconds of
+        each other, giving a true simultaneous-start for cluster-scale
+        startup profiling.
+        """
+        log_info(f'\nStarting on {len(self.nodes)} node(s)...')
+
+        timings = []
+
+        def _start_with_timing(node):
+            target = self._exec_target(node)
+            try:
+                ok, elapsed = self.start_node(node)
+            except Exception as e:
+                log_info(f'  {target} -> FAILED: {e}')
+                ok, elapsed = False, 0.0
+            timings.append((target, elapsed, bool(ok)))
+            return ok
+
+        results = []
+        with ThreadPoolExecutor(max_workers=len(self.nodes) or 1) as pool:
+            futures = {pool.submit(_start_with_timing, n): n for n in self.nodes}
+            for future in as_completed(futures):
+                results.append(future.result())
+
+        ok = sum(1 for r in results if r)
+        total = len(results)
+        log_info(f'\nStart result: {ok}/{total} succeeded')
         _print_timings('start', timings)
+
+    def do_deploy(self):
+        """Full lifecycle: install + start on all nodes.
+
+        Equivalent to ``do_install`` followed by ``do_start``. Kept for
+        backward compatibility with the ``deploy`` CLI subcommand.
+        """
+        self.do_install()
+        log_info('\n--- install done, starting ---')
+        self.do_start()
 
     def do_stop(self):
         if not self.nodes:
@@ -1476,8 +1615,20 @@ def main():
     shared.add_argument('--kvtest-binary-path',
                         help='Path to kvtest binary (default: output/kvtest, or deploy.json kvtest_binary_path)')
 
+    # install
+    p = sub.add_parser('install', help='Upload binary + .so + procmon + launcher (no start)',
+                       parents=[shared])
+    p.add_argument('deploy_json', help='Path to deploy.json')
+
+    # start
+    p = sub.add_parser('start', help='Start kvtest on all nodes (assumes install ran)',
+                       parents=[shared])
+    p.add_argument('deploy_json', help='Path to deploy.json')
+    p.add_argument('config_template', nargs='?', default='config/config.json.example',
+                   help='Config template (default: config/config.json.example)')
+
     # deploy
-    p = sub.add_parser('deploy', help='Deploy + start (auto stop+collect if duration set)',
+    p = sub.add_parser('deploy', help='Install + start (auto stop+collect if duration set)',
                        parents=[shared])
     p.add_argument('deploy_json', help='Path to deploy.json')
     p.add_argument('config_template', nargs='?', default='config/config.json.example',
@@ -1517,14 +1668,23 @@ def main():
         cmd_gen_config(args)
         return
 
-    deployer = Deployer(args.deploy_json, args.config_template)
+    # install does not need a config template; pass None so Deployer does
+    # not require the file. start/deploy/stop/collect all take an optional
+    # config_template positional (default config/config.json.example), so
+    # getattr(..., 'config_template', None) returns the actual path or None.
+    config_template = getattr(args, 'config_template', None)
+    deployer = Deployer(args.deploy_json, config_template)
 
     # Resolve binary path: CLI --kvtest-binary-path > deploy.json "kvtest_binary_path" > output/kvtest
     default_binary = os.path.join(deployer.base_dir, 'output', 'kvtest')
     deployer.binary_path = getattr(args, 'kvtest_binary_path', None) or deployer.deploy.get(
         'kvtest_binary_path') or default_binary
 
-    if args.command == 'deploy':
+    if args.command == 'install':
+        deployer.do_install()
+    elif args.command == 'start':
+        deployer.do_start()
+    elif args.command == 'deploy':
         deployer.do_deploy()
         duration = parse_duration(deployer.deploy.get('duration', '0'))
         if duration > 0:
