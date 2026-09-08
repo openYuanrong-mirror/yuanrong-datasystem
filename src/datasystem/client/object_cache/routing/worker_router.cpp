@@ -233,6 +233,18 @@ Status WorkerRouter::SelectWorkers(const std::vector<std::string> &keys, DataPla
     return Status::OK();
 }
 
+std::vector<HostPort> WorkerRouter::GetAvailableSameNodeWorkers() const
+{
+    auto view = std::atomic_load(&ringView_);
+    std::vector<HostPort> workers;
+    for (const auto &worker : *view->sameNodeWorkers) {
+        if (IsWorkerAvailable(worker)) {
+            workers.emplace_back(worker);
+        }
+    }
+    return workers;
+}
+
 std::vector<HostPort> WorkerRouter::GetAvailableWorkers() const
 {
     auto view = std::atomic_load(&ringView_);

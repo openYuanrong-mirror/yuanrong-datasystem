@@ -30,6 +30,7 @@
 
 #include <tbb/concurrent_hash_map.h>
 
+#include "datasystem/client/mmap_manager/host_memory_pin_manager.h"
 #include "datasystem/client/object_cache/transport/data_plane/i_data_transporter.h"
 #include "datasystem/client/object_cache/transport/data_plane/shm_transporter.h"
 #include "datasystem/client/object_cache/transport/data_plane/ub_transporter.h"
@@ -79,7 +80,8 @@ public:
                               std::shared_ptr<IUbReceiveBufferProvider> ubBufferProvider = nullptr,
                               bool enableClientDirectPipelineH2D = false, int32_t pipelineThreadNum = 64,
                               std::shared_ptr<ThreadPool> releasePool = nullptr, bool initializeUbRuntime = true,
-                              bool allowUbRuntimeFailure = false);
+                              bool allowUbRuntimeFailure = false,
+                              std::shared_ptr<HostMemoryPinManager> hostMemoryPinManager = nullptr);
     virtual ~DataPlaneManager();
 
     /** @brief Initialize manager lifecycle and, when requested, process-level UB resources. */
@@ -263,6 +265,7 @@ private:
     bthread::Mutex lifecycleMutex_;
     std::atomic<bool> initialized_{ false };
     std::weak_ptr<ThreadPool> releasePool_;
+    std::shared_ptr<HostMemoryPinManager> hostMemoryPinManager_;
 };
 }  // namespace client
 }  // namespace datasystem

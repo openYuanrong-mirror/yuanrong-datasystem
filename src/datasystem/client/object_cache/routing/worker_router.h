@@ -99,6 +99,8 @@ public:
                          std::unordered_map<HostPort, std::vector<std::string>> &groups,
                          const std::vector<HostPort> &exclude = {}) const;
 
+    std::vector<HostPort> GetAvailableSameNodeWorkers() const;
+
     std::vector<HostPort> GetAvailableWorkers() const;
 
     // Called by Refresher to update hash ring data.

@@ -30,6 +30,7 @@
 #include <string>
 #include <vector>
 
+#include "datasystem/client/mmap_manager/host_memory_pin_manager.h"
 #include "datasystem/client/object_cache/routing/ub_health_filter.h"
 #include "datasystem/client/object_cache/transport/data_plane/data_plane_manager.h"
 #include "datasystem/client/object_cache/transport/object_read/object_read_flow.h"
@@ -57,6 +58,7 @@ namespace client {
 struct TransportLayerOptions {
     BrpcChannelConfig channelConfig;
     std::shared_ptr<ThreadPool> releasePool;
+    std::shared_ptr<HostMemoryPinManager> hostMemoryPinManager;
     bool enableClientDirectPipelineH2D = false;
     int32_t pipelineThreadNum = 64;
     // Keep eager UB setup by default; non-pipeline callers that have not negotiated UB may opt out explicitly.

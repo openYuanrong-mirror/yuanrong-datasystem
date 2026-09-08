@@ -62,6 +62,8 @@ public:
                          std::unordered_map<HostPort, std::vector<std::string>> &groups,
                          const std::vector<HostPort> &exclude = {});
 
+    std::vector<HostPort> GetAvailableSameNodeWorkers() const;
+
     void UpdateState(const HostPort &addr, StatusCode status);
 
     bool ForceRefresh();

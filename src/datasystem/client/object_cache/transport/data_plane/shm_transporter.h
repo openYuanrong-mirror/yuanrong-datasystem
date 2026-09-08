@@ -41,9 +41,11 @@ namespace client {
 class ShmTransporter : public IDataTransporter {
 public:
     explicit ShmTransporter(HostPort workerAddr, std::shared_ptr<WorkerRpcClient> rpcClient,
-                           std::weak_ptr<ThreadPool> releasePool = {})
+                           std::weak_ptr<ThreadPool> releasePool = {},
+                           std::shared_ptr<HostMemoryPinManager> hostMemoryPinManager = nullptr)
         : rpcClient_(std::move(rpcClient)),
-          shmConnection_(std::make_shared<ShmConnection>(std::move(workerAddr), rpcClient_, std::move(releasePool)))
+          shmConnection_(std::make_shared<ShmConnection>(std::move(workerAddr), rpcClient_, std::move(releasePool),
+                                                         std::move(hostMemoryPinManager)))
     {
     }
     ~ShmTransporter() override = default;

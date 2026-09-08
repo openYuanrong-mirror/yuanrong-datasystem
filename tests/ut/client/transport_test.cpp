@@ -1617,7 +1617,7 @@ TEST(ShmConnectionTest, VoluntaryScaleDownDoesNotReconnectSharedMemory)
     auto releasePool = std::make_shared<ThreadPool>(0, 1, "scale_in_disconnect_test");
     ShmConnection connection(MakeAddress(9001), rpcClient, releasePool);
     auto fdChannel = std::make_shared<ShmFdChannel>(rpcClient, ShmFd(), false, "endpoint-client");
-    auto mmapManager = std::make_shared<MmapManager>(fdChannel, false);
+    auto mmapManager = std::make_shared<MmapManager>(fdChannel, false, std::make_shared<HostMemoryPinManager>());
     auto session = std::shared_ptr<ShmSession>(new ShmSession(
         MakeAddress(9001), rpcClient, fdChannel, mmapManager, "endpoint-client", "worker-start", 1,
         releasePool, MakeRequestContext(), true, connection.scaleInDraining_));
@@ -2400,7 +2400,9 @@ TEST(DataPlaneManagerTest, UbRuntimeIsNotPublishedBeforeInitializationCompletes)
 TEST(DataPlaneManagerTest, ShmCandidateDoesNotDependOnInitialWorkerShmCapability)
 {
     ApiDeadlineGuard deadline(1000);
-    DataPlaneManager manager(MakeSignature(), ConnectOptions{}.fastTransportMemSize);
+    auto pinManager = std::make_shared<HostMemoryPinManager>();
+    DataPlaneManager manager(MakeSignature(), ConnectOptions{}.fastTransportMemSize, {}, nullptr, false, 64, nullptr,
+                             true, false, pinManager);
     ASSERT_TRUE(manager.Init().IsOk());
     std::shared_ptr<IDataTransporter> first;
     std::shared_ptr<IDataTransporter> second;

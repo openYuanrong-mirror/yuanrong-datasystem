@@ -102,7 +102,7 @@ public:
                                        std::shared_ptr<client::ListenWorker> &localListenWorker);
     bool CommitPreferredLocalWorker(WorkerNode oldNode, const HostPort &localAddress,
                                     const std::shared_ptr<ClientWorkerRemoteApi> &localWorkerApi,
-                                    std::unique_ptr<client::MmapManager> localMmapManager,
+                                    std::unique_ptr<client::MmapManager> &localMmapManager,
                                     const std::shared_ptr<client::ListenWorker> &localListenWorker);
     bool RecoverPreferredLocalWorker();
     bool ReadyToExit(WorkerNode node, const std::shared_ptr<IClientWorkerApi> &workerApi,

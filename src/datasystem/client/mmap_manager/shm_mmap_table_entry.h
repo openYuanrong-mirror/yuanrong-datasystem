@@ -22,8 +22,11 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "datasystem/client/mmap_manager/immap_table_entry.h"
 #include "datasystem/utils/status.h"
@@ -58,12 +61,52 @@ public:
 
     void SkipHostMemoryPin();
 
+    void SetHostMemoryOperationMutex(const std::shared_ptr<std::mutex> &mutex);
+
+    void SetClientExitingFlag(const std::shared_ptr<std::atomic<bool>> &clientExiting);
+
     bool IsCudaHostMemoryRegistrationDone() const override;
 
+    void MarkVoluntaryScaleDown();
+
+    bool Contains(const void *pointer) const;
+
+    Status GetMemcpySegmentSizes(const void *pointer, size_t size, std::vector<size_t> &segmentSizes) const;
+
 private:
+    struct PinRange {
+        uint8_t *startAddr{ nullptr };
+        size_t totalSize{ 0 };
+        size_t sliceSize{ 0 };
+    };
+
+    struct PinFragment {
+        uint8_t *pointer;
+        size_t size;
+    };
+
+    struct PinResult {
+        size_t successCount{ 0 };
+        size_t attemptedFragmentCount{ 0 };
+        size_t retryCount{ 0 };
+    };
+
+    void BuildPinRange();
+    size_t GetPinFragmentCount() const;
+    PinFragment GetPinFragment(size_t fragmentIndex) const;
+    bool PinHostMemoryFragment(size_t fragmentIndex);
+    PinResult PinHostMemoryFragments();
+    bool UnpinHostMemoryFragment(size_t fragmentIndex);
+    void UnpinHostMemory();
+
     const std::string clientId_;
+    PinRange pinRange_;
+    std::shared_ptr<std::mutex> hostMemoryOperationMutex_{ std::make_shared<std::mutex>() };
+    std::shared_ptr<std::atomic<bool>> clientExiting_;
     std::atomic<bool> pinCompleted_{ false };
     std::atomic<bool> pinAttempted_{ false };
+    std::atomic<size_t> pinnedFragmentCount_{ 0 };
+    std::atomic<bool> voluntaryScaleDown_{ false };
 };
 }  // namespace client
 }  // namespace datasystem

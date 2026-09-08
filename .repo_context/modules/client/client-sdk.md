@@ -99,6 +99,11 @@
   - Routed same-host Get uses one endpoint-scoped SHM session per target Worker. Object metadata, reference acquisition,
     and `DecreaseReference` use the client-facing `WorkerOCService`; only fd-session bootstrap and control
     (`GetSocketPath`, `RegisterClient`, `GetClientFd`, `DisconnectClient`) use `WorkerService`.
+    A successful heartbeat reporting voluntary scale-down marks that Worker's current mmap entries before connection
+    cleanup. Their CUDA host-memory unregister loop skips the normal five-millisecond inter-fragment interval, while
+    restart, heartbeat failure, and other non-voluntary cleanup paths retain the interval.
+    Normal Object/KV/Stream Client shutdown also sets a Client-wide exit flag before SHM transport cleanup, so every
+    entry owned by that Client skips the unregister interval even when a Buffer delays entry destruction.
     `ShmTransporter` never falls back to `WorkerWorkerOCService.GetObjectRemote` for an SHM candidate. Each session owns
     its fd-passing socket and private `MmapManager`, while returned Buffers retain a session/mmap owner that releases the
     reference to the actual data Worker. Session failure closes the socket so Worker client-lost cleanup resolves any
@@ -124,12 +129,23 @@
     latch rather than the SDK's initially bound Worker lock id. Transport selection/admission, session, fd-channel,
     auth, legacy reference state, and the mmap manager/table use bthread mutex/RWLock/condition-variable primitives
     because these paths can be entered from brpc/bthread execution contexts.
-  - Each non-embedded shared-memory mmap table lazily owns one serial background worker for CUDA host-memory
-    registration. An mmap becomes usable before registration completes. KV `Get(..., ReadOnlyBuffer)` copies an
-    affected SHM payload under its read latch into Buffer-owned pageable memory. KV `Create`/`MCreate` similarly expose
-    Buffer-owned pageable memory while registration is pending; `Set`/`MSet` copy it back into the already allocated
-    Worker SHM with a CPU copy before publishing, without waiting for registration. Plain `Get(..., Optional<Buffer>)`
-    keeps its existing zero-copy behavior. Mmap-table shutdown drains pin work before entries can unpin and unmap.
+  - Non-embedded shared-memory mmap entries submit CUDA host-memory registration to one client-wide serial background
+    worker. All entries owned by that client also share one operation mutex, so whole-mapping registration and
+    destructor-driven unregistration cannot overlap. An mmap is usable immediately: KV `Create`/`MCreate` and both
+    Buffer-returning `Get` variants expose the Worker SHM directly without waiting for registration or allocating a
+    temporary Host buffer. Registration and unregistration divide each Worker mapping into fixed 64 MiB fragments
+    (with a smaller tail fragment when needed) and wait 5 ms between fragments. Client
+    `DsCudaMemcpyAsync` splits H2D/D2H ranges at those planned fragment boundaries only when the Host pointer belongs to
+    a Worker SHM mapping; other Host memory is submitted as one copy. The pin task retains the mmap entry, so shutdown
+    cannot unpin or unmap it while registration is still running. Per-fragment register/unregister start and finish
+    details are `VLOG(1)`; failures remain `ERROR`, while each whole Worker mapping emits `INFO` start/finish summaries
+    with elapsed time and failure counts. A `DsCudaMemcpyAsync` crossing fragment boundaries emits one `VLOG(1)`
+    summary.
+    CUDA-enabled applications must call `KVClient::RegisterCudaFuncs` before initializing any `KVClient`; the first
+    valid process-wide callback table is frozen, and later registration attempts are ignored with a warning. All four
+    callbacks (`hostRegister`, `hostUnregister`, `getErrorString`, and `memcpyAsync`) must be non-null for registration
+    to be valid. Pin, unpin, and memcpy operations each use one synchronized callback snapshot without holding the
+    publication lock while invoking application code.
   - Embedded mmap entries resolve allocator-owned worker fds to the allocator's existing address and borrow those fds;
     they do not close them. Non-embedded mmap entries instead own the SCM_RIGHTS fd copies received from the worker.
   - `client::TransportLayer` also provides internal same-worker `MCreate`/`MSet` primitives. TCP MCreate allocates local
@@ -692,6 +708,7 @@
     transport reconcile thread restores a quarantined target only after an exact Client-to-Worker UB WRITE probe and
     current topology-incarnation fencing succeed.
   - standby failover candidate order is randomized per switch attempt, so when one worker fails a batch of clients can spread across the remaining ready workers instead of stampeding to the first candidate in a shared list.
+  - preferred same-node Worker replacement stops and joins the retired listener outside the switch mutex before releasing its mmap manager; rejected candidates follow the same listener-before-manager teardown order because listener callbacks retain a raw manager pointer.
   - after a standby switch publishes the new current worker, cleanup of the previous worker's mmap fds captured at switch commit runs immediately when that worker API has no pending invocations; otherwise cleanup is deferred until its invocation count reaches zero. Cleanup removes only the captured fds, so mappings added for another worker before the deferred callback runs are preserved.
   - Python `DsTensorClient` depends on `HeteroClient`; tensor features are not an independent transport stack.
 - Useful debug points:

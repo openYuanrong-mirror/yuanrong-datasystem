@@ -16,6 +16,7 @@
  */
 
 #include "datasystem/client/object_cache/object_client_impl.h"
+
 #include "datasystem/client/object_cache/worker_failover.h"
 #include "datasystem/client/object_cache/bound_mode.h"
 #include "datasystem/client/object_cache/routed_mode.h"
@@ -45,6 +46,7 @@
 #include <tbb/concurrent_hash_map.h>
 
 #include "datasystem/client/client_flags_monitor.h"
+#include "datasystem/client/mmap_manager/host_memory_pin_manager.h"
 #include "datasystem/client/mmap_manager/immap_table_entry.h"
 #include "datasystem/client/object_cache/routing/routing.h"
 #include "datasystem/client/object_cache/transport/common/deadline_retry.h"
@@ -59,6 +61,7 @@
 #include "datasystem/client/object_cache/routing/worker_router.h"
 #include "datasystem/common/device/device_manager_factory.h"
 #include "datasystem/common/device/device_helper.h"
+#include "datasystem/common/device/nvidia/cuda_host_memory.h"
 #include "datasystem/common/flags/common_flags.h"
 #include "datasystem/common/flags/flags.h"
 #include "datasystem/common/iam/tenant_auth_manager.h"
@@ -355,7 +358,8 @@ static constexpr int32_t INIT_SELECT_WORKER_TRIES = 6;
 }  // namespace
 
 ObjectClientImpl::ObjectClientImpl(const ConnectOptions &connectOptions1)
-    : shmRecoveryState_(std::make_unique<ShmRecoveryState>())
+    : hostMemoryPinManager_(std::make_shared<client::HostMemoryPinManager>()),
+      shmRecoveryState_(std::make_unique<ShmRecoveryState>())
 {
     failover_ = std::make_unique<WorkerFailover>(*this);
     BoundMode::Deps boundDeps{ workerApi_,
@@ -538,6 +542,7 @@ Status ObjectClientImpl::ShutDown(bool &needRollbackState, bool isDestruct)
     if (!needRollbackState) {
         return rc;
     }
+    hostMemoryPinManager_->MarkClientExiting();
     // When invoked from ~ObjectClientImpl (isDestruct=true), this runs during process
     // teardown if the client is process-static (e.g. a static shared_ptr<ObjectClient>
     // in a test, or a global in an embedding host). C++ destroys thread_local objects
@@ -706,6 +711,7 @@ Status ObjectClientImpl::InitTransportLayer()
     client::TransportLayerOptions options;
     options.channelConfig = std::move(channelConfig);
     options.releasePool = asyncReleasePool_;
+    options.hostMemoryPinManager = hostMemoryPinManager_;
     options.enableClientDirectPipelineH2D = enableClientDirectPipelineH2D_;
     options.pipelineThreadNum = clientDirectPipelineH2DThreadNum_;
     // RegisterClient decides whether this process can actually use UB and requests the runtime before this method.
@@ -903,7 +909,7 @@ Status ObjectClientImpl::InitClientRuntimeAt(WorkerNode node, bool initWithWorke
                                              bool routedWorkerIsLocal)
 {
     auto &workerApi = workerApi_[node];
-    mmapManager_ = std::make_unique<client::MmapManager>(workerApi, initWithWorker);
+    mmapManager_ = std::make_unique<client::MmapManager>(workerApi, initWithWorker, hostMemoryPinManager_);
     ConstructTreadPool();
     if (!enableLocalCache_ || enableClientDirectPipelineH2D_) {
         RETURN_IF_NOT_OK(InitTransportLayer());
@@ -959,6 +965,7 @@ Status ObjectClientImpl::InitListenWorkerAt(WorkerNode node, bool isLocalWorker)
         listenWorker_[node]->SetWorkerTimeoutHandle([this] { failover_->ProcessWorkerTimeout(); });
         listenWorker_[node]->SetReleaseFdCallBack(
             [this](const std::vector<int64_t> &fds) { mmapManager_->ClearExpiredFds(fds); });
+        listenWorker_[node]->SetVoluntaryScaleDownHandle([this] { mmapManager_->MarkVoluntaryScaleDown(); });
     } else {
         listenWorker_[node]->AddRecoveryCallback(
             this,
@@ -3700,7 +3707,6 @@ Status ObjectClientImpl::MSet(const std::vector<std::shared_ptr<Buffer>> &buffer
         batchExistence = existence;
         // Routed (lc=false two-step Create) buffers are published through the transport layer below.
         CHECK_FAIL_RETURN_STATUS(!buffer->bufferInfo_->isSeal, K_OC_ALREADY_SEALED, "Client object is already sealed");
-        RETURN_IF_NOT_OK(buffer->CopyPageableDataToShm());
         if (buffer->bufferInfo_->isRoutedWrite) {
             hasRouted = true;
             continue;
@@ -4634,6 +4640,38 @@ std::string ObjectClientImpl::GetTransportType() const
     return AccessTransportTracker::ToString();
 }
 
+Status ObjectClientImpl::DsCudaMemcpyAsync(void *dst, const void *src, size_t size, DsCudaMemcpyKind kind,
+                                           void *stream)
+{
+    if (size == 0) {
+        return Status::OK();
+    }
+    CHECK_FAIL_RETURN_STATUS(dst != nullptr && src != nullptr, K_INVALID,
+                             "CUDA memcpy source and destination must not be null");
+    CHECK_FAIL_RETURN_STATUS(kind == DsCudaMemcpyKind::HOST_TO_DEVICE || kind == DsCudaMemcpyKind::DEVICE_TO_HOST,
+                             K_INVALID, "Invalid CUDA memcpy direction");
+    RETURN_RUNTIME_ERROR_IF_NULL(hostMemoryPinManager_);
+    const void *hostPointer = kind == DsCudaMemcpyKind::HOST_TO_DEVICE ? src : dst;
+    std::vector<size_t> segmentSizes;
+    RETURN_IF_NOT_OK(hostMemoryPinManager_->GetMemcpySegmentSizes(hostPointer, size, segmentSizes));
+    if (segmentSizes.size() > 1) {
+        const char *direction = kind == DsCudaMemcpyKind::HOST_TO_DEVICE ? "H2D" : "D2H";
+        VLOG(1) << "[CudaMemcpyAsync] Worker shared memory copy crosses pin fragment boundaries, direction: "
+                << direction << ", hostPointer: " << hostPointer << ", size: " << size
+                << ", segmentCount: " << segmentSizes.size()
+                << ", firstSegmentSize: " << segmentSizes.front()
+                << ", lastSegmentSize: " << segmentSizes.back();
+    }
+    size_t offset = 0;
+    for (size_t segmentSize : segmentSizes) {
+        auto *segmentDst = static_cast<uint8_t *>(dst) + offset;
+        const auto *segmentSrc = static_cast<const uint8_t *>(src) + offset;
+        RETURN_IF_NOT_OK(datasystem::DsCudaMemcpyAsync(segmentDst, segmentSrc, segmentSize, kind, stream));
+        offset += segmentSize;
+    }
+    return Status::OK();
+}
+
 void ObjectClientImpl::WarmupClientWorkerConnection()
 {
     bool skipWarmup = false;
@@ -4680,6 +4718,78 @@ Status ObjectClientImpl::WarmupOneClientWorkerConnection(const std::string &key,
     return Status::OK();
 }
 
+namespace {
+Status EvaluateSameNodeWarmupResult(const std::vector<HostPort> &availableWorkers,
+                                    const std::unordered_set<HostPort> &warmedWorkers, size_t maxWarmedCount,
+                                    const Status &firstFailure)
+{
+    const size_t targetWarmedCount = std::min(maxWarmedCount, availableWorkers.size());
+    const size_t availableWarmedCount =
+        std::count_if(availableWorkers.begin(), availableWorkers.end(), [&warmedWorkers](const auto &worker) {
+            return warmedWorkers.find(worker) != warmedWorkers.end();
+        });
+    const bool targetWarmed = availableWarmedCount >= targetWarmedCount;
+    if (targetWarmed && availableWorkers.size() > maxWarmedCount) {
+        LOG(INFO) << FormatString("[CLIENT_WORKER_WARMUP] same-node warmup reached limit, available=%zu, target=%zu, "
+                                  "warmed=%zu, limitReached=true",
+                                  availableWorkers.size(), targetWarmedCount, availableWarmedCount);
+    }
+    if (!targetWarmed && firstFailure.IsOk()) {
+        return Status(K_RPC_DEADLINE_EXCEEDED, "Same-node warmup stopped before reaching its target");
+    }
+    return firstFailure;
+}
+}  // namespace
+
+Status ObjectClientImpl::WarmupSameNodeClientWorkerConnections(
+    const std::string &keyPrefix, const std::string &value, const SetParam &setParam,
+    TimeoutDuration &warmupBudget, std::vector<Optional<Buffer>> &buffers,
+    std::vector<std::string> &warmupKeys, size_t &warmedCount)
+{
+    constexpr size_t maxWarmedCount = 20;
+    std::unordered_set<HostPort> warmedWorkers;
+    Status firstFailure = Status::OK();
+    size_t keyIndex = 0;
+    while (warmedWorkers.size() < maxWarmedCount && warmupBudget.CalcRealRemainingTime() > 0) {
+        auto routing = std::atomic_load(&routing_);
+        RETURN_RUNTIME_ERROR_IF_NULL(routing);
+        const auto availableWorkers = routing->GetAvailableSameNodeWorkers();
+        if (availableWorkers.empty()) {
+            firstFailure = Status(K_NO_AVAILABLE_WORKER, "No same-node worker is available for warmup");
+            break;
+        }
+        const size_t targetWarmedCount = std::min(maxWarmedCount, availableWorkers.size());
+        const size_t availableWarmedCount =
+            std::count_if(availableWorkers.begin(), availableWorkers.end(), [&warmedWorkers](const auto &worker) {
+                return warmedWorkers.find(worker) != warmedWorkers.end();
+            });
+        if (availableWarmedCount >= targetWarmedCount) {
+            break;
+        }
+        std::string key;
+        HostPort selectedWorker;
+        Status rc;
+        do {
+            key = keyPrefix + "_" + std::to_string(keyIndex++);
+            rc = routing->SelectWorker(key, client::DataPlacementPolicy::REQUIRED_SAME_NODE, selectedWorker);
+        } while (rc.IsOk() && warmedWorkers.find(selectedWorker) != warmedWorkers.end()
+                 && warmupBudget.CalcRealRemainingTime() > 0);
+        if (rc.IsOk()) {
+            rc = WarmupOneClientWorkerConnection(key, value, setParam, warmupBudget, buffers, warmupKeys);
+        }
+        if (rc.IsOk()) {
+            warmedWorkers.emplace(selectedWorker);
+        } else if (firstFailure.IsOk()) {
+            firstFailure = rc;
+        }
+    }
+    warmedCount = warmedWorkers.size();
+    auto routing = std::atomic_load(&routing_);
+    RETURN_RUNTIME_ERROR_IF_NULL(routing);
+    const auto availableWorkers = routing->GetAvailableSameNodeWorkers();
+    return EvaluateSameNodeWarmupResult(availableWorkers, warmedWorkers, maxWarmedCount, firstFailure);
+}
+
 void ObjectClientImpl::CleanupWarmupObjects(const std::vector<std::string> &warmupKeys)
 {
     if (warmupKeys.empty()) {
@@ -4698,9 +4808,7 @@ Status ObjectClientImpl::DoWarmupClientWorkerConnection()
 {
     try {
         constexpr uint32_t warmupTtlSecond = 5;
-        // Split warmup into two phases: same-node (large value, exercises the SHM
-        // fd-passing path) and meta-owner (small value, exercises the cross-node
-        // RPC path). 20/80 split favors the metadata path which dominates traffic.
+        // Same-node large values exercise SHM; meta-owner small values exercise RPC.
         constexpr int32_t warmupTimeoutMs = 500;
         constexpr size_t sameNodeCount = 20;
         constexpr size_t metaOwnerCount = 80;
@@ -4721,14 +4829,18 @@ Status ObjectClientImpl::DoWarmupClientWorkerConnection()
         LOG(INFO) << FormatString("[CLIENT_WORKER_WARMUP] begin, business_timeout_ms=%d, budget_ms=%d",
                                   requestTimeoutMs_, warmupTimeoutMs);
         std::vector<Optional<Buffer>> buffers;
-        // Phase 1: same-node workers (REQUIRED_SAME_NODE when localcache=false).
-        dataPlacementPolicy_ = enableLocalCache_
-            ? savedPolicy
-            : client::DataPlacementPolicy::REQUIRED_SAME_NODE;
-        for (size_t i = 0; i < sameNodeCount; ++i) {
-            RETURN_IF_NOT_OK(WarmupOneClientWorkerConnection(
-                warmupKeyPrefix + "_" + std::to_string(i), sameNodeWarmupValue, setParam, warmupBudget, buffers,
-                warmupKeys));
+        Status sameNodeRc = Status::OK();
+        size_t warmedCount = sameNodeCount;
+        dataPlacementPolicy_ = enableLocalCache_ ? savedPolicy : client::DataPlacementPolicy::REQUIRED_SAME_NODE;
+        if (enableLocalCache_) {
+            for (size_t i = 0; i < sameNodeCount; ++i) {
+                RETURN_IF_NOT_OK(WarmupOneClientWorkerConnection(
+                    warmupKeyPrefix + "_" + std::to_string(i), sameNodeWarmupValue, setParam, warmupBudget, buffers,
+                    warmupKeys));
+            }
+        } else {
+            sameNodeRc = WarmupSameNodeClientWorkerConnections(warmupKeyPrefix, sameNodeWarmupValue, setParam,
+                                                               warmupBudget, buffers, warmupKeys, warmedCount);
         }
         // Phase 2: meta-owner (hash-ring owner, may be cross-node RPC).
         dataPlacementPolicy_ = client::DataPlacementPolicy::PREFERRED_META_OWNER;
@@ -4737,9 +4849,9 @@ Status ObjectClientImpl::DoWarmupClientWorkerConnection()
                 warmupKeyPrefix + "_m" + std::to_string(i), metaOwnerValue, setParam, warmupBudget, buffers,
                 warmupKeys));
         }
-        LOG(INFO) << FormatString("[CLIENT_WORKER_WARMUP] success, prefix=%s, sameNode=%zu, metaOwner=%zu",
-                                  warmupKeyPrefix, sameNodeCount, metaOwnerCount);
-        return Status::OK();
+        LOG(INFO) << FormatString("[CLIENT_WORKER_WARMUP] finished, prefix=%s, sameNode=%zu, metaOwner=%zu",
+                                  warmupKeyPrefix, warmedCount, metaOwnerCount);
+        return sameNodeRc;
     } catch (const std::exception &e) {
         LOG(WARNING) << FormatString("[CLIENT_WORKER_WARMUP] exception, error=%s", e.what());
         return Status(K_RUNTIME_ERROR, e.what());

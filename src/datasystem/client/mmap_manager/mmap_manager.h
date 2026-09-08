@@ -25,8 +25,9 @@
 #include <string>
 #include <vector>
 
-#include "datasystem/client/worker_api/client_worker_common_api.h"
+#include "datasystem/client/mmap_manager/host_memory_pin_manager.h"
 #include "datasystem/client/mmap_manager/immap_table.h"
+#include "datasystem/client/worker_api/client_worker_common_api.h"
 #include "datasystem/common/log/log.h"
 #include "datasystem/common/shared_memory/shm_unit.h"
 #include "datasystem/utils/status.h"
@@ -53,9 +54,11 @@ public:
  */
 class MmapManager {
 public:
-    explicit MmapManager(std::shared_ptr<IClientWorkerCommonApi> clientWorker, bool enableEmbeddedClient);
+    explicit MmapManager(std::shared_ptr<IClientWorkerCommonApi> clientWorker, bool enableEmbeddedClient,
+                         std::shared_ptr<HostMemoryPinManager> pinManager);
 
-    MmapManager(std::shared_ptr<IShmFdProvider> fdProvider, bool enableHugeTlb);
+    MmapManager(std::shared_ptr<IShmFdProvider> fdProvider, bool enableHugeTlb,
+                std::shared_ptr<HostMemoryPinManager> pinManager);
 
     ~MmapManager();
 
@@ -143,6 +146,11 @@ public:
      * @brief Invalid the current mmap table.
      */
     void CleanInvalidMmapTable();
+
+    /**
+     * @brief Mark current mappings so their unpin skips the fragment interval during voluntary scale-down.
+     */
+    void MarkVoluntaryScaleDown();
 
 private:
     // Closes every non-negative fd in clientFds[fromIdx..]. Extracted from LookupUnitsAndMmapFds error

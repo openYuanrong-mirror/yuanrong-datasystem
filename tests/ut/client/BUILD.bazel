@@ -3,6 +3,14 @@ load("//bazel:build_defs.bzl", "ds_cc_test")
 package(default_visibility = ["//visibility:public"])
 
 ds_cc_test(
+    name = "cuda_host_memory_test",
+    srcs = ["cuda_host_memory_test.cpp"],
+    deps = [
+        "//src/datasystem/common/device/nvidia:cuda_host_memory",
+    ],
+)
+
+ds_cc_test(
     name = "client_worker_common_api_test",
     srcs = ["client_worker_common_api_test.cpp"],
     deps = [

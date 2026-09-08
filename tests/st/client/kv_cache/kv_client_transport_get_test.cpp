@@ -1551,7 +1551,7 @@ TEST_F(KVClientTransportGetDrainingRealUrmaTest, DrainingTargetUsesUb)
 }
 
 
-TEST_F(KVClientTransportGetWithShmTest, PinPendingSingleAndBatchReadOnlyGetUsePageableMemory)
+TEST_F(KVClientTransportGetWithShmTest, PinPendingSingleAndBatchReadOnlyGetUseSharedMemory)
 {
     std::vector<std::string> keys;
     GetRealHashKeysToWorker(META_OWNER_INDEX, 3, keys);
@@ -1564,8 +1564,6 @@ TEST_F(KVClientTransportGetWithShmTest, PinPendingSingleAndBatchReadOnlyGetUsePa
 
     DS_ASSERT_OK(inject::Set("ShmMmapTableEntry.PinHostMemory", "1*pause()"));
     Raii clearPin([] { (void)inject::Clear("ShmMmapTableEntry.PinHostMemory"); });
-    DS_ASSERT_OK(inject::Set("Buffer.AllocatePageableMemory", "call()"));
-    Raii clearAlloc([] { (void)inject::Clear("Buffer.AllocatePageableMemory"); });
 
     Optional<ReadOnlyBuffer> singleBuffer;
     DS_ASSERT_OK(reader_->Get(keys[0], singleBuffer));
@@ -1583,7 +1581,6 @@ TEST_F(KVClientTransportGetWithShmTest, PinPendingSingleAndBatchReadOnlyGetUsePa
         ASSERT_EQ(std::memcmp(batchBuffers[i]->ImmutableData(), values[i + 1].data(), values[i + 1].size()), 0);
     }
     ASSERT_EQ(AccessTransportTracker::ToString(), "SHM");
-    ASSERT_GE(inject::GetExecuteCount("Buffer.AllocatePageableMemory"), 3u);
 }
 
 TEST_F(KVClientTransportGetWithTargetShmDisabledTest, BoundWorkerShmDoesNotEnableTargetWorkerShm)

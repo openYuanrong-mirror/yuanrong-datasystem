@@ -26,6 +26,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "datasystem/client/mmap_manager/host_memory_pin_manager.h"
 #include "datasystem/client/mmap_manager/mmap_manager.h"
 #include "datasystem/client/object_cache/transport/data_plane/i_data_plane_connection.h"
 #include "datasystem/client/object_cache/transport/data_plane/i_data_transporter.h"
@@ -75,6 +76,7 @@ public:
     static Status Create(const HostPort &workerAddr, const std::shared_ptr<WorkerRpcClient> &rpcClient,
                          const TransportRequestContext &context, std::weak_ptr<ThreadPool> releasePool,
                          std::shared_ptr<std::atomic<bool>> scaleInDraining,
+                         const std::shared_ptr<HostMemoryPinManager> &hostMemoryPinManager,
                          std::shared_ptr<ShmSession> &session);
 
     ~ShmSession();
@@ -164,7 +166,8 @@ private:
 class ShmConnection final : public IDataPlaneConnection {
 public:
     ShmConnection(HostPort workerAddr, std::shared_ptr<WorkerRpcClient> rpcClient,
-                  std::weak_ptr<ThreadPool> releasePool);
+                  std::weak_ptr<ThreadPool> releasePool,
+                  std::shared_ptr<HostMemoryPinManager> hostMemoryPinManager = nullptr);
     ~ShmConnection() override;
 
     Status Establish(const HostPort &workerAddr) override;
@@ -188,6 +191,7 @@ private:
     HostPort workerAddr_;
     std::shared_ptr<WorkerRpcClient> rpcClient_;
     std::weak_ptr<ThreadPool> releasePool_;
+    std::shared_ptr<HostMemoryPinManager> hostMemoryPinManager_;
     mutable bthread::Mutex mutex_;
     bthread::ConditionVariable cv_;
     std::shared_ptr<ShmSession> session_;

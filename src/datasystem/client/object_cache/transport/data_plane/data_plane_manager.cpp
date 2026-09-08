@@ -129,12 +129,13 @@ DataPlaneManager::DataPlaneManager(std::shared_ptr<Signature> signature, uint64_
                                    std::shared_ptr<IUbReceiveBufferProvider> ubBufferProvider,
                                    bool enableClientDirectPipelineH2D, int32_t pipelineThreadNum,
                                    std::shared_ptr<ThreadPool> releasePool, bool initializeUbRuntime,
-                                   bool allowUbRuntimeFailure)
+                                   bool allowUbRuntimeFailure,
+                                   std::shared_ptr<HostMemoryPinManager> hostMemoryPinManager)
     : signature_(std::move(signature)), channelConfig_(std::move(channelConfig)),
       ubBufferProvider_(std::move(ubBufferProvider)), fastTransportMemSize_(fastTransportMemSize),
       initializeUbRuntime_(initializeUbRuntime), allowUbRuntimeFailure_(allowUbRuntimeFailure),
       enableClientDirectPipelineH2D_(enableClientDirectPipelineH2D), pipelineThreadNum_(pipelineThreadNum),
-      releasePool_(std::move(releasePool))
+      releasePool_(std::move(releasePool)), hostMemoryPinManager_(std::move(hostMemoryPinManager))
 {
 }
 
@@ -797,7 +798,8 @@ Status DataPlaneManager::BuildTransporter(const HostPort &workerAddr, TransportH
         // through GetSocketPath and RegisterClient when the first request supplies its auth context.
         CHECK_FAIL_RETURN_STATUS(rpcClient != nullptr && rpcClient->IsAlive(), K_RPC_UNAVAILABLE,
                                  "SHM_CANDIDATE worker RPC client is unavailable");
-        out = std::make_shared<ShmTransporter>(workerAddr, rpcClient, releasePool_);
+        RETURN_RUNTIME_ERROR_IF_NULL(hostMemoryPinManager_);
+        out = std::make_shared<ShmTransporter>(workerAddr, rpcClient, releasePool_, hostMemoryPinManager_);
         return Status::OK();
     }
     if (hint != TransportHint::TCP_ONLY) {

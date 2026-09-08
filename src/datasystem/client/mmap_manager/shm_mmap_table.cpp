@@ -19,9 +19,7 @@
  */
 #include "datasystem/client/mmap_manager/shm_mmap_table.h"
 
-#include <atomic>
 #include <cstddef>
-#include <exception>
 
 #include "datasystem/common/util/status_helper.h"
 #include "datasystem/common/util/strings_util.h"
@@ -33,6 +31,7 @@ ShmMmapTable::~ShmMmapTable() = default;
 Status ShmMmapTable::MmapAndStoreFd(const int &clientFd, const int &workerFd, const uint64_t &mmapSize,
                                     const std::string &tenantId, const std::string &clientId)
 {
+    RETURN_RUNTIME_ERROR_IF_NULL(pinManager_);
     bthread::RWLockWrGuard l(mutex_);
     auto entry = mmapTable_.find(workerFd);
     if (entry == mmapTable_.end()) {
@@ -42,7 +41,7 @@ Status ShmMmapTable::MmapAndStoreFd(const int &clientFd, const int &workerFd, co
                                       clientId, workerFd, clientFd, mmapSize);
             auto newEntry = std::make_shared<ShmMmapTableEntry>(clientFd, mmapSize, clientId);
             RETURN_IF_NOT_OK(newEntry->Init(enableHugeTlb_, tenantId));
-            SubmitHostMemoryPin(newEntry);
+            pinManager_->Submit(newEntry);
             mmapTable_[workerFd] = std::move(newEntry);
         }
     } else {
@@ -51,20 +50,16 @@ Status ShmMmapTable::MmapAndStoreFd(const int &clientFd, const int &workerFd, co
     return Status::OK();
 }
 
-void ShmMmapTable::SubmitHostMemoryPin(const std::shared_ptr<ShmMmapTableEntry> &entry)
+void ShmMmapTable::MarkVoluntaryScaleDown()
 {
-    try {
-        if (pinThread_ == nullptr) {
-            pinThread_ = std::make_unique<ThreadPool>(1, 1, "cuda_host_pin");
+    bthread::RWLockRdGuard l(mutex_);
+    for (const auto &entry : mmapTable_) {
+        auto *shmEntry = dynamic_cast<ShmMmapTableEntry *>(entry.second.get());
+        if (shmEntry != nullptr) {
+            shmEntry->MarkVoluntaryScaleDown();
         }
-        pinThread_->Execute([entry] { entry->PinHostMemory(); });
-    } catch (const std::exception &e) {
-        entry->SkipHostMemoryPin();
-        LOG(WARNING) << "Submit CUDA host memory pin task failed: " << e.what();
-    } catch (...) {
-        entry->SkipHostMemoryPin();
-        LOG(WARNING) << "Submit CUDA host memory pin task failed with an unknown exception";
     }
 }
+
 }  // namespace client
 }  // namespace datasystem

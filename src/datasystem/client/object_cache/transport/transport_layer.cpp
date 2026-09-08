@@ -236,7 +236,7 @@ TransportLayer::TransportLayer(std::shared_ptr<Signature> signature, std::shared
                                                   std::move(options.channelConfig), ubBufferProvider,
                                                   options.enableClientDirectPipelineH2D, options.pipelineThreadNum,
                                                   releasePool_, options.initializeUbRuntime,
-                                                  options.allowUbRuntimeFailure);
+                                                  options.allowUbRuntimeFailure, options.hostMemoryPinManager);
     auto retry = std::make_shared<DeadlineRetry>(std::move(options.retryAdmissionCheck));
     auto metadata = std::make_shared<ObjectMetadataClient>(manager_, retry, advisor_, std::move(ubBufferProvider),
                                                            GetConfiguredUbInlineBufferSize(),

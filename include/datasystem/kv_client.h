@@ -31,6 +31,7 @@
 #include "datasystem/kv/read_only_buffer.h"
 #include "datasystem/utils/device_blob.h"
 #include "datasystem/utils/connection.h"
+#include "datasystem/utils/cuda_funcs.h"
 #include "datasystem/utils/optional.h"
 #include "datasystem/utils/status.h"
 #include "datasystem/utils/string_view.h"
@@ -111,6 +112,31 @@ public:
     ///
     /// \return Status of the call.
     Status Init(const KVClientConfig &clientConfig);
+
+    /// \brief Register process-wide CUDA callbacks supplied by the CUDA-enabled application.
+    ///
+    /// Call this before initializing any KVClient in the process. The first valid registration is
+    /// frozen for the process lifetime; later registrations are ignored with a warning. A registration
+    /// is valid only when hostRegister, hostUnregister, getErrorString and memcpyAsync are all non-null.
+    /// The callback implementations and any dynamic libraries containing them must remain loaded until
+    /// all KVClient instances and all CUDA copy, pin, and unpin operations have completed. The callbacks
+    /// must not re-enter Datasystem APIs.
+    /// \param[in] funcs CUDA callbacks. Datasystem itself does not depend on CUDA headers.
+    static void RegisterCudaFuncs(const CudaFuncs &funcs);
+
+    /// \brief Submit an asynchronous H2D or D2H copy.
+    ///
+    /// Copies involving Worker shared memory are split at host-registration boundaries. Other host
+    /// memory, including the Client temporary buffer, is submitted as one copy. The call does not
+    /// synchronize the stream; the caller must keep the source, destination, and owning Buffer alive
+    /// until the submitted operations complete.
+    /// \param[in] dst Destination address.
+    /// \param[in] src Source address.
+    /// \param[in] size Number of bytes to copy. Zero returns success without invoking the callback.
+    /// \param[in] kind Copy direction.
+    /// \param[in] stream Opaque CUDA stream supplied by the application.
+    /// \return K_OK when every copy was submitted; an error if validation or any submission fails.
+    Status DsCudaMemcpyAsync(void *dst, const void *src, size_t size, DsCudaMemcpyKind kind, void *stream);
 
     /// \brief Init KVClient object with worker in the same process.
     /// \param[in] config configs of the embedded worker.

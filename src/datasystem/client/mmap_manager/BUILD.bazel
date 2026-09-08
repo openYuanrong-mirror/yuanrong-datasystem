@@ -10,6 +10,7 @@ ds_cc_library(
     srcs = [
         "embedded_mmap_table.cpp",
         "embedded_mmap_table_entry.cpp",
+        "host_memory_pin_manager.cpp",
         "immap_table.cpp",
         "shm_mmap_table.cpp",
         "shm_mmap_table_entry.cpp",
@@ -17,6 +18,7 @@ ds_cc_library(
     hdrs = [
         "embedded_mmap_table.h",
         "embedded_mmap_table_entry.h",
+        "host_memory_pin_manager.h",
         "immap_table.h",
         "shm_mmap_table.h",
         "shm_mmap_table_entry.h",

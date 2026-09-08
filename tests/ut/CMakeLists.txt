@@ -69,6 +69,7 @@ list(FILTER DS_UT_OBJECT_SRCS EXCLUDE REGEX .*/master/object_cache/oc_migrate_me
 
 list(FILTER DS_TEST_UT_SRCS EXCLUDE REGEX "hixl_plugin_loader_test")
 list(FILTER DS_TEST_UT_SRCS EXCLUDE REGEX "hixl_transport_plugin_test")
+list(FILTER DS_TEST_UT_SRCS EXCLUDE REGEX ".*/client/cuda_host_memory_test\\.cpp$")
 
 set(UT_COMMON_SRCS
         test_main.cpp
@@ -199,6 +200,9 @@ function(add_ds_ut_executable TARGET_NAME)
     add_executable(${TARGET_NAME} ${ARGN})
     target_compile_definitions(${TARGET_NAME} PRIVATE ${BIN_PATH_LIST})
 endfunction()
+
+add_ds_ut_executable(cuda_host_memory_test client/cuda_host_memory_test.cpp)
+target_link_libraries(cuda_host_memory_test PRIVATE GTest::gtest GTest::gtest_main common_cuda_host_memory)
 
 add_ds_ut_executable(ds_ut
         ${DS_TEST_UT_SRCS}
@@ -452,6 +456,7 @@ if (BUILD_WITH_URMA)
 endif()
 
 add_datasystem_test(ds_ut TEST_ENVIRONMENTS ${TEST_ENVIRONMENT})
+add_datasystem_test(cuda_host_memory_test TEST_ENVIRONMENTS ${TEST_ENVIRONMENT})
 add_datasystem_test(ds_ut_stream TEST_ENVIRONMENTS ${TEST_ENVIRONMENT})
 add_datasystem_test(ds_ut_object TEST_ENVIRONMENTS ${TEST_ENVIRONMENT})
 add_datasystem_test(oc_migrate_metadata_manager_test TIMEOUT 8 TEST_ENVIRONMENTS ${TEST_ENVIRONMENT})

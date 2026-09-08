@@ -87,6 +87,7 @@ ds_cc_library(
         "//include/datasystem:headers",
         "//src/datasystem/client/worker_api:client_worker_common_api",
         "//src/datasystem/client/mmap_manager:mmap_manager",
+        "//src/datasystem/client/mmap_manager:mmap_table",
         "//src/datasystem/client/object_cache/routing:routing",
         "//src/datasystem/common/ak_sk:signature",
         "//src/datasystem/common/eventloop:common_event_loop",
