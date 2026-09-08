@@ -234,6 +234,39 @@ bool ValidateOptionalLogName(const char *flagName, const std::string &value)
                                flagName, value);
     return false;
 }
+
+bool ValidateUrmaPollSize(const char *flagName, uint32_t value)
+{
+    constexpr uint32_t kMinPollSize = 1;
+    constexpr uint32_t kMaxPollSize = 16;  // Device can poll at most 16 completion records at a time.
+    if (value < kMinPollSize || value > kMaxPollSize) {
+        LOG(ERROR) << FormatString("The %s flag is %u, which must be in [%u, %u].", flagName, value,
+                                   kMinPollSize, kMaxPollSize);
+        return false;
+    }
+    return true;
+}
+
+bool ValidateLogMonitorExporter(const char *flagName, const std::string &value)
+{
+    if (value == "harddisk") {
+        return true;
+    }
+    LOG(ERROR) << FormatString("Invalid %s value: '%s'. Only 'harddisk' is supported.", flagName, value);
+    return false;
+}
+
+bool ValidateWorkerDirectPort(const char *flagName, int32_t value)
+{
+    constexpr int32_t kMinPort = 0;
+    constexpr int32_t kMaxPort = 65535;
+    if (value < kMinPort || value > kMaxPort) {
+        LOG(ERROR) << FormatString("The %s flag is %d, which must be in [%d, %d] (0 disables the direct port).",
+                                   flagName, value, kMinPort, kMaxPort);
+        return false;
+    }
+    return true;
+}
 }  // namespace
 
 DS_DEFINE_validator(l2_cache_type, &Validator::ValidateL2CacheType);
@@ -277,6 +310,10 @@ DS_DEFINE_validator(etcd_address, &Validator::ValidateEtcdAddresses);
 DS_DEFINE_validator(request_sample_rate, &ValidateSampleRateRange);
 DS_DEFINE_validator(access_sample_rate, &ValidateSampleRateRange);
 DS_DEFINE_validator(diagnostic_sample_rate, &ValidateSampleRateRange);
+DS_DEFINE_validator(urma_poll_size, &ValidateUrmaPollSize);
+DS_DEFINE_validator(log_monitor_exporter, &ValidateLogMonitorExporter);
+DS_DEFINE_validator(oc_worker_worker_direct_port, &ValidateWorkerDirectPort);
+DS_DEFINE_validator(sc_worker_worker_direct_port, &ValidateWorkerDirectPort);
 
 namespace datasystem {
 void LinkCommonFlagsValidators()

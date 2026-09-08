@@ -543,6 +543,19 @@ target_link_libraries(util_flags_ut PRIVATE
         -Wl,--reduce-memory-overheads)
 add_datasystem_test(util_flags_ut TEST_ENVIRONMENTS ${TEST_ENVIRONMENT})
 
+add_executable(worker_param_flag_validate_ut
+        "${CMAKE_CURRENT_SOURCE_DIR}/common/flags/worker_param_flag_validate_test.cpp"
+        $<TARGET_OBJECTS:_ds_ut_main_obj>
+        $<TARGET_OBJECTS:_ds_ut_common_obj>)
+target_link_libraries(worker_param_flag_validate_ut PRIVATE
+        ${DS_UT_HEAVY_LINK_START}
+        ${DS_UT_DEPEND_LIBS}
+        ${DS_UT_COMMON_UTIL_EXTRA_LIBS}
+        dynamic_flag_config
+        ${DS_UT_HEAVY_LINK_END}
+        -Wl,--reduce-memory-overheads)
+add_datasystem_test(worker_param_flag_validate_ut TEST_ENVIRONMENTS ${TEST_ENVIRONMENT})
+
 add_executable(operation_logger_ut
         "${CMAKE_CURRENT_SOURCE_DIR}/common/log/operation_logger_test.cpp")
 target_link_libraries(operation_logger_ut

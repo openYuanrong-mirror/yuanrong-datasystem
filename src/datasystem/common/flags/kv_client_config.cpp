@@ -25,7 +25,7 @@ namespace {
 constexpr int MIN_LOG_SEVERITY = 0;
 constexpr int MAX_LOG_SEVERITY = 3;
 constexpr int MIN_VLOG_LEVEL = 0;
-constexpr int MAX_VLOG_LEVEL = 10;
+constexpr int MAX_VLOG_LEVEL = 3;
 constexpr int MIN_MAX_LOG_SIZE_MB = 1;
 constexpr int MAX_MAX_LOG_SIZE_MB = 4095;
 constexpr uint32_t MAX_LOG_FILE_NUM = 200000;

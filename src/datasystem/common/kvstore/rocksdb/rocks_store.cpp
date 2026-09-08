@@ -53,6 +53,7 @@ DS_DEFINE_string(rocksdb_write_mode, "async",
                  "Config the rocksdb support none, sync or async, async by default. Optional value: "
                  "'none', 'sync', 'async'. This represents the method of writing metadata to rocksdb.");
 DS_DEFINE_validator(rocksdb_write_mode, &Validator::ValidateRocksdbModeType);
+DS_DEFINE_validator(rocksdb_background_threads, &Validator::ValidateInt32);
 
 namespace datasystem {
 std::mutex RocksStore::lck;

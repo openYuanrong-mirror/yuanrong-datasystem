@@ -89,11 +89,11 @@
     },
     "oc_worker_worker_direct_port": {
         "value": "0",
-        "description": "A direct tcp/ip port for worker to workers scenarios to improve latency. Acceptable values:0 or a positive integer. 0 indicates disabled."
+        "description": "A direct tcp/ip port for worker to workers scenarios to improve latency. Valid range is [0, 65535]. 0 indicates disabled."
     },
     "sc_worker_worker_direct_port": {
         "value": "0",
-        "description": "A direct tcp/ip port for worker to workers scenarios to improve latency. Acceptable values:0, or some positive integer. 0 means disabled."
+        "description": "A direct tcp/ip port for worker to workers scenarios to improve latency. Valid range is [0, 65535]. 0 means disabled."
     },
     "oc_worker_worker_pool_size": {
         "value": "3",
@@ -237,7 +237,7 @@
     },
     "log_monitor_exporter": {
         "value": "harddisk",
-        "description": "Specify the type of exporter, either harddisk or backend. Only takes effect when log_monitor or json_log_monitor is true."
+        "description": "Specify the type of exporter. Only 'harddisk' is supported. Only takes effect when log_monitor or json_log_monitor is true."
     },
     "log_monitor_interval_ms": {
         "value": "10000",
@@ -453,7 +453,7 @@
     },
     "max_log_size": {
         "value": "400",
-        "description": "Maximum log file size (in MB), must be greater than 0."
+        "description": "Maximum log file size (in MB). Valid range is [1, 4095]."
     },
     "max_log_file_num": {
         "value": "5",

@@ -109,11 +109,11 @@ TEST_F(DynamicConfigUpdaterTest, RuntimeApplicabilityFilterRejectsUnsupportedFla
 TEST_F(DynamicConfigUpdaterTest, RejectWhenSpecialValidationFailsBeforeCommit)
 {
     flagConfig_.SetValidateSpecial([](const std::string &flagName, const std::string &newVal) {
-        return flagName == "v" && newVal == "4";
+        return flagName == "v" && newVal == "2";
     });
     DynamicConfigUpdater updater(flagConfig_);
 
-    auto status = updater.ApplyJson(R"({"v":"4"})");
+    auto status = updater.ApplyJson(R"({"v":"2"})");
     EXPECT_TRUE(status.IsError());
     EXPECT_THAT(status.GetMsg(), testing::HasSubstr("special validation rejected"));
     EXPECT_EQ(FLAGS_v, 0);
@@ -122,11 +122,11 @@ TEST_F(DynamicConfigUpdaterTest, RejectWhenSpecialValidationFailsBeforeCommit)
 TEST_F(DynamicConfigUpdaterTest, RejectSpecialValidationBeforePartialCommit)
 {
     flagConfig_.SetValidateSpecial([](const std::string &flagName, const std::string &newVal) {
-        return flagName == "v" && newVal == "4";
+        return flagName == "v" && newVal == "2";
     });
     DynamicConfigUpdater updater(flagConfig_);
 
-    auto status = updater.ApplyJson(R"({"request_sample_rate":"0.5","v":"4"})");
+    auto status = updater.ApplyJson(R"({"request_sample_rate":"0.5","v":"2"})");
     EXPECT_TRUE(status.IsError());
     EXPECT_THAT(status.GetMsg(), testing::HasSubstr("special validation rejected"));
     EXPECT_DOUBLE_EQ(FLAGS_request_sample_rate, 1.0);
