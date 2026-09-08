@@ -89,6 +89,10 @@ public:
     virtual Status InvokeDecreaseReference(const TransportRequestContext &context, const ShmKey &shmId,
                                            bool delayRelease = false);
 
+    /** @brief Release multiple worker-side allocations in one control RPC. */
+    virtual Status InvokeDecreaseReferences(const TransportRequestContext &context,
+                                            const std::vector<ShmKey> &shmIds, bool delayRelease = false);
+
     /** @brief Exchange URMA connection data over this worker's cached brpc channel. */
     virtual Status ExchangeUrmaConnectInfo(UrmaHandshakeRspPb &response);
 

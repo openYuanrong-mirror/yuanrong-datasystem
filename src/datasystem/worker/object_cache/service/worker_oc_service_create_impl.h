@@ -18,6 +18,16 @@
 #ifndef DATASYSTEM_OBJECT_CACHE_WORKER_SERVICE_CREATE_IMPL_H
 #define DATASYSTEM_OBJECT_CACHE_WORKER_SERVICE_CREATE_IMPL_H
 
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include <tbb/concurrent_hash_map.h>
+
+#include "datasystem/common/string_intern/string_ref.h"
 #include "datasystem/object/object_enum.h"
 #include "datasystem/utils/status.h"
 #include "datasystem/worker/object_cache/service/worker_oc_service_crud_common_api.h"
@@ -48,6 +58,40 @@ public:
     Status MultiCreate(const MultiCreateReqPb &req, MultiCreateRspPb &resp);
 
 private:
+    // This table is a short-lived concurrent set. The interned UUID carries a precomputed hash, and
+    // the accessor is released before shared-memory allocation to keep the hot critical section small.
+    using TbbCreatingAllocationTable = tbb::concurrent_hash_map<ShmKey, std::nullptr_t>;
+
+    Status ResolveCreateShmId(const std::string &allocationId, ShmKey &shmId, bool &reserved);
+
+    Status ReserveAllocationId(const std::string &allocationId, ShmKey &shmId);
+
+    Status ReserveMultiAllocationIds(const MultiCreateReqPb &req, std::vector<ShmKey> &shmIds,
+                                     std::vector<ShmKey> &reservations);
+
+    void ReleaseReservations(const std::vector<ShmKey> &reservations);
+
+    Status FillCreateResponse(const ClientKey &clientId, const std::shared_ptr<ShmUnit> &shmUnit,
+                              size_t metadataSize, CreateRspPb &resp);
+
+    Status AuthenticateCreateRequest(const CreateReqPb &req, std::string &tenantId);
+
+    bool IsMultiCreateObjectExisting(const MultiCreateReqPb &req, int index, const std::string &objectKey,
+                                     MultiCreateRspPb &resp);
+
+    Status AllocateMultiCreateShmUnit(const MultiCreateReqPb &req, int index, const std::string &objectKey,
+                                      const std::vector<std::shared_ptr<ShmOwner>> &shmOwners,
+                                      const std::vector<uint32_t> &shmIndexMapping,
+                                      std::shared_ptr<ShmUnit> &shmUnit);
+
+    Status FillMultiCreateShmUnits(const MultiCreateReqPb &req, const std::string &tenantId,
+                                   const ClientKey &clientId,
+                                   const std::vector<std::shared_ptr<ShmOwner>> &shmOwners,
+                                   const std::vector<uint32_t> &shmIndexMapping,
+                                   const std::vector<ShmKey> &requestShmIds,
+                                   std::vector<std::shared_ptr<ShmUnit>> &shmUnits,
+                                   std::vector<CreateRspPb> &subRsp, std::vector<Status> &results,
+                                   MultiCreateRspPb &resp);
 
     /**
      * @brief The implementation of Create.
@@ -56,14 +100,15 @@ private:
      * @param[in] rawObjectKey Object key without the tenant prefix.
      * @param[in] dataSize Requested object size.
      * @param[in] requestTimeoutMs Remaining request timeout in milliseconds.
+     * @param[in] allocationId Optional client-generated shared-memory allocation UUID.
      * @param[out] resp The rpc response protobuf
      * @param[in] cacheType The type of cache.
      * @return K_OK on success; the error code otherwise.
      * K_DUPLICATED: the object already exists, no need to create.
      */
     Status CreateImpl(const std::string &tenantId, const ClientKey &clientId, const std::string &rawObjectKey,
-                      size_t dataSize, int64_t requestTimeoutMs, CreateRspPb &resp,
-                      CacheType cacheType = CacheType::MEMORY);
+                       size_t dataSize, int64_t requestTimeoutMs, const std::string &allocationId, CreateRspPb &resp,
+                       CacheType cacheType = CacheType::MEMORY);
 
     /**
      * @brief Helper function to allocate aggregated memory for objects creation.
@@ -95,6 +140,7 @@ private:
     void CheckExistence(const MultiCreateReqPb &req, const std::string &tenantId, MultiCreateRspPb &resp);
 
     std::atomic<uint64_t> shmIdCounter{0};
+    TbbCreatingAllocationTable creatingAllocations_;
     std::shared_ptr<AkSkManager> akSkManager_{ nullptr };
 
     HostPort localAddress_;

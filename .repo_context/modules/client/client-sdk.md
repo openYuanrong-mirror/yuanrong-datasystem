@@ -212,6 +212,22 @@
     `Signature`. Target workers authenticate routed Create, Publish, and cleanup requests by signature without requiring
     endpoint-local client registration. UB allocations are released asynchronously after the final Publish attempt, or
     synchronously after a local copy failure; shutdown drains the release queue before closing data-plane connections.
+    Non-TCP Create/MultiCreate also carry client-generated allocation UUIDs that are reused by same-worker retries and
+    transport fallback. The Worker uses each UUID as the `shmId`, so an ambiguous RPC result can be cleaned up without
+    receiving the Create response. The allocation fields use numbers after the authentication fields so older Workers
+    preserve the canonical serialization order used for signature verification. Ambiguous IDs are batched into bounded
+    background DecreaseReference retries on a dedicated four-thread pool. Submission is non-blocking and drops cleanup
+    when all four slots are occupied, incrementing `client_ambiguous_create_cleanup_dropped_total`; retries reuse the
+    cached RPC client without repeated teardown. A
+    later successful SHM/UB attempt with the same ID cancels that cleanup, while a TCP fallback keeps cleanup pending
+    because it does not consume the Worker allocation. Worker-first rolling upgrade is required for immediate cleanup.
+    The retry backoffs `{0, 100, 400}` create an approximately 500 ms scheduling window measured from cleanup-task
+    start. Each cleanup RPC is capped at 500 ms so a failed Worker cannot extend Client shutdown by the normal request
+    timeout; RPC execution and cleanup-pool scheduling are outside the scheduling-window bound. This is a best-effort
+    window, not a protocol guarantee. If every DecreaseReference reaches the Worker before a delayed Create calls
+    `AddShmUnit`, each removal is an idempotent no-op and the later reference is outside client cleanup coverage.
+    Worker hard reclaim is a fallback only for references marked reclaimable, currently routed Create allocations for
+    clients without a SHM session on that target Worker; SHM-enabled client references continue to use reconciliation.
   - Public `ObjectBuffer` keeps transport-owned state opaque and exposes a status-returning `Create` factory; callers
     must pass state whose dynamic type is `ObjectBufferInfo`. Source-tree transport code uses
     `src/datasystem/client/transport/object_buffer_internal.h` for typed access, preventing installed SDK headers from
@@ -643,8 +659,11 @@
   - Transport MSet preserves worker-reported partial failures and performs at most one same-worker UB recovery attempt.
     Routed `MultiCreateReqPb` and `MultiPublishReqPb` requests carry `is_routed=true`; target workers authenticate their
     signatures and tenant IDs without requiring the client to register separately on every metadata-owner worker.
-    MultiCreate has no idempotency marker, so `K_RPC_UNAVAILABLE` is treated as an ambiguous allocation result: the
-    transport state is torn down for the next request, but the current MultiCreate is not replayed. For MSet,
+    MultiCreate carries one positional allocation UUID per key. A first-attempt reservation `K_TRY_AGAIN` waits 1 ms
+    within the API deadline and retries once on the same transport with the same UUIDs. `K_RPC_UNAVAILABLE` rebuilds the
+    transport once and replays the request with the same UUIDs, preventing a second allocation for a duplicate attempt;
+    a terminal ambiguous result schedules batched background DecreaseReference retries for those UUIDs. An explicit
+    Worker application error is not ambiguous and does not schedule cleanup. For MSet,
     `K_URMA_NEED_CONNECT` resets only the cached UB data plane and reuses the RPC client. A pre-Publish
     `K_RPC_UNAVAILABLE` may rebuild both RPC and data-plane state and retry once; after `InvokeMultiSet` starts, the same
     code is ambiguous and is not replayed. A dead UB connection is never converted into whole-batch TCP fallback. If the
@@ -704,6 +723,15 @@
     verifies successful data and metadata publication, complete transaction rerouting after a Publish-time scale-down
     or worker-not-ready response, Set and MSet rerouting from Create and Publish stages, and the rule that an ambiguous
     Publish connection failure is not replayed on another worker.
+  - `tests/st/client/kv_cache/kv_client_create_timeout_cleanup_test.cpp` uses a 1 GiB Worker SHM arena.
+    The client-cleanup case delays 130 Worker responses after `AddShmUnit`, expects all 8 MiB Sets to time out,
+    and keeps hard reclaim outside
+    the test window, and verifies Worker reference metrics converge before a final Set. A second case blocks all four
+    cleanup slots, verifies overflow increments the dropped-cleanup metric, and uses test-only eligibility injection to
+    prove Worker hard reclaim returns the reference table to zero before the final Set. A third case pauses Create
+    before `AddShmUnit`, observes all three client cleanup calls while the allocation is absent, then releases Create
+    after the approximately 500 ms cleanup window. It verifies the late reference first appears and is ultimately
+    removed by Worker hard reclaim rather than by client cleanup.
   - A raw Client-to-Worker CQE status `9` quarantines only that routed Set/MSet write target. The current request keeps
     same-worker TCP fallback semantics; a failed request is rerouted only when Publish was not attempted or bRPC marks
     it definitely unsent. Get admission and the Client-local CQE-status-`4` sender circuit remain independent. The

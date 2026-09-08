@@ -28,6 +28,7 @@
 #include <optional>
 #include <shared_mutex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "datasystem/client/mmap_manager/host_memory_pin_manager.h"
@@ -126,7 +127,7 @@ public:
      * @return K_OK on success; the error code otherwise.
      */
     Status Create(const HostPort &workerAddr, const std::string &objectKey, uint64_t dataSize,
-                  const TransportCreateParam &param, std::shared_ptr<ObjectBuffer> &buffer);
+                  TransportCreateParam param, std::shared_ptr<ObjectBuffer> &buffer);
 
     /**
      * @brief Commit an ObjectBuffer through the selected transport.
@@ -139,7 +140,7 @@ public:
 
     /** @brief Create transport-native buffers for a same-worker MSet batch. */
     Status MCreate(const HostPort &workerAddr, const std::vector<std::string> &objectKeys,
-                   const std::vector<uint64_t> &dataSizes, const TransportCreateParam &param,
+                   const std::vector<uint64_t> &dataSizes, TransportCreateParam param,
                    std::vector<std::shared_ptr<ObjectBuffer>> &buffers);
 
     /** @brief Commit a same-worker MSet batch and return per-object failures. */
@@ -175,7 +176,8 @@ protected:
     TransportLayer(std::shared_ptr<DataPlaneManager> dataPlaneManager, std::shared_ptr<TransportAdvisor> advisor);
     TransportLayer(std::shared_ptr<DataPlaneManager> dataPlaneManager, std::shared_ptr<TransportAdvisor> advisor,
                    std::chrono::milliseconds localUbProbeBaseDelay,
-                   std::shared_ptr<UbHealthFilter> readSourceFilter = nullptr);
+                   std::shared_ptr<UbHealthFilter> readSourceFilter = nullptr,
+                   std::shared_ptr<ThreadPool> releasePool = nullptr);
     bool ReportProviderUbFailure(const HostPort &provider, const ProviderUbFailureDetailPb &detail);
     Status CheckUbReadSource(const HostPort &workerAddr, AccessTransportKind &deniedKind) const;
 
@@ -246,6 +248,19 @@ private:
 
     void ScheduleRelease(const HostPort &workerAddr, const ShmKey &shmId, const TransportRequestContext &context,
                          std::optional<TransportHint> transportHint = std::nullopt);
+    void ScheduleAmbiguousCreateCleanup(const HostPort &workerAddr, const std::unordered_set<ShmKey> &shmIds,
+                                        const TransportRequestContext &context);
+    Status TryCreate(const HostPort &workerAddr, const std::string &objectKey, uint64_t dataSize,
+                     const TransportCreateParam &param, TransportHint hint,
+                     std::shared_ptr<ObjectBuffer> &buffer, std::unordered_set<ShmKey> &ambiguousShmIds);
+    Status TryMCreate(const HostPort &workerAddr, const std::vector<std::string> &objectKeys,
+                      const std::vector<uint64_t> &dataSizes, const TransportCreateParam &param,
+                      TransportHint hint, std::vector<std::shared_ptr<ObjectBuffer>> &buffers,
+                      std::unordered_set<ShmKey> &ambiguousShmIds);
+    Status TryMCreateFallbacks(const HostPort &workerAddr, const std::vector<std::string> &objectKeys,
+                               const std::vector<uint64_t> &dataSizes, const TransportCreateParam &param,
+                               TransportHint hint, std::vector<std::shared_ptr<ObjectBuffer>> &buffers,
+                               std::unordered_set<ShmKey> &ambiguousShmIds);
     void ScheduleMSetReleases(const std::vector<std::shared_ptr<ObjectBuffer>> &buffers,
                               const TransportRequestContext &context, const TransportMSetResult &result,
                               std::optional<TransportHint> transportHint = std::nullopt);
@@ -263,6 +278,7 @@ private:
     std::shared_ptr<DataPlaneManager> manager_;
     std::shared_ptr<TransportAdvisor> advisor_;
     std::shared_ptr<ThreadPool> releasePool_;
+    std::shared_ptr<ThreadPool> ambiguousCreateCleanupPool_;
     std::shared_ptr<UbHealthFilter> healthFilter_;
     std::unique_ptr<ObjectReadFlow> objectRead_;
     std::shared_ptr<LocalUbSenderState> localUbSenderState_;

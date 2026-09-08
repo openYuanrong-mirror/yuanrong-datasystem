@@ -313,7 +313,8 @@ Status RoutedMode::CreateRoutedBuffer(const std::string &objectKey, uint64_t dat
     createParam.writeMode = param.writeMode;
     createParam.subTimeoutMs = requestTimeoutMs_;
     std::shared_ptr<ObjectBuffer> objBuf;
-    RETURN_IF_NOT_OK(transportLayer_->Create(routeContext.worker, objectKey, dataSize, createParam, objBuf));
+    RETURN_IF_NOT_OK(transportLayer_->Create(routeContext.worker, objectKey, dataSize, std::move(createParam),
+                                             objBuf));
     // Bridge: transfer the routed ObjectBufferInfo (populated by ShmTransporter::Create with
     // workerAddr/shmId/pointer/mmapEntry/sessionLockId/receiveBufferOwner) to a legacy Buffer.
     auto bufferInfo = ObjectBufferInternal::ExtractInfo(objBuf);
@@ -389,7 +390,7 @@ Status RoutedMode::ProcessRoutedMCreateGroup(const HostPort &worker, const std::
     createParam.writeMode = param.writeMode;
     createParam.subTimeoutMs = requestTimeoutMs_;
     std::vector<std::shared_ptr<ObjectBuffer>> objBufs;
-    RETURN_IF_NOT_OK(transportLayer_->MCreate(worker, keys, sizes, createParam, objBufs));
+    RETURN_IF_NOT_OK(transportLayer_->MCreate(worker, keys, sizes, std::move(createParam), objBufs));
     for (auto &objBuf : objBufs) {
         // Bridge: transfer the routed ObjectBufferInfo to a legacy Buffer at its original index.
         auto bufferInfo = ObjectBufferInternal::ExtractInfo(objBuf);
@@ -432,7 +433,7 @@ Status RoutedMode::ProcessTransportPut(
     createParam.subTimeoutMs = subTimeoutMs;
     failureStage = SetFailureStage::CREATE;
     std::shared_ptr<ObjectBuffer> buffer;
-    RETURN_IF_NOT_OK(transportLayer_->Create(routeContext.worker, objectKey, size, createParam, buffer));
+    RETURN_IF_NOT_OK(transportLayer_->Create(routeContext.worker, objectKey, size, std::move(createParam), buffer));
 
     failureStage = SetFailureStage::TRANSFER;
     const bool traceEnabled = IsClientLatencyTraceActive();
@@ -885,7 +886,8 @@ Status RoutedMode::ProcessTransportMSet(const MSetRouteGroup &group, const MSetP
     point.RecordAndReset(PerfKey::CLIENT_MSET_MULTICREATE);
     failureStage = SetFailureStage::CREATE;
     std::vector<std::shared_ptr<ObjectBuffer>> buffers;
-    RETURN_IF_NOT_OK(transportLayer_->MCreate(routeContext.worker, group.keys, sizes, createParam, buffers));
+    RETURN_IF_NOT_OK(
+        transportLayer_->MCreate(routeContext.worker, group.keys, sizes, std::move(createParam), buffers));
     point.RecordAndReset(PerfKey::CLIENT_MSET_MEMCOPY);
     failureStage = SetFailureStage::TRANSFER;
     Status copyRc = MemoryCopyTransportMSetBuffers(group, buffers, dataSizeSum);

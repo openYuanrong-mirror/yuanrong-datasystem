@@ -280,8 +280,8 @@ public:
         RETURN_IF_NOT_OK(BuildMultiCreateRequest(keys, sizes, param, multiReq));
         MultiCreateRspPb multiRsp;
         uint32_t workerVersion = 0;
-        // Single MultiCreate RPC (1 RTT). On RPC failure the worker does not allocate; on response
-        // loss the worker releases any partial allocations via the expired-fds reconciler.
+        // Single MultiCreate RPC (1 RTT). If the response is lost, TransportLayer reuses the positional
+        // allocation IDs for one replay and schedules direct cleanup for a terminal ambiguous result.
         RETURN_IF_NOT_OK(rpcClient_->InvokeMultiCreate(param.subTimeoutMs, multiReq, multiRsp, workerVersion));
         if (static_cast<size_t>(multiRsp.results_size()) != keys.size()) {
             // The worker allocated some objects but returned a mismatched result count (e.g. partial

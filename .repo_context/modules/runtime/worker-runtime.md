@@ -362,6 +362,11 @@
     another hash-ring member. Direct writes are rejected at exit intent only when `enable_leaving_intercept` is enabled;
     otherwise they are rejected after topology data drain starts, preserving the local-client unregister contract.
     This gate is deliberately separate from incoming migration admission. Read-only RPCs keep their existing behavior.
+  - Routed Create/MultiCreate requests may carry client-generated allocation UUIDs. The Worker validates each UUID,
+    uses it directly as the `shmId`, and reserves it in a short-lived TBB concurrent hash set before allocating memory.
+    A completed duplicate returns `K_DUPLICATED`; an in-flight duplicate returns `K_TRY_AGAIN`; neither path allocates a
+    second region. Legacy requests without allocation UUIDs retain Worker-generated IDs. The reservation accessor is
+    released before allocator work and the entry is erased by RAII after response construction and reference insertion.
   - metadata ownership task ranges do not describe where object data is physically resident. ScaleIn therefore drains
     the leaving Worker's complete local object table once per source/batch before task-scoped metadata migration. The
     Worker callback adapter coalesces concurrent disjoint tasks behind a deadline-aware process-local gate; metadata

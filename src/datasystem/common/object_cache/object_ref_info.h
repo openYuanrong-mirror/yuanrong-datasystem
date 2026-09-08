@@ -479,6 +479,9 @@ public:
      */
     Status GetShmUnit(const ShmKey &shmId, std::shared_ptr<ShmUnit> &shmUnit);
 
+    /** @brief Return whether a shared-memory unit is present without constructing a not-found Status. */
+    bool ContainsShmUnit(const ShmKey &shmId) const;
+
     /**
      * @brief Remove a client from the client table.
      * @param[in] clientId uuid of client.
@@ -557,9 +560,9 @@ public:
 private:
     /**
      * @brief Proactively reclaim shm units whose soft deadline + hard timeout passed without a
-     * client ReconcileShmRef. Only reclaimable items (create path under enableLocalCache=false)
-     * are eligible. Safe because PublishImpl removes the client ref on any publish outcome, so
-     * anything still in shmRefTable_ here was never published.
+     * client ReconcileShmRef. Only items explicitly marked reclaimable are eligible. Create marks
+     * an item reclaimable only when the target Worker has no SHM session for that client. This is
+     * safe because PublishImpl removes those client refs on every publish outcome.
      * @param[in] hardReclaimItems Items popped from maybeExpiredShmQueue_ that exceeded the hard timeout.
      */
     void HardReclaimExpiredShmUnits(const std::vector<MaybeExpiredShmItem> &hardReclaimItems);

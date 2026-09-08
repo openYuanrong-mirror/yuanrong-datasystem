@@ -47,6 +47,7 @@
 #include "datasystem/common/shared_memory/delayed_release_shm_manager.h"
 #include "datasystem/common/util/raii.h"
 #include "datasystem/common/util/request_context.h"
+#include "datasystem/common/util/uuid_generator.h"
 #include "datasystem/client/object_cache/transport/object_read/object_read_types.h"
 #include "datasystem/protos/master_object.pb.h"
 #include "datasystem/protos/worker_object.pb.h"
@@ -894,6 +895,109 @@ private:
     memory::Allocator *allocator_{ nullptr };
     uint32_t savedArenaPerTenant_{ 0 };
 };
+
+TEST_F(WorkerOcServiceImplTest, AllocationIdReservationUsesStableShmIdAndRejectsConcurrentDuplicate)
+{
+    const std::string allocationId = GetStringUuid();
+    constexpr size_t requestCount = 16;
+    std::vector<std::future<Status>> requests;
+    requests.reserve(requestCount);
+    for (size_t i = 0; i < requestCount; ++i) {
+        requests.emplace_back(std::async(std::launch::async, [this, &allocationId] {
+            ShmKey shmId;
+            return impl_->createProc_->ReserveAllocationId(allocationId, shmId);
+        }));
+    }
+
+    size_t successCount = 0;
+    size_t retryCount = 0;
+    for (auto &request : requests) {
+        Status rc = request.get();
+        successCount += rc.IsOk() ? 1 : 0;
+        retryCount += rc.GetCode() == K_TRY_AGAIN ? 1 : 0;
+    }
+    EXPECT_EQ(successCount, 1u);
+    EXPECT_EQ(retryCount, requestCount - 1);
+    EXPECT_EQ(impl_->createProc_->creatingAllocations_.erase(ShmKey::Intern(allocationId)), 1u);
+}
+
+TEST_F(WorkerOcServiceImplTest, AllocationIdReservationPreventsStaleShmLookupRace)
+{
+    constexpr const char *injectPoint = "WorkerOcServiceCreateImpl.ReserveAllocationId.afterShmLookup";
+    const std::string allocationId = GetStringUuid();
+    const ShmKey shmId = ShmKey::Intern(allocationId);
+    DS_ASSERT_OK(inject::Set(injectPoint, "1*pause()"));
+
+    auto pausedRequest = std::async(std::launch::async, [this, &allocationId] {
+        ShmKey reservedShmId;
+        return impl_->createProc_->ReserveAllocationId(allocationId, reservedShmId);
+    });
+    Raii clearInject([injectPoint]() { (void)inject::Clear(injectPoint); });
+    ASSERT_TRUE(WaitForInjectPointExecuteCount(injectPoint, 1, std::chrono::seconds(1)));
+
+    ShmKey concurrentShmId;
+    const Status concurrentRc = impl_->createProc_->ReserveAllocationId(allocationId, concurrentShmId);
+    const auto clientId = ClientKey::Intern("stale-lookup-client");
+    if (concurrentRc.IsOk()) {
+        auto shmUnit = std::make_shared<ShmUnit>();
+        shmUnit->id = shmId;
+        impl_->memoryRefTable_->AddShmUnit(clientId, shmUnit);
+        (void)impl_->createProc_->creatingAllocations_.erase(shmId);
+    }
+
+    DS_ASSERT_OK(inject::Clear(injectPoint));
+    EXPECT_EQ(concurrentRc.GetCode(), K_TRY_AGAIN);
+    ASSERT_EQ(pausedRequest.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    DS_EXPECT_OK(pausedRequest.get());
+    EXPECT_EQ(impl_->createProc_->creatingAllocations_.erase(shmId), 1u);
+    if (concurrentRc.IsOk()) {
+        DS_EXPECT_OK(impl_->memoryRefTable_->RemoveShmUnit(clientId, shmId));
+    }
+}
+
+TEST_F(WorkerOcServiceImplTest, ResolveCreateShmIdUsesAllocationIdAndRejectsInvalidUuid)
+{
+    const std::string allocationId = GetStringUuid();
+    ShmKey shmId;
+    bool reserved = false;
+
+    DS_ASSERT_OK(impl_->createProc_->ResolveCreateShmId(allocationId, shmId, reserved));
+    EXPECT_TRUE(reserved);
+    EXPECT_EQ(shmId.ToString(), allocationId);
+    EXPECT_EQ(impl_->createProc_->creatingAllocations_.erase(shmId), 1u);
+
+    auto shmUnit = std::make_shared<ShmUnit>();
+    shmUnit->id = shmId;
+    const auto clientId = ClientKey::Intern("allocation-id-client");
+    impl_->memoryRefTable_->AddShmUnit(clientId, shmUnit, K_META_MOVING_RETRY_TIMEOUT_MS, true);
+    EXPECT_EQ(impl_->createProc_->ReserveAllocationId(allocationId, shmId).GetCode(), K_DUPLICATED);
+    DS_EXPECT_OK(impl_->memoryRefTable_->RemoveShmUnit(clientId, shmId));
+
+    EXPECT_EQ(impl_->createProc_->ResolveCreateShmId("not-a-uuid", shmId, reserved).GetCode(), K_INVALID);
+}
+
+TEST_F(WorkerOcServiceImplTest, ReserveMultiAllocationIdsPreservesPositionAndValidatesCount)
+{
+    const std::vector<std::string> allocationIds = { GetStringUuid(), GetStringUuid() };
+    MultiCreateReqPb request;
+    request.add_object_key("key-0");
+    request.add_object_key("key-1");
+    for (const auto &allocationId : allocationIds) {
+        request.add_allocation_ids(allocationId);
+    }
+
+    std::vector<ShmKey> shmIds;
+    std::vector<ShmKey> reservations;
+    DS_ASSERT_OK(impl_->createProc_->ReserveMultiAllocationIds(request, shmIds, reservations));
+    ASSERT_EQ(shmIds.size(), allocationIds.size());
+    for (size_t index = 0; index < allocationIds.size(); ++index) {
+        EXPECT_EQ(shmIds[index].ToString(), allocationIds[index]);
+    }
+    impl_->createProc_->ReleaseReservations(reservations);
+
+    request.add_object_key("key-2");
+    EXPECT_EQ(impl_->createProc_->ReserveMultiAllocationIds(request, shmIds, reservations).GetCode(), K_INVALID);
+}
 
 TEST_F(WorkerOcServiceImplTest, DecreaseMemoryRefDelaysOnlyMarkedShmUnit)
 {

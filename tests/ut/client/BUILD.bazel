@@ -96,6 +96,7 @@ ds_cc_test(
         "//src/datasystem/common/object_cache:object_base",
         "//src/datasystem/common/object_cache:object_buffer",
         "//src/datasystem/common/rpc:api_deadline",
+        "//src/datasystem/common/rpc:brpc_status_util",
         "//src/datasystem/common/rpc:mem_view",
         "//src/datasystem/common/rpc:rpc_message",
         "//src/datasystem/common/util:common_util",

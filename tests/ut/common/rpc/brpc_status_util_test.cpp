@@ -57,6 +57,7 @@ TEST(BrpcStatusUtilTest, DsErrSentinelRecoverServerCode)
     auto st = TryExtractStatusFromControllerError(errText, ECONNREFUSED);
     ASSERT_TRUE(st.IsError());
     EXPECT_EQ(st.GetCode(), static_cast<StatusCode>(5));
+    EXPECT_TRUE(IsBrpcServerApplicationError(st));
     // The original brpc ErrorText must be preserved so on-call keeps the
     // server-side application error context. The DS_ERR sentinel bytes are
     // left in the text (they are non-printing SOH/STX, harmless in logs);
@@ -74,6 +75,25 @@ TEST(BrpcStatusUtilTest, DsErrSentinelUsesLastOccurrence)
     EXPECT_EQ(st.GetCode(), static_cast<StatusCode>(5));
 }
 
+TEST(BrpcStatusUtilTest, ServerDeadlineSentinelIsDistinguishableFromTransportTimeout)
+{
+    const std::string errText = "worker rejected expired request "
+                                + DsErrSentinel(std::to_string(static_cast<int>(K_RPC_DEADLINE_EXCEEDED)));
+    const auto st = TryExtractStatusFromControllerError(errText, kBrpcErpcTimedOut);
+
+    EXPECT_EQ(st.GetCode(), K_RPC_DEADLINE_EXCEEDED);
+    EXPECT_TRUE(IsBrpcServerApplicationError(st));
+}
+
+TEST(BrpcStatusUtilTest, ServerNotOwnerDoesNotConsumeRedirectExtra)
+{
+    const std::string errText = "redirect " + DsErrSentinel(std::to_string(static_cast<int>(K_NOT_OWNER)));
+    const auto st = TryExtractStatusFromControllerError(errText, kBrpcInternal);
+
+    EXPECT_EQ(st.GetCode(), K_NOT_OWNER);
+    EXPECT_FALSE(st.HasExtra());
+}
+
 TEST(BrpcStatusUtilTest, CorruptSentinelFallsBackToErrnoMapping)
 {
     // Non-numeric sentinel body → fall through to errno mapping.
@@ -87,6 +107,7 @@ TEST(BrpcStatusUtilTest, BrpcErpcTimedOutMapsToDeadlineExceeded)
 {
     auto st = TryExtractStatusFromControllerError("timed out", kBrpcErpcTimedOut);
     EXPECT_EQ(st.GetCode(), StatusCode::K_RPC_DEADLINE_EXCEEDED);
+    EXPECT_FALSE(IsBrpcServerApplicationError(st));
 }
 
 TEST(BrpcStatusUtilTest, SystemETimedoutMapsToDeadlineExceeded)

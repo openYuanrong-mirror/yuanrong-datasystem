@@ -42,6 +42,8 @@ Status BuildCreateRequest(const std::string &key, uint64_t size, const Transport
                           CreateReqPb &request)
 {
     RETURN_IF_NOT_OK(ValidateCreateRequest(key, size, param));
+    CHECK_FAIL_RETURN_STATUS(param.allocationIds.empty(), K_INVALID,
+                             "Create accepts only one allocation ID");
     request.Clear();
     request.set_client_id(param.requestContext.clientId);
     request.set_object_key(key);
@@ -51,6 +53,7 @@ Status BuildCreateRequest(const std::string &key, uint64_t size, const Transport
     request.set_cache_type(static_cast<uint32_t>(param.cacheType));
     request.set_request_timeout(TimeoutDuration::CeilUsToMs(ApiDeadline::Instance().ApiRemainingUs()));
     request.set_is_routed(true);
+    request.set_allocation_id(param.allocationId);
     return Status::OK();
 }
 

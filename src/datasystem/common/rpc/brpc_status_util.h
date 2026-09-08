@@ -20,6 +20,8 @@
  * ErrorInfoPb field (named "error", "last_rc", or "err") in the response. This
  * utility reads that field so the client stub can return the server's actual
  * error code instead of K_RPC_CANCELLED.
+ * Extracted server errors carry an internal response-origin marker so callers can distinguish them from transport
+ * failures with the same StatusCode. K_NOT_OWNER keeps Status::extra available for redirect data.
  */
 #ifndef DATASYSTEM_COMMON_RPC_BRPC_STATUS_UTIL_H
 #define DATASYSTEM_COMMON_RPC_BRPC_STATUS_UTIL_H
@@ -65,6 +67,7 @@ inline constexpr int kBrpcShutdownWrite = 2007; // brpc::ESHUTDOWNWRITE — peer
 inline constexpr int kBrpcDetailLogLevel = 2;
 inline constexpr int kDecimalRadix = 10;
 inline constexpr char kBrpcRequestNotSentExtra[] = "brpc_request_not_sent";
+inline constexpr char kBrpcServerRespondedExtra[] = "brpc_server_responded";
 
 /**
  * @brief Check whether brpc proved that a request failed before reaching the peer.
@@ -76,6 +79,12 @@ inline constexpr char kBrpcRequestNotSentExtra[] = "brpc_request_not_sent";
 inline bool IsBrpcRequestDefinitelyNotSent(const Status &status)
 {
     return status.GetExtra() == kBrpcRequestNotSentExtra;
+}
+
+/** @brief Check whether the status came from an explicit server application response. */
+inline bool IsBrpcServerApplicationError(const Status &status)
+{
+    return status.GetExtra() == kBrpcServerRespondedExtra;
 }
 
 inline bool IsBrpcConnectionEstablishmentError(int errorCode)
@@ -316,6 +325,14 @@ inline bool TryParseDsErrCode(const std::string &codeStr, long &codeOut)
     return false;
 }
 
+inline Status MapControllerErrorToStatus(const std::string &errorText, int errorCode)
+{
+    VLOG(1) << "[BRPC_STATUS] No DS_ERR in controller error, fallback to brpc errno mapping"
+            << ", errorCode=" << errorCode << ", errorTextLen=" << errorText.size()
+            << ", errorText=" << FormatStringForLog(errorText);
+    return MapBrpcErrorCodeToStatus(errorCode, errorText);
+}
+
 /**
  * @brief Extract Status from brpc Controller error text (\\x01DS_ERR:code\\x02 sentinel).
  *
@@ -346,36 +363,32 @@ inline Status TryExtractStatusFromControllerError(const std::string &errorText, 
     // chain A→B→C, if C returns DS_ERR:5 and B wraps it as DS_ERR:7,
     // the caller should see 7 (the error from the immediate callee).
     size_t dsPos = errorText.rfind("\x01" "DS_ERR:");
-    if (dsPos != std::string::npos) {
-        size_t codeStart = dsPos + 8;
-        size_t codeEnd = errorText.find("\x02", codeStart);
-        if (codeEnd != std::string::npos) {
-            std::string codeStr = errorText.substr(codeStart, codeEnd - codeStart);
-            long code = 0;
-            if (TryParseDsErrCode(codeStr, code)) {
-                // Keep the server error code and the full brpc ErrorText so
-                // on-call retains the original application error context (the
-                // sentinel itself is stripped). No __LINE__/__FILE__: they
-                // would point at this helper, not the failing call site.
-                std::string cleanMsg = "RPC failed: code=" + codeStr + "; " + errorText;
-                VLOG(kBrpcDetailLogLevel)
-                    << "[BRPC_STATUS] Extract DS_ERR from controller error, code=" << codeStr
-                    << ", errorTextLen=" << errorText.size();
-                return Status(static_cast<StatusCode>(code), cleanMsg);
-            }
-            LOG(WARNING) << "Corrupt DS_ERR sentinel in Controller error text: '"
-                         << codeStr << "', falling back to brpc errno mapping";
-        }
+    if (dsPos == std::string::npos) {
+        return MapControllerErrorToStatus(errorText, errorCode);
     }
-    // No (parseable) DS_ERR sentinel → transport/brpc-internal failure.
-    // Map the brpc ErrorCode so connection/timeout errors are not masked as
-    // K_RPC_CANCELLED. When errorCode == 0 (call site did not capture it),
-    // MapBrpcErrorCodeToStatus falls through to K_RPC_CANCELLED, preserving
-    // prior behavior for legacy callers.
-    VLOG(1) << "[BRPC_STATUS] No DS_ERR in controller error, fallback to brpc errno mapping"
-            << ", errorCode=" << errorCode << ", errorTextLen=" << errorText.size()
-            << ", errorText=" << FormatStringForLog(errorText);
-    return MapBrpcErrorCodeToStatus(errorCode, errorText);
+    size_t codeStart = dsPos + 8;
+    size_t codeEnd = errorText.find("\x02", codeStart);
+    if (codeEnd == std::string::npos) {
+        return MapControllerErrorToStatus(errorText, errorCode);
+    }
+    std::string codeStr = errorText.substr(codeStart, codeEnd - codeStart);
+    long code = 0;
+    if (!TryParseDsErrCode(codeStr, code)) {
+        LOG(WARNING) << "Corrupt DS_ERR sentinel in Controller error text: '"
+                     << codeStr << "', falling back to brpc errno mapping";
+        return MapControllerErrorToStatus(errorText, errorCode);
+    }
+    // Keep the server error code and the full brpc ErrorText so on-call retains the original application error
+    // context. No __LINE__/__FILE__: they would point at this helper, not the failing call site.
+    std::string cleanMsg = "RPC failed: code=" + codeStr + "; " + errorText;
+    VLOG(kBrpcDetailLogLevel) << "[BRPC_STATUS] Extract DS_ERR from controller error, code=" << codeStr
+                              << ", errorTextLen=" << errorText.size();
+    Status status(static_cast<StatusCode>(code), cleanMsg);
+    // K_NOT_OWNER reserves Status::extra for redirect data and is never an ambiguous transport failure.
+    if (status.GetCode() != K_NOT_OWNER) {
+        status.WithExtra(kBrpcServerRespondedExtra);
+    }
+    return status;
 }
 
 }  // namespace datasystem
