@@ -54,6 +54,8 @@ void EmitFileTestLogs()
     testing::internal::CaptureStderr();
     TE_LOG_INFO << "transfer-engine-info-file-test";
     TE_VLOG_1 << "transfer-engine-vmodule-file-test";
+    TE_VLOG_1 << "hixl register memory success";
+    TE_VLOG_1 << "hixl unregister memory success";
     TE_LOG_WARNING << "transfer-engine-warning-file-test";
     TE_LOG_ERROR << "transfer-engine-error-file-test";
     FlushLogs();
@@ -64,14 +66,20 @@ void ExpectSeverityFileRouting(const std::string &infoContent, const std::string
 {
     EXPECT_NE(infoContent.find("transfer-engine-info-file-test"), std::string::npos);
     EXPECT_NE(infoContent.find("transfer-engine-vmodule-file-test"), std::string::npos);
+    EXPECT_NE(infoContent.find("hixl register memory success"), std::string::npos);
+    EXPECT_NE(infoContent.find("hixl unregister memory success"), std::string::npos);
     EXPECT_NE(infoContent.find("transfer-engine-warning-file-test"), std::string::npos);
     EXPECT_NE(infoContent.find("transfer-engine-error-file-test"), std::string::npos);
     EXPECT_EQ(warningContent.find("transfer-engine-info-file-test"), std::string::npos);
     EXPECT_EQ(warningContent.find("transfer-engine-vmodule-file-test"), std::string::npos);
+    EXPECT_EQ(warningContent.find("hixl register memory success"), std::string::npos);
+    EXPECT_EQ(warningContent.find("hixl unregister memory success"), std::string::npos);
     EXPECT_NE(warningContent.find("transfer-engine-warning-file-test"), std::string::npos);
     EXPECT_NE(warningContent.find("transfer-engine-error-file-test"), std::string::npos);
     EXPECT_EQ(errorContent.find("transfer-engine-info-file-test"), std::string::npos);
     EXPECT_EQ(errorContent.find("transfer-engine-warning-file-test"), std::string::npos);
+    EXPECT_EQ(errorContent.find("hixl register memory success"), std::string::npos);
+    EXPECT_EQ(errorContent.find("hixl unregister memory success"), std::string::npos);
     EXPECT_NE(errorContent.find("transfer-engine-error-file-test"), std::string::npos);
 }
 
