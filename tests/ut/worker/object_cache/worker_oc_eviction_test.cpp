@@ -170,6 +170,93 @@ public:
         DS_ASSERT_OK(manager->Init(globalRefs, akSkManager_));
     }
 
+    void CheckAllocationEviction(StatusCode allocationError, bool retryOnOOM, bool aboveLowWater, bool expectEviction)
+    {
+        std::unique_ptr<WorkerOcEvictionManager> uniqueManager;
+        std::shared_ptr<ObjectGlobalRefTable<ClientKey>> globalRefs;
+        InitEvictionManager(uniqueManager, globalRefs);
+        std::shared_ptr<WorkerOcEvictionManager> manager(std::move(uniqueManager));
+        constexpr uint64_t objectSize = 16 * 1024 * 1024;
+        constexpr uint64_t requestSize = 1024 * 1024;
+        const auto targetUsage = aboveLowWater ? manager->GetLowWaterMark(CacheType::MEMORY) : 0;
+        for (size_t i = 0; i == 0 || allocator->GetTotalRealMemoryUsage() <= targetUsage; ++i) {
+            auto key = "allocation-eviction-" + std::to_string(i);
+            DS_ASSERT_OK(CreateObject(key, objectSize - GetMetaSize(objectSize),
+                                      WriteMode::NONE_L2_CACHE, true, true));
+            manager->Add(key);
+        }
+        ASSERT_FALSE(EvictWhenMemoryExceedThrehold("allocation-request", requestSize, manager, ServiceType::OBJECT,
+                                                  CacheType::MEMORY));
+        const auto usedBefore = GetAllocatedSize();
+        ASSERT_EQ(manager->IsAboveLowWaterMark(requestSize, 0, CacheType::MEMORY), aboveLowWater);
+
+        auto &timeout = GetRequestContext()->reqTimeoutDuration;
+        const auto savedTimeout = timeout;
+        Raii clearInjection([&timeout, savedTimeout] {
+            (void)inject::Clear("worker.Allocator.AllocateMemory");
+            timeout = savedTimeout;
+        });
+        if (allocationError != K_OK) {
+            DS_ASSERT_OK(inject::Set("worker.Allocator.AllocateMemory",
+                                     allocationError == K_OUT_OF_MEMORY ? "1*return(K_OUT_OF_MEMORY)"
+                                                                        : "1*return(K_RUNTIME_ERROR)"));
+        }
+        GetRequestContext()->reqTimeoutDuration.Init(2000);
+        ShmUnit unit;
+        auto rc = AllocateMemoryForObject("allocation-request", requestSize, 0, false, manager, unit,
+                                          CacheType::MEMORY, retryOnOOM);
+        const bool expectSuccess = allocationError == K_OK || (allocationError == K_OUT_OF_MEMORY && retryOnOOM);
+        ASSERT_EQ(rc.GetCode(), expectSuccess ? K_OK : allocationError) << rc.ToString();
+        // A barrier on the single eviction executor observes completion without racing its asynchronous release.
+        auto drained = manager->memEvictTaskThreadPool_->Submit([] {});
+        ASSERT_EQ(drained.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+        drained.get();
+        const auto allocatedSize = expectSuccess ? requestSize : 0;
+        if (expectEviction) {
+            EXPECT_LT(GetAllocatedSize(), usedBefore + allocatedSize);
+            EXPECT_FALSE(manager->IsAboveLowWaterMark(requestSize, 0, CacheType::MEMORY));
+            EXPECT_GT(GetAllocatedSize(), allocatedSize);
+        } else {
+            EXPECT_EQ(GetAllocatedSize(), usedBefore + allocatedSize);
+        }
+    }
+
+    void CheckOomRetryLimit(int64_t remainingTime, uint64_t expectedRetries, bool evictionRunning = false)
+    {
+        std::unique_ptr<WorkerOcEvictionManager> uniqueManager;
+        std::shared_ptr<ObjectGlobalRefTable<ClientKey>> globalRefs;
+        InitEvictionManager(uniqueManager, globalRefs);
+        std::shared_ptr<WorkerOcEvictionManager> manager(std::move(uniqueManager));
+        std::promise<void> releaseEviction;
+        auto released = releaseEviction.get_future().share();
+        Raii unblockEviction([&releaseEviction] { releaseEviction.set_value(); });
+        if (evictionRunning) {
+            manager->memEvictTaskThreadPool_->Execute([released] { released.wait(); });
+            manager->Evict();
+            ASSERT_FALSE(manager->isDone_.load());
+        }
+        auto &timeout = GetRequestContext()->reqTimeoutDuration;
+        const auto savedTimeout = timeout;
+        Raii clearInjection([&timeout, savedTimeout] {
+            (void)inject::Clear("worker.Allocator.AllocateMemory");
+            (void)inject::Clear("worker.AllocateMemory.sleepTime");
+            timeout = savedTimeout;
+        });
+        // An uninitialized timeout returns its default duration without depending on wall-clock time or binary stubs.
+        timeout = TimeoutDuration(remainingTime);
+        DS_ASSERT_OK(inject::Set("worker.Allocator.AllocateMemory", "return(K_OUT_OF_MEMORY)"));
+        DS_ASSERT_OK(inject::Set("worker.AllocateMemory.sleepTime", "call(0)"));
+        ShmUnit unit;
+        auto rc = AllocateMemoryForObject("oom-retry-limit", 1024, 0, false, manager, unit);
+        EXPECT_EQ(rc.GetCode(), K_OUT_OF_MEMORY);
+        EXPECT_EQ(inject::GetExecuteCount("worker.Allocator.AllocateMemory"), expectedRetries + 1);
+        EXPECT_EQ(inject::GetExecuteCount("worker.AllocateMemory.sleepTime"), expectedRetries);
+        EXPECT_EQ(GetAllocatedSize(), 0U);
+        if (evictionRunning) {
+            EXPECT_FALSE(manager->isDone_.load());
+        }
+    }
+
     void AddThreeTrackedObjects(WorkerOcEvictionManager &manager,
                                 const std::shared_ptr<ObjectGlobalRefTable<ClientKey>> &globalRefs)
     {
@@ -982,6 +1069,51 @@ TEST_F(EvictionManagerTest, TestEvictionManagerInit)
     EvictionList::Node oldest;
     DS_EXPECT_OK(evictionManager.GetAllObjectsInfo(objsInList, oldest));
     ASSERT_EQ(objsInList.size(), size_t(0));
+}
+
+TEST_F(EvictionManagerTest, AllocationOomBelowHighWatermarkTriggersEviction)
+{
+    CheckAllocationEviction(K_OUT_OF_MEMORY, true, true, true);
+}
+
+TEST_F(EvictionManagerTest, AllocationOomRespectsLowWatermark)
+{
+    CheckAllocationEviction(K_OUT_OF_MEMORY, true, false, false);
+}
+
+TEST_F(EvictionManagerTest, AllocationOomWithoutRetryDoesNotEvict)
+{
+    CheckAllocationEviction(K_OUT_OF_MEMORY, false, true, false);
+}
+
+TEST_F(EvictionManagerTest, AllocationNonOomErrorDoesNotEvict)
+{
+    CheckAllocationEviction(K_RUNTIME_ERROR, true, true, false);
+}
+
+TEST_F(EvictionManagerTest, AllocationSuccessBelowHighWatermarkDoesNotEvict)
+{
+    CheckAllocationEviction(K_OK, true, true, false);
+}
+
+TEST_F(EvictionManagerTest, AllocationPersistentOomHasBoundedRetries)
+{
+    CheckOomRetryLimit(2000, 13);
+}
+
+TEST_F(EvictionManagerTest, AllocationOomRetriesWithTwentyMillisecondsLeft)
+{
+    CheckOomRetryLimit(20, 13);
+}
+
+TEST_F(EvictionManagerTest, AllocationOomRetriesWhileEvictionIsRunning)
+{
+    CheckOomRetryLimit(2000, 13, true);
+}
+
+TEST_F(EvictionManagerTest, AllocationOomReservesReplyTime)
+{
+    CheckOomRetryLimit(5, 0);
 }
 
 TEST_F(EvictionManagerTest, EvictionRemoveMetaRequestRespectsRedirectPolicy)

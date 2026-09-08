@@ -46,7 +46,7 @@ DS_DECLARE_uint64(oc_worker_aggregate_merge_size);
 
 namespace datasystem {
 namespace object_cache {
-constexpr int64_t K_MIN_OOM_RETRY_TIMEOUT_MS = 50;
+constexpr int64_t K_MIN_OOM_RETRY_TIMEOUT_MS = 5;
 
 ObjCacheShmUnit::ObjCacheShmUnit()
 {
@@ -225,12 +225,13 @@ Status AllocateMemoryForObject(const std::string &objectKey, const uint64_t data
     }
     // Allocate some memory into this shmUnit
     auto tenantId = TenantAuthManager::ExtractTenantId(objectKey);
-    static const std::vector<int> WAIT_MSECOND = { 1, 10, 50, 100, 200, 400, 800, 1600, 3200 };
+    constexpr int maxOomRetries = 13;
+    constexpr int64_t maxOomBackoffMs = 2048;
     Status rc = shmUnit.AllocateMemory(tenantId, needSize, populate, ServiceType::OBJECT,
                                        static_cast<memory::CacheType>(cacheType));
     if (rc.GetCode() == K_OUT_OF_MEMORY && retryOnOOM) {
         INJECT_POINT("worker.AllocateMemory.afterOOM");
-        for (int t : WAIT_MSECOND) {
+        for (int retry = 0; retry < maxOomRetries; ++retry) {
             auto remainingTime = GetRequestContext()->reqTimeoutDuration.CalcRealRemainingTime();
             if (remainingTime <= K_MIN_OOM_RETRY_TIMEOUT_MS) {
                 VLOG(1) << FormatString(
@@ -238,8 +239,10 @@ Status AllocateMemoryForObject(const std::string &objectKey, const uint64_t data
                     remainingTime, objectKey, needSize);
                 break;
             }
+            evictionManager->Evict(needSize, cacheType);
             auto retryBudget = remainingTime - K_MIN_OOM_RETRY_TIMEOUT_MS;
-            auto sleepTime = std::min<int64_t>(retryBudget, t);
+            auto backoff = std::min(maxOomBackoffMs, int64_t{ 1 } << retry);
+            auto sleepTime = std::min(retryBudget, backoff);
             INJECT_POINT("worker.AllocateMemory.sleepTime", [&sleepTime](int time) {
                 sleepTime = time;
                 return Status::OK();
@@ -252,7 +255,6 @@ Status AllocateMemoryForObject(const std::string &objectKey, const uint64_t data
             if (rc.GetCode() != K_OUT_OF_MEMORY) {
                 break;
             }
-            (void)EvictWhenMemoryExceedThrehold(objectKey, needSize, evictionManager, ServiceType::OBJECT, cacheType);
         }
     }
     RETURN_IF_NOT_OK_PRINT_ERROR_MSG(rc, FormatString("[ObjectKey %s] Error while allocating memory.", objectKey));
