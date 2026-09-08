@@ -40,6 +40,7 @@
 #include "datasystem/cluster/repository/topology_repository_codec.h"
 #include "datasystem/common/constants.h"
 #include "datasystem/common/encrypt/secret_manager.h"
+#include "datasystem/common/flags/eviction_heat.h"
 #include "datasystem/common/flags/flags.h"
 #include "datasystem/common/flags/dynamic_config_updater.h"
 #include "datasystem/common/log/trace.h"
@@ -2494,7 +2495,9 @@ Status WorkerOCServer::InitClusterRuntimeAndServices()
     }
     RETURN_IF_NOT_OK_PRINT_ERROR_MSG(ResolveLocalMetadataAddress(), "Resolve local metadata address failed");
     RETURN_IF_NOT_OK(ConstructTopologyRuntime());
-    if (IsLocalMetadataMaster() && EnableOCService()) {
+    // The runtime policy rollout is part of the heat eviction feature set; clock-only clusters never
+    // receive a rollout, so skip the store (and its periodic coordination-backend polling) entirely.
+    if (IsLocalMetadataMaster() && EnableOCService() && GetEvictionStrategy() == "heat") {
         RETURN_IF_NOT_OK_PRINT_ERROR_MSG(InitEvictionPolicyRolloutStore(), "Init eviction policy rollout store failed");
     }
 

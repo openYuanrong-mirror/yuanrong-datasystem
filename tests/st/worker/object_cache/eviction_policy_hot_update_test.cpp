@@ -86,7 +86,7 @@ public:
         opts.masterIdx = 0;
         opts.workerGflagParams =
             "-shared_memory_size_mb=64 -log_monitor=true -log_monitor_interval_ms=1000 "
-            "-eviction_strategy=clock -enable_memory_rebalance=false -v=1";
+            "-eviction_strategy=heat -enable_memory_rebalance=false -v=1";
         opts.injectActions = "NodeSelector.setInterval:call(200);ResourceManager.setInterval:call(200);"
                              "WorkerOCServer.heatMaintenanceIntervalMs:call(200)";
     }
@@ -395,6 +395,7 @@ protected:
     }
 
     Status WaitForWorkerFailure(uint64_t epoch, uint32_t workerIndex, StatusCode expectedCode,
+                                master::EvictionPolicyPb expectedActivePolicy,
                                 master::EvictionPolicyUpdatePhasePb expectedPhase,
                                 const std::string &expectedReason)
     {
@@ -410,7 +411,7 @@ protected:
                         || worker.status() != master::EVICTION_POLICY_WORKER_FAILED) {
                         continue;
                     }
-                    CHECK_FAIL_RETURN_STATUS(worker.active_policy() == master::EVICTION_POLICY_CLOCK
+                    CHECK_FAIL_RETURN_STATUS(worker.active_policy() == expectedActivePolicy
                                                  && worker.epoch() == epoch && worker.phase() == expectedPhase
                                                  && worker.failure_code() == static_cast<int32_t>(expectedCode)
                                                  && worker.failure_reason().find(expectedReason) != std::string::npos,
@@ -566,20 +567,21 @@ public:
         LEVEL1_EvictionPolicyHotUpdateTest::SetClusterSetupOptions(opts);
         opts.workerGflagParams =
             "-shared_memory_size_mb=64 -log_monitor=true -log_monitor_interval_ms=1000 "
-            "-eviction_strategy=clock -enable_memory_rebalance=true -rebalance_source_usage_percent=30 "
+            "-eviction_strategy=heat -enable_memory_rebalance=true -rebalance_strategy=heat "
+            "-rebalance_heat_source_usage_percent=30 -rebalance_heat_source_usage_percent_low=20 "
             "-rebalance_usage_gap_percent=10 -v=1";
     }
 };
 
-TEST_F(LEVEL1_EvictionPolicyHotUpdateTest, ClockHeatClockConvergesAcrossAllWorkers)
+TEST_F(LEVEL1_EvictionPolicyHotUpdateTest, HeatClockHeatConvergesAcrossAllWorkers)
 {
     DS_ASSERT_OK(WriteWorkerObjects());
     DS_ASSERT_OK(CheckAllObjectsReadable());
     uint32_t partialCohortPercent = 0;
     DS_ASSERT_OK(FindPartialCohortPercent(partialCohortPercent));
-    DS_ASSERT_OK(RunPolicyUpdate(master::EVICTION_POLICY_CLOCK, master::EVICTION_POLICY_HEAT, 101,
+    DS_ASSERT_OK(RunPolicyUpdate(master::EVICTION_POLICY_HEAT, master::EVICTION_POLICY_CLOCK, 101,
                                  partialCohortPercent));
-    DS_ASSERT_OK(RunPolicyUpdate(master::EVICTION_POLICY_HEAT, master::EVICTION_POLICY_CLOCK, 102,
+    DS_ASSERT_OK(RunPolicyUpdate(master::EVICTION_POLICY_CLOCK, master::EVICTION_POLICY_HEAT, 102,
                                  FULL_COHORT_PERCENT));
 }
 
@@ -589,15 +591,15 @@ TEST_F(LEVEL1_EvictionPolicyHotUpdateTest, PrecheckAdmissionFailureKeepsOldPolic
     constexpr uint64_t recoveryEpoch = 202;
     constexpr uint64_t maximumSourceObjects = 1;
     DS_ASSERT_OK(WriteWorkerObjects());
-    DS_ASSERT_OK(StartPolicyUpdate(master::EVICTION_POLICY_HEAT, rejectedEpoch, master::EVICTION_POLICY_PRECHECK,
+    DS_ASSERT_OK(StartPolicyUpdate(master::EVICTION_POLICY_CLOCK, rejectedEpoch, master::EVICTION_POLICY_PRECHECK,
                                    FULL_COHORT_PERCENT, 0, maximumSourceObjects));
     for (uint32_t worker = 0; worker < WORKER_COUNT; ++worker) {
         DS_ASSERT_OK(WaitForWorkerFailure(rejectedEpoch, worker, StatusCode::K_NO_SPACE,
-                                         master::EVICTION_POLICY_STABLE,
+                                         master::EVICTION_POLICY_HEAT, master::EVICTION_POLICY_STABLE,
                                          "source object count exceeds the precheck limit"));
     }
     DS_ASSERT_OK(CheckAllObjectsReadable());
-    DS_ASSERT_OK(RunPolicyUpdate(master::EVICTION_POLICY_CLOCK, master::EVICTION_POLICY_HEAT, recoveryEpoch,
+    DS_ASSERT_OK(RunPolicyUpdate(master::EVICTION_POLICY_HEAT, master::EVICTION_POLICY_CLOCK, recoveryEpoch,
                                  FULL_COHORT_PERCENT));
 }
 
@@ -606,16 +608,16 @@ TEST_F(LEVEL1_EvictionPolicyHotUpdateTest, AuditMutationRetriesAndConverges)
     constexpr uint64_t epoch = 301;
     DS_ASSERT_OK(WriteWorkerObjects());
     DS_ASSERT_OK(cluster_->SetInjectAction(WORKER, FAULT_WORKER_INDEX, AFTER_AUDIT_INJECT, "1*pause()"));
-    DS_ASSERT_OK(StartPolicyUpdate(master::EVICTION_POLICY_HEAT, epoch, master::EVICTION_POLICY_PRECHECK,
+    DS_ASSERT_OK(StartPolicyUpdate(master::EVICTION_POLICY_CLOCK, epoch, master::EVICTION_POLICY_PRECHECK,
                                    FULL_COHORT_PERCENT));
     master::GetEvictionPolicyUpdateProgressRspPb progress;
     bool observedConverting = false;
     bool wroteDuringConversion = false;
     DS_ASSERT_OK(WaitForWorkerStatus(
-        epoch, master::EVICTION_POLICY_WORKER_READY, master::EVICTION_POLICY_CLOCK, master::EVICTION_POLICY_HEAT,
+        epoch, master::EVICTION_POLICY_WORKER_READY, master::EVICTION_POLICY_HEAT, master::EVICTION_POLICY_CLOCK,
         master::EVICTION_POLICY_PRECHECK, FULL_COHORT_PERCENT, GetAllWorkerAddresses(), progress,
         observedConverting, wroteDuringConversion));
-    DS_ASSERT_OK(StartPolicyUpdate(master::EVICTION_POLICY_HEAT, epoch, master::EVICTION_POLICY_COMMIT_CONVERT,
+    DS_ASSERT_OK(StartPolicyUpdate(master::EVICTION_POLICY_CLOCK, epoch, master::EVICTION_POLICY_COMMIT_CONVERT,
                                    FULL_COHORT_PERCENT));
     DS_ASSERT_OK(WaitForInjectExecution(FAULT_WORKER_INDEX, AFTER_AUDIT_INJECT));
 
@@ -625,11 +627,11 @@ TEST_F(LEVEL1_EvictionPolicyHotUpdateTest, AuditMutationRetriesAndConverges)
     DS_ASSERT_OK(getRc);
 
     DS_ASSERT_OK(WaitForWorkerFailure(epoch, FAULT_WORKER_INDEX, StatusCode::K_TRY_AGAIN,
-                                     master::EVICTION_POLICY_VERIFYING,
+                                     master::EVICTION_POLICY_HEAT, master::EVICTION_POLICY_VERIFYING,
                                      "membership changed after audit"));
     wroteDuringConversion = true;
     DS_ASSERT_OK(WaitForWorkerStatus(
-        epoch, master::EVICTION_POLICY_WORKER_ACTIVE, master::EVICTION_POLICY_HEAT, master::EVICTION_POLICY_HEAT,
+        epoch, master::EVICTION_POLICY_WORKER_ACTIVE, master::EVICTION_POLICY_CLOCK, master::EVICTION_POLICY_CLOCK,
         master::EVICTION_POLICY_COMMIT_CONVERT, FULL_COHORT_PERCENT, GetAllWorkerAddresses(), progress,
         observedConverting, wroteDuringConversion, true));
     DS_ASSERT_OK(CheckAllObjectsReadable());
@@ -640,16 +642,16 @@ TEST_F(LEVEL1_EvictionPolicyHotUpdateTest, MasterWorkerCrashAfterAuditRecoversFo
     constexpr uint64_t epoch = 401;
     DS_ASSERT_OK(WriteWorkerObjects());
     DS_ASSERT_OK(cluster_->SetInjectAction(WORKER, MASTER_WORKER_INDEX, AFTER_AUDIT_INJECT, "1*pause()"));
-    DS_ASSERT_OK(StartPolicyUpdate(master::EVICTION_POLICY_HEAT, epoch, master::EVICTION_POLICY_PRECHECK,
+    DS_ASSERT_OK(StartPolicyUpdate(master::EVICTION_POLICY_CLOCK, epoch, master::EVICTION_POLICY_PRECHECK,
                                    FULL_COHORT_PERCENT));
     master::GetEvictionPolicyUpdateProgressRspPb progress;
     bool observedConverting = false;
     bool wroteDuringConversion = false;
     DS_ASSERT_OK(WaitForWorkerStatus(
-        epoch, master::EVICTION_POLICY_WORKER_READY, master::EVICTION_POLICY_CLOCK, master::EVICTION_POLICY_HEAT,
+        epoch, master::EVICTION_POLICY_WORKER_READY, master::EVICTION_POLICY_HEAT, master::EVICTION_POLICY_CLOCK,
         master::EVICTION_POLICY_PRECHECK, FULL_COHORT_PERCENT, GetAllWorkerAddresses(), progress,
         observedConverting, wroteDuringConversion));
-    DS_ASSERT_OK(StartPolicyUpdate(master::EVICTION_POLICY_HEAT, epoch, master::EVICTION_POLICY_COMMIT_CONVERT,
+    DS_ASSERT_OK(StartPolicyUpdate(master::EVICTION_POLICY_CLOCK, epoch, master::EVICTION_POLICY_COMMIT_CONVERT,
                                    FULL_COHORT_PERCENT));
     DS_ASSERT_OK(WaitForInjectExecution(MASTER_WORKER_INDEX, AFTER_AUDIT_INJECT));
 
@@ -662,7 +664,7 @@ TEST_F(LEVEL1_EvictionPolicyHotUpdateTest, MasterWorkerCrashAfterAuditRecoversFo
 
     wroteDuringConversion = true;
     DS_ASSERT_OK(WaitForWorkerStatus(
-        epoch, master::EVICTION_POLICY_WORKER_ACTIVE, master::EVICTION_POLICY_HEAT, master::EVICTION_POLICY_HEAT,
+        epoch, master::EVICTION_POLICY_WORKER_ACTIVE, master::EVICTION_POLICY_CLOCK, master::EVICTION_POLICY_CLOCK,
         master::EVICTION_POLICY_COMMIT_CONVERT, FULL_COHORT_PERCENT, GetAllWorkerAddresses(), progress,
         observedConverting, wroteDuringConversion, true, 0, MASTER_WORKER_INDEX));
     DS_ASSERT_OK(CheckSurvivingWorkerObjectsReadable(MASTER_WORKER_INDEX));
@@ -672,13 +674,13 @@ TEST_F(LEVEL1_EvictionPolicyHotUpdateTest, CommitDrainsRunningEvictionBeforeMigr
 {
     constexpr uint64_t epoch = 501;
     DS_ASSERT_OK(WriteWorkerObjects());
-    DS_ASSERT_OK(StartPolicyUpdate(master::EVICTION_POLICY_HEAT, epoch, master::EVICTION_POLICY_PRECHECK,
+    DS_ASSERT_OK(StartPolicyUpdate(master::EVICTION_POLICY_CLOCK, epoch, master::EVICTION_POLICY_PRECHECK,
                                    FULL_COHORT_PERCENT));
     master::GetEvictionPolicyUpdateProgressRspPb progress;
     bool observedConverting = false;
     bool wroteDuringConversion = false;
     DS_ASSERT_OK(WaitForWorkerStatus(
-        epoch, master::EVICTION_POLICY_WORKER_READY, master::EVICTION_POLICY_CLOCK, master::EVICTION_POLICY_HEAT,
+        epoch, master::EVICTION_POLICY_WORKER_READY, master::EVICTION_POLICY_HEAT, master::EVICTION_POLICY_CLOCK,
         master::EVICTION_POLICY_PRECHECK, FULL_COHORT_PERCENT, GetAllWorkerAddresses(), progress,
         observedConverting, wroteDuringConversion));
 
@@ -691,7 +693,7 @@ TEST_F(LEVEL1_EvictionPolicyHotUpdateTest, CommitDrainsRunningEvictionBeforeMigr
     Status commitRc(K_NOT_READY, "Eviction round did not reach the pause point");
     Status cancelObservedRc(K_NOT_READY, "Policy update did not request eviction cancellation");
     if (evictionPauseRc.IsOk()) {
-        commitRc = StartPolicyUpdate(master::EVICTION_POLICY_HEAT, epoch,
+        commitRc = StartPolicyUpdate(master::EVICTION_POLICY_CLOCK, epoch,
                                      master::EVICTION_POLICY_COMMIT_CONVERT, FULL_COHORT_PERCENT);
         if (commitRc.IsOk()) {
             cancelObservedRc = WaitForInjectExecution(FAULT_WORKER_INDEX, AFTER_CANCEL_INJECT, false);
@@ -718,7 +720,7 @@ TEST_F(LEVEL1_EvictionPolicyHotUpdateTest, CommitDrainsRunningEvictionBeforeMigr
 
     wroteDuringConversion = true;
     DS_ASSERT_OK(WaitForWorkerStatus(
-        epoch, master::EVICTION_POLICY_WORKER_ACTIVE, master::EVICTION_POLICY_HEAT, master::EVICTION_POLICY_HEAT,
+        epoch, master::EVICTION_POLICY_WORKER_ACTIVE, master::EVICTION_POLICY_CLOCK, master::EVICTION_POLICY_CLOCK,
         master::EVICTION_POLICY_COMMIT_CONVERT, FULL_COHORT_PERCENT, GetAllWorkerAddresses(), progress,
         observedConverting, wroteDuringConversion, true, 0));
     DS_ASSERT_OK(CheckFreshWritesReadable(epoch));
@@ -742,17 +744,17 @@ TEST_F(LEVEL1_EvictionPolicyHotUpdateRebalanceTest, SourceRebalanceDrainsBeforeP
     bool observedConverting = false;
     bool wroteDuringConversion = false;
     if (sendPausedRc.IsOk()) {
-        precheckRc = StartPolicyUpdate(master::EVICTION_POLICY_HEAT, epoch, master::EVICTION_POLICY_PRECHECK,
+        precheckRc = StartPolicyUpdate(master::EVICTION_POLICY_CLOCK, epoch, master::EVICTION_POLICY_PRECHECK,
                                        FULL_COHORT_PERCENT);
     }
     if (precheckRc.IsOk()) {
         readyRc = WaitForWorkerStatus(
-            epoch, master::EVICTION_POLICY_WORKER_READY, master::EVICTION_POLICY_CLOCK,
-            master::EVICTION_POLICY_HEAT, master::EVICTION_POLICY_PRECHECK, FULL_COHORT_PERCENT,
+            epoch, master::EVICTION_POLICY_WORKER_READY, master::EVICTION_POLICY_HEAT,
+            master::EVICTION_POLICY_CLOCK, master::EVICTION_POLICY_PRECHECK, FULL_COHORT_PERCENT,
             GetAllWorkerAddresses(), progress, observedConverting, wroteDuringConversion);
     }
     if (readyRc.IsOk()) {
-        commitRc = StartPolicyUpdate(master::EVICTION_POLICY_HEAT, epoch,
+        commitRc = StartPolicyUpdate(master::EVICTION_POLICY_CLOCK, epoch,
                                      master::EVICTION_POLICY_COMMIT_CONVERT, FULL_COHORT_PERCENT);
     }
     if (commitRc.IsOk()) {
@@ -769,8 +771,8 @@ TEST_F(LEVEL1_EvictionPolicyHotUpdateRebalanceTest, SourceRebalanceDrainsBeforeP
     DS_ASSERT_OK(clearSendRc);
     DS_ASSERT_OK(clearDrainRc);
     DS_ASSERT_OK(WaitForWorkerStatus(
-        epoch, master::EVICTION_POLICY_WORKER_ACTIVE, master::EVICTION_POLICY_HEAT,
-        master::EVICTION_POLICY_HEAT, master::EVICTION_POLICY_COMMIT_CONVERT, FULL_COHORT_PERCENT,
+        epoch, master::EVICTION_POLICY_WORKER_ACTIVE, master::EVICTION_POLICY_CLOCK,
+        master::EVICTION_POLICY_CLOCK, master::EVICTION_POLICY_COMMIT_CONVERT, FULL_COHORT_PERCENT,
         GetAllWorkerAddresses(), progress, observedConverting, wroteDuringConversion, true, 0));
     DS_ASSERT_OK(CheckRebalancePressureReadable(sourceWorker));
 }
@@ -807,17 +809,17 @@ TEST_F(LEVEL1_EvictionPolicyHotUpdateRebalanceTest, TargetMigrationDrainsBeforeP
     bool observedConverting = false;
     bool wroteDuringConversion = false;
     if (migrationPausedRc.IsOk()) {
-        precheckRc = StartPolicyUpdate(master::EVICTION_POLICY_HEAT, epoch, master::EVICTION_POLICY_PRECHECK,
+        precheckRc = StartPolicyUpdate(master::EVICTION_POLICY_CLOCK, epoch, master::EVICTION_POLICY_PRECHECK,
                                        FULL_COHORT_PERCENT);
     }
     if (precheckRc.IsOk()) {
         readyRc = WaitForWorkerStatus(
-            epoch, master::EVICTION_POLICY_WORKER_READY, master::EVICTION_POLICY_CLOCK,
-            master::EVICTION_POLICY_HEAT, master::EVICTION_POLICY_PRECHECK, FULL_COHORT_PERCENT,
+            epoch, master::EVICTION_POLICY_WORKER_READY, master::EVICTION_POLICY_HEAT,
+            master::EVICTION_POLICY_CLOCK, master::EVICTION_POLICY_PRECHECK, FULL_COHORT_PERCENT,
             GetAllWorkerAddresses(), progress, observedConverting, wroteDuringConversion);
     }
     if (readyRc.IsOk()) {
-        commitRc = StartPolicyUpdate(master::EVICTION_POLICY_HEAT, epoch,
+        commitRc = StartPolicyUpdate(master::EVICTION_POLICY_CLOCK, epoch,
                                      master::EVICTION_POLICY_COMMIT_CONVERT, FULL_COHORT_PERCENT);
     }
     if (commitRc.IsOk()) {
@@ -835,8 +837,8 @@ TEST_F(LEVEL1_EvictionPolicyHotUpdateRebalanceTest, TargetMigrationDrainsBeforeP
     DS_ASSERT_OK(clearAdmissionRc);
     DS_ASSERT_OK(clearDrainRc);
     DS_ASSERT_OK(WaitForWorkerStatus(
-        epoch, master::EVICTION_POLICY_WORKER_ACTIVE, master::EVICTION_POLICY_HEAT,
-        master::EVICTION_POLICY_HEAT, master::EVICTION_POLICY_COMMIT_CONVERT, FULL_COHORT_PERCENT,
+        epoch, master::EVICTION_POLICY_WORKER_ACTIVE, master::EVICTION_POLICY_CLOCK,
+        master::EVICTION_POLICY_CLOCK, master::EVICTION_POLICY_COMMIT_CONVERT, FULL_COHORT_PERCENT,
         GetAllWorkerAddresses(), progress, observedConverting, wroteDuringConversion, true));
     DS_ASSERT_OK(CheckRebalancePressureReadable(sourceWorker));
 }
