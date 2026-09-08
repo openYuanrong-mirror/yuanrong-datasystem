@@ -5,7 +5,7 @@
 - Status:
   - `active`
 - Last verified against source:
-  - `2026-07-18`
+  - `2026-09-04`
 - Canonical source roots:
   - `tests`
   - `tests/README.md`
@@ -355,6 +355,21 @@ bazel test --config=release --config=test \
 bazel test //tests/ut/client:urma_send_lane_test --config=test --test_output=streamed
 ```
 
+- URMA per-peer in-flight and circuit-breaker coverage:
+  - `ds_ut_urma_connection_inflight` is a hardware-independent CMake target available with either real URMA or the
+    URMA mock build. It covers the per-peer slot cap, peer isolation, breaker state retained across replacements,
+    cooldown and single-probe admission over repeated failed generations, successful-probe/instance-change recovery,
+    stale-generation completion fencing, and held-connection lifetime across removal. Scoped map entries are cleaned
+    by RAII; a narrow friend helper replaces the private/public preprocessor override.
+  - `ds_ut_urma_send_jetty_fault` also covers persistent synthetic status-9 CQEs through the production completion
+    handler and real local Jetty pool (or URMA mock): eight initial retirements, then one failed probe per recovery
+    generation, with healthy-peer lane availability checked during cooldown. It does not replace network-handshake ST.
+
+```bash
+cmake --build build --target ds_ut_urma_connection_inflight -j
+build/tests/ut/ds_ut_urma_connection_inflight
+```
+
 - Manual URMA remote-Jetty reuse coverage:
   - `//tests/ut/client:urma_remote_jetty_reuse_test` is a Bazel `manual` target, deliberately separate from the
     header-only `urma_send_lane_test`.
@@ -436,7 +451,12 @@ DS_URMA_DEV_NAME=<device> \
     reaches the limiter's 1 MiB exclusive upper bound, and fallback-disabled repeated pool backpressure without object
     WR post or TCP success. The fallback-disabled KVClient assertion expects an eventual `K_URMA_TRY_AGAIN` error rather
     than TCP success; the dedicated status prevents replaying exhausted URMA lanes as generic application
-    `K_TRY_AGAIN`, while the manager fault UT checks the exact acquire error. Provider-side admission coverage injects
+    `K_TRY_AGAIN`, while the manager fault UT checks the exact acquire error.
+    `CircuitBrokenPeerReconnectsBeforeLargeTcpFallback` forces the provider connection into the same breaker state at
+    lane acquisition, verifies that a payload above the TCP fallback limit first surfaces the breaker and limiter
+    rejection, then observes eventual recovery after cooldown, renewed URMA lane acquisition and the original value.
+    It does not directly observe map replacement or physically exhaust the pool; those are separate test contracts.
+    Provider-side admission coverage injects
     CQE status 9 on a real remote GET writeback, keeps the requester quarantined during the assertion window, and
     verifies that subsequent ordinary and aggregate Batch Gets either carry the complete payload over TCP or return
     `K_URMA_WORKER_UNAVAILABLE` when fallback is disabled, without acquiring an URMA send lane. The target also covers

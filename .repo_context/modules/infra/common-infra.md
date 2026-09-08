@@ -182,7 +182,16 @@ MADV_HUGEPAGE)` to the shared-memory memfd mapping after `mmap` succeeds when th
     threshold of 16. The internal retire threshold is fixed at 32 against a JFS depth of 256; reaching it keeps the
     Jetty out of the reusable pool, installs normal pending-retire ownership, and queues provider
     modify/flush/delete work on the existing asynchronous finalizer. These thresholds are intentionally not exposed as
-    runtime flags.
+    runtime flags. A peer that retires eight send Jetties is circuit-broken to bound its pool damage. Connection
+    stability checks retain the broken entry and request the existing single-flight handshake after cooldown.
+    Same-incarnation replacements share the retire budget, in-flight cap and exponentially backed-off probe state
+    (1 second initially, capped at 30 seconds). Only one lane is admitted while half-open; a completely successful
+    lane resets the budget, while failed, cancelled or timed-out probes reopen it. A changed nonempty instance ID
+    starts independent state. Old generations cannot admit new work or reset the new probe with late completions.
+    Read/write/gather paths release connection-map accessors after copying shared ownership; replacement and removal
+    do not clear live holders in place. RPC-shared lanes keep using their original connection generation.
+    Last-holder destruction remains synchronous, outside the connection-map lock; `URMA_CONNECTION_CLEANUP`
+    measures target/segment unimport cost in the existing perf framework. It is not claimed to be latency-free.
     Worker-to-worker Batch Get is a narrower RPC-scoped exception: `BatchGetObjectRemoteImpl` attempts one shared-lane
     acquire before object processing. On success it passes the lane to ordinary and gather writes and seals it once
     after all sub-request WRs are created. When the acquire fails and transport fallback is enabled, the whole RPC is

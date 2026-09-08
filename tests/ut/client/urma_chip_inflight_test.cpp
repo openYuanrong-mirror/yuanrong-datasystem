@@ -20,6 +20,7 @@
 #define private public
 #include "datasystem/common/rdma/urma_manager.h"
 #undef private
+#include "datasystem/common/util/raii.h"
 
 namespace datasystem {
 namespace {
@@ -42,27 +43,32 @@ TEST(UrmaChipInflightTest, FormatsNonZeroCountsWithRealChipIds)
 TEST(UrmaChipInflightTest, RecordsCumulativeNumaWriteCountsBySourceAndDestinationChip)
 {
     auto &manager = UrmaManager::Instance();
-    manager.srcChipWriteCounts_.at(1).store(0, std::memory_order_relaxed);
-    manager.srcChipWriteCounts_.at(2).store(0, std::memory_order_relaxed);
-    manager.dstChipWriteCounts_.at(1).store(0, std::memory_order_relaxed);
-    manager.dstChipWriteCounts_.at(2).store(0, std::memory_order_relaxed);
-    manager.src1Dst2WriteCount_.store(0, std::memory_order_relaxed);
-    manager.src2Dst1WriteCount_.store(0, std::memory_order_relaxed);
+    const auto resetCounts = [&manager] {
+        manager.srcChipWriteCounts_.at(1).store(0, std::memory_order_relaxed);
+        manager.srcChipWriteCounts_.at(2).store(0, std::memory_order_relaxed);
+        manager.dstChipWriteCounts_.at(1).store(0, std::memory_order_relaxed);
+        manager.dstChipWriteCounts_.at(2).store(0, std::memory_order_relaxed);
+        manager.src1Src2WriteCount_.store(0, std::memory_order_relaxed);
+        manager.src2Src1WriteCount_.store(0, std::memory_order_relaxed);
+    };
+    resetCounts();
+    Raii cleanup(resetCounts);
 
     manager.RecordNumaWriteChipCounts(1, 2);
-    manager.RecordNumaWriteCrossChipCount(1, 2);
     manager.RecordNumaWriteChipCounts(2, 1);
-    manager.RecordNumaWriteCrossChipCount(2, 1);
     manager.RecordNumaWriteChipCounts(INVALID_CHIP_ID, INVALID_CHIP_ID);
 
     EXPECT_STREQ(manager.GetNumaWriteChipCountsString(),
-                 "{src1:1,src2:1,dst1:1,dst2:1,src1_dst2:1,src2_dst1:1}");
-    manager.srcChipWriteCounts_.at(1).store(0, std::memory_order_relaxed);
-    manager.srcChipWriteCounts_.at(2).store(0, std::memory_order_relaxed);
-    manager.dstChipWriteCounts_.at(1).store(0, std::memory_order_relaxed);
-    manager.dstChipWriteCounts_.at(2).store(0, std::memory_order_relaxed);
-    manager.src1Dst2WriteCount_.store(0, std::memory_order_relaxed);
-    manager.src2Dst1WriteCount_.store(0, std::memory_order_relaxed);
+                 "{src1:1,src2:1,dst1:1,dst2:1,src1_src2:0,src2_src1:0}");
+
+    manager.RecordNumaWriteSourceSwitchCount(1, 2);
+    manager.RecordNumaWriteSourceSwitchCount(2, 1);
+    manager.RecordNumaWriteSourceSwitchCount(1, 1);
+    manager.RecordNumaWriteSourceSwitchCount(2, 2);
+    manager.RecordNumaWriteSourceSwitchCount(INVALID_CHIP_ID, 2);
+    manager.RecordNumaWriteSourceSwitchCount(1, INVALID_CHIP_ID);
+    EXPECT_STREQ(manager.GetNumaWriteChipCountsString(),
+                 "{src1:1,src2:1,dst1:1,dst2:1,src1_src2:1,src2_src1:1}");
 }
 
 TEST(UrmaChipInflightTest, TracksBothSourceChipCountersForEventLifetime)

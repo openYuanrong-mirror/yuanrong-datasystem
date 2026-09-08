@@ -476,6 +476,84 @@ TEST(UrmaSendJettyFaultTest, RepeatedCqeStatus9RefillsWithoutExceedingUniqueJett
     }
 }
 
+TEST(UrmaSendJettyFaultTest, PersistentCqeFailureKeepsBudgetAcrossConnectionGenerations)
+{
+    if (!IsUrmaFaultTestEnvAvailable()) {
+        GTEST_SKIP() << "URMA fault test requires a usable device or URMA mock";
+    }
+    auto &manager = UrmaManager::Instance();
+    ASSERT_TRUE(InitManagerForFaultTest(manager).IsOk());
+    auto &resource = *manager.urmaResource_;
+    const std::string key = "persistent-cqe-peer";
+    Raii cleanup([&] { (void)manager.RemoveRemoteDevice(key); });
+    auto connection = MakeTestConnection();
+    auto install = [&](const std::shared_ptr<UrmaConnection> &current) {
+        TbbUrmaConnectionMap::accessor accessor;
+        manager.urmaConnectionMap_.insert(accessor, key);
+        accessor->second = current;
+    };
+    install(connection);
+    constexpr int64_t slotBudgetUs = 1000;
+    constexpr uint32_t retireThreshold = 8;
+    uint32_t retired = 0;
+    auto failLane = [&] {
+        ASSERT_TRUE(WaitForIdleSendLane(resource));
+        ASSERT_TRUE(connection->AcquireInflightSlot(slotBudgetUs).IsOk());
+        std::shared_ptr<UrmaJetty> jetty;
+        ASSERT_TRUE(resource.AcquireJetty(jetty).IsOk());
+        jetty->BindConnection(connection);
+        constexpr uint64_t requestBase = 50000;
+        const auto requestId = requestBase + retired;
+        auto lane = std::make_shared<UrmaSendLaneLease>(jetty, requestId, connection);
+        ASSERT_TRUE(resource.RegisterActiveSendLane(lane).IsOk());
+        lane->AddWr();
+        ASSERT_TRUE(resource.SealActiveSendLane(lane).IsOk());
+        urma_cr_t completion{};
+        completion.status = static_cast<urma_cr_status_t>(kRecoverableCqeStatus);
+        completion.user_ctx = requestId;
+        const auto jettyId = jetty->GetJettyId();
+        completion.local_id = jettyId;
+        std::unordered_set<uint64_t> completed;
+        std::unordered_map<uint64_t, int> failed;
+        EXPECT_EQ(manager.CheckCompletionRecordStatus(&completion, 1, completed, failed).GetCode(), K_URMA_ERROR);
+        ASSERT_FALSE(jetty->IsValid());
+        ASSERT_TRUE(resource.HandleFlushErrDone(jettyId).IsOk());
+        ASSERT_TRUE(WaitUntil([&] {
+            std::shared_ptr<UrmaJetty> registered;
+            return resource.GetJettyById(jettyId, registered).IsError();
+        }));
+        ++retired;
+    };
+    for (uint32_t i = 0; i < retireThreshold; ++i) {
+        ASSERT_NO_FATAL_FAILURE(failLane());
+    }
+    ASSERT_TRUE(connection->IsCircuitBroken());
+    constexpr uint32_t recoveryGenerations = 2;
+    for (uint32_t generation = 0; generation < recoveryGenerations; ++generation) {
+        auto next = MakeTestConnection();
+        EXPECT_EQ(next->PrepareReplacement(*connection).GetCode(), K_URMA_TRY_AGAIN);
+        EXPECT_EQ(connection->AcquireInflightSlot(slotBudgetUs).GetCode(), K_URMA_TRY_AGAIN);
+        ASSERT_TRUE(WaitForIdleSendLane(resource));
+        UrmaJfrInfo healthyInfo;
+        healthyInfo.uniqueInstanceId = "healthy-cqe-peer";
+        auto healthy = std::make_shared<UrmaConnection>(nullptr, healthyInfo);
+        ASSERT_TRUE(healthy->AcquireInflightSlot(slotBudgetUs).IsOk());
+        std::shared_ptr<UrmaJetty> healthyJetty;
+        ASSERT_TRUE(resource.AcquireJetty(healthyJetty).IsOk());
+        resource.ReleaseJetty(healthyJetty);
+        healthy->ReleaseInflightSlot();
+        ASSERT_TRUE(WaitUntil([&] { return connection->CanReconnect(); }));
+        ASSERT_TRUE(next->PrepareReplacement(*connection).IsOk());
+        install(next);
+        connection = std::move(next);
+        ASSERT_NO_FATAL_FAILURE(failLane());
+        EXPECT_TRUE(connection->IsCircuitBroken());
+        EXPECT_FALSE(connection->CanReconnect());
+        EXPECT_EQ(retired, retireThreshold + generation + 1);
+    }
+    ASSERT_TRUE(WaitForIdleSendLane(resource));
+}
+
 TEST(UrmaSendJettyFaultTest, NonRecoverableCqeDoesNotRecreateOrLeakLane)
 {
     if (!IsUrmaFaultTestEnvAvailable()) {

@@ -23,18 +23,61 @@
 #include <cstdio>
 #include <cstdlib>
 #include <chrono>
+#include <future>
 #include <memory>
 #include <string>
 #include <thread>
 
 #include <gtest/gtest.h>
 
-#define private public
 #include "datasystem/common/rdma/urma_manager.h"
 #include "datasystem/common/rdma/urma_resource.h"
-#undef private
 
 namespace datasystem {
+class UrmaConnectionTestAccess {
+public:
+    UrmaConnectionTestAccess() = delete;
+    ~UrmaConnectionTestAccess() = delete;
+    static constexpr auto MaxInflight = UrmaConnection::MAX_INFLIGHT_JETTIES;
+    static constexpr auto MaxRetired = UrmaConnection::MAX_RETIRED_JETTIES;
+
+    static uint32_t Inflight(const UrmaConnection &connection)
+    {
+        std::lock_guard<bthread::Mutex> lock(connection.peerState_->mutex);
+        return connection.peerState_->inflight;
+    }
+
+    static void ExpireCooldown(UrmaConnection &connection)
+    {
+        std::lock_guard<bthread::Mutex> lock(connection.peerState_->mutex);
+        connection.peerState_->retryAfter = std::chrono::steady_clock::time_point::min();
+    }
+
+    static std::shared_ptr<UrmaConnection> Find(const std::string &key)
+    {
+        TbbUrmaConnectionMap::const_accessor accessor;
+        auto &map = UrmaManager::Instance().urmaConnectionMap_;
+        return map.find(accessor, key) ? accessor->second : nullptr;
+    }
+
+    static void Put(const std::string &key, std::shared_ptr<UrmaConnection> connection)
+    {
+        TbbUrmaConnectionMap::accessor accessor;
+        UrmaManager::Instance().urmaConnectionMap_.insert(accessor, key);
+        accessor->second = std::move(connection);
+    }
+
+    static UrmaResource &Resource()
+    {
+        return *UrmaManager::Instance().urmaResource_;
+    }
+
+    static bool HoldRead(const std::string &key, TbbUrmaConnectionMap::const_accessor &accessor)
+    {
+        return UrmaManager::Instance().urmaConnectionMap_.find(accessor, key);
+    }
+};
+
 namespace {
 using datasystem::HostPort;
 
@@ -96,26 +139,26 @@ TEST(UrmaConnectionInflightTest, AcquireRespectsPerPeerCap)
 {
     // A peer may hold at most MAX_INFLIGHT_JETTIES concurrent slots; the next acquire blocks.
     auto conn = MakeConnection();
-    for (uint32_t i = 0; i < UrmaConnection::MAX_INFLIGHT_JETTIES; ++i) {
+    for (uint32_t i = 0; i < UrmaConnectionTestAccess::MaxInflight; ++i) {
         ASSERT_TRUE(conn->AcquireInflightSlot(LONG_BUDGET_US).IsOk()) << "slot " << i << " should succeed";
     }
     std::printf("[EVIDENCE] peer-X held %u slots (=MAX_INFLIGHT_JETTIES=%u) after %u successful acquires\n",
-                conn->inflightJettyCount_, UrmaConnection::MAX_INFLIGHT_JETTIES,
-                UrmaConnection::MAX_INFLIGHT_JETTIES);
-    EXPECT_EQ(conn->inflightJettyCount_, UrmaConnection::MAX_INFLIGHT_JETTIES);
+                UrmaConnectionTestAccess::Inflight(*conn), UrmaConnectionTestAccess::MaxInflight,
+                UrmaConnectionTestAccess::MaxInflight);
+    EXPECT_EQ(UrmaConnectionTestAccess::Inflight(*conn), UrmaConnectionTestAccess::MaxInflight);
     // 9th acquire with a tiny budget times out instead of exceeding the cap.
     auto rc = conn->AcquireInflightSlot(TINY_BUDGET_US);
     std::printf("[EVIDENCE] 9th acquire rc=%d (%s), count still %u (cap not exceeded)\n",
-                static_cast<int>(rc.GetCode()), rc.GetMsg().c_str(), conn->inflightJettyCount_);
+                static_cast<int>(rc.GetCode()), rc.GetMsg().c_str(), UrmaConnectionTestAccess::Inflight(*conn));
     EXPECT_EQ(rc.GetCode(), StatusCode::K_URMA_TRY_AGAIN);
-    EXPECT_EQ(conn->inflightJettyCount_, UrmaConnection::MAX_INFLIGHT_JETTIES);
+    EXPECT_EQ(UrmaConnectionTestAccess::Inflight(*conn), UrmaConnectionTestAccess::MaxInflight);
 }
 
 TEST(UrmaConnectionInflightTest, ReleaseUnblocksWaiter)
 {
     // After a release, a previously-blocked waiter proceeds and the count stays bounded.
     auto conn = MakeConnection();
-    for (uint32_t i = 0; i < UrmaConnection::MAX_INFLIGHT_JETTIES; ++i) {
+    for (uint32_t i = 0; i < UrmaConnectionTestAccess::MaxInflight; ++i) {
         ASSERT_TRUE(conn->AcquireInflightSlot(LONG_BUDGET_US).IsOk());
     }
     std::atomic<bool> acquired{ false };
@@ -125,17 +168,17 @@ TEST(UrmaConnectionInflightTest, ReleaseUnblocksWaiter)
             acquired.store(true);
         }
         std::printf("[EVIDENCE] waiter woke, rc=%d, count=%u\n",
-                    static_cast<int>(rc.GetCode()), conn->inflightJettyCount_);
+                    static_cast<int>(rc.GetCode()), UrmaConnectionTestAccess::Inflight(*conn));
     });
     // Give the waiter time to park on the condvar.
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     std::printf("[EVIDENCE] before release: waiter acquired=%d, count=%u (waiter blocked)\n",
-                acquired.load() ? 1 : 0, conn->inflightJettyCount_);
+                acquired.load() ? 1 : 0, UrmaConnectionTestAccess::Inflight(*conn));
     EXPECT_FALSE(acquired.load()) << "waiter must block while cap is saturated";
     conn->ReleaseInflightSlot();
     waiter.join();
     EXPECT_TRUE(acquired.load()) << "waiter woken after release";
-    EXPECT_EQ(conn->inflightJettyCount_, UrmaConnection::MAX_INFLIGHT_JETTIES);
+    EXPECT_EQ(UrmaConnectionTestAccess::Inflight(*conn), UrmaConnectionTestAccess::MaxInflight);
     // Cleanup so the test does not leak a slot into the next case.
     conn->ReleaseInflightSlot();
 }
@@ -145,20 +188,20 @@ TEST(UrmaConnectionInflightTest, PeersAreIsolated)
     // Peer X saturating its cap does not block peer Y.
     auto connX = MakeConnection("peer-X");
     auto connY = MakeConnection("peer-Y");
-    for (uint32_t i = 0; i < UrmaConnection::MAX_INFLIGHT_JETTIES; ++i) {
+    for (uint32_t i = 0; i < UrmaConnectionTestAccess::MaxInflight; ++i) {
         ASSERT_TRUE(connX->AcquireInflightSlot(LONG_BUDGET_US).IsOk());
     }
     std::printf("[EVIDENCE] peer-X saturated at %u; peer-Y count=%u before its acquire\n",
-                connX->inflightJettyCount_, connY->inflightJettyCount_);
+                UrmaConnectionTestAccess::Inflight(*connX), UrmaConnectionTestAccess::Inflight(*connY));
     // Y can still acquire its own slots while X is saturated.
     ASSERT_TRUE(connY->AcquireInflightSlot(LONG_BUDGET_US).IsOk());
     std::printf("[EVIDENCE] peer-Y acquired 1 slot (count=%u) while peer-X still at %u (isolated)\n",
-                connY->inflightJettyCount_, connX->inflightJettyCount_);
-    EXPECT_EQ(connY->inflightJettyCount_, 1u);
+                UrmaConnectionTestAccess::Inflight(*connY), UrmaConnectionTestAccess::Inflight(*connX));
+    EXPECT_EQ(UrmaConnectionTestAccess::Inflight(*connY), 1u);
     // X is still blocked at its cap.
     EXPECT_EQ(connX->AcquireInflightSlot(TINY_BUDGET_US).GetCode(), StatusCode::K_URMA_TRY_AGAIN);
     connY->ReleaseInflightSlot();
-    while (connX->inflightJettyCount_ > 0) {
+    while (UrmaConnectionTestAccess::Inflight(*connX) > 0) {
         connX->ReleaseInflightSlot();
     }
 }
@@ -173,10 +216,10 @@ TEST(UrmaConnectionInflightTest, UnbalancedReleaseDoesNotUnderflow)
     ASSERT_TRUE(conn->AcquireInflightSlot(LONG_BUDGET_US).IsOk());
     conn->ReleaseInflightSlot();
     conn->ReleaseInflightSlot();  // unbalanced double release
-    EXPECT_EQ(conn->inflightJettyCount_, 0u) << "counter must not wrap below zero";
+    EXPECT_EQ(UrmaConnectionTestAccess::Inflight(*conn), 0u) << "counter must not wrap below zero";
     // Peer not frozen: a subsequent acquire still succeeds.
     ASSERT_TRUE(conn->AcquireInflightSlot(LONG_BUDGET_US).IsOk());
-    EXPECT_EQ(conn->inflightJettyCount_, 1u);
+    EXPECT_EQ(UrmaConnectionTestAccess::Inflight(*conn), 1u);
     conn->ReleaseInflightSlot();
 }
 
@@ -191,7 +234,7 @@ TEST(UrmaConnectionInflightTest, BadPeerRotationIsCircuitBroken)
     }
     auto &manager = UrmaManager::Instance();
     ASSERT_TRUE(manager.Init(HostPort("127.0.0.1", 0)).IsOk());
-    auto &resource = *manager.urmaResource_;
+    auto &resource = UrmaConnectionTestAccess::Resource();
     const auto st0 = resource.GetSendJettyPoolStats();
     ASSERT_GT(st0.poolSize, 0u) << "pool must be initialized";
 
@@ -214,8 +257,8 @@ TEST(UrmaConnectionInflightTest, BadPeerRotationIsCircuitBroken)
     }
     std::printf("[EVIDENCE] bad peer retired %d jetties then circuit-broken "
                 "(MAX_RETIRED_JETTIES=%u, pool was %zu)\n",
-                retired, UrmaConnection::MAX_RETIRED_JETTIES, st0.poolSize);
-    EXPECT_EQ(retired, UrmaConnection::MAX_RETIRED_JETTIES) << "damage must be bounded, not the whole pool";
+                retired, UrmaConnectionTestAccess::MaxRetired, st0.poolSize);
+    EXPECT_EQ(retired, UrmaConnectionTestAccess::MaxRetired) << "damage must be bounded, not the whole pool";
     EXPECT_TRUE(bad->IsCircuitBroken());
     // Circuit-broken peer: further acquisition is refused outright.
     auto rc = bad->AcquireInflightSlot(LONG_BUDGET_US);
@@ -236,13 +279,187 @@ TEST(UrmaConnectionInflightTest, BadPeerRotationIsCircuitBroken)
     rebuilt->ReleaseInflightSlot();
 }
 
+class ScopedConnectionEntry {
+public:
+    explicit ScopedConnectionEntry(std::string key) : key_(std::move(key)) {}
+    ~ScopedConnectionEntry() { (void)UrmaManager::Instance().RemoveRemoteDevice(key_); }
+    const std::string &Key() const { return key_; }
+
+private:
+    std::string key_;
+};
+
+void TripBreaker(const std::shared_ptr<UrmaConnection> &connection)
+{
+    for (uint32_t i = 0; i < UrmaConnectionTestAccess::MaxRetired; ++i) {
+        connection->OnJettyRetired();
+    }
+}
+
+TEST(UrmaConnectionInflightTest, BrokenEntryRetainsBudgetUntilCooledDownReplacement)
+{
+    ScopedConnectionEntry entry("breaker-recovery");
+    auto old = MakeConnection();
+    TripBreaker(old);
+    UrmaConnectionTestAccess::Put(entry.Key(), old);
+    auto &manager = UrmaManager::Instance();
+    EXPECT_EQ(manager.CheckUrmaConnectionStable(entry.Key(), "peer-X").GetCode(), K_URMA_TRY_AGAIN);
+    EXPECT_EQ(UrmaConnectionTestAccess::Find(entry.Key()), old);
+    UrmaConnectionTestAccess::ExpireCooldown(*old);
+    EXPECT_EQ(manager.CheckUrmaConnectionStable(entry.Key(), "peer-X").GetCode(), K_URMA_NEED_CONNECT);
+    EXPECT_EQ(UrmaConnectionTestAccess::Find(entry.Key()), old);
+    auto rebuilt = MakeConnection();
+    ASSERT_TRUE(rebuilt->PrepareReplacement(*old).IsOk());
+    UrmaConnectionTestAccess::Put(entry.Key(), rebuilt);
+    EXPECT_TRUE(manager.CheckUrmaConnectionStable(entry.Key(), "peer-X").IsOk());
+    EXPECT_EQ(old->GetUrmaJfrInfo().uniqueInstanceId, "peer-X");
+    EXPECT_EQ(old->AcquireInflightSlot(TINY_BUDGET_US).GetCode(), K_URMA_TRY_AGAIN);
+}
+
+TEST(UrmaConnectionInflightTest, RepeatedFailedGenerationsOnlyAdmitOneProbeAfterCooldown)
+{
+    ScopedConnectionEntry entry("persistent-failure-generations");
+    auto connection = MakeConnection();
+    auto healthy = MakeConnection("healthy");
+    TripBreaker(connection);
+    UrmaConnectionTestAccess::Put(entry.Key(), connection);
+    constexpr uint32_t generations = 3;
+    for (uint32_t generation = 0; generation < generations; ++generation) {
+        auto next = MakeConnection();
+        EXPECT_EQ(next->PrepareReplacement(*connection).GetCode(), K_URMA_TRY_AGAIN);
+        UrmaConnectionTestAccess::ExpireCooldown(*connection);
+        ASSERT_TRUE(next->PrepareReplacement(*connection).IsOk());
+        UrmaConnectionTestAccess::Put(entry.Key(), next);
+        ASSERT_TRUE(next->AcquireInflightSlot(TINY_BUDGET_US).IsOk());
+        EXPECT_EQ(next->AcquireInflightSlot(TINY_BUDGET_US).GetCode(), K_URMA_TRY_AGAIN);
+        ASSERT_TRUE(healthy->AcquireInflightSlot(TINY_BUDGET_US).IsOk());
+        healthy->ReleaseInflightSlot();
+        next->OnJettyRetired();
+        next->ReleaseInflightSlot();
+        EXPECT_TRUE(next->IsCircuitBroken());
+        EXPECT_FALSE(next->CanReconnect());
+        connection = std::move(next);
+    }
+}
+
+TEST(UrmaConnectionInflightTest, OnlyCurrentSuccessfulProbeResetsBudget)
+{
+    auto old = MakeConnection();
+    TripBreaker(old);
+    UrmaConnectionTestAccess::ExpireCooldown(*old);
+    auto next = MakeConnection();
+    ASSERT_TRUE(next->PrepareReplacement(*old).IsOk());
+    ASSERT_TRUE(next->AcquireInflightSlot(TINY_BUDGET_US).IsOk());
+    old->OnTransferFinished(true);
+    EXPECT_EQ(next->AcquireInflightSlot(TINY_BUDGET_US).GetCode(), K_URMA_TRY_AGAIN);
+    next->OnTransferFinished(true);
+    next->ReleaseInflightSlot();
+    for (uint32_t i = 0; i < UrmaConnectionTestAccess::MaxInflight; ++i) {
+        ASSERT_TRUE(next->AcquireInflightSlot(TINY_BUDGET_US).IsOk());
+    }
+    for (uint32_t i = 0; i < UrmaConnectionTestAccess::MaxInflight; ++i) {
+        next->ReleaseInflightSlot();
+    }
+    next->OnJettyRetired();
+    EXPECT_FALSE(next->IsCircuitBroken());
+}
+
+TEST(UrmaConnectionInflightTest, FailedProbeAndChangedInstance)
+{
+    auto old = MakeConnection();
+    TripBreaker(old);
+    UrmaConnectionTestAccess::ExpireCooldown(*old);
+    auto next = MakeConnection();
+    ASSERT_TRUE(next->PrepareReplacement(*old).IsOk());
+    ASSERT_TRUE(next->AcquireInflightSlot(TINY_BUDGET_US).IsOk());
+    next->OnTransferFinished(false);
+    next->ReleaseInflightSlot();
+    EXPECT_TRUE(next->IsCircuitBroken());
+    EXPECT_FALSE(next->CanReconnect());
+    auto restarted = MakeConnection("peer-new-instance");
+    ASSERT_TRUE(restarted->PrepareReplacement(*next).IsOk());
+    EXPECT_FALSE(restarted->IsCircuitBroken());
+    ASSERT_TRUE(restarted->AcquireInflightSlot(TINY_BUDGET_US).IsOk());
+    restarted->ReleaseInflightSlot();
+}
+
+TEST(UrmaConnectionInflightTest, StableCheckAndRemovalDoNotWaitForHeldConnection)
+{
+    ScopedConnectionEntry entry("held-connection");
+    auto held = MakeConnection();
+    TripBreaker(held);
+    UrmaConnectionTestAccess::Put(entry.Key(), held);
+    std::thread remover([&] { EXPECT_TRUE(UrmaManager::Instance().RemoveRemoteDevice(entry.Key()).IsOk()); });
+    remover.join();
+    EXPECT_EQ(UrmaConnectionTestAccess::Find(entry.Key()), nullptr);
+    EXPECT_EQ(held->GetUrmaJfrInfo().uniqueInstanceId, "peer-X");
+    EXPECT_TRUE(held->IsCircuitBroken());
+}
+
+TEST(UrmaConnectionInflightTest, ProbeOutcomeRequiresSuccessfulCompletedWr)
+{
+    auto jetty = MakeOpaqueJetty();
+    UrmaSendLaneLease empty(jetty);
+    empty.Seal();
+    EXPECT_FALSE(empty.CompletedSuccessfully());
+    UrmaSendLaneLease cancelled(jetty);
+    cancelled.AddWr();
+    cancelled.CancelWr();
+    cancelled.Seal();
+    EXPECT_FALSE(cancelled.CompletedSuccessfully());
+    UrmaSendLaneLease failed(jetty);
+    failed.AddWr();
+    failed.CompleteWr(false);
+    failed.Seal();
+    EXPECT_FALSE(failed.CompletedSuccessfully());
+    UrmaSendLaneLease success(jetty);
+    success.AddWr();
+    success.CompleteWr(true);
+    success.Seal();
+    EXPECT_TRUE(success.CompletedSuccessfully());
+}
+
+TEST(UrmaConnectionInflightTest, StabilityCheckDoesNotAcquireWriterWhileReaderIsHeld)
+{
+    ScopedConnectionEntry entry("stable-check-read-lock");
+    auto connection = MakeConnection();
+    TripBreaker(connection);
+    UrmaConnectionTestAccess::ExpireCooldown(*connection);
+    UrmaConnectionTestAccess::Put(entry.Key(), connection);
+    TbbUrmaConnectionMap::const_accessor heldRead;
+    ASSERT_TRUE(UrmaConnectionTestAccess::HoldRead(entry.Key(), heldRead));
+    auto checked = std::async(std::launch::async, [&] {
+        return UrmaManager::Instance().CheckUrmaConnectionStable(entry.Key(), "peer-X");
+    });
+    constexpr auto waitBudget = std::chrono::seconds(1);
+    const auto waitResult = checked.wait_for(waitBudget);
+    heldRead.release();
+    EXPECT_EQ(waitResult, std::future_status::ready);
+    EXPECT_EQ(checked.get().GetCode(), K_URMA_NEED_CONNECT);
+}
+
+TEST(UrmaConnectionInflightTest, SharedLaneOwnsConnectionAfterMapRemoval)
+{
+    ScopedConnectionEntry entry("lane-connection-lifetime");
+    auto connection = MakeConnection();
+    std::weak_ptr<UrmaConnection> weak = connection;
+    UrmaConnectionTestAccess::Put(entry.Key(), connection);
+    auto lane = std::make_shared<UrmaSendLaneLease>(MakeOpaqueJetty(), 0, connection);
+    connection.reset();
+    ASSERT_TRUE(UrmaManager::Instance().RemoveRemoteDevice(entry.Key()).IsOk());
+    EXPECT_FALSE(weak.expired());
+    EXPECT_EQ(lane->GetConnection()->GetUrmaJfrInfo().uniqueInstanceId, "peer-X");
+    lane.reset();
+    EXPECT_TRUE(weak.expired());
+}
+
 TEST(UrmaConnectionInflightTest, NegativeDeadlineRejectedImmediately)
 {
     // A non-positive remaining budget must not block; it returns deadline-exceeded at once.
     auto conn = MakeConnection();
     auto rc = conn->AcquireInflightSlot(0);
     EXPECT_EQ(rc.GetCode(), StatusCode::K_RPC_DEADLINE_EXCEEDED);
-    EXPECT_EQ(conn->inflightJettyCount_, 0u);
+    EXPECT_EQ(UrmaConnectionTestAccess::Inflight(*conn), 0u);
 }
 
 }  // namespace

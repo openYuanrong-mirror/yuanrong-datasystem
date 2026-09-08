@@ -792,12 +792,14 @@ Status UrmaManager::AcquireRecvTarget(uint64_t segAddress, uint64_t segSize, con
     remoteSenderAddr.ParseString(address);
     std::string remoteConnectionId = remoteSenderAddr.ToString();
 
+    std::shared_lock<std::shared_timed_mutex> lock(remoteMapMutex_);
     TbbUrmaConnectionMap::const_accessor connectionAccessor;
     CHECK_FAIL_RETURN_STATUS_PRINT_ERROR(
         urmaConnectionMap_.find(connectionAccessor, remoteConnectionId) && connectionAccessor->second != nullptr,
         K_URMA_NEED_CONNECT,
         FormatString("[AcquireRecvTarget] No exchanged URMA connection for %s; cannot use exchanged recv Jetty",
                      remoteConnectionId));
+    connectionAccessor.release();
 
     std::shared_ptr<UrmaJetty> recvJetty;
     RETURN_IF_NOT_OK_APPEND_MSG(
@@ -1752,6 +1754,7 @@ Status UrmaManager::AcquireSendLaneFromConnection(const std::shared_ptr<UrmaConn
     RETURN_IF_NOT_OK(connection->AcquireInflightSlot(remainingUs));
     auto rc = urmaResource_->AcquireJetty(jetty);
     if (rc.IsError()) {
+        connection->OnTransferFinished(false);
         connection->ReleaseInflightSlot();
         if (rc.GetCode() == K_URMA_TRY_AGAIN) {
             INJECT_POINT("UrmaManager.AcquireSendLaneFromConnection.PoolExhausted");
@@ -1775,6 +1778,7 @@ Status UrmaManager::AcquireSendLaneFromConnection(const std::shared_ptr<UrmaConn
     if (targetJetty == nullptr) {
         urmaResource_->ReleaseJetty(jetty);
         jetty.reset();
+        connection->OnTransferFinished(false);
         connection->ReleaseInflightSlot();
         const auto &jfrInfo = connection->GetUrmaJfrInfo();
         const auto srcAddress = localUrmaInfo_.localAddress.ToString();
@@ -2016,19 +2020,28 @@ Status UrmaManager::ImportRemoteJetty(const UrmaJfrInfo &jfrInfo, uint32_t &loca
         jfrInfo.clientId.empty() ? jfrInfo.localAddress.ToString() : jfrInfo.clientId;
     std::shared_lock<std::shared_timed_mutex> l(remoteMapMutex_);
     // Insert or update the connection (in case the sending worker restarts)
+    std::shared_ptr<UrmaConnection> previous;
     TbbUrmaConnectionMap::accessor accessor;
     auto res = urmaConnectionMap_.insert(accessor, remoteConnectionId);
     if (!res && accessor->second != nullptr) {
-        if (accessor->second->GetUrmaJfrInfo().ToString() == jfrInfo.ToString()) {
+        if (accessor->second->GetUrmaJfrInfo().ToString() == jfrInfo.ToString()
+            && !accessor->second->IsCircuitBroken()) {
             // Identical connection already exists, return existing local Jetty ID
             RETURN_IF_NOT_OK(GetOrCreateLocalJetty(remoteConnectionId, localJettyId, JettyType::RECV));
             return Status::OK();
         }
-        accessor->second->Clear();
+        previous = accessor->second;
+        if (previous->GetUrmaJfrInfo().uniqueInstanceId == jfrInfo.uniqueInstanceId) {
+            CHECK_FAIL_RETURN_STATUS(previous->CanReconnect(), K_URMA_TRY_AGAIN,
+                                     "Peer circuit-broken; reconnect cooldown has not elapsed");
+        }
     }
     bool success = false;
-    Raii raii([&success, &accessor, this]() {
-        if (!success) {
+    Raii raii([&success, &accessor, &previous, res, this]() {
+        if (!success && previous != nullptr) {
+            previous->RequireReconnect();
+        }
+        if (!success && res) {
             LOG(INFO) << "Fail to import remote jfr.";
             urmaConnectionMap_.erase(accessor);
         }
@@ -2041,7 +2054,11 @@ Status UrmaManager::ImportRemoteJetty(const UrmaJfrInfo &jfrInfo, uint32_t &loca
     // Get or create a local JETTY for this connection (reused across reconnections)
     RETURN_IF_NOT_OK(GetOrCreateLocalJetty(remoteConnectionId, localJettyId, JettyType::RECV));
 
-    accessor->second = std::make_shared<UrmaConnection>(std::move(targetJetty), jfrInfo);
+    auto connection = std::make_shared<UrmaConnection>(std::move(targetJetty), jfrInfo);
+    if (previous != nullptr) {
+        RETURN_IF_NOT_OK(connection->PrepareReplacement(*previous));
+    }
+    accessor->second = std::move(connection);
     success = true;
     return Status::OK();
 }
@@ -2065,8 +2082,8 @@ Status UrmaManager::ImportRemoteInfo(const UrmaHandshakeReqPb &req)
         auto rc = accessor->second->ImportRemoteSeg(segInfo, urmaResource_->GetContext(), urmaResource_->GetUrmaToken(),
                                                     importSegmentFlag_);
         if (rc.IsError()) {
-            // clear import jfr and seg to reconnect next time
-            urmaConnectionMap_.erase(accessor);
+            // Retain the peer budget while requesting a new transport after import failure.
+            accessor->second->RequireReconnect();
             LOG(ERROR) << "Failed to import remote segment, remoteConnectionId: " << remoteConnectionId
                        << ", status: " << rc.ToString();
             return rc;
@@ -2114,6 +2131,20 @@ Status UrmaManager::ImportTargetJetty(const UrmaJfrInfo &remoteInfo, std::unique
     return Status::OK();
 }
 
+static Status ImportOutboundSegments(const UrmaHandshakeReqPb &handShake, UrmaConnection &connection,
+                                     UrmaResource &resource, urma_import_seg_flag_t importSegmentFlag)
+{
+    PerfPoint segPoint(PerfKey::URMA_IMPORT_REMOTE_SEGMENT);
+    for (int i = 0; i < handShake.seg_infos_size(); i++) {
+        const auto &segInfo = handShake.seg_infos(i);
+        RETURN_IF_NOT_OK_APPEND_MSG(
+            connection.ImportRemoteSeg(segInfo, resource.GetContext(), resource.GetUrmaToken(), importSegmentFlag),
+            "Failed to import remote segment in FinalizeOutboundConnection");
+    }
+    segPoint.Record();
+    return Status::OK();
+}
+
 Status UrmaManager::FinalizeOutboundConnection(const UrmaHandshakeRspPb &rsp)
 {
     METRIC_TIMER(metrics::KvMetricId::URMA_CONNECTION_SETUP_LATENCY);
@@ -2130,15 +2161,24 @@ Status UrmaManager::FinalizeOutboundConnection(const UrmaHandshakeRspPb &rsp)
     const std::string remoteConnectionId = requestAddress.ToString();
 
     std::shared_lock<std::shared_timed_mutex> l(remoteMapMutex_);
+    std::shared_ptr<UrmaConnection> previous;
     TbbUrmaConnectionMap::accessor accessor;
     auto res = urmaConnectionMap_.insert(accessor, remoteConnectionId);
     if (!res && accessor->second != nullptr) {
-        RETURN_OK_IF_TRUE(accessor->second->GetUrmaJfrInfo().ToString() == remoteInfo.ToString());
-        accessor->second->Clear();
+        RETURN_OK_IF_TRUE(accessor->second->GetUrmaJfrInfo().ToString() == remoteInfo.ToString()
+                         && !accessor->second->IsCircuitBroken());
+        previous = accessor->second;
+        if (previous->GetUrmaJfrInfo().uniqueInstanceId == remoteInfo.uniqueInstanceId) {
+            CHECK_FAIL_RETURN_STATUS(previous->CanReconnect(), K_URMA_TRY_AGAIN,
+                                     "Peer circuit-broken; reconnect cooldown has not elapsed");
+        }
     }
     bool success = false;
-    Raii raii([&success, &accessor, this]() {
-        if (!success) {
+    Raii raii([&success, &accessor, &previous, res, this]() {
+        if (!success && previous != nullptr) {
+            previous->RequireReconnect();
+        }
+        if (!success && res) {
             LOG(INFO) << "Erase outbound connection.";
             urmaConnectionMap_.erase(accessor);
         }
@@ -2148,18 +2188,13 @@ Status UrmaManager::FinalizeOutboundConnection(const UrmaHandshakeRspPb &rsp)
     std::unique_ptr<UrmaTargetJetty> targetJetty;
     RETURN_IF_NOT_OK(ImportTargetJetty(remoteInfo, targetJetty, nullptr));
 
-    accessor->second = std::make_shared<UrmaConnection>(std::move(targetJetty), remoteInfo);
-    auto connection = accessor->second;
+    auto connection = std::make_shared<UrmaConnection>(std::move(targetJetty), remoteInfo);
 
-    // Import remote segments
-    PerfPoint segPoint(PerfKey::URMA_IMPORT_REMOTE_SEGMENT);
-    for (int i = 0; i < handShake.seg_infos_size(); i++) {
-        auto &segInfo = handShake.seg_infos(i);
-        RETURN_IF_NOT_OK_APPEND_MSG(connection->ImportRemoteSeg(segInfo, urmaResource_->GetContext(),
-                                                                urmaResource_->GetUrmaToken(), importSegmentFlag_),
-                                    "Failed to import remote segment in FinalizeOutboundConnection");
+    RETURN_IF_NOT_OK(ImportOutboundSegments(handShake, *connection, *urmaResource_, importSegmentFlag_));
+    if (previous != nullptr) {
+        RETURN_IF_NOT_OK(connection->PrepareReplacement(*previous));
     }
-    segPoint.Record();
+    accessor->second = std::move(connection);
     success = true;
     point.Record();
     return Status::OK();
@@ -2244,11 +2279,13 @@ Status UrmaManager::UrmaWriteImpl(const UrmaWriteArgs &args, std::vector<uint64_
     auto laneLease = externalLaneLease;
     if (ownsLaneLease) {
         RETURN_IF_NOT_OK(AcquireSendLaneFromConnection(args.connection, jetty, targetJetty));
-        laneLease = std::make_shared<UrmaSendLaneLease>(jetty, requestId_.load(std::memory_order_relaxed));
+        laneLease =
+            std::make_shared<UrmaSendLaneLease>(jetty, requestId_.load(std::memory_order_relaxed), args.connection);
         auto registerRc = urmaResource_->RegisterActiveSendLane(laneLease);
         if (registerRc.IsError()) {
             LOG_IF_ERROR(urmaResource_->RetireJetty(jetty),
                          "Failed to retire URMA send Jetty after lane registration failure");
+            args.connection->OnTransferFinished(false);
             args.connection->ReleaseInflightSlot();
             return registerRc;
         }
@@ -2414,17 +2451,19 @@ Status UrmaManager::AcquireSendLane(const UrmaRemoteAddrPb &urmaInfo, std::share
     CHECK_FAIL_RETURN_STATUS_PRINT_ERROR(res, K_RUNTIME_ERROR,
                                          FormatString("Failed to find jfr from %s", remoteConnectionId));
     auto connection = constAccessor->second;
+    constAccessor.release();
     CHECK_FAIL_RETURN_STATUS_PRINT_ERROR(connection != nullptr, K_RUNTIME_ERROR, "Urma connection is null");
     std::shared_ptr<UrmaJetty> jetty;
     urma_target_jetty_t *targetJetty = nullptr;
     RETURN_IF_NOT_OK(AcquireSendLaneFromConnection(connection, jetty, targetJetty));
     CHECK_FAIL_RETURN_STATUS_PRINT_ERROR(targetJetty != nullptr, K_RUNTIME_ERROR,
                                          "Batch Get got empty remote target Jetty");
-    laneLease = std::make_shared<UrmaSendLaneLease>(jetty, requestId_.load(std::memory_order_relaxed));
+    laneLease = std::make_shared<UrmaSendLaneLease>(jetty, requestId_.load(std::memory_order_relaxed), connection);
     auto registerRc = urmaResource_->RegisterActiveSendLane(laneLease);
     if (registerRc.IsError()) {
         LOG_IF_ERROR(urmaResource_->RetireJetty(jetty),
                      "Failed to retire URMA send Jetty after lane registration failure");
+        connection->OnTransferFinished(false);
         connection->ReleaseInflightSlot();
         laneLease.reset();
         return registerRc;
@@ -2488,6 +2527,10 @@ Status UrmaManager::UrmaWritePayloadImpl(const UrmaRemoteAddrPb &urmaInfo, const
     CHECK_FAIL_RETURN_STATUS_PRINT_ERROR(res, K_RUNTIME_ERROR,
                                          FormatString("Failed to find jfr from %s", remoteConnectionId));
     connection = constAccessor->second;
+    constAccessor.release();
+    if (externalLaneLease != nullptr && externalLaneLease->GetJetty() != nullptr) {
+        connection = externalLaneLease->GetConnection();
+    }
     CHECK_FAIL_RETURN_STATUS_PRINT_ERROR(connection != nullptr, K_RUNTIME_ERROR, "Urma connection is null");
 
     point.RecordAndReset(PerfKey::URMA_WRITE_FIND_REMOTE_SEGMENT);
@@ -2508,11 +2551,13 @@ Status UrmaManager::UrmaWritePayloadImpl(const UrmaRemoteAddrPb &urmaInfo, const
         auto laneLease = externalLaneLease;
         if (ownsLaneLease) {
             RETURN_IF_NOT_OK(AcquireSendLaneFromConnection(connection, jetty, targetJetty));
-            laneLease = std::make_shared<UrmaSendLaneLease>(jetty, requestId_.load(std::memory_order_relaxed));
+            laneLease =
+                std::make_shared<UrmaSendLaneLease>(jetty, requestId_.load(std::memory_order_relaxed), connection);
             auto registerRc = urmaResource_->RegisterActiveSendLane(laneLease);
             if (registerRc.IsError()) {
                 LOG_IF_ERROR(urmaResource_->RetireJetty(jetty),
                              "Failed to retire URMA send Jetty after lane registration failure");
+                connection->OnTransferFinished(false);
                 connection->ReleaseInflightSlot();
                 return registerRc;
             }
@@ -2615,7 +2660,8 @@ Status UrmaManager::UrmaRead(const UrmaRemoteAddrPb &urmaInfo, const uint64_t &l
     }
     CHECK_FAIL_RETURN_STATUS_PRINT_ERROR(res, K_RUNTIME_ERROR,
                                          FormatString("Failed to find jfr from %s", remoteConnectionId));
-    auto &connection = constAccessor->second;
+    auto connection = constAccessor->second;
+    constAccessor.release();
     CHECK_FAIL_RETURN_STATUS_PRINT_ERROR(connection != nullptr, K_RUNTIME_ERROR, "Urma connection is null");
     UrmaRemoteSegmentMap::const_accessor remoteSegAccessor;
     RETURN_IF_NOT_OK(connection->GetRemoteSeg(segVa, remoteSegAccessor));
@@ -2631,11 +2677,12 @@ Status UrmaManager::UrmaRead(const UrmaRemoteAddrPb &urmaInfo, const uint64_t &l
     std::shared_ptr<UrmaJetty> jetty;
     urma_target_jetty_t *targetJetty = nullptr;
     RETURN_IF_NOT_OK(AcquireSendLaneFromConnection(connection, jetty, targetJetty));
-    auto laneLease = std::make_shared<UrmaSendLaneLease>(jetty, requestId_.load(std::memory_order_relaxed));
+    auto laneLease = std::make_shared<UrmaSendLaneLease>(jetty, requestId_.load(std::memory_order_relaxed), connection);
     auto registerRc = urmaResource_->RegisterActiveSendLane(laneLease);
     if (registerRc.IsError()) {
         LOG_IF_ERROR(urmaResource_->RetireJetty(jetty),
                      "Failed to retire URMA send Jetty after lane registration failure");
+        connection->OnTransferFinished(false);
         connection->ReleaseInflightSlot();
         return registerRc;
     }
@@ -2728,6 +2775,10 @@ Status UrmaManager::InitGatherWriteContext(const RemoteSegInfo &remoteInfo, size
     CHECK_FAIL_RETURN_STATUS_PRINT_ERROR(
         found, K_RUNTIME_ERROR, FormatString("Failed to find jfr from %s", context.remoteAddress));
     context.connection = context.connectionAccessor->second;
+    context.connectionAccessor.release();
+    if (externalLaneLease != nullptr && externalLaneLease->GetJetty() != nullptr) {
+        context.connection = externalLaneLease->GetConnection();
+    }
     CHECK_FAIL_RETURN_STATUS_PRINT_ERROR(context.connection != nullptr, K_RUNTIME_ERROR, "Urma connection is null");
     RETURN_IF_NOT_OK(context.connection->GetRemoteSeg(remoteInfo.segAddr, context.remoteSegAccessor));
 
@@ -2744,12 +2795,13 @@ Status UrmaManager::InitGatherWriteContext(const RemoteSegInfo &remoteInfo, size
     context.laneLease = externalLaneLease;
     if (context.ownsLaneLease) {
         RETURN_IF_NOT_OK(AcquireSendLaneFromConnection(context.connection, context.jetty, context.targetJetty));
-        context.laneLease =
-            std::make_shared<UrmaSendLaneLease>(context.jetty, requestId_.load(std::memory_order_relaxed));
+        context.laneLease = std::make_shared<UrmaSendLaneLease>(
+            context.jetty, requestId_.load(std::memory_order_relaxed), context.connection);
         auto registerRc = urmaResource_->RegisterActiveSendLane(context.laneLease);
         if (registerRc.IsError()) {
             LOG_IF_ERROR(urmaResource_->RetireJetty(context.jetty),
                          "Failed to retire URMA send Jetty after lane registration failure");
+            context.connection->OnTransferFinished(false);
             context.connection->ReleaseInflightSlot();
             return registerRc;
         }
@@ -3029,13 +3081,12 @@ Status UrmaManager::RemoveRemoteResources(const std::string &connectionKey)
 {
     bool removed = false;
 
+    std::shared_lock<std::shared_timed_mutex> lock(remoteMapMutex_);
+    std::shared_ptr<UrmaConnection> removedConnection;
     TbbUrmaConnectionMap::accessor connectionAccessor;
     if (urmaConnectionMap_.find(connectionAccessor, connectionKey)) {
         LOG(INFO) << "Remove UrmaConnection for " << connectionKey;
-        auto &connection = connectionAccessor->second;
-        if (connection != nullptr) {
-            connection->Clear();
-        }
+        removedConnection = connectionAccessor->second;
         urmaConnectionMap_.erase(connectionAccessor);
         removed = true;
         INJECT_POINT("UrmaManager.RemoveRemoteResources");
@@ -3069,6 +3120,7 @@ Status UrmaManager::StrToEid(const std::string &eid, urma_eid_t &out)
 
 Status UrmaManager::CheckUrmaConnectionStable(const std::string &hostAddress, const std::string &instanceId)
 {
+    std::shared_lock<std::shared_timed_mutex> lock(remoteMapMutex_);
     TbbUrmaConnectionMap::const_accessor constAccessor;
     auto res = urmaConnectionMap_.find(constAccessor, hostAddress);
     if (!res) {
@@ -3081,6 +3133,16 @@ Status UrmaManager::CheckUrmaConnectionStable(const std::string &hostAddress, co
         constAccessor->second != nullptr, K_RUNTIME_ERROR,
         FormatString("Urma connection is null. remoteAddress=%s, remoteInstanceId=%s", hostAddress.c_str(),
                      instanceId.empty() ? "UNKNOWN" : instanceId.c_str()));
+    if (constAccessor->second->IsCircuitBroken()) {
+        if (instanceId.empty() || instanceId == constAccessor->second->GetUrmaJfrInfo().uniqueInstanceId) {
+            CHECK_FAIL_RETURN_STATUS(constAccessor->second->CanReconnect(), K_URMA_TRY_AGAIN,
+                                     "Peer circuit-broken; reconnect cooldown has not elapsed");
+        }
+        LOG_FIRST_AND_EVERY_N(WARNING, K_URMA_WARNING_LOG_EVERY_N)
+            << "[URMA_NEED_CONNECT] Connection circuit-broken for remoteAddress: " << hostAddress
+            << ", remoteInstanceId=" << (instanceId.empty() ? "UNKNOWN" : instanceId) << ", need reconnect.";
+        RETURN_STATUS(K_URMA_NEED_CONNECT, "Urma connection is circuit-broken and needs to be reconnected!");
+    }
     if (!instanceId.empty()) {
         const auto &cachedInstanceId = constAccessor->second->GetUrmaJfrInfo().uniqueInstanceId;
         if (cachedInstanceId != instanceId) {
