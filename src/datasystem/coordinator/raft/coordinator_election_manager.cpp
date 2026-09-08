@@ -585,6 +585,11 @@ void CoordinatorElectionManager::RunBootstrapControl() noexcept
         return;
     }
 
+    LOG(INFO) << "COORDINATOR_RAFT_METADATA_ABSENT current_addr=" << options_.raftFlags.localAddress
+              << " data_dir=" << options_.raftFlags.dataDir
+              << " metadata_state=ABSENT; no local Raft persistence found. If this is a restart, check the data "
+                 "directory and volume mount; restarting an existing member without its Raft data is not a "
+                 "supported recovery path.";
     std::chrono::steady_clock::time_point nextWarningAt{};
     while (!IsBootstrapStopRequested()) {
         std::vector<std::string> normalizedCandidates;
@@ -777,6 +782,14 @@ Status CoordinatorElectionManager::TryBuildCommittedStartPlanLocked(const std::v
         if (std::binary_search(quorumConfirmedPeers->begin(), quorumConfirmedPeers->end(),
                                options_.raftFlags.localAddress)) {
             startPlan = BootstrapPlan{ *quorumConfirmedPeers };
+            LOG(WARNING) << "COORDINATOR_RAFT_EXISTING_MEMBER_WITHOUT_LOCAL_DATA current_addr="
+                         << options_.raftFlags.localAddress << " data_dir=" << options_.raftFlags.dataDir
+                         << " metadata_state=ABSENT committed_peers=" << VectorToString(*quorumConfirmedPeers)
+                         << "; peer quorum confirms this address is already a member, but local Raft persistence "
+                            "is absent. Possible data loss or incorrect data directory/volume mount; in-place "
+                            "recovery is unsupported and log catch-up may stall. Check the original persistent "
+                            "volume before retrying; if data is lost, isolate this instance and replace it with a "
+                            "new endpoint through membership management while the cluster still has quorum.";
         } else {
             startPlan = WaitingToJoinPlan{};
         }
