@@ -174,7 +174,7 @@ TEST_F(MmapManagerTest, TestLookupUnitsAndMmapFdsShmPathWithStubGetClientFd)
 #endif
 }
 
-TEST_F(MmapManagerTest, TestCudaHostMemoryPinRunsInBackground)
+TEST_F(MmapManagerTest, TestCompatibilityConstructorRunsCudaHostMemoryPinInBackground)
 {
 #if defined(__linux__)
     constexpr int mmapSize = 4096;
@@ -189,7 +189,7 @@ TEST_F(MmapManagerTest, TestCudaHostMemoryPinRunsInBackground)
     ASSERT_TRUE(inject::Set("ShmMmapTableEntry.PinHostMemory", "1*sleep(1000)").IsOk());
     Raii clearInject([] { (void)inject::Clear("ShmMmapTableEntry.PinHostMemory"); });
 
-    MmapManager mmapManager(api, false, std::make_shared<HostMemoryPinManager>());
+    MmapManager mmapManager(api, false);
     auto unit = std::make_shared<ShmUnitInfo>(workerFd, static_cast<uint64_t>(mmapSize));
     auto start = std::chrono::steady_clock::now();
     ASSERT_TRUE(mmapManager.LookupUnitsAndMmapFd("tenant_ut", unit).IsOk());

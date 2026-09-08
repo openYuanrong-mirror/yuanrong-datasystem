@@ -54,6 +54,9 @@ public:
  */
 class MmapManager {
 public:
+    // Compatibility path for StreamClient. Object-cache callers must pass the Client-wide pin manager explicitly.
+    explicit MmapManager(std::shared_ptr<IClientWorkerCommonApi> clientWorker, bool enableEmbeddedClient);
+
     explicit MmapManager(std::shared_ptr<IClientWorkerCommonApi> clientWorker, bool enableEmbeddedClient,
                          std::shared_ptr<HostMemoryPinManager> pinManager);
 
