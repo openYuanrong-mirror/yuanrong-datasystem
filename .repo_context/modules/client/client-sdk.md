@@ -113,7 +113,9 @@
     `RegisterClient` because lossless ScaleIn has entered draining while the object still resides there, the direct
     read keeps the metadata-selected Worker and uses bounded transport fallback: UB first when URMA is enabled, then
     TCP. Only transport/capability failures advance the fallback chain; object, authentication, and application errors
-    are returned unchanged. Every candidate shares the public Get deadline and is attempted at most once. The path
+    are returned unchanged. Every candidate shares the public Get deadline and is attempted at most once. A data Worker
+    `K_NOT_FOUND` is terminal because it is returned after Worker-side retries are exhausted; among not-found statuses,
+    only `K_WORKER_PULL_OBJECT_NOT_FOUND` remains eligible for Client replica retry. The path
     covers topology propagation and selection/admission races after the proactive draining-state route takes effect;
     it never falls back to a Worker-to-Worker object RPC. Routed
     Create/MCreate uses a local payload buffer and never resolves a target Worker's fd

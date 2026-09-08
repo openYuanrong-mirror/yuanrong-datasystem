@@ -60,6 +60,20 @@ constexpr int64_t SHM_CONNECT_FAILURE_BACKOFF_INITIAL_MS = 10;
 constexpr int64_t SHM_CONNECT_FAILURE_BACKOFF_MAX_MS = 1000;
 constexpr int64_t SHM_CONNECT_FAILURE_BACKOFF_MULTIPLIER = 2;
 
+void LogShmConnectionFailure(const HostPort &workerAddr, uint64_t attemptId, int64_t retryDelayMs,
+                             uint64_t connectUs, const Status &result, bool becameDegraded)
+{
+    if (!becameDegraded) {
+        VLOG(1) << "[TransportGet][SHM_CONNECTION] SHM remains unavailable; requests can use fallback, worker: "
+                << workerAddr.ToString() << ", attempt: " << attemptId << ", retry_ms: " << retryDelayMs
+                << ", connect_us: " << connectUs << ", status: " << result.ToString();
+        return;
+    }
+    LOG(WARNING) << "[TransportGet][SHM_CONNECTION] SHM unavailable; requests can use fallback, worker: "
+                 << workerAddr.ToString() << ", attempt: " << attemptId << ", retry_ms: " << retryDelayMs
+                 << ", connect_us: " << connectUs << ", status: " << result.ToString();
+}
+
 Status RemainingTimeoutMs(int64_t &timeoutMs)
 {
     const int64_t remainingUs = ApiDeadline::Instance().ApiRemainingUs();
@@ -78,35 +92,8 @@ void CloseFds(std::vector<int> &fds)
     fds.clear();
 }
 
-Status ConnectFdSocket(const HostPort &workerAddr, const std::shared_ptr<WorkerRpcClient> &rpcClient,
-                       const TransportRequestContext &context, ShmFd &socketFd, bool &isScmTcp,
-                       int32_t &serverFd)
+Status ReceiveServerFdImpl(UnixSockFd &socket, bool isScmTcp, int32_t &serverFd)
 {
-    GetSocketPathReqPb pathReq;
-    pathReq.set_token(context.token);
-    pathReq.set_tenant_id(context.tenantId);
-    GetSocketPathRspPb pathRsp;
-    RETURN_IF_NOT_OK(rpcClient->InvokeGetSocketPath(pathReq, pathRsp));
-
-    std::string endpoint;
-    isScmTcp = pathRsp.shm_worker_port() > 0;
-    if (isScmTcp) {
-        endpoint = FormatString("tcp://%s:%d", workerAddr.Host(), pathRsp.shm_worker_port());
-    } else {
-        CHECK_FAIL_RETURN_STATUS(!pathRsp.path().empty(), K_NOT_SUPPORTED,
-                                 "Worker did not provide an fd-passing endpoint");
-        endpoint = FormatString("ipc://%s", pathRsp.path());
-    }
-
-    UnixSockFd socket(RPC_NO_FILE_FD, isScmTcp);
-    Status connectRc = socket.Connect(endpoint);
-    if (connectRc.IsError()) {
-        // UnixSockFd does not close its fd in the destructor. Connect may leave an fd open
-        // after a UDS connect failure or a TCP post-connect socket-option failure.
-        socket.Close();
-        return connectRc;
-    }
-    ShmFd socketOwner(socket.GetFd());
     int64_t remainingMs = 0;
     RETURN_IF_NOT_OK(RemainingTimeoutMs(remainingMs));
     RETURN_IF_NOT_OK(socket.SetTimeout(std::min<int64_t>(STUB_FRONTEND_TIMEOUT, remainingMs)));
@@ -123,7 +110,62 @@ Status ConnectFdSocket(const HostPort &workerAddr, const std::shared_ptr<WorkerR
         CloseFds(probeFds);
         RETURN_IF_NOT_OK_APPEND_MSG(rc, "Receive SCMTCP locality probe failed");
     }
-    RETURN_IF_NOT_OK(socket.SetTimeout(0));
+    return socket.SetTimeout(0);
+}
+
+Status ReceiveServerFd(UnixSockFd &socket, bool isScmTcp, int32_t &serverFd,
+                       TransportPhaseLatencyRecorder *recorder)
+{
+    const auto phaseBegin = recorder == nullptr ? TransportPhaseLatencyRecorder::TimePoint{}
+                                                : recorder->StartPhase();
+    Status rc = ReceiveServerFdImpl(socket, isScmTcp, serverFd);
+    if (recorder != nullptr) {
+        recorder->RecordPhase("shm_fd_socket_handshake", phaseBegin, TransportLatencyThreshold::RPC);
+    }
+    return rc;
+}
+
+Status ConnectFdSocket(const HostPort &workerAddr, const std::shared_ptr<WorkerRpcClient> &rpcClient,
+                       const TransportRequestContext &context, ShmFd &socketFd, bool &isScmTcp,
+                       int32_t &serverFd, TransportPhaseLatencyRecorder *recorder)
+{
+    GetSocketPathReqPb pathReq;
+    pathReq.set_token(context.token);
+    pathReq.set_tenant_id(context.tenantId);
+    GetSocketPathRspPb pathRsp;
+    const auto getPathBegin = recorder == nullptr ? TransportPhaseLatencyRecorder::TimePoint{}
+                                                  : recorder->StartPhase();
+    Status rc = rpcClient->InvokeGetSocketPath(pathReq, pathRsp);
+    if (recorder != nullptr) {
+        recorder->RecordPhase("shm_get_socket_path", getPathBegin, TransportLatencyThreshold::RPC);
+    }
+    RETURN_IF_NOT_OK(rc);
+
+    std::string endpoint;
+    isScmTcp = pathRsp.shm_worker_port() > 0;
+    if (isScmTcp) {
+        endpoint = FormatString("tcp://%s:%d", workerAddr.Host(), pathRsp.shm_worker_port());
+    } else {
+        CHECK_FAIL_RETURN_STATUS(!pathRsp.path().empty(), K_NOT_SUPPORTED,
+                                 "Worker did not provide an fd-passing endpoint");
+        endpoint = FormatString("ipc://%s", pathRsp.path());
+    }
+
+    UnixSockFd socket(RPC_NO_FILE_FD, isScmTcp);
+    const auto connectBegin = recorder == nullptr ? TransportPhaseLatencyRecorder::TimePoint{}
+                                                  : recorder->StartPhase();
+    Status connectRc = socket.Connect(endpoint);
+    if (recorder != nullptr) {
+        recorder->RecordPhase("shm_fd_socket_connect", connectBegin, TransportLatencyThreshold::RPC);
+    }
+    if (connectRc.IsError()) {
+        // UnixSockFd does not close its fd in the destructor. Connect may leave an fd open
+        // after a UDS connect failure or a TCP post-connect socket-option failure.
+        socket.Close();
+        return connectRc;
+    }
+    ShmFd socketOwner(socket.GetFd());
+    RETURN_IF_NOT_OK(ReceiveServerFd(socket, isScmTcp, serverFd, recorder));
     socketFd.Reset(socketOwner.Release());
     return Status::OK();
 }
@@ -262,17 +304,23 @@ Status ShmSession::Create(const HostPort &workerAddr, const std::shared_ptr<Work
                           const TransportRequestContext &context, std::weak_ptr<ThreadPool> releasePool,
                           std::shared_ptr<std::atomic<bool>> scaleInDraining,
                           const std::shared_ptr<HostMemoryPinManager> &hostMemoryPinManager,
-                          std::shared_ptr<ShmSession> &session)
+                          std::shared_ptr<ShmSession> &session, TransportPhaseLatencyRecorder *recorder)
 {
     session.reset();
     RETURN_RUNTIME_ERROR_IF_NULL(rpcClient);
     ShmFd socketFd;
     bool isScmTcp = false;
     int32_t serverFd = INVALID_SHM_FD;
-    RETURN_IF_NOT_OK(ConnectFdSocket(workerAddr, rpcClient, context, socketFd, isScmTcp, serverFd));
+    RETURN_IF_NOT_OK(ConnectFdSocket(workerAddr, rpcClient, context, socketFd, isScmTcp, serverFd, recorder));
 
     RegisterClientRspPb response;
-    RETURN_IF_NOT_OK(RegisterShmClient(rpcClient, context, serverFd, response));
+    const auto registerBegin = recorder == nullptr ? TransportPhaseLatencyRecorder::TimePoint{}
+                                                   : recorder->StartPhase();
+    Status registerRc = RegisterShmClient(rpcClient, context, serverFd, response);
+    if (recorder != nullptr) {
+        recorder->RecordPhase("shm_register_client", registerBegin, TransportLatencyThreshold::RPC);
+    }
+    RETURN_IF_NOT_OK(registerRc);
     CHECK_FAIL_RETURN_STATUS(!response.client_id().empty(), K_RUNTIME_ERROR,
                              "RegisterClient returned an empty client ID");
     CHECK_FAIL_RETURN_STATUS(!response.unhealthy(), K_NOT_READY,
@@ -745,9 +793,13 @@ Status ShmConnection::WaitForConnecting(std::unique_lock<bthread::Mutex> &lock)
 }
 
 Status ShmConnection::CompleteConnectionAttempt(uint64_t attemptId, const std::shared_ptr<ShmSession> &candidate,
-                                                Status result, std::shared_ptr<ShmSession> &session)
+                                                Status result, uint64_t connectUs,
+                                                std::shared_ptr<ShmSession> &session)
 {
     bool publish = false;
+    bool becameDegraded = false;
+    bool recovered = false;
+    int64_t retryDelayMs = 0;
     {
         std::lock_guard<bthread::Mutex> lock(mutex_);
         connecting_ = false;
@@ -756,12 +808,15 @@ Status ShmConnection::CompleteConnectionAttempt(uint64_t attemptId, const std::s
         }
         publish = result.IsOk() && !closed_ && attemptId == attemptId_;
         if (publish) {
+            recovered = retryAfter_ != std::chrono::steady_clock::time_point{};
             session_ = candidate;
             session = candidate;
             failureBackoffMs_ = SHM_CONNECT_FAILURE_BACKOFF_INITIAL_MS;
             retryAfter_ = {};
         } else if (result.IsError() && !closed_) {
+            becameDegraded = retryAfter_ == std::chrono::steady_clock::time_point{};
             lastConnectFailure_ = result;
+            retryDelayMs = failureBackoffMs_;
             retryAfter_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(failureBackoffMs_);
             failureBackoffMs_ = std::min<int64_t>(failureBackoffMs_ * SHM_CONNECT_FAILURE_BACKOFF_MULTIPLIER,
                                                   SHM_CONNECT_FAILURE_BACKOFF_MAX_MS);
@@ -770,6 +825,15 @@ Status ShmConnection::CompleteConnectionAttempt(uint64_t attemptId, const std::s
     }
     if (!publish && candidate != nullptr) {
         candidate->Close(true);
+    }
+    if (result.IsError() && retryDelayMs > 0 && !IsWorkerDrainingForScaleIn(result)) {
+        LogShmConnectionFailure(workerAddr_, attemptId, retryDelayMs, connectUs, result, becameDegraded);
+    } else if (publish && recovered) {
+        LOG(INFO) << "[TransportGet][SHM_CONNECTION] SHM recovered; new requests prefer SHM, worker: "
+                  << workerAddr_.ToString() << ", attempt: " << attemptId << ", connect_us: " << connectUs;
+    } else if (publish) {
+        VLOG(1) << "[TransportGet][SHM_CONNECTION] SHM connected, worker: " << workerAddr_.ToString()
+                << ", attempt: " << attemptId << ", connect_us: " << connectUs;
     }
     if (result.IsError()) {
         return result;
@@ -780,37 +844,94 @@ Status ShmConnection::CompleteConnectionAttempt(uint64_t attemptId, const std::s
 
 Status ShmConnection::Acquire(const TransportRequestContext &context, std::shared_ptr<ShmSession> &session)
 {
+    return AcquireImpl(context, true, session);
+}
+
+Status ShmConnection::TryAcquire(const TransportRequestContext &context, std::shared_ptr<ShmSession> &session,
+                                 TransportPhaseLatencyRecorder *recorder)
+{
+    return AcquireImpl(context, false, session, recorder);
+}
+
+Status ShmConnection::WaitForExistingAttempt(std::unique_lock<bthread::Mutex> &lock, bool waitForConnecting,
+                                             TransportPhaseLatencyRecorder *recorder)
+{
+    if (!waitForConnecting && connecting_ && !closed_) {
+        return Status(K_TRY_AGAIN, "Shared-memory connection establishment is in progress");
+    }
+    if (!connecting_ || closed_) {
+        return Status::OK();
+    }
+    const auto waitBegin = recorder == nullptr ? TransportPhaseLatencyRecorder::TimePoint{}
+                                               : recorder->StartPhase();
+    while (connecting_ && !closed_) {
+        Status waitRc = WaitForConnecting(lock);
+        if (waitRc.IsError()) {
+            if (recorder != nullptr) {
+                recorder->RecordPhase("shm_connection_singleflight_wait", waitBegin,
+                                      TransportLatencyThreshold::PROCESS);
+            }
+            return waitRc;
+        }
+    }
+    if (recorder != nullptr) {
+        recorder->RecordPhase("shm_connection_singleflight_wait", waitBegin, TransportLatencyThreshold::PROCESS);
+    }
+    return Status::OK();
+}
+
+Status ShmConnection::PrepareAcquire(bool waitForConnecting, uint64_t &attemptId, bool &startConnection,
+                                     std::shared_ptr<ShmSession> &session,
+                                     TransportPhaseLatencyRecorder *recorder)
+{
+    startConnection = false;
+    const auto lockBegin = recorder == nullptr ? TransportPhaseLatencyRecorder::TimePoint{}
+                                               : recorder->StartPhase();
+    std::unique_lock<bthread::Mutex> lock(mutex_);
+    if (recorder != nullptr) {
+        recorder->RecordPhase("shm_connection_lock_wait", lockBegin, TransportLatencyThreshold::PROCESS);
+    }
+    RETURN_IF_NOT_OK(WaitForExistingAttempt(lock, waitForConnecting, recorder));
+    CHECK_FAIL_RETURN_STATUS(!closed_, K_SHUTTING_DOWN, "Shared-memory connection is closed");
+    if (scaleInDraining_->load(std::memory_order_acquire)) {
+        return Status(K_NOT_READY, WORKER_DRAINING_FOR_SCALE_IN_MESSAGE);
+    }
+    if (session_ != nullptr && session_->IsAlive()) {
+        session = session_;
+        return Status::OK();
+    }
+    if (std::chrono::steady_clock::now() < retryAfter_) {
+        return lastConnectFailure_;
+    }
+    connecting_ = true;
+    attemptId = ++attemptId_;
+    startConnection = true;
+    return Status::OK();
+}
+
+Status ShmConnection::AcquireImpl(const TransportRequestContext &context, bool waitForConnecting,
+                                  std::shared_ptr<ShmSession> &session,
+                                  TransportPhaseLatencyRecorder *recorder)
+{
     session.reset();
     uint64_t attemptId = 0;
-    {
-        std::unique_lock<bthread::Mutex> lock(mutex_);
-        bool keepWaiting = connecting_ && !closed_;
-        while (keepWaiting) {
-            // WaitForConnecting blocks on the cv until the in-flight connect publishes a result
-            // (connecting_/closed_ flip under mutex_) or the API deadline expires (returns error).
-            RETURN_IF_NOT_OK(WaitForConnecting(lock));
-            // Re-read the control flags after the cv wait released and reacquired mutex_.
-            keepWaiting = connecting_ && !closed_;
-        }
-        CHECK_FAIL_RETURN_STATUS(!closed_, K_SHUTTING_DOWN, "Shared-memory connection is closed");
-        if (scaleInDraining_->load(std::memory_order_acquire)) {
-            return Status(K_NOT_READY, WORKER_DRAINING_FOR_SCALE_IN_MESSAGE);
-        }
-        if (session_ != nullptr && session_->IsAlive()) {
-            session = session_;
-            return Status::OK();
-        }
-        if (std::chrono::steady_clock::now() < retryAfter_) {
-            return lastConnectFailure_;
-        }
-        connecting_ = true;
-        attemptId = ++attemptId_;
+    bool startConnection = false;
+    RETURN_IF_NOT_OK(PrepareAcquire(waitForConnecting, attemptId, startConnection, session, recorder));
+    if (!startConnection) {
+        return Status::OK();
     }
 
     std::shared_ptr<ShmSession> candidate;
+    const auto connectBegin = std::chrono::steady_clock::now();
     Status result = ShmSession::Create(workerAddr_, rpcClient_, context, releasePool_, scaleInDraining_,
-                                       hostMemoryPinManager_, candidate);
-    return CompleteConnectionAttempt(attemptId, candidate, std::move(result), session);
+                                       hostMemoryPinManager_, candidate, recorder);
+    const auto connectUs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                    std::chrono::steady_clock::now() - connectBegin)
+                                                    .count());
+    if (recorder != nullptr) {
+        recorder->RecordPhase("shm_session_create", connectUs, TransportLatencyThreshold::RPC);
+    }
+    return CompleteConnectionAttempt(attemptId, candidate, std::move(result), connectUs, session);
 }
 
 bool ShmConnection::IsAlive() const

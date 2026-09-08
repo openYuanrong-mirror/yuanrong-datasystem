@@ -1391,7 +1391,7 @@ TEST_F(KVClientTransportGetTest, LocalCacheGetStaysOnBoundWorkerWhenCrossNodeCon
     ASSERT_EQ(after.queryAndGet, before.queryAndGet);
 }
 
-TEST_F(KVClientTransportGetWithShmTest, NonBoundSameHostWorkerUsesWorkerOcFdPassing)
+TEST_F(KVClientTransportGetWithShmTest, NonBoundSameHostConcurrentGetSupportsNonBlockingShmStartup)
 {
     std::vector<std::string> keys;
     GetRealHashKeysToWorker(META_OWNER_INDEX, 1, keys);
@@ -1431,7 +1431,9 @@ TEST_F(KVClientTransportGetWithShmTest, NonBoundSameHostWorkerUsesWorkerOcFdPass
     GetRpcCounts(after);
 
     ASSERT_EQ(after.queryAndGet, before.queryAndGet + CONCURRENT_GET_COUNT);
-    ASSERT_EQ(after.workerOcGet, before.workerOcGet);
+    // The connection owner uses SHM; followers may use local fallback instead of waiting for SHM establishment.
+    ASSERT_GE(after.workerOcGet, before.workerOcGet);
+    ASSERT_LT(after.workerOcGet, before.workerOcGet + CONCURRENT_GET_COUNT);
     ASSERT_EQ(after.getObjectRemote, before.getObjectRemote);
     ASSERT_EQ(after.batchGetObjectRemote, before.batchGetObjectRemote);
     ASSERT_EQ(after.registerShmClient, before.registerShmClient + 1);

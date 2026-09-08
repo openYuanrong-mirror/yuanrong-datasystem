@@ -1130,12 +1130,13 @@ public:
     }
 
     Status QueryAndGet(const HostPort &address, const ObjectMetadataBatch &items,
-                       std::shared_ptr<const TransportReadContext>) override
+                       std::shared_ptr<const TransportReadContext>, bool traceEnabled) override
     {
         {
             std::lock_guard<std::mutex> lock(mutex);
             addresses.push_back(address);
             threadIds.push_back(std::this_thread::get_id());
+            traceDecisions.push_back(traceEnabled);
             keyGroups.emplace_back();
             for (const auto *item : items) {
                 keyGroups.back().push_back(item->objectKey);
@@ -1182,6 +1183,7 @@ public:
     std::vector<HostPort> addresses;
     std::vector<std::vector<std::string>> keyGroups;
     std::vector<std::thread::id> threadIds;
+    std::vector<bool> traceDecisions;
     std::unordered_map<std::string, Status> groupStatuses;
     std::unordered_map<std::string, Status> itemStatuses;
     std::unordered_map<std::string, AccessTransportKind> inlineKinds;
@@ -1423,8 +1425,9 @@ TEST(UbConnectionTest, PayloadOnlyClientBatchGetCapabilityDefaultsToFalse)
 
 class TestTransportLayer : public TransportLayer {
 public:
-    explicit TestTransportLayer(std::shared_ptr<DataPlaneManager> dataPlaneManager)
-        : TransportLayer(std::move(dataPlaneManager), std::make_shared<TransportAdvisor>())
+    explicit TestTransportLayer(std::shared_ptr<DataPlaneManager> dataPlaneManager,
+                                std::shared_ptr<TransportAdvisor> advisor = std::make_shared<TransportAdvisor>())
+        : TransportLayer(std::move(dataPlaneManager), std::move(advisor))
     {
     }
 
@@ -1637,6 +1640,40 @@ TEST(ShmConnectionTest, VoluntaryScaleDownDoesNotReconnectSharedMemory)
     EXPECT_EQ(acquired, nullptr);
     releasePool.reset();
     EXPECT_EQ(rpcClient->shmDisconnectInvokeCount.load(), 1);
+}
+
+TEST(ShmConnectionTest, TryAcquireDoesNotWaitForConcurrentConnectionAttempt)
+{
+    ApiDeadlineGuard deadline(1000);
+    auto rpcClient = std::make_shared<AuthBoundaryWorkerRpcClient>(MakeSignature());
+    ShmConnection connection(MakeAddress(9001), rpcClient, std::weak_ptr<ThreadPool>{});
+    connection.connecting_ = true;
+    std::shared_ptr<ShmSession> acquired;
+
+    const Status rc = connection.TryAcquire(MakeRequestContext(), acquired);
+
+    EXPECT_EQ(rc.GetCode(), K_TRY_AGAIN);
+    EXPECT_EQ(acquired, nullptr);
+    EXPECT_EQ(rpcClient->getSocketPathInvokeCount, 0);
+    connection.connecting_ = false;
+}
+
+TEST(ShmConnectionTest, FailedTryAcquirePreservesCauseAndBacksOffReconnect)
+{
+    ApiDeadlineGuard deadline(1000);
+    auto rpcClient = std::make_shared<AuthBoundaryWorkerRpcClient>(MakeSignature());
+    ShmConnection connection(MakeAddress(9001), rpcClient, std::weak_ptr<ThreadPool>{});
+    std::shared_ptr<ShmSession> acquired;
+
+    const Status first = connection.TryAcquire(MakeRequestContext(), acquired);
+    const Status second = connection.TryAcquire(MakeRequestContext(), acquired);
+
+    EXPECT_EQ(first.GetCode(), K_RUNTIME_ERROR);
+    EXPECT_EQ(second.GetCode(), first.GetCode());
+    EXPECT_EQ(second.GetMsg(), first.GetMsg());
+    EXPECT_EQ(rpcClient->getSocketPathInvokeCount, 1);
+    EXPECT_NE(connection.retryAfter_, std::chrono::steady_clock::time_point{});
+    EXPECT_EQ(acquired, nullptr);
 }
 
 TEST(WorkerRpcClientTest, ShmDisconnectUsesBoundedSignedWorkerServiceRequest)
@@ -2455,7 +2492,7 @@ TEST(DataPlaneManagerTest, TransportKindChangeReusesRpcClient)
     EXPECT_EQ(manager.transportBuildCount, 2);
 }
 
-TEST(DataPlaneManagerTest, ShmToUbFallbackRebuildsSingleTransporterOnDemand)
+TEST(DataPlaneManagerTest, ShmToUbFallbackRetainsBothTransporters)
 {
     FakeDataPlaneManager manager;
     std::shared_ptr<IDataTransporter> firstShm;
@@ -2467,10 +2504,54 @@ TEST(DataPlaneManagerTest, ShmToUbFallbackRebuildsSingleTransporterOnDemand)
     ASSERT_TRUE(manager.GetOrCreate(address, TransportHint::UB_CANDIDATE, ub).IsOk());
     ASSERT_TRUE(manager.GetOrCreate(address, TransportHint::SHM_CANDIDATE, secondShm).IsOk());
 
-    EXPECT_NE(firstShm, secondShm);
+    EXPECT_EQ(firstShm, secondShm);
     EXPECT_NE(firstShm, ub);
     EXPECT_EQ(manager.rpcBuildCount, 1);
-    EXPECT_EQ(manager.transportBuildCount, 3);
+    EXPECT_EQ(manager.transportBuildCount, 2);
+}
+
+TEST(DataPlaneManagerTest, ResetClosesRetainedShmAndUbTransporters)
+{
+    FakeDataPlaneManager manager;
+    std::shared_ptr<IDataTransporter> shm;
+    std::shared_ptr<IDataTransporter> ub;
+    const HostPort address = MakeAddress(2030);
+
+    ASSERT_TRUE(manager.GetOrCreate(address, TransportHint::SHM_CANDIDATE, shm).IsOk());
+    ASSERT_TRUE(manager.GetOrCreate(address, TransportHint::UB_CANDIDATE, ub).IsOk());
+    manager.ResetDataPlane(address);
+
+    auto fakeShm = std::dynamic_pointer_cast<FakeTransporter>(shm);
+    auto fakeUb = std::dynamic_pointer_cast<FakeTransporter>(ub);
+    ASSERT_NE(fakeShm, nullptr);
+    ASSERT_NE(fakeUb, nullptr);
+    EXPECT_EQ(fakeShm->closeCount, 1);
+    EXPECT_EQ(fakeUb->closeCount, 1);
+}
+
+TEST(DataPlaneManagerTest, ResetUbTransporterRetainsShmTransporter)
+{
+    FakeDataPlaneManager manager;
+    std::shared_ptr<IDataTransporter> shm;
+    std::shared_ptr<IDataTransporter> ub;
+    std::shared_ptr<IDataTransporter> reusedShm;
+    std::shared_ptr<IDataTransporter> rebuiltUb;
+    const HostPort address = MakeAddress(2031);
+
+    ASSERT_TRUE(manager.GetOrCreate(address, TransportHint::SHM_CANDIDATE, shm).IsOk());
+    ASSERT_TRUE(manager.GetOrCreate(address, TransportHint::UB_CANDIDATE, ub).IsOk());
+    manager.ResetTransporter(address, AccessTransportKind::UB);
+    ASSERT_TRUE(manager.GetOrCreate(address, TransportHint::SHM_CANDIDATE, reusedShm).IsOk());
+    ASSERT_TRUE(manager.GetOrCreate(address, TransportHint::UB_CANDIDATE, rebuiltUb).IsOk());
+
+    auto fakeShm = std::dynamic_pointer_cast<FakeTransporter>(shm);
+    auto fakeUb = std::dynamic_pointer_cast<FakeTransporter>(ub);
+    ASSERT_NE(fakeShm, nullptr);
+    ASSERT_NE(fakeUb, nullptr);
+    EXPECT_EQ(reusedShm, shm);
+    EXPECT_NE(rebuiltUb, ub);
+    EXPECT_EQ(fakeShm->closeCount, 0);
+    EXPECT_EQ(fakeUb->closeCount, 1);
 }
 
 TEST(DataPlaneManagerTest, StaleShmHintDoesNotReplaceUbAfterScaleInDrain)
@@ -3159,7 +3240,7 @@ TEST(ObjectMetadataClientTest, UbInlineDataUsesConfiguredCapacityAndExternalBuff
 }
 
 #ifdef USE_URMA
-TEST(ObjectMetadataClientTest, ShmPreparationFailureTriesUbBeforeTcp)
+TEST(ObjectMetadataClientTest, ShmPreparationFailureReusesShmAndUbTransporters)
 {
     ApiDeadlineGuard deadline(1000);
     const bool enableUrma = FLAGS_enable_urma;
@@ -3170,7 +3251,7 @@ TEST(ObjectMetadataClientTest, ShmPreparationFailureTriesUbBeforeTcp)
     manager->queryAndGetHandler = [](const HostPort &, const QueryAndGetReqPb &request,
                                      QueryAndGetRspPb &response, std::vector<RpcMessage> &) {
         EXPECT_TRUE(request.data_request().has_ub());
-        AddLocation(response, "key", MakeAddress(51), 6);
+        AddLocation(response, request.object_keys(0), MakeAddress(51), 6);
         return Status::OK();
     };
     ObjectMetadataClient metadata(manager, std::make_shared<DeadlineRetry>(),
@@ -3181,8 +3262,11 @@ TEST(ObjectMetadataClientTest, ShmPreparationFailureTriesUbBeforeTcp)
     auto readContext = std::make_shared<TransportReadContext>();
 
     ASSERT_TRUE(metadata.QueryAndGet(MakeAddress(41), batch, readContext).IsOk());
+    auto secondResults = MakeMetadataItems({ { 0, "second-key", MakeAddress(41) } });
+    auto secondBatch = MakeMetadataBatch(secondResults);
+    ASSERT_TRUE(metadata.QueryAndGet(MakeAddress(41), secondBatch, readContext).IsOk());
     EXPECT_EQ(manager->transportBuildCount, 2);
-    EXPECT_EQ(bufferProvider->allocateCount, 1);
+    EXPECT_EQ(bufferProvider->allocateCount, 2);
 }
 #endif
 
@@ -3413,6 +3497,7 @@ TEST(ObjectReadFlowTest, RecordsDirectReadLatencyTicksWhenEnabled)
                                         Trace::Instance().GetLatencyTickDroppedCount());
     EXPECT_NE(phases.Find(LatencySummaryPhase::CLIENT_RPC_DIRECT_QUERY_AND_GET), nullptr);
     EXPECT_NE(phases.Find(LatencySummaryPhase::CLIENT_RPC_DIRECT_GET_DATA), nullptr);
+    EXPECT_EQ(metadata->traceDecisions, std::vector<bool>({ true }));
     EXPECT_EQ(replicas->traceDecisions, std::vector<bool>({ true }));
 }
 
@@ -6425,11 +6510,11 @@ TEST(ReplicaReaderTest, EnablesTransportPhaseRecordingOnlyForTracedRequest)
     EXPECT_EQ(manager->transportBuildTraceEnabled, std::vector<bool>({ false, true }));
 }
 
-TEST(ReplicaReaderTest, StopsOnNonRetryableLocationError)
+TEST(ReplicaReaderTest, StopsOnNotFoundWithoutTryingNextLocation)
 {
     ApiDeadlineGuard deadline(1000);
     auto manager = std::make_shared<FakeDataPlaneManager>();
-    manager->transporterGetStatuses = { { Status(K_INVALID, "invalid") } };
+    manager->transporterGetStatuses = { { Status(K_NOT_FOUND, "missing") }, { Status::OK() } };
     auto executor = std::make_shared<DataPlaneExecutor>(manager, std::make_shared<TransportAdvisor>());
     ReplicaReader reader(executor, std::make_shared<DeadlineRetry>(), std::make_shared<ThreadPool>(1));
     master::ObjectLocationInfoPb location;
@@ -6439,7 +6524,7 @@ TEST(ReplicaReaderTest, StopsOnNonRetryableLocationError)
     location.add_object_locations(MakeAddress(34).ToString());
     ObjectReadItemResult result;
 
-    EXPECT_EQ(reader.Read(location, result, MakeReadContext()).GetCode(), K_INVALID);
+    EXPECT_EQ(reader.Read(location, result, MakeReadContext()).GetCode(), K_NOT_FOUND);
     EXPECT_EQ(manager->transportBuildCount, 1);
 }
 
@@ -6447,7 +6532,7 @@ TEST(ReplicaReaderTest, StartsAnotherRoundWithoutRefreshingMetadata)
 {
     ApiDeadlineGuard deadline(1000);
     auto manager = std::make_shared<FakeDataPlaneManager>();
-    manager->transporterGetStatuses = { { Status(K_NOT_FOUND, "first") },
+    manager->transporterGetStatuses = { { Status(K_RPC_CANCELLED, "first") },
                                         { Status(K_RPC_CANCELLED, "second") } };
     auto executor = std::make_shared<DataPlaneExecutor>(manager, std::make_shared<TransportAdvisor>());
     ReplicaReader reader(executor, std::make_shared<DeadlineRetry>(), std::make_shared<ThreadPool>(1));
@@ -6579,7 +6664,7 @@ TEST(ReplicaReaderTest, BatchRetryableItemsRegroupAtNextReplicaAndSuccessfulPeer
     manager->configureTransporter = [](const HostPort &address, FakeTransporter &transporter) {
         if (address.ToString() == MakeAddress(45).ToString()
             || address.ToString() == MakeAddress(46).ToString()) {
-            transporter.getStatuses = { Status(K_NOT_FOUND, "first replica missing") };
+            transporter.getStatuses = { Status(K_WORKER_PULL_OBJECT_NOT_FOUND, "first replica missing") };
         }
     };
     auto executor = std::make_shared<DataPlaneExecutor>(manager, std::make_shared<TransportAdvisor>());
@@ -6781,7 +6866,7 @@ TEST(ReplicaReaderTest, BatchMixedItemStatusesTransitionIndependently)
                 EXPECT_EQ(inputs.size(), 3u);
                 outputs.resize(3);
                 outputs[0].status = Status::OK();
-                outputs[1].status = Status(K_NOT_FOUND, "retry next replica");
+                outputs[1].status = Status(K_WORKER_PULL_OBJECT_NOT_FOUND, "retry next replica");
                 outputs[2].status = Status(K_INVALID, "terminal");
                 return Status::OK();
             };
@@ -6825,23 +6910,26 @@ TEST(ReplicaReaderTest, BatchInvalidItemsDoNotCorruptValidPeer)
     EXPECT_TRUE(validResult.status.IsOk());
 }
 
-TEST(ReplicaReaderTest, BatchNonRetryableItemTerminatesWithoutTryingNextReplica)
+TEST(ReplicaReaderTest, BatchNotFoundTerminatesWithoutTryingNextReplica)
 {
+    InitBatchGetMetrics();
     ApiDeadlineGuard deadline(1000);
     auto manager = std::make_shared<FakeDataPlaneManager>();
     manager->configureTransporter = [](const HostPort &address, FakeTransporter &transporter) {
         if (address.ToString() == MakeAddress(59).ToString()) {
-            transporter.getStatuses = { Status(K_INVALID, "terminal") };
+            transporter.getStatuses = { Status(K_NOT_FOUND, "missing") };
         }
     };
     auto executor = std::make_shared<DataPlaneExecutor>(manager, std::make_shared<TransportAdvisor>());
-    ReplicaReader reader(executor, std::make_shared<DeadlineRetry>(), std::make_shared<ThreadPool>(1));
+    ControlledReplicaReader reader(executor, std::make_shared<ThreadPool>(1));
     auto location = MakeReplicaLocation("key", 1, { MakeAddress(59), MakeAddress(60) });
     ObjectReadItemResult result;
 
-    EXPECT_EQ(reader.ReadBatch({ MakeReplicaReadRequest(&location, &result) }).GetCode(), K_INVALID);
-    EXPECT_EQ(result.status.GetCode(), K_INVALID);
+    EXPECT_EQ(reader.ReadBatch({ MakeReplicaReadRequest(&location, &result) }).GetCode(), K_NOT_FOUND);
+    EXPECT_EQ(result.status.GetCode(), K_NOT_FOUND);
     EXPECT_EQ(manager->transportBuildCount, 1);
+    EXPECT_EQ(reader.backoffCount, 0);
+    ExpectMetricAbsent("client_direct_batch_get_replica_retry_total");
 }
 
 TEST(ReplicaReaderTest, BatchStaleTransportSnapshotAdvancesReplica)
@@ -6942,7 +7030,7 @@ TEST(ReplicaReaderTest, BatchBacksOffOnceAfterAllUnresolvedItemsCompleteReplicaR
                                   || address.ToString() == MakeAddress(63).ToString();
         transporter.getHandler = [count, firstReplica](const DataGetRequest &, DataGetResult &) {
             const int invocation = count->fetch_add(1);
-            return firstReplica && invocation > 0 ? Status::OK() : Status(K_NOT_FOUND, "round miss");
+            return firstReplica && invocation > 0 ? Status::OK() : Status(K_RPC_CANCELLED, "round retry");
         };
     };
     auto executor = std::make_shared<DataPlaneExecutor>(manager, std::make_shared<TransportAdvisor>());
@@ -6971,16 +7059,16 @@ TEST(ReplicaReaderTest, BatchDifferingReplicaCountsShareBackoffAfterLongestRound
     manager->configureTransporter = [=](const HostPort &address, FakeTransporter &transporter) {
         if (address.ToString() == MakeAddress(75).ToString()) {
             transporter.getHandler = [shortCalls](const DataGetRequest &, DataGetResult &) {
-                return shortCalls->fetch_add(1) == 0 ? Status(K_NOT_FOUND, "short round miss") : Status::OK();
+                return shortCalls->fetch_add(1) == 0 ? Status(K_RPC_CANCELLED, "short round retry") : Status::OK();
             };
         } else if (address.ToString() == MakeAddress(76).ToString()) {
             transporter.getHandler = [firstLongCalls](const DataGetRequest &, DataGetResult &) {
-                return firstLongCalls->fetch_add(1) == 0 ? Status(K_NOT_FOUND, "first long miss") : Status::OK();
+                return firstLongCalls->fetch_add(1) == 0 ? Status(K_RPC_CANCELLED, "first long retry") : Status::OK();
             };
         } else {
             transporter.getHandler = [secondLongCalls](const DataGetRequest &, DataGetResult &) {
                 ++(*secondLongCalls);
-                return Status(K_NOT_FOUND, "second long miss");
+                return Status(K_RPC_CANCELLED, "second long retry");
             };
         }
     };
@@ -7006,7 +7094,7 @@ TEST(ReplicaReaderTest, BatchDeadlineReturnsLastMeaningfulItemError)
     ApiDeadlineGuard deadline(1000);
     auto manager = std::make_shared<FakeDataPlaneManager>();
     manager->configureTransporter = [](const HostPort &, FakeTransporter &transporter) {
-        transporter.getStatuses = { Status(K_NOT_FOUND, "meaningful miss") };
+        transporter.getStatuses = { Status(K_RPC_CANCELLED, "meaningful retry error") };
     };
     auto executor = std::make_shared<DataPlaneExecutor>(manager, std::make_shared<TransportAdvisor>());
     ControlledReplicaReader reader(executor, std::make_shared<ThreadPool>(1));
@@ -7015,9 +7103,9 @@ TEST(ReplicaReaderTest, BatchDeadlineReturnsLastMeaningfulItemError)
     ObjectReadItemResult result;
 
     Status status = reader.ReadBatch({ MakeReplicaReadRequest(&location, &result) });
-    EXPECT_EQ(status.GetCode(), K_NOT_FOUND);
-    EXPECT_EQ(result.status.GetCode(), K_NOT_FOUND);
-    EXPECT_EQ(result.status.GetMsg(), "meaningful miss");
+    EXPECT_EQ(status.GetCode(), K_RPC_CANCELLED);
+    EXPECT_EQ(result.status.GetCode(), K_RPC_CANCELLED);
+    EXPECT_EQ(result.status.GetMsg(), "meaningful retry error");
     EXPECT_EQ(reader.backoffCount, 1);
 }
 
@@ -7044,14 +7132,14 @@ TEST(ReplicaReaderTest, BatchSingleReplicaBackoffDoesNotCountReplicaRetry)
     InitBatchGetMetrics();
     ApiDeadlineGuard deadline(1000);
     auto manager = std::make_shared<FakeDataPlaneManager>();
-    manager->transporterGetStatuses = { { Status(K_NOT_FOUND, "round exhausted") } };
+    manager->transporterGetStatuses = { { Status(K_RPC_CANCELLED, "round exhausted") } };
     auto executor = std::make_shared<DataPlaneExecutor>(manager, std::make_shared<TransportAdvisor>());
     ControlledReplicaReader reader(executor, std::make_shared<ThreadPool>(1));
     reader.backoffStatus = Status(K_RPC_DEADLINE_EXCEEDED, "deadline during backoff");
     auto location = MakeReplicaLocation("single", 1, { MakeAddress(79) });
     ObjectReadItemResult result;
 
-    EXPECT_EQ(reader.ReadBatch({ MakeReplicaReadRequest(&location, &result) }).GetCode(), K_NOT_FOUND);
+    EXPECT_EQ(reader.ReadBatch({ MakeReplicaReadRequest(&location, &result) }).GetCode(), K_RPC_CANCELLED);
     EXPECT_EQ(reader.backoffCount, 1);
     ExpectMetricAbsent("client_direct_batch_get_replica_retry_total");
 }
@@ -7954,7 +8042,7 @@ TEST(TransportLayerTest, SetRetryOnUrmaNeedConnect)
     manager->transporterSetStatuses = {
         { Status(K_URMA_NEED_CONNECT, "reconnect") }, { Status::OK() }
     };
-    TestTransportLayer layer(manager);
+    TestTransportLayer layer(manager, std::make_shared<FixedTransportAdvisor>(TransportHint::UB_CANDIDATE));
 
     // Create first
     TransportCreateParam createParam = MakeCreateParam();
@@ -8033,7 +8121,7 @@ TEST(TransportLayerTest, SetDoesNotRetrySecondFailure)
     manager->transporterSetStatuses = {
         { Status(K_URMA_NEED_CONNECT, "first") }, { Status(K_URMA_NEED_CONNECT, "second") }
     };
-    TestTransportLayer layer(manager);
+    TestTransportLayer layer(manager, std::make_shared<FixedTransportAdvisor>(TransportHint::UB_CANDIDATE));
 
     TransportCreateParam createParam = MakeCreateParam();
     std::shared_ptr<ObjectBuffer> buffer;
@@ -8111,7 +8199,7 @@ TEST(TransportLayerTest, MSetRetryOnUrmaNeedConnectRebuildsOnlyDataPlane)
     manager->transporterMSetStatuses = {
         { Status(K_URMA_NEED_CONNECT, "reconnect") }, { Status::OK() }
     };
-    TestTransportLayer layer(manager);
+    TestTransportLayer layer(manager, std::make_shared<FixedTransportAdvisor>(TransportHint::UB_CANDIDATE));
     std::vector<std::shared_ptr<ObjectBuffer>> buffers;
     ASSERT_TRUE(layer.MCreate(MakeAddress(41), { "key-a", "key-b" }, { 4, 4 }, MakeCreateParam(), buffers).IsOk());
     ASSERT_EQ(buffers.size(), 2u);
