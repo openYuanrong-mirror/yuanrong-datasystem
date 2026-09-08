@@ -100,6 +100,10 @@ Status ValidateMultiCreateRequest(const std::vector<std::string> &keys, const st
                              "MCreate key and size counts must match");
     CHECK_FAIL_RETURN_STATUS(Validator::IsBatchSizeUnderLimit(keys.size()), K_INVALID,
                              "MCreate key count exceeds the batch limit");
+    CHECK_FAIL_RETURN_STATUS(param.allocationIds.empty() || param.allocationIds.size() == keys.size(), K_INVALID,
+                             "MCreate allocation ID count must match the key count");
+    CHECK_FAIL_RETURN_STATUS(param.allocationId.empty(), K_INVALID,
+                             "MCreate accepts only positional allocation IDs");
     std::unordered_set<std::string> uniqueKeys;
     uniqueKeys.reserve(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -124,6 +128,7 @@ Status BuildMultiCreateRequest(const std::vector<std::string> &keys, const std::
     request.set_is_routed(true);
     request.mutable_object_key()->Add(keys.begin(), keys.end());
     request.mutable_data_size()->Add(sizes.begin(), sizes.end());
+    request.mutable_allocation_ids()->Add(param.allocationIds.begin(), param.allocationIds.end());
     return Status::OK();
 }
 

@@ -132,8 +132,8 @@ public:
      * @param[in] sizes Object sizes corresponding positionally to keys.
      * @param[in] param Create parameters and client identity.
      * @param[out] buffers Caller-owned buffers consumed by MSet; partial output is not returned on failure.
-     * @return K_OK on success. Ambiguous peer-unavailable RPC failures are not replayed because MultiCreate has no
-     *         idempotency marker and the worker may already have allocated memory.
+     * @return K_OK on success. The transport facade may replay an ambiguous RPC failure with the same positional
+     *         allocation IDs; a modern worker rejects the duplicate without allocating another region.
      */
     virtual Status MCreate(const HostPort &workerAddr, const std::vector<std::string> &keys,
                            const std::vector<uint64_t> &sizes, const TransportCreateParam &param,

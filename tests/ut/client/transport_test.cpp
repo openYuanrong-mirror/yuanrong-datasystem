@@ -76,6 +76,7 @@ extern char **environ;
 #include "datasystem/common/object_cache/urma_fallback_tcp_limiter.h"
 #include "datasystem/common/rdma/fast_transport_manager_wrapper.h"
 #include "datasystem/common/rpc/api_deadline.h"
+#include "datasystem/common/rpc/brpc_status_util.h"
 #include "datasystem/common/rpc/mem_view.h"
 #include "datasystem/common/util/raii.h"
 #include "datasystem/common/util/status_helper.h"
@@ -518,10 +519,21 @@ public:
     Status InvokeDecreaseReference(const TransportRequestContext &context, const ShmKey &shmId,
                                    bool delayRelease = false) override
     {
+        return InvokeDecreaseReferences(context, { shmId }, delayRelease);
+    }
+
+    Status InvokeDecreaseReferences(const TransportRequestContext &context, const std::vector<ShmKey> &shmIds,
+                                    bool delayRelease = false) override
+    {
         ++decreaseReferenceCount;
         decreaseReferenceContexts.push_back(context);
-        decreaseReferenceShmIds.push_back(shmId);
+        decreaseReferenceBatches.push_back(shmIds);
+        decreaseReferenceShmIds.insert(decreaseReferenceShmIds.end(), shmIds.begin(), shmIds.end());
         decreaseReferenceDelayRelease.push_back(delayRelease);
+        decreaseReferenceRemainingUs.push_back(ApiDeadline::Instance().ApiRemainingUs());
+        if (afterDecreaseReference) {
+            afterDecreaseReference(decreaseReferenceCount);
+        }
         return decreaseReferenceStatus;
     }
 
@@ -594,12 +606,15 @@ public:
     StatusCode multiSetLastCode = K_OK;
     std::string multiSetLastMessage;
     std::vector<TransportRequestContext> decreaseReferenceContexts;
+    std::vector<std::vector<ShmKey>> decreaseReferenceBatches;
     std::vector<ShmKey> decreaseReferenceShmIds;
     std::vector<bool> decreaseReferenceDelayRelease;
+    std::vector<int64_t> decreaseReferenceRemainingUs;
     std::function<void()> onSetInvoke;
     std::function<void()> afterSetInvoke;
     std::function<void()> onMultiSetInvoke;
     std::function<void()> afterMultiSetInvoke;
+    std::function<void(int)> afterDecreaseReference;
 };
 
 class BlockingFdWorkerRpcClient final : public FakeWorkerRpcClient {
@@ -890,11 +905,12 @@ public:
     }
 
     Status Create(const HostPort &workerAddr, const std::string &key, uint64_t size,
-                  const TransportCreateParam &, std::shared_ptr<ObjectBuffer> &buffer) override
+                  const TransportCreateParam &param, std::shared_ptr<ObjectBuffer> &buffer) override
     {
         ++createCount;
         createdKeys.push_back(key);
         createdSizes.push_back(size);
+        createParams.push_back(param);
         if (!createStatuses.empty()) {
             Status rc = createStatuses.front();
             createStatuses.erase(createStatuses.begin());
@@ -937,6 +953,7 @@ public:
                    std::vector<std::shared_ptr<ObjectBuffer>> &buffers) override
     {
         ++mCreateCount;
+        mCreateParams.push_back(param);
         if (!mCreateStatuses.empty()) {
             Status rc = mCreateStatuses.front();
             mCreateStatuses.erase(mCreateStatuses.begin());
@@ -1014,6 +1031,8 @@ public:
     std::vector<Status> mSetStatuses;
     std::vector<std::string> createdKeys;
     std::vector<uint64_t> createdSizes;
+    std::vector<TransportCreateParam> createParams;
+    std::vector<TransportCreateParam> mCreateParams;
     std::vector<TransportSetParam> setParams;
     std::vector<std::string> setPayloads;
     std::vector<std::string> mSetFailedKeys;
@@ -1083,6 +1102,10 @@ public:
             transporter->setStatuses = std::move(transporterSetStatuses.front());
             transporterSetStatuses.erase(transporterSetStatuses.begin());
         }
+        if (!transporterCreateStatuses.empty()) {
+            transporter->createStatuses = std::move(transporterCreateStatuses.front());
+            transporterCreateStatuses.erase(transporterCreateStatuses.begin());
+        }
         if (!transporterMCreateStatuses.empty()) {
             transporter->mCreateStatuses = std::move(transporterMCreateStatuses.front());
             transporterMCreateStatuses.erase(transporterMCreateStatuses.begin());
@@ -1111,6 +1134,7 @@ public:
     std::vector<Status> transportBuildStatuses;
     std::vector<Status> existInvokeStatuses;
     std::vector<std::vector<Status>> transporterGetStatuses;
+    std::vector<std::vector<Status>> transporterCreateStatuses;
     std::vector<std::vector<Status>> transporterSetStatuses;
     std::vector<std::vector<Status>> transporterMCreateStatuses;
     std::vector<std::vector<Status>> transporterMSetStatuses;
@@ -1431,9 +1455,22 @@ public:
     {
     }
 
+    TestTransportLayer(std::shared_ptr<DataPlaneManager> dataPlaneManager,
+                       std::shared_ptr<TransportAdvisor> advisor,
+                       std::shared_ptr<ThreadPool> releasePool)
+        : TransportLayer(std::move(dataPlaneManager), std::move(advisor), std::chrono::seconds(1), nullptr,
+                         std::move(releasePool))
+    {
+    }
+
     void SetObjectRead(std::unique_ptr<ObjectReadFlow> objectRead)
     {
         objectRead_ = std::move(objectRead);
+    }
+
+    void SetAmbiguousCreateCleanupPool(std::shared_ptr<ThreadPool> cleanupPool)
+    {
+        ambiguousCreateCleanupPool_ = std::move(cleanupPool);
     }
 };
 
@@ -1858,6 +1895,14 @@ TEST(WorkerRpcClientTest, SignsCreateAndSetBeforeRpc)
     EXPECT_EQ(client.decreaseReferenceInvokeCount, 2);
     EXPECT_EQ(client.invokedDecreaseReferenceRequest.object_keys(0), "shm-2");
     EXPECT_TRUE(client.invokedDecreaseReferenceRequest.delay_release());
+
+    ASSERT_TRUE(client.InvokeDecreaseReferences(
+                          context, { ShmKey::Intern("shm-3"), ShmKey::Intern("shm-4") })
+                    .IsOk());
+    EXPECT_EQ(client.decreaseReferenceInvokeCount, 3);
+    ASSERT_EQ(client.invokedDecreaseReferenceRequest.object_keys_size(), 2);
+    EXPECT_EQ(client.invokedDecreaseReferenceRequest.object_keys(0), "shm-3");
+    EXPECT_EQ(client.invokedDecreaseReferenceRequest.object_keys(1), "shm-4");
 }
 
 TEST(WorkerRpcClientTest, RecordsRoutedSetRpcTotalLatency)
@@ -7366,12 +7411,14 @@ TEST(SetRequestBuilderTest, PreservesIdentityTenantAndWriteOptions)
 {
     TransportCreateParam createParam = MakeCreateParam();
     createParam.cacheType = CacheType::DISK;
+    createParam.allocationId = "7fe3f66f-82d3-475d-9d9a-075cc604d344";
     CreateReqPb createRequest;
     ASSERT_TRUE(BuildCreateRequest("request-key", 64, createParam, createRequest).IsOk());
     EXPECT_EQ(createRequest.client_id(), "client-1");
     EXPECT_EQ(createRequest.token(), "token-1");
     EXPECT_EQ(createRequest.tenant_id(), "tenant-1");
     EXPECT_TRUE(createRequest.is_routed());
+    EXPECT_EQ(createRequest.allocation_id(), createParam.allocationId);
 
     ObjectBufferInfo info;
     info.objectKey = "request-key";
@@ -7467,11 +7514,17 @@ TEST(TcpTransporterTest, SetPropagatesRpcError)
 TEST(MSetRequestBuilderTest, BuildsMultiCreateAndAlignsMixedFallbackPayloads)
 {
     MultiCreateReqPb createRequest;
-    ASSERT_TRUE(BuildMultiCreateRequest({ "key-a", "key-b" }, { 4, 5 }, MakeCreateParam(), createRequest).IsOk());
+    TransportCreateParam createParam = MakeCreateParam();
+    createParam.allocationIds = { "87b8440d-607c-4087-a8f3-0f2cb7b7cd44",
+                                  "6cfce9af-577b-438c-839a-63461d7ecb05" };
+    ASSERT_TRUE(BuildMultiCreateRequest({ "key-a", "key-b" }, { 4, 5 }, createParam, createRequest).IsOk());
     EXPECT_EQ(createRequest.client_id(), "client-1");
     EXPECT_EQ(createRequest.object_key_size(), 2);
     EXPECT_TRUE(createRequest.skip_check_existence());
     EXPECT_TRUE(createRequest.is_routed());
+    ASSERT_EQ(createRequest.allocation_ids_size(), 2);
+    EXPECT_EQ(createRequest.allocation_ids(0), createParam.allocationIds[0]);
+    EXPECT_EQ(createRequest.allocation_ids(1), createParam.allocationIds[1]);
 
     const HostPort workerAddr = MakeAddress(9000);
     auto ubBuffer = MakeTransportBuffer(workerAddr, "ub-key", "urma", "shm-ub", true);
@@ -7491,6 +7544,15 @@ TEST(MSetRequestBuilderTest, BuildsMultiCreateAndAlignsMixedFallbackPayloads)
     EXPECT_EQ(publishRequest.object_info(1).shm_id(), "shm-ub");
     ASSERT_EQ(payloads.size(), 1u);
     EXPECT_EQ(std::string(static_cast<const char *>(payloads[0].Data()), payloads[0].Size()), "tcp");
+}
+
+TEST(MSetRequestBuilderTest, RejectsMismatchedAllocationIds)
+{
+    TransportCreateParam createParam = MakeCreateParam();
+    createParam.allocationIds = { "87b8440d-607c-4087-a8f3-0f2cb7b7cd44" };
+    MultiCreateReqPb request;
+
+    EXPECT_EQ(BuildMultiCreateRequest({ "key-a", "key-b" }, { 4, 5 }, createParam, request).GetCode(), K_INVALID);
 }
 
 TEST(MSetRequestBuilderTest, EnablesWorkerAutoReleaseOnlyForPureShmOrUbBatch)
@@ -8138,22 +8200,299 @@ TEST(TransportLayerTest, SetDoesNotRetrySecondFailure)
     EXPECT_EQ(releaseCount, 1);
 }
 
-// MCreate replays an ambiguous (K_RPC_UNAVAILABLE, response lost) failure: it rebuilds the RPC +
-// data plane and retries once, consistent with Create and Set (Component C). A lost response may
-// leave the worker with partial allocations, reclaimed by the expired-fds reconciler (the same
-// fallback Create relies on). MCreate has no publish step, so unlike MSet it always replays.
+// MCreate replays an ambiguous response-loss failure with the same allocation IDs so the worker
+// cannot allocate a second set of buffers for the retry.
 TEST(TransportLayerTest, MCreateReplaysAmbiguousRpcFailure)
 {
     auto manager = std::make_shared<FakeDataPlaneManager>();
     manager->transporterMCreateStatuses = { { Status(K_RPC_UNAVAILABLE, "response lost") } };
-    TestTransportLayer layer(manager);
+    auto advisor = std::make_shared<FixedTransportAdvisor>(TransportHint::SHM_CANDIDATE);
+    std::shared_ptr<FakeWorkerRpcClient> replayRpcClient;
+    {
+        TestTransportLayer layer(manager, advisor);
+        std::vector<std::shared_ptr<ObjectBuffer>> buffers;
+
+        EXPECT_TRUE(
+            layer.MCreate(MakeAddress(40), { "key-a", "key-b" }, { 4, 4 }, MakeCreateParam(), buffers).IsOk());
+        EXPECT_FALSE(buffers.empty());
+        EXPECT_EQ(manager->transportBuildCount, 2);  // initial build + rebuild after Teardown
+        ASSERT_EQ(manager->builtTransporters.size(), 2u);
+        EXPECT_EQ(manager->builtTransporters[0]->mCreateCount, 1);  // first attempt on the original transporter
+        ASSERT_EQ(manager->builtTransporters[0]->mCreateParams.size(), 1u);
+        ASSERT_EQ(manager->builtTransporters[1]->mCreateParams.size(), 1u);
+        const auto &firstIds = manager->builtTransporters[0]->mCreateParams[0].allocationIds;
+        const auto &retryIds = manager->builtTransporters[1]->mCreateParams[0].allocationIds;
+        ASSERT_EQ(firstIds.size(), 2u);
+        EXPECT_EQ(firstIds, retryIds);
+        EXPECT_NE(firstIds[0], firstIds[1]);
+        replayRpcClient = std::dynamic_pointer_cast<FakeWorkerRpcClient>(
+            manager->builtTransporters[1]->rpcClient);
+    }
+    ASSERT_NE(replayRpcClient, nullptr);
+    EXPECT_EQ(replayRpcClient->decreaseReferenceCount, 0);
+}
+
+TEST(TransportLayerTest, MCreateRetriesReservationConflictOnceWithStableAllocationIds)
+{
+    auto manager = std::make_shared<FakeDataPlaneManager>();
+    manager->transporterMCreateStatuses = { { Status(K_TRY_AGAIN, "allocation is being created"), Status::OK() } };
+    auto advisor = std::make_shared<FixedTransportAdvisor>(TransportHint::SHM_CANDIDATE);
+    TestTransportLayer layer(manager, advisor);
     std::vector<std::shared_ptr<ObjectBuffer>> buffers;
 
-    EXPECT_TRUE(layer.MCreate(MakeAddress(40), { "key-a", "key-b" }, { 4, 4 }, MakeCreateParam(), buffers).IsOk());
-    EXPECT_FALSE(buffers.empty());
-    EXPECT_EQ(manager->transportBuildCount, 2);  // initial build + rebuild after Teardown
+    ASSERT_TRUE(layer.MCreate(MakeAddress(47), { "key-a", "key-b" }, { 4, 4 }, MakeCreateParam(), buffers).IsOk());
+
+    ASSERT_EQ(manager->builtTransporters.size(), 1u);
+    const auto &transporter = manager->builtTransporters.front();
+    ASSERT_EQ(transporter->mCreateParams.size(), 2u);
+    EXPECT_EQ(transporter->mCreateParams[0].allocationIds, transporter->mCreateParams[1].allocationIds);
+}
+
+TEST(TransportLayerTest, ExplicitWorkerCreateDeadlineDoesNotScheduleAmbiguousCleanup)
+{
+    auto manager = std::make_shared<FakeDataPlaneManager>();
+    Status workerDeadline(K_RPC_DEADLINE_EXCEEDED, "worker rejected expired request");
+    workerDeadline.WithExtra(kBrpcServerRespondedExtra);
+    manager->transporterCreateStatuses = { { workerDeadline } };
+    auto advisor = std::make_shared<FixedTransportAdvisor>(TransportHint::SHM_CANDIDATE);
+    {
+        TestTransportLayer layer(manager, advisor);
+        std::shared_ptr<ObjectBuffer> buffer;
+
+        const Status rc = layer.Create(MakeAddress(48), "expired-create-key", 64, MakeCreateParam(), buffer);
+        EXPECT_EQ(rc.GetCode(), K_RPC_DEADLINE_EXCEEDED);
+    }
+
+    ASSERT_NE(manager->lastRpcClient, nullptr);
+    EXPECT_EQ(manager->lastRpcClient->decreaseReferenceCount, 0);
+}
+
+TEST(TransportLayerTest, CreateReplaySuccessDoesNotScheduleAmbiguousCleanup)
+{
+    auto manager = std::make_shared<FakeDataPlaneManager>();
+    manager->transporterCreateStatuses = { { Status(K_RPC_UNAVAILABLE, "response lost") } };
+    auto advisor = std::make_shared<FixedTransportAdvisor>(TransportHint::SHM_CANDIDATE);
+    std::shared_ptr<FakeWorkerRpcClient> replayRpcClient;
+    {
+        TestTransportLayer layer(manager, advisor);
+        std::shared_ptr<ObjectBuffer> buffer;
+
+        ASSERT_TRUE(layer.Create(MakeAddress(40), "replay-key", 64, MakeCreateParam(), buffer).IsOk());
+        ASSERT_EQ(manager->builtTransporters.size(), 2u);
+        ASSERT_EQ(manager->builtTransporters[0]->createParams.size(), 1u);
+        ASSERT_EQ(manager->builtTransporters[1]->createParams.size(), 1u);
+        const auto &firstParam = manager->builtTransporters[0]->createParams.front();
+        const auto &retryParam = manager->builtTransporters[1]->createParams.front();
+        EXPECT_EQ(firstParam.allocationId, retryParam.allocationId);
+        replayRpcClient = std::dynamic_pointer_cast<FakeWorkerRpcClient>(
+            manager->builtTransporters[1]->rpcClient);
+    }
+    ASSERT_NE(replayRpcClient, nullptr);
+    EXPECT_EQ(replayRpcClient->decreaseReferenceCount, 0);
+}
+
+TEST(TransportLayerTest, CreateReusesAllocationIdForTransportFallback)
+{
+    auto manager = std::make_shared<FakeDataPlaneManager>();
+    manager->transporterCreateStatuses = { { Status(K_NOT_SUPPORTED, "SHM unavailable") }, { Status::OK() } };
+    auto advisor = std::make_shared<FixedTransportAdvisor>(TransportHint::SHM_CANDIDATE);
+    TestTransportLayer layer(manager, advisor);
+    std::shared_ptr<ObjectBuffer> buffer;
+
+    ASSERT_TRUE(layer.Create(MakeAddress(43), "fallback-key", 64, MakeCreateParam(), buffer).IsOk());
+
     ASSERT_EQ(manager->builtTransporters.size(), 2u);
-    EXPECT_EQ(manager->builtTransporters[0]->mCreateCount, 1);  // first attempt on the original transporter
+    ASSERT_EQ(manager->builtTransporters[0]->createParams.size(), 1u);
+    ASSERT_EQ(manager->builtTransporters[1]->createParams.size(), 1u);
+    EXPECT_EQ(manager->builtTransporters[0]->createParams[0].allocationId,
+              manager->builtTransporters[1]->createParams[0].allocationId);
+}
+
+TEST(TransportLayerTest, AmbiguousCreateFailureSchedulesRepeatedCleanupForStableAllocationId)
+{
+    auto manager = std::make_shared<FakeDataPlaneManager>();
+    manager->transporterCreateStatuses = { { Status(K_RPC_DEADLINE_EXCEEDED, "response lost") } };
+    auto releasePool = std::make_shared<ThreadPool>(1, 1, "blocked_regular_release");
+    auto releaseTaskStarted = std::make_shared<std::promise<void>>();
+    auto releaseTaskStartedFuture = releaseTaskStarted->get_future();
+    auto unblockReleaseTask = std::make_shared<std::promise<void>>();
+    auto unblockReleaseTaskFuture = unblockReleaseTask->get_future().share();
+    releasePool->Execute([releaseTaskStarted, unblockReleaseTaskFuture]() {
+        releaseTaskStarted->set_value();
+        unblockReleaseTaskFuture.wait();
+    });
+    ASSERT_EQ(releaseTaskStartedFuture.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    auto cleanupDone = std::make_shared<std::promise<void>>();
+    auto cleanupFuture = cleanupDone->get_future();
+    auto signaled = std::make_shared<std::atomic<bool>>(false);
+    manager->configureTransporter = [cleanupDone, signaled](const HostPort &, FakeTransporter &transporter) {
+        auto rpcClient = std::dynamic_pointer_cast<FakeWorkerRpcClient>(transporter.rpcClient);
+        ASSERT_NE(rpcClient, nullptr);
+        rpcClient->afterDecreaseReference = [cleanupDone, signaled](int count) {
+            if (count == 3 && !signaled->exchange(true)) {
+                cleanupDone->set_value();
+            }
+        };
+    };
+    auto advisor = std::make_shared<FixedTransportAdvisor>(TransportHint::SHM_CANDIDATE);
+    TestTransportLayer layer(manager, advisor, releasePool);
+    std::shared_ptr<ObjectBuffer> buffer;
+
+    Status rc = layer.Create(MakeAddress(42), "response-lost-key", 64, MakeCreateParam(), buffer);
+    unblockReleaseTask->set_value();
+
+    EXPECT_EQ(rc.GetCode(), K_RPC_DEADLINE_EXCEEDED);
+    ASSERT_EQ(manager->builtTransporters.size(), 1u);
+    ASSERT_EQ(manager->builtTransporters[0]->createParams.size(), 1u);
+    const auto allocationId = manager->builtTransporters[0]->createParams[0].allocationId;
+    EXPECT_FALSE(allocationId.empty());
+    const auto cleanupStatus = cleanupFuture.wait_for(std::chrono::seconds(2));
+    ASSERT_EQ(cleanupStatus, std::future_status::ready);
+    auto cleanupClient = manager->lastRpcClient;
+    ASSERT_NE(cleanupClient, nullptr);
+    EXPECT_EQ(cleanupClient->decreaseReferenceCount, 3);
+    ASSERT_EQ(cleanupClient->decreaseReferenceBatches.size(), 3u);
+    ASSERT_EQ(cleanupClient->decreaseReferenceRemainingUs.size(), 3u);
+    for (const auto remainingUs : cleanupClient->decreaseReferenceRemainingUs) {
+        EXPECT_GT(remainingUs, 0);
+        EXPECT_LE(remainingUs, 500'000);
+    }
+    for (const auto &batch : cleanupClient->decreaseReferenceBatches) {
+        ASSERT_EQ(batch.size(), 1u);
+        EXPECT_EQ(batch.front(), ShmKey::Intern(allocationId));
+    }
+}
+
+TEST(TransportLayerTest, FullAmbiguousCreateCleanupPoolDropsTaskAndIncrementsMetric)
+{
+    InitBatchGetMetrics();
+    auto manager = std::make_shared<FakeDataPlaneManager>();
+    manager->transporterCreateStatuses = { { Status(K_RPC_DEADLINE_EXCEEDED, "response lost") } };
+    auto cleanupPool = std::make_shared<ThreadPool>(1, 1, "full_ambiguous_create_cleanup");
+    auto cleanupTaskStarted = std::make_shared<std::promise<void>>();
+    auto cleanupTaskStartedFuture = cleanupTaskStarted->get_future();
+    auto unblockCleanupTask = std::make_shared<std::promise<void>>();
+    auto unblockCleanupTaskFuture = unblockCleanupTask->get_future().share();
+    auto cleanupTaskUnblocked = std::make_shared<std::atomic<bool>>(false);
+    auto unblock = [unblockCleanupTask, cleanupTaskUnblocked]() {
+        if (!cleanupTaskUnblocked->exchange(true)) {
+            unblockCleanupTask->set_value();
+        }
+    };
+    Raii outerUnblockGuard(unblock);
+    ASSERT_TRUE(cleanupPool->ExecuteNoWait([cleanupTaskStarted, unblockCleanupTaskFuture]() {
+        cleanupTaskStarted->set_value();
+        unblockCleanupTaskFuture.wait();
+    }));
+    ASSERT_EQ(cleanupTaskStartedFuture.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    auto advisor = std::make_shared<FixedTransportAdvisor>(TransportHint::SHM_CANDIDATE);
+    TestTransportLayer layer(manager, advisor);
+    Raii innerUnblockGuard(unblock);
+    layer.SetAmbiguousCreateCleanupPool(cleanupPool);
+    std::shared_ptr<ObjectBuffer> buffer;
+
+    const Status rc = layer.Create(MakeAddress(46), "dropped-cleanup-key", 64, MakeCreateParam(), buffer);
+
+    EXPECT_EQ(rc.GetCode(), K_RPC_DEADLINE_EXCEEDED);
+    ASSERT_NE(manager->lastRpcClient, nullptr);
+    EXPECT_EQ(manager->lastRpcClient->decreaseReferenceCount, 0);
+    ExpectMetricTotal("client_ambiguous_create_cleanup_dropped_total", 1);
+}
+
+TEST(TransportLayerTest, AmbiguousCreateCleanupDoesNotTeardownRpcClientBetweenRetries)
+{
+    auto manager = std::make_shared<FakeDataPlaneManager>();
+    manager->transporterCreateStatuses = { { Status(K_RPC_DEADLINE_EXCEEDED, "response lost") } };
+    auto cleanupDone = std::make_shared<std::promise<void>>();
+    auto cleanupFuture = cleanupDone->get_future();
+    auto signaled = std::make_shared<std::atomic<bool>>(false);
+    manager->configureTransporter = [cleanupDone, signaled](const HostPort &, FakeTransporter &transporter) {
+        auto rpcClient = std::dynamic_pointer_cast<FakeWorkerRpcClient>(transporter.rpcClient);
+        ASSERT_NE(rpcClient, nullptr);
+        rpcClient->decreaseReferenceStatus = Status(K_RPC_PEER_DEAD, "peer unavailable");
+        rpcClient->afterDecreaseReference = [cleanupDone, signaled](int count) {
+            if (count == 3 && !signaled->exchange(true)) {
+                cleanupDone->set_value();
+            }
+        };
+    };
+    auto advisor = std::make_shared<FixedTransportAdvisor>(TransportHint::SHM_CANDIDATE);
+    TestTransportLayer layer(manager, advisor);
+    std::shared_ptr<ObjectBuffer> buffer;
+
+    const Status rc = layer.Create(MakeAddress(45), "peer-dead-key", 64, MakeCreateParam(), buffer);
+
+    EXPECT_EQ(rc.GetCode(), K_RPC_DEADLINE_EXCEEDED);
+    ASSERT_EQ(cleanupFuture.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    ASSERT_NE(manager->lastRpcClient, nullptr);
+    EXPECT_EQ(manager->lastRpcClient->decreaseReferenceCount, 3);
+    EXPECT_EQ(manager->rpcBuildCount, 1);
+}
+
+TEST(TransportLayerTest, CreateReplayConflictPreservesAmbiguousRpcFailure)
+{
+    auto manager = std::make_shared<FakeDataPlaneManager>();
+    manager->transporterCreateStatuses = { { Status(K_RPC_UNAVAILABLE, "response lost") },
+                                           { Status(K_DUPLICATED, "allocation already exists") } };
+    auto releasePool = std::make_shared<ThreadPool>(1, 1, "create_replay_conflict_cleanup");
+    auto cleanupDone = std::make_shared<std::promise<void>>();
+    auto cleanupFuture = cleanupDone->get_future();
+    auto signaled = std::make_shared<std::atomic<bool>>(false);
+    manager->configureTransporter = [cleanupDone, signaled](const HostPort &, FakeTransporter &transporter) {
+        auto rpcClient = std::dynamic_pointer_cast<FakeWorkerRpcClient>(transporter.rpcClient);
+        ASSERT_NE(rpcClient, nullptr);
+        rpcClient->afterDecreaseReference = [cleanupDone, signaled](int count) {
+            if (count == 3 && !signaled->exchange(true)) {
+                cleanupDone->set_value();
+            }
+        };
+    };
+    auto advisor = std::make_shared<FixedTransportAdvisor>(TransportHint::SHM_CANDIDATE);
+    TestTransportLayer layer(manager, advisor, releasePool);
+    std::shared_ptr<ObjectBuffer> buffer;
+
+    const Status rc = layer.Create(MakeAddress(44), "replay-conflict-key", 64, MakeCreateParam(), buffer);
+
+    EXPECT_EQ(rc.GetCode(), K_RPC_UNAVAILABLE);
+    ASSERT_EQ(cleanupFuture.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    ASSERT_NE(manager->lastRpcClient, nullptr);
+    EXPECT_EQ(manager->lastRpcClient->decreaseReferenceCount, 3);
+}
+
+TEST(TransportLayerTest, TcpFallbackKeepsAmbiguousShmAllocationForCleanup)
+{
+    const bool enableUrma = FLAGS_enable_urma;
+    Raii restoreEnableUrma([enableUrma]() { FLAGS_enable_urma = enableUrma; });
+    FLAGS_enable_urma = false;
+    auto manager = std::make_shared<FakeDataPlaneManager>();
+    manager->transporterCreateStatuses = { { Status(K_RPC_UNAVAILABLE, "response lost") },
+                                           { Status(K_NOT_SUPPORTED, "SHM unavailable") },
+                                           { Status::OK() } };
+    auto releasePool = std::make_shared<ThreadPool>(1, 1, "tcp_fallback_allocation_cleanup");
+    auto cleanupDone = std::make_shared<std::promise<void>>();
+    auto cleanupFuture = cleanupDone->get_future();
+    auto signaled = std::make_shared<std::atomic<bool>>(false);
+    manager->configureTransporter = [cleanupDone, signaled](const HostPort &, FakeTransporter &transporter) {
+        auto rpcClient = std::dynamic_pointer_cast<FakeWorkerRpcClient>(transporter.rpcClient);
+        ASSERT_NE(rpcClient, nullptr);
+        rpcClient->afterDecreaseReference = [cleanupDone, signaled](int count) {
+            if (count == 3 && !signaled->exchange(true)) {
+                cleanupDone->set_value();
+            }
+        };
+    };
+    auto advisor = std::make_shared<FixedTransportAdvisor>(TransportHint::SHM_CANDIDATE);
+    TestTransportLayer layer(manager, advisor, releasePool);
+    std::shared_ptr<ObjectBuffer> buffer;
+
+    ASSERT_TRUE(layer.Create(MakeAddress(45), "tcp-fallback-key", 64, MakeCreateParam(), buffer).IsOk());
+    ASSERT_EQ(cleanupFuture.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    ASSERT_EQ(manager->builtTransporters.size(), 3u);
+    const auto allocationId = manager->builtTransporters[0]->createParams[0].allocationId;
+    ASSERT_NE(manager->lastRpcClient, nullptr);
+    ASSERT_FALSE(manager->lastRpcClient->decreaseReferenceBatches.empty());
+    EXPECT_EQ(manager->lastRpcClient->decreaseReferenceBatches.front(),
+              std::vector<ShmKey>{ ShmKey::Intern(allocationId) });
 }
 
 TEST(TransportLayerTest, MSetDoesNotReplayAmbiguousRpcFailure)

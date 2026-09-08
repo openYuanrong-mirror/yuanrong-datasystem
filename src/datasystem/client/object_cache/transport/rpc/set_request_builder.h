@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
 #include "datasystem/common/log/access_recorder.h"
 #include "datasystem/common/object_cache/object_base.h"
@@ -43,6 +44,8 @@ struct TransportCreateParam {
     ConsistencyType consistencyType = ConsistencyType::PRAM;
     WriteMode writeMode = WriteMode::NONE_L2_CACHE;
     int64_t subTimeoutMs = 0;
+    std::string allocationId;
+    std::vector<std::string> allocationIds;
 };
 
 struct TransportSetParam {

@@ -58,6 +58,11 @@ message CreateReqPb {
   uint64 timestamp = 100;
   string signature = 101;
   string access_key = 102;
+  // Client-generated UUID for this allocation. New workers use it as shm_id so the client can release an
+  // allocation even when CreateRsp is lost. Empty keeps the legacy worker-generated shm_id behavior.
+  // Compatibility invariant: future signed request fields must use numbers greater than 103 so old workers
+  // preserve the canonical AK/SK serialization order when they ignore unknown fields.
+  string allocation_id = 103;
 }
 
 message CreateRspPb {
@@ -87,6 +92,10 @@ message MultiCreateReqPb {
   uint64 timestamp = 100;
   string signature = 101;
   string access_key = 102;
+  // Positional client-generated allocation UUIDs. Empty keeps the legacy worker-generated shm_id behavior.
+  // Compatibility invariant: future signed request fields must use numbers greater than 103 so old workers
+  // preserve the canonical AK/SK serialization order when they ignore unknown fields.
+  repeated string allocation_ids = 103;
 }
 
 message MultiCreateRspPb {

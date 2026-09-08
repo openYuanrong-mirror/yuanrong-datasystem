@@ -22,6 +22,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <exception>
+#include <new>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -40,6 +41,7 @@
 #include "datasystem/common/inject/inject_point.h"
 #include "datasystem/common/log/access_recorder.h"
 #include "datasystem/common/log/log.h"
+#include "datasystem/common/metrics/kv_metrics.h"
 #include "datasystem/common/object_cache/ub_failure_classifier.h"
 #ifdef USE_URMA
 #include "datasystem/common/rdma/urma_manager.h"
@@ -50,6 +52,7 @@
 #include "datasystem/common/util/status_helper.h"
 #include "datasystem/common/util/timer.h"
 #include "datasystem/common/util/uri.h"
+#include "datasystem/common/util/uuid_generator.h"
 
 #include "butil/time.h"
 
@@ -61,6 +64,109 @@ constexpr int32_t PROVIDER_UB_RECOVERY_PROBE_TIMEOUT_MS = 3'000;
 // SHM-off fallback is a steady-state path (every write on a SHM-disabled same-host worker); throttle the
 // diagnostic so it does not flood the log. Matches the read-path/DataPlaneExecutor convention.
 constexpr int TRANSPORT_DIAG_LOG_RATE = 100;
+constexpr int AMBIGUOUS_CREATE_CLEANUP_ATTEMPTS = 3;
+constexpr int AMBIGUOUS_CREATE_CLEANUP_BACKOFF_MS[] = { 0, 100, 400 };
+constexpr int AMBIGUOUS_CREATE_CLEANUP_RPC_TIMEOUT_MS = 500;
+constexpr size_t AMBIGUOUS_CREATE_CLEANUP_THREAD_NUM = 4;
+constexpr int AMBIGUOUS_CREATE_CLEANUP_DROP_LOG_RATE = 100;
+constexpr int64_t MCREATE_RESERVATION_RETRY_BACKOFF_MS = 1;
+
+Status GenerateAllocationId(TransportCreateParam &param)
+{
+    try {
+        param.allocationId.clear();
+        param.allocationIds.clear();
+        param.allocationId = GetStringUuid();
+    } catch (const std::bad_alloc &error) {
+        return Status(K_OUT_OF_MEMORY, error.what());
+    }
+    CHECK_FAIL_RETURN_STATUS(!param.allocationId.empty(), K_RUNTIME_ERROR, "Generate allocation ID failed");
+    return Status::OK();
+}
+
+Status GenerateAllocationIds(size_t count, TransportCreateParam &param)
+{
+    param.allocationId.clear();
+    param.allocationIds.clear();
+    try {
+        std::vector<std::string> allocationIds;
+        allocationIds.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            auto allocationId = GetStringUuid();
+            CHECK_FAIL_RETURN_STATUS(!allocationId.empty(), K_RUNTIME_ERROR, "Generate allocation ID failed");
+            allocationIds.emplace_back(std::move(allocationId));
+        }
+        param.allocationIds = std::move(allocationIds);
+    } catch (const std::bad_alloc &error) {
+        return Status(K_OUT_OF_MEMORY, error.what());
+    }
+    return Status::OK();
+}
+
+void RecordAllocationIds(const TransportCreateParam &param, std::unordered_set<ShmKey> &shmIds)
+{
+    if (!param.allocationId.empty()) {
+        shmIds.emplace(ShmKey::Intern(param.allocationId));
+    }
+    for (const auto &allocationId : param.allocationIds) {
+        shmIds.emplace(ShmKey::Intern(allocationId));
+    }
+}
+
+void ForgetAllocationIds(const TransportCreateParam &param, std::unordered_set<ShmKey> &shmIds)
+{
+    if (shmIds.empty()) {
+        return;
+    }
+    if (!param.allocationId.empty()) {
+        (void)shmIds.erase(ShmKey::Intern(param.allocationId));
+    }
+    for (const auto &allocationId : param.allocationIds) {
+        (void)shmIds.erase(ShmKey::Intern(allocationId));
+    }
+}
+
+bool IsAmbiguousCreateFailure(const Status &status)
+{
+    if (!IsRetryableRpcError(status) && !IsNonRetryableRpcError(status)) {
+        return false;
+    }
+    return !IsBrpcRequestDefinitelyNotSent(status) && !IsBrpcServerApplicationError(status);
+}
+
+bool IsAllocationReplayConflict(const Status &status)
+{
+    return status.GetCode() == K_DUPLICATED || status.GetCode() == K_TRY_AGAIN;
+}
+
+Status ReleaseAllocationIdsOnce(const std::shared_ptr<DataPlaneManager> &manager, const HostPort &workerAddr,
+                                const std::vector<ShmKey> &shmIds,
+                                const TransportRequestContext &context)
+{
+    std::shared_ptr<WorkerRpcClient> rpcClient;
+    RETURN_IF_NOT_OK(manager->GetOrCreateRpcClient(workerAddr, rpcClient));
+    return rpcClient->InvokeDecreaseReferences(context, shmIds);
+}
+
+void CleanupAmbiguousAllocations(const std::shared_ptr<DataPlaneManager> &manager, const HostPort &workerAddr,
+                                 const std::vector<ShmKey> &shmIds,
+                                 const TransportRequestContext &context)
+{
+    Status lastRc;
+    for (int attempt = 0; attempt < AMBIGUOUS_CREATE_CLEANUP_ATTEMPTS; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(AMBIGUOUS_CREATE_CLEANUP_BACKOFF_MS[attempt]));
+        ApiDeadlineGuard rpcDeadline(AMBIGUOUS_CREATE_CLEANUP_RPC_TIMEOUT_MS);
+        lastRc = ReleaseAllocationIdsOnce(manager, workerAddr, shmIds, context);
+    }
+    if (lastRc.IsError()) {
+        LOG(WARNING) << "Ambiguous Create allocation cleanup exhausted, worker=" << workerAddr.ToString()
+                     << ", clientId=" << context.clientId << ", allocationCount=" << shmIds.size()
+                     << ", status=" << lastRc;
+    } else {
+        VLOG(1) << "Ambiguous Create allocation cleanup RPCs completed, worker=" << workerAddr.ToString()
+                << ", clientId=" << context.clientId << ", allocationCount=" << shmIds.size();
+    }
+}
 
 uint64_t GetConfiguredUbInlineBufferSize()
 {
@@ -226,7 +332,10 @@ TransportLayer::LocalUbSenderOperation::~LocalUbSenderOperation()
 
 TransportLayer::TransportLayer(std::shared_ptr<Signature> signature, std::shared_ptr<ThreadPool> taskPool,
                                uint64_t fastTransportMemSize, TransportLayerOptions options)
-    : advisor_(std::make_shared<TransportAdvisor>()), releasePool_(std::move(options.releasePool))
+    : advisor_(std::make_shared<TransportAdvisor>()),
+      releasePool_(std::move(options.releasePool)),
+      ambiguousCreateCleanupPool_(
+          std::make_shared<ThreadPool>(0, AMBIGUOUS_CREATE_CLEANUP_THREAD_NUM, "ambiguous-create-cleanup"))
 {
     localUbSenderState_ = std::make_shared<LocalUbSenderState>();
     localUbSenderState_->reconcileMutex = reconcileMutex_;
@@ -268,9 +377,13 @@ TransportLayer::TransportLayer(std::shared_ptr<DataPlaneManager> dataPlaneManage
 TransportLayer::TransportLayer(std::shared_ptr<DataPlaneManager> dataPlaneManager,
                                std::shared_ptr<TransportAdvisor> advisor,
                                std::chrono::milliseconds localUbProbeBaseDelay,
-                               std::shared_ptr<UbHealthFilter> readSourceFilter)
+                               std::shared_ptr<UbHealthFilter> readSourceFilter,
+                               std::shared_ptr<ThreadPool> releasePool)
     : manager_(std::move(dataPlaneManager)),
       advisor_(std::move(advisor)),
+      releasePool_(std::move(releasePool)),
+      ambiguousCreateCleanupPool_(
+          std::make_shared<ThreadPool>(0, AMBIGUOUS_CREATE_CLEANUP_THREAD_NUM, "ambiguous-create-cleanup")),
       healthFilter_(readSourceFilter == nullptr ? std::make_shared<UbHealthFilter>() : std::move(readSourceFilter))
 {
     localUbSenderState_ = std::make_shared<LocalUbSenderState>();
@@ -695,36 +808,38 @@ bool TransportLayer::IsSameHostWorker(const HostPort &workerAddr) const
 }
 
 Status TransportLayer::Create(const HostPort &workerAddr, const std::string &objectKey, uint64_t dataSize,
-                              const TransportCreateParam &param, std::shared_ptr<ObjectBuffer> &buffer)
+                              TransportCreateParam param, std::shared_ptr<ObjectBuffer> &buffer)
 {
     RETURN_IF_NOT_OK(ValidateCreateRequest(objectKey, dataSize, param));
     INJECT_POINT("TransportLayer.Create.beforeTransport");
     RETURN_RUNTIME_ERROR_IF_NULL(manager_);
     RETURN_RUNTIME_ERROR_IF_NULL(advisor_);
-    TransportHint hint = advisor_->GetTransportHint(workerAddr);
-    auto runCreate = [&](TransportHint h) -> Status {
-        LocalUbSenderOperation operation;
-        RETURN_IF_NOT_OK(CheckLocalUbSenderAdmission(h));
-        std::shared_ptr<IDataTransporter> transporter;
-        RETURN_IF_NOT_OK(manager_->GetOrCreate(workerAddr, h, transporter));
-        RETURN_IF_NOT_OK(AcquireLocalUbSenderAdmission(h, operation));
-        return transporter->Create(workerAddr, objectKey, dataSize, param, buffer);
-    };
-    Status rc = runCreate(hint);
+    const auto hint = advisor_->GetTransportHint(workerAddr);
+    param.allocationId.clear();
+    param.allocationIds.clear();
+    if (hint != TransportHint::TCP_ONLY) {
+        RETURN_IF_NOT_OK(GenerateAllocationId(param));
+    }
+    std::unordered_set<ShmKey> ambiguousShmIds;
+    Status rc = TryCreate(workerAddr, objectKey, dataSize, param, hint, buffer, ambiguousShmIds);
     if (rc.GetCode() == K_RPC_UNAVAILABLE) {
+        const Status ambiguousRc = rc;
         LOG(WARNING) << "Rebuild RPC and data plane for worker " << workerAddr.ToString()
                      << " after Create failed: " << rc;
         manager_->Teardown(workerAddr);
-        rc = runCreate(hint);
+        rc = TryCreate(workerAddr, objectKey, dataSize, param, hint, buffer, ambiguousShmIds);
+        if (IsAllocationReplayConflict(rc)) {
+            rc = ambiguousRc;
+        }
     }
     if (rc.GetCode() == K_NOT_SUPPORTED) {
-        // SHM fd-passing endpoint unavailable on this worker; escalate UB then TCP for the write.
         for (const auto &fallbackHint : advisor_->GetFallbackHints(hint)) {
             LOG_EVERY_N(WARNING, TRANSPORT_DIAG_LOG_RATE)
                 << "Create SHM unavailable on worker " << workerAddr.ToString() << ", fall back to "
                 << TransportHintName(fallbackHint);
-            rc = runCreate(fallbackHint);
+            rc = TryCreate(workerAddr, objectKey, dataSize, param, fallbackHint, buffer, ambiguousShmIds);
             if (rc.IsOk()) {
+                ScheduleAmbiguousCreateCleanup(workerAddr, ambiguousShmIds, param.requestContext);
                 return rc;
             }
         }
@@ -734,6 +849,30 @@ Status TransportLayer::Create(const HostPort &workerAddr, const std::string &obj
         // outage (e.g. local UB sender circuit-break) does not emit one WARN per request.
         LOG_EVERY_N(WARNING, TRANSPORT_DIAG_LOG_RATE)
             << "Create still failed for worker " << workerAddr.ToString() << ": " << rc;
+        ScheduleAmbiguousCreateCleanup(workerAddr, ambiguousShmIds, param.requestContext);
+    }
+    return rc;
+}
+
+Status TransportLayer::TryCreate(const HostPort &workerAddr, const std::string &objectKey, uint64_t dataSize,
+                                 const TransportCreateParam &param, TransportHint hint,
+                                 std::shared_ptr<ObjectBuffer> &buffer,
+                                 std::unordered_set<ShmKey> &ambiguousShmIds)
+{
+    LocalUbSenderOperation operation;
+    RETURN_IF_NOT_OK(CheckLocalUbSenderAdmission(hint));
+    std::shared_ptr<IDataTransporter> transporter;
+    RETURN_IF_NOT_OK(manager_->GetOrCreate(workerAddr, hint, transporter));
+    RETURN_IF_NOT_OK(AcquireLocalUbSenderAdmission(hint, operation));
+    Status rc = transporter->Create(workerAddr, objectKey, dataSize, param, buffer);
+    if (IsAmbiguousCreateFailure(rc)) {
+        try {
+            RecordAllocationIds(param, ambiguousShmIds);
+        } catch (const std::bad_alloc &error) {
+            LOG(WARNING) << "Failed to track ambiguous Create allocation: " << error.what();
+        }
+    } else if (rc.IsOk() && hint != TransportHint::TCP_ONLY) {
+        ForgetAllocationIds(param, ambiguousShmIds);
     }
     return rc;
 }
@@ -889,52 +1028,92 @@ Status TransportLayer::RetrySet(const HostPort &workerAddr, ObjectBuffer &buffer
 }
 
 Status TransportLayer::MCreate(const HostPort &workerAddr, const std::vector<std::string> &objectKeys,
-                               const std::vector<uint64_t> &dataSizes, const TransportCreateParam &param,
+                               const std::vector<uint64_t> &dataSizes, TransportCreateParam param,
                                std::vector<std::shared_ptr<ObjectBuffer>> &buffers)
 {
     RETURN_IF_NOT_OK(ValidateMultiCreateRequest(objectKeys, dataSizes, param));
     INJECT_POINT("TransportLayer.MCreate.beforeTransport");
     RETURN_RUNTIME_ERROR_IF_NULL(manager_);
     RETURN_RUNTIME_ERROR_IF_NULL(advisor_);
-    TransportHint hint = advisor_->GetTransportHint(workerAddr);
-    auto runMCreate = [&](TransportHint h) -> Status {
-        LocalUbSenderOperation operation;
-        RETURN_IF_NOT_OK(CheckLocalUbSenderAdmission(h));
-        std::shared_ptr<IDataTransporter> transporter;
-        RETURN_IF_NOT_OK(manager_->GetOrCreate(workerAddr, h, transporter));
-        RETURN_IF_NOT_OK(AcquireLocalUbSenderAdmission(h, operation));
-        return transporter->MCreate(workerAddr, objectKeys, dataSizes, param, buffers);
-    };
-    Status rc = runMCreate(hint);
+    const auto hint = advisor_->GetTransportHint(workerAddr);
+    param.allocationId.clear();
+    param.allocationIds.clear();
+    if (hint != TransportHint::TCP_ONLY) {
+        RETURN_IF_NOT_OK(GenerateAllocationIds(objectKeys.size(), param));
+    }
+    std::unordered_set<ShmKey> ambiguousShmIds;
+    Status rc = TryMCreate(workerAddr, objectKeys, dataSizes, param, hint, buffers, ambiguousShmIds);
+    if (rc.GetCode() == K_TRY_AGAIN) {
+        int64_t backoffMs = MCREATE_RESERVATION_RETRY_BACKOFF_MS;
+        RETURN_IF_NOT_OK(DeadlineRetry().Backoff(backoffMs));
+        rc = TryMCreate(workerAddr, objectKeys, dataSizes, param, hint, buffers, ambiguousShmIds);
+    }
     if (IsNonRetryableRpcError(rc)) {
-        // Dead peer: tear down without retrying (the peer is gone). MultiCreate is not replayed since it
-        // has no idempotency marker and the worker may have allocated memory before the failure.
         LOG(WARNING) << "Tear down dead RPC peer for worker " << workerAddr.ToString()
                      << " after MCreate failed without retry: " << rc;
         manager_->Teardown(workerAddr);
+        ScheduleAmbiguousCreateCleanup(workerAddr, ambiguousShmIds, param.requestContext);
         return rc;
     }
     if (rc.GetCode() == K_RPC_UNAVAILABLE) {
-        // Rebuild once and retry, consistent with the Create path. MultiCreate has no idempotency marker,
-        // so a lost response may leave the worker holding partial allocations; those are reclaimed by the
-        // expired-fds reconciler (same fallback Create relies on).
+        const Status ambiguousRc = rc;
         LOG(WARNING) << "Rebuild RPC and data plane for worker " << workerAddr.ToString()
                      << " after ambiguous MCreate failure, retrying once: " << rc;
         manager_->Teardown(workerAddr);
-        rc = runMCreate(hint);
+        rc = TryMCreate(workerAddr, objectKeys, dataSizes, param, hint, buffers, ambiguousShmIds);
+        if (IsAllocationReplayConflict(rc)) {
+            rc = ambiguousRc;
+        }
         if (rc.GetCode() != K_NOT_SUPPORTED) {
+            ScheduleAmbiguousCreateCleanup(workerAddr, ambiguousShmIds, param.requestContext);
             return rc;
         }
     }
     if (rc.GetCode() == K_NOT_SUPPORTED) {
-        for (const auto &fallbackHint : advisor_->GetFallbackHints(hint)) {
-            LOG_EVERY_N(WARNING, TRANSPORT_DIAG_LOG_RATE)
-                << "MCreate SHM unavailable on worker " << workerAddr.ToString() << ", fall back to "
-                << TransportHintName(fallbackHint);
-            rc = runMCreate(fallbackHint);
-            if (rc.IsOk()) {
-                return rc;
-            }
+        rc = TryMCreateFallbacks(workerAddr, objectKeys, dataSizes, param, hint, buffers, ambiguousShmIds);
+    }
+    ScheduleAmbiguousCreateCleanup(workerAddr, ambiguousShmIds, param.requestContext);
+    return rc;
+}
+
+Status TransportLayer::TryMCreate(const HostPort &workerAddr, const std::vector<std::string> &objectKeys,
+                                  const std::vector<uint64_t> &dataSizes, const TransportCreateParam &param,
+                                  TransportHint hint, std::vector<std::shared_ptr<ObjectBuffer>> &buffers,
+                                  std::unordered_set<ShmKey> &ambiguousShmIds)
+{
+    LocalUbSenderOperation operation;
+    RETURN_IF_NOT_OK(CheckLocalUbSenderAdmission(hint));
+    std::shared_ptr<IDataTransporter> transporter;
+    RETURN_IF_NOT_OK(manager_->GetOrCreate(workerAddr, hint, transporter));
+    RETURN_IF_NOT_OK(AcquireLocalUbSenderAdmission(hint, operation));
+    Status rc = transporter->MCreate(workerAddr, objectKeys, dataSizes, param, buffers);
+    if (IsAmbiguousCreateFailure(rc)) {
+        try {
+            RecordAllocationIds(param, ambiguousShmIds);
+        } catch (const std::bad_alloc &error) {
+            LOG(WARNING) << "Failed to track ambiguous MCreate allocations: " << error.what();
+        }
+    } else if (rc.IsOk() && hint != TransportHint::TCP_ONLY) {
+        ForgetAllocationIds(param, ambiguousShmIds);
+    }
+    return rc;
+}
+
+Status TransportLayer::TryMCreateFallbacks(const HostPort &workerAddr,
+                                           const std::vector<std::string> &objectKeys,
+                                           const std::vector<uint64_t> &dataSizes,
+                                           const TransportCreateParam &param, TransportHint hint,
+                                           std::vector<std::shared_ptr<ObjectBuffer>> &buffers,
+                                           std::unordered_set<ShmKey> &ambiguousShmIds)
+{
+    Status rc(K_NOT_SUPPORTED, "No MCreate fallback transport is available");
+    for (const auto &fallbackHint : advisor_->GetFallbackHints(hint)) {
+        LOG_EVERY_N(WARNING, TRANSPORT_DIAG_LOG_RATE)
+            << "MCreate SHM unavailable on worker " << workerAddr.ToString() << ", fall back to "
+            << TransportHintName(fallbackHint);
+        rc = TryMCreate(workerAddr, objectKeys, dataSizes, param, fallbackHint, buffers, ambiguousShmIds);
+        if (rc.IsOk()) {
+            break;
         }
     }
     return rc;
@@ -1074,6 +1253,46 @@ void TransportLayer::ScheduleRelease(const HostPort &workerAddr, const ShmKey &s
         }
         LOG_IF_ERROR(rc, "Async release of routed Set allocation failed");
     });
+}
+
+void TransportLayer::ScheduleAmbiguousCreateCleanup(const HostPort &workerAddr,
+                                                    const std::unordered_set<ShmKey> &shmIds,
+                                                    const TransportRequestContext &context)
+{
+    if (shmIds.empty()) {
+        return;
+    }
+    try {
+        auto manager = manager_;
+        std::vector<ShmKey> allocationIds(shmIds.begin(), shmIds.end());
+        const auto allocationCount = allocationIds.size();
+        const char *dropReason = nullptr;
+        {
+            // Serialize only pool admission with Shutdown; task execution never holds this lock.
+            std::lock_guard<bthread::Mutex> shutdownLock(shutdownMutex_);
+            if (ambiguousCreateCleanupPool_ == nullptr) {
+                dropReason = "cleanup pool is unavailable";
+            } else if (!ambiguousCreateCleanupPool_->ExecuteNoWait(
+                [manager, workerAddr, allocationIds = std::move(allocationIds), context]() {
+                    CleanupAmbiguousAllocations(manager, workerAddr, allocationIds, context);
+                })) {
+                dropReason = "cleanup pool is full";
+            }
+        }
+        if (dropReason != nullptr) {
+            METRIC_INC(metrics::KvMetricId::CLIENT_AMBIGUOUS_CREATE_CLEANUP_DROPPED_TOTAL);
+            LOG_EVERY_N(WARNING, AMBIGUOUS_CREATE_CLEANUP_DROP_LOG_RATE)
+                << "Drop ambiguous Create cleanup because " << dropReason << ", worker=" << workerAddr.ToString()
+                << ", clientId=" << context.clientId << ", allocationCount=" << allocationCount
+                << "; worker hard reclaim applies only when these allocations were marked reclaimable";
+        }
+    } catch (const std::exception &error) {
+        METRIC_INC(metrics::KvMetricId::CLIENT_AMBIGUOUS_CREATE_CLEANUP_DROPPED_TOTAL);
+        LOG_EVERY_N(WARNING, AMBIGUOUS_CREATE_CLEANUP_DROP_LOG_RATE)
+            << "Drop ambiguous Create cleanup because scheduling failed, worker=" << workerAddr.ToString()
+            << ", clientId=" << context.clientId << ", error=" << error.what()
+            << "; worker hard reclaim applies only when these allocations were marked reclaimable";
+    }
 }
 
 Status TransportLayer::InvokeReleaseWithRetry(const HostPort &workerAddr, const ShmKey &shmId,
@@ -1276,7 +1495,8 @@ void TransportLayer::Shutdown()
     if (reconcileThread.joinable()) {
         reconcileThread.join();
     }
-    // Drain pending DecreaseReference tasks before closing their endpoint connections.
+    // Drain cleanup and regular DecreaseReference tasks before closing their endpoint connections.
+    ambiguousCreateCleanupPool_.reset();
     releasePool_.reset();
     objectRead_.reset();
     if (manager_ != nullptr) {

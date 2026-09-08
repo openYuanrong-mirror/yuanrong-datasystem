@@ -455,13 +455,22 @@ Status WorkerRpcClient::InvokeMultiSet(int64_t subTimeoutMs, MultiPublishReqPb &
 Status WorkerRpcClient::InvokeDecreaseReference(const TransportRequestContext &context, const ShmKey &shmId,
                                                 bool delayRelease)
 {
+    return InvokeDecreaseReferences(context, { shmId }, delayRelease);
+}
+
+Status WorkerRpcClient::InvokeDecreaseReferences(const TransportRequestContext &context,
+                                                 const std::vector<ShmKey> &shmIds, bool delayRelease)
+{
     CHECK_FAIL_RETURN_STATUS(IsAlive(), K_RPC_UNAVAILABLE,
                              "Routed worker RPC client is not initialized");
     CHECK_FAIL_RETURN_STATUS(!context.clientId.empty(), K_INVALID, "DecreaseReference client ID must not be empty");
-    CHECK_FAIL_RETURN_STATUS(!shmId.Empty(), K_INVALID, "DecreaseReference shm ID must not be empty");
+    CHECK_FAIL_RETURN_STATUS(!shmIds.empty(), K_INVALID, "DecreaseReference shm IDs must not be empty");
     DecreaseReferenceRequest request;
     request.set_client_id(context.clientId);
-    request.add_object_keys(shmId);
+    for (const auto &shmId : shmIds) {
+        CHECK_FAIL_RETURN_STATUS(!shmId.Empty(), K_INVALID, "DecreaseReference shm ID must not be empty");
+        request.add_object_keys(shmId);
+    }
     request.set_token(context.token);
     request.set_tenant_id(context.tenantId);
     request.set_is_routed(true);

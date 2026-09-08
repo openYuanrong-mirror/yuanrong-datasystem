@@ -172,11 +172,13 @@ enum class KvMetricId : uint16_t {
     // TCP reuses id 20 (WORKER_TO_CLIENT_GET_TCP_TOTAL_BYTES);
     WORKER_TO_CLIENT_GET_SHM_TOTAL_BYTES = 141,
     WORKER_TO_CLIENT_GET_URMA_TOTAL_BYTES = 142,
-    // SharedMemoryRefTable: count of shm units proactively reclaimed after the hard timeout
-    // passed without a client ReconcileShmRef (create-but-not-published orphans). A sustained
-    // non-zero value indicates client-side release failures or clients not revisiting.
+    // SharedMemoryRefTable: count of eligible shm units proactively reclaimed after the hard timeout
+    // passed without a client ReconcileShmRef. A sustained non-zero value indicates client-side
+    // release failures or clients not revisiting; non-reclaimable SHM-session refs are excluded.
     WORKER_SHM_REF_HARD_RECLAIM_TOTAL = 143,
-    KV_METRIC_END = 144,
+    // Ambiguous Create cleanup tasks dropped because the dedicated client cleanup pool cannot accept them.
+    CLIENT_AMBIGUOUS_CREATE_CLEANUP_DROPPED_TOTAL = 144,
+    KV_METRIC_END = 145,
 };
 
 Status InitKvMetrics();

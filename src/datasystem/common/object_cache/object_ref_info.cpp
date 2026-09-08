@@ -102,6 +102,12 @@ Status SharedMemoryRefTable::GetShmUnit(const ShmKey &shmId, std::shared_ptr<Shm
     return Status::OK();
 }
 
+bool SharedMemoryRefTable::ContainsShmUnit(const ShmKey &shmId) const
+{
+    TbbMemoryObjectRefTable::const_accessor accessor;
+    return shmRefTable_.find(accessor, shmId);
+}
+
 void SharedMemoryRefTable::ClientTableGetOrInsert(const ClientKey &clientId,
                                                   TbbMemoryClientRefTable::const_accessor &accessor)
 {
@@ -210,6 +216,9 @@ Status SharedMemoryRefTable::RemoveShmUnit(const ClientKey &clientId, const ShmK
     TbbMemoryClientRefTable::accessor clientAccessor;
     TbbMemoryObjectRefTable::accessor shmAccessor;
 
+#ifdef WITH_TESTS
+    INJECT_POINT("RemoveShmUnit.BeforeLookup");
+#endif
     // first lock clientAccessor, then lock shmAccessor.
     auto found = clientRefTable_.find(clientAccessor, clientId);
     if (!found) {
