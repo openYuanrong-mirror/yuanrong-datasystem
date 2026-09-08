@@ -8,6 +8,8 @@ namespace datasystem {
 namespace {
 
 constexpr size_t K_BATCH_READ_ITEM_WIRE_BYTES = sizeof(uint64_t) * 3;
+constexpr uint32_t K_MAX_BATCH_READ_ITEMS = 4096;
+constexpr uint32_t K_MAX_CONTROL_STRING_BYTES = 64 * 1024;
 
 uint64_t HostToBe64(uint64_t value)
 {
@@ -101,6 +103,9 @@ bool ReadString(const std::vector<uint8_t> &buf, size_t *off, std::string *v)
 {
     uint32_t len = 0;
     if (!ReadU32(buf, off, &len)) {
+        return false;
+    }
+    if (len > K_MAX_CONTROL_STRING_BYTES) {
         return false;
     }
     if (*off + len > buf.size()) {
@@ -253,7 +258,7 @@ bool DecodeBatchReadReq(const std::vector<uint8_t> &in, BatchReadTriggerRequest 
         return false;
     }
     const size_t remaining = in.size() - off;
-    if (itemCount > remaining / K_BATCH_READ_ITEM_WIRE_BYTES) {
+    if (itemCount > K_MAX_BATCH_READ_ITEMS || itemCount > remaining / K_BATCH_READ_ITEM_WIRE_BYTES) {
         return false;
     }
     req->items.clear();

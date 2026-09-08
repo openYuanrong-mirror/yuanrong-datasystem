@@ -2,7 +2,7 @@
  * Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
  */
 
-#include "internal/backend/ascend/hixl_d2d_backend.h"
+#include "internal/backend/ascend/ascend_backend.h"
 
 #include <unistd.h>
 
@@ -11,12 +11,12 @@
 #include <cstdlib>
 #include <limits>
 #include <map>
-#include <sstream>
 #include <utility>
 #include <vector>
 
 #include <hixl/hixl.h>
 
+#include "internal/backend/ascend/hixl_config.h"
 #include "internal/control_plane/socket_rpc_transport.h"
 #include "internal/log/environment_dump.h"
 #include "internal/log/logging.h"
@@ -25,23 +25,31 @@
 namespace datasystem {
 namespace {
 
+constexpr uint64_t K_REGISTER_BASE_ALIGNMENT = 2ULL * 1024ULL * 1024ULL;
+
 constexpr int32_t K_DEFAULT_HIXL_BASE_PORT = 20000;
 constexpr int32_t K_PORT_SEGMENT_SIZE = 100;
 constexpr int32_t K_DEFAULT_CONNECT_TIMEOUT_MS = 10000;
 constexpr int32_t K_DEFAULT_TRANSFER_TIMEOUT_MS = 10000;
+constexpr int32_t K_DEFAULT_READ_LEASE_TTL_MS = 30000;
+constexpr int32_t K_READ_LEASE_TIMEOUT_MARGIN_MS = 1000;
 constexpr int32_t K_MAX_TCP_PORT = 65535;
 constexpr int32_t K_DECIMAL_BASE = 10;
 constexpr size_t K_MAX_TRANSFER_OPS_PER_CALL = 4096;
 constexpr char K_OPTION_AUTO_CONNECT[] = "AutoConnect";
 constexpr char K_OPTION_GLOBAL_RESOURCE_CONFIG[] = "GlobalResourceConfig";
+constexpr char K_OPTION_LOCAL_COMM_RES[] = "LocalCommRes";
 
 struct HixlInitConfig {
     std::map<hixl::AscendString, hixl::AscendString> options;
     std::string localHost;
     std::string endpoint;
     std::string routePolicy;
+    std::string requestedCsMode;
     std::string bufferPool;
-    std::string autoConnect;
+    std::string localCommRes;
+    std::string requestedAutoConnect;
+    std::string autoConnectOption;
     std::string globalResourceConfig;
     std::string rdmaTrafficClass;
     std::string rdmaServiceLevel;
@@ -49,10 +57,13 @@ struct HixlInitConfig {
     int32_t localDeviceId = -1;
     int32_t connectTimeoutMs = 0;
     int32_t transferTimeoutMs = 0;
-    bool autoConnectConfigured = false;
+    bool autoConnectEnabled = false;
+    bool localCommResConfigured = false;
+    bool globalResourceConfigUserConfigured = false;
     bool globalResourceConfigConfigured = false;
     bool rdmaTrafficClassConfigured = false;
     bool rdmaServiceLevelConfigured = false;
+    HixlEngineMode engineMode = HixlEngineMode::kLegacy;
 };
 
 std::string GetEnvOrDefault(const char *name, const std::string &defaultValue)
@@ -164,16 +175,71 @@ int32_t ResolvePhysicalDeviceId(int32_t logicalDeviceId)
     return devices[static_cast<size_t>(logicalDeviceId)];
 }
 
-void BuildHixlInitConfig(HixlInitConfig &config)
+#if defined(TRANSFER_ENGINE_HIXL_CS_AVAILABLE) || defined(TRANSFER_ENGINE_HIXL_AUTO_CONNECT_AVAILABLE)
+bool QueryHixlCapability(hixl::FeatureType feature, const char *featureName)
+{
+    int32_t value = hixl::FEATURE_NOT_SUPPORTED;
+    const hixl::Status status = hixl::Hixl::GetCapability(feature, value);
+    if (status != hixl::SUCCESS) {
+        TE_LOG_WARNING << "Hixl::GetCapability failed"
+                       << ", feature=" << featureName
+                       << ", hixl_status=" << status;
+        return false;
+    }
+    return value == hixl::FEATURE_SUPPORTED;
+}
+#endif
+
+bool QueryHixlCsCapability()
+{
+#ifdef TRANSFER_ENGINE_HIXL_CS_AVAILABLE
+    return QueryHixlCapability(hixl::CLIENT_SERVER_COMM, "CLIENT_SERVER_COMM");
+#else
+    return false;
+#endif
+}
+
+bool QueryHixlAutoConnectCapability()
+{
+#ifdef TRANSFER_ENGINE_HIXL_AUTO_CONNECT_AVAILABLE
+    return QueryHixlCapability(hixl::AUTO_CONNECT, "AUTO_CONNECT");
+#else
+    return false;
+#endif
+}
+
+Result BuildHixlInitConfig(const std::string &routePolicy, HixlInitConfig &config)
 {
     config.bufferPool = GetEnvOrDefault("TRANSFER_ENGINE_HIXL_BUFFER_POOL", "0:0");
     config.options[hixl::AscendString(hixl::OPTION_BUFFER_POOL)] = hixl::AscendString(config.bufferPool.c_str());
-    config.autoConnectConfigured = GetEnvIfSet("TRANSFER_ENGINE_HIXL_AUTO_CONNECT", config.autoConnect);
-    if (config.autoConnectConfigured) {
-        config.options[hixl::AscendString(K_OPTION_AUTO_CONNECT)] = hixl::AscendString(config.autoConnect.c_str());
-    }
-    config.globalResourceConfigConfigured =
+    config.requestedAutoConnect = GetEnvOrDefault("TRANSFER_ENGINE_HIXL_AUTO_CONNECT", "auto");
+    HixlAutoConnectConfig autoConnectConfig;
+    TE_RETURN_IF_ERROR(ResolveHixlAutoConnectConfig(config.requestedAutoConnect, QueryHixlAutoConnectCapability(),
+                                                    &autoConnectConfig));
+    config.autoConnectEnabled = autoConnectConfig.enabled;
+    config.autoConnectOption = std::move(autoConnectConfig.optionValue);
+    config.options[hixl::AscendString(K_OPTION_AUTO_CONNECT)] =
+        hixl::AscendString(config.autoConnectOption.c_str());
+    config.globalResourceConfigUserConfigured =
         GetEnvIfSet("TRANSFER_ENGINE_HIXL_GLOBAL_RESOURCE_CONFIG", config.globalResourceConfig);
+    config.requestedCsMode = GetEnvOrDefault("TRANSFER_ENGINE_HIXL_CS_MODE", K_DEFAULT_HIXL_CS_MODE);
+    HixlCsConfigInput csInput;
+    csInput.requestedMode = config.requestedCsMode;
+    csInput.routePolicy = routePolicy;
+    GetEnvIfSet("TRANSFER_ENGINE_HIXL_LOCAL_COMM_RES", csInput.localCommRes);
+    csInput.globalResourceConfig = config.globalResourceConfig;
+    csInput.capabilityAvailable = QueryHixlCsCapability();
+    csInput.legacyRoceEnabled = GetEnvOrDefault("HCCL_INTRA_ROCE_ENABLE", "0") == "1";
+    HixlCsConfig csConfig;
+    TE_RETURN_IF_ERROR(ResolveHixlCsConfig(csInput, &csConfig));
+    config.engineMode = csConfig.engineMode;
+    config.localCommRes = std::move(csConfig.localCommRes);
+    config.localCommResConfigured = !config.localCommRes.empty();
+    if (config.localCommResConfigured) {
+        config.options[hixl::AscendString(K_OPTION_LOCAL_COMM_RES)] = hixl::AscendString(config.localCommRes.c_str());
+    }
+    config.globalResourceConfig = std::move(csConfig.globalResourceConfig);
+    config.globalResourceConfigConfigured = !config.globalResourceConfig.empty();
     if (config.globalResourceConfigConfigured) {
         config.options[hixl::AscendString(K_OPTION_GLOBAL_RESOURCE_CONFIG)] =
             hixl::AscendString(config.globalResourceConfig.c_str());
@@ -192,21 +258,26 @@ void BuildHixlInitConfig(HixlInitConfig &config)
         config.options[hixl::AscendString(hixl::OPTION_RDMA_SERVICE_LEVEL)] =
             hixl::AscendString(config.rdmaServiceLevel.c_str());
     }
+    return Result::OK();
 }
 
 void LogHixlInitializeBegin(const HixlInitConfig &config)
 {
-    TE_LOG_INFO << "hixl backend initialize begin"
+    TE_LOG_INFO << "ascend backend initialize begin"
                 << ", local_host=" << config.localHost << ", local_port=" << config.localPort
                 << ", logical_device_id=" << config.localDeviceId
                 << ", physical_device_id=" << ResolvePhysicalDeviceId(config.localDeviceId)
                 << ", hixl_endpoint=" << config.endpoint << ", hixl_route_policy=" << config.routePolicy
+                << ", hixl_engine_mode=" << HixlEngineModeName(config.engineMode)
+                << ", requested_cs_mode=" << config.requestedCsMode
                 << ", connect_timeout_ms=" << config.connectTimeoutMs
                 << ", transfer_timeout_ms=" << config.transferTimeoutMs
                 << ", buffer_pool=" << config.bufferPool
-                << ", auto_connect_configured=" << config.autoConnectConfigured
-                << ", auto_connect=" << (config.autoConnectConfigured ? config.autoConnect : "(default)")
+                << ", auto_connect_requested=" << config.requestedAutoConnect
+                << ", auto_connect_enabled=" << config.autoConnectEnabled
+                << ", local_comm_res_configured=" << config.localCommResConfigured
                 << ", global_resource_config_configured=" << config.globalResourceConfigConfigured
+                << ", global_resource_config_user_configured=" << config.globalResourceConfigUserConfigured
                 << ", global_resource_config_bytes=" << config.globalResourceConfig.size()
                 << ", rdma_traffic_class_configured=" << config.rdmaTrafficClassConfigured
                 << ", rdma_traffic_class="
@@ -230,22 +301,22 @@ uint64_t SaturatingBatchBytes(const std::vector<TransferReadOp> &ops, size_t bas
 
 }  // namespace
 
-struct HixlD2DBackend::Impl {
+struct AscendBackend::Impl {
     hixl::Hixl engine;
     bool initialized = false;
 };
 
-HixlD2DBackend::HixlD2DBackend() : impl_(std::make_unique<Impl>())
+AscendBackend::AscendBackend() : impl_(std::make_unique<Impl>())
 {
     internal::InitializeLogging();
 }
 
-HixlD2DBackend::~HixlD2DBackend()
+AscendBackend::~AscendBackend()
 {
     FinalizeLocal();
 }
 
-void HixlD2DBackend::FinalizeLocal()
+void AscendBackend::FinalizeLocal()
 {
     std::lock_guard<std::mutex> lock(mutex_);
     DisconnectAllLocked();
@@ -265,21 +336,23 @@ void HixlD2DBackend::FinalizeLocal()
         impl_->engine.Finalize();
         impl_->initialized = false;
     }
+    engineMode_ = HixlEngineMode::kLegacy;
+    autoConnectEnabled_ = false;
 }
 
-std::string HixlD2DBackend::RoutePolicy() const
+std::string AscendBackend::RoutePolicy() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
     return routePolicy_;
 }
 
-uint64_t HixlD2DBackend::MemoryGeneration() const
+uint64_t AscendBackend::MemoryGeneration() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
     return memGeneration_;
 }
 
-Result HixlD2DBackend::InitializeLocal(const std::string &localHost, uint16_t localPort, int32_t localDeviceId)
+Result AscendBackend::InitializeLocal(const std::string &localHost, uint16_t localPort, int32_t localDeviceId)
 {
     TE_CHECK_OR_RETURN(localDeviceId >= 0, ErrorCode::kInvalid, "local_device_id is invalid");
     std::string routePolicy;
@@ -288,15 +361,21 @@ Result HixlD2DBackend::InitializeLocal(const std::string &localHost, uint16_t lo
     std::string endpoint;
     TE_RETURN_IF_ERROR(BuildEndpoint(localHost, localDeviceId, &endpoint));
     HixlInitConfig config;
-    BuildHixlInitConfig(config);
+    TE_RETURN_IF_ERROR(BuildHixlInitConfig(routePolicy, config));
 
     connectTimeoutMs_ = GetEnvI32("TRANSFER_ENGINE_HIXL_CONNECT_TIMEOUT_MS", K_DEFAULT_CONNECT_TIMEOUT_MS);
     transferTimeoutMs_ = GetEnvI32("TRANSFER_ENGINE_HIXL_TRANSFER_TIMEOUT_MS", K_DEFAULT_TRANSFER_TIMEOUT_MS);
+    const int32_t readLeaseTtlMs =
+        GetEnvI32("TRANSFER_ENGINE_HIXL_READ_LEASE_TTL_MS", K_DEFAULT_READ_LEASE_TTL_MS);
+    TE_CHECK_OR_RETURN(transferTimeoutMs_ <= readLeaseTtlMs - K_READ_LEASE_TIMEOUT_MARGIN_MS, ErrorCode::kInvalid,
+                       "hixl read lease ttl should exceed transfer timeout by at least 1000 ms");
 
     std::lock_guard<std::mutex> lock(mutex_);
-    TE_CHECK_OR_RETURN(!impl_->initialized, ErrorCode::kInvalid, "hixl backend already initialized");
+    TE_CHECK_OR_RETURN(!impl_->initialized, ErrorCode::kInvalid, "ascend backend already initialized");
     localDeviceId_ = localDeviceId;
     routePolicy_ = routePolicy;
+    engineMode_ = config.engineMode;
+    autoConnectEnabled_ = config.autoConnectEnabled;
     hixlEndpoint_ = endpoint;
 
     internal::DumpProcessEnvironment("hixl_backend_initialize");
@@ -310,24 +389,28 @@ Result HixlD2DBackend::InitializeLocal(const std::string &localHost, uint16_t lo
     LogHixlInitializeBegin(config);
     const hixl::Status status = impl_->engine.Initialize(hixl::AscendString(hixlEndpoint_.c_str()), config.options);
     if (status != hixl::SUCCESS) {
-        TE_LOG_ERROR << "hixl backend initialize failed"
+        TE_LOG_ERROR << "ascend backend initialize failed"
                      << ", hixl_endpoint=" << hixlEndpoint_ << ", hixl_route_policy=" << routePolicy_
+                     << ", hixl_engine_mode=" << HixlEngineModeName(engineMode_)
                      << ", local_device_id=" << localDeviceId_ << ", hixl_status=" << status;
         return HixlStatusToResult(status, "Hixl::Initialize");
     }
     impl_->initialized = true;
 
-    TE_LOG_INFO << "hixl backend initialized"
+    TE_LOG_INFO << "ascend backend initialized"
                 << ", local_host=" << localHost << ", local_port=" << localPort
                 << ", local_device_id=" << localDeviceId_ << ", hixl_endpoint=" << hixlEndpoint_
-                << ", hixl_route_policy=" << routePolicy_ << ", connect_timeout_ms=" << connectTimeoutMs_
-                << ", transfer_timeout_ms=" << transferTimeoutMs_;
+                << ", hixl_route_policy=" << routePolicy_ << ", hixl_engine_mode=" << HixlEngineModeName(engineMode_)
+                << ", connect_timeout_ms=" << connectTimeoutMs_ << ", transfer_timeout_ms=" << transferTimeoutMs_
+                << ", read_lease_ttl_ms=" << readLeaseTtlMs;
     return Result::OK();
 }
 
-Result HixlD2DBackend::RegisterLocalMemory(uint64_t addr, uint64_t length)
+Result AscendBackend::RegisterLocalMemory(uint64_t addr, uint64_t length)
 {
     TE_CHECK_OR_RETURN(addr > 0 && length > 0, ErrorCode::kInvalid, "invalid memory region");
+    TE_CHECK_OR_RETURN(addr <= std::numeric_limits<uint64_t>::max() - length, ErrorCode::kInvalid,
+                       "memory region overflow");
     std::lock_guard<std::mutex> lock(mutex_);
     bool registeredNew = false;
     TE_RETURN_IF_ERROR(RegisterOneLocked(addr, length, &registeredNew));
@@ -338,7 +421,7 @@ Result HixlD2DBackend::RegisterLocalMemory(uint64_t addr, uint64_t length)
     return Result::OK();
 }
 
-Result HixlD2DBackend::UnregisterLocalMemory(uint64_t addr, uint64_t length)
+Result AscendBackend::UnregisterLocalMemory(uint64_t addr, uint64_t length)
 {
     TE_CHECK_OR_RETURN(addr > 0 && length > 0, ErrorCode::kInvalid, "invalid memory region");
     std::lock_guard<std::mutex> lock(mutex_);
@@ -351,10 +434,10 @@ Result HixlD2DBackend::UnregisterLocalMemory(uint64_t addr, uint64_t length)
     return rc;
 }
 
-Result HixlD2DBackend::PrepareReadDestinations(const std::vector<TransferMemoryRegion> &regions)
+Result AscendBackend::PrepareReadDestinations(const std::vector<TransferMemoryRegion> &regions)
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    TE_CHECK_OR_RETURN(impl_->initialized, ErrorCode::kNotReady, "hixl backend is not initialized");
+    TE_CHECK_OR_RETURN(impl_->initialized, ErrorCode::kNotReady, "ascend backend is not initialized");
     for (size_t regionIndex = 0; regionIndex < regions.size(); ++regionIndex) {
         const auto &region = regions[regionIndex];
         if (region.addr == 0 || region.length == 0) {
@@ -381,27 +464,30 @@ Result HixlD2DBackend::PrepareReadDestinations(const std::vector<TransferMemoryR
     return Result::OK();
 }
 
-Result HixlD2DBackend::CreateRootInfo(std::string *rootInfoBytes)
+Result AscendBackend::CreateRootInfo(std::string *rootInfoBytes)
 {
     TE_CHECK_PTR_OR_RETURN(rootInfoBytes);
     std::lock_guard<std::mutex> lock(mutex_);
-    TE_CHECK_OR_RETURN(impl_->initialized, ErrorCode::kNotReady, "hixl backend is not initialized");
-    RootInfo info;
+    TE_CHECK_OR_RETURN(impl_->initialized, ErrorCode::kNotReady, "ascend backend is not initialized");
+    HixlPeerInfo info;
     info.backendKind = BackendKind();
     info.endpoint = hixlEndpoint_;
     info.routePolicy = routePolicy_;
-    *rootInfoBytes = EncodeRootInfo(info);
+    info.engineMode = engineMode_;
+    *rootInfoBytes = EncodeHixlPeerInfo(info);
     return Result::OK();
 }
 
-Result HixlD2DBackend::InitRecv(const ConnectionSpec &spec, const std::string &rootInfoBytes)
+Result AscendBackend::InitRecv(const ConnectionSpec &spec, const std::string &rootInfoBytes)
 {
-    RootInfo rootInfo;
-    TE_RETURN_IF_ERROR(ParseRootInfo(rootInfoBytes, &rootInfo));
+    HixlPeerInfo rootInfo;
+    TE_RETURN_IF_ERROR(ParseHixlPeerInfo(rootInfoBytes, &rootInfo));
     TE_CHECK_OR_RETURN(rootInfo.backendKind == BackendKind(), ErrorCode::kNotSupported,
-                       "peer root info is not hixl");
+                       "peer root info backend is not ascend");
     TE_CHECK_OR_RETURN(rootInfo.routePolicy == routePolicy_, ErrorCode::kNotSupported,
                        "hixl route policy mismatch");
+    TE_CHECK_OR_RETURN(rootInfo.engineMode == engineMode_, ErrorCode::kNotSupported,
+                       "hixl engine mode mismatch");
     TE_CHECK_OR_RETURN(!rootInfo.endpoint.empty(), ErrorCode::kInvalid, "hixl peer endpoint is empty");
 
     std::lock_guard<std::mutex> lock(mutex_);
@@ -409,45 +495,52 @@ Result HixlD2DBackend::InitRecv(const ConnectionSpec &spec, const std::string &r
     return Result::OK();
 }
 
-Result HixlD2DBackend::InitSend(const ConnectionSpec &spec, const std::string &rootInfoBytes)
+Result AscendBackend::InitSend(const ConnectionSpec &spec, const std::string &rootInfoBytes)
 {
-    RootInfo rootInfo;
-    Result parseRc = ParseRootInfo(rootInfoBytes, &rootInfo);
+    HixlPeerInfo rootInfo;
+    Result parseRc = ParseHixlPeerInfo(rootInfoBytes, &rootInfo);
     if (parseRc.IsError()) {
         return parseRc;
     }
+    TE_CHECK_OR_RETURN(rootInfo.backendKind == BackendKind(), ErrorCode::kNotSupported,
+                       "peer root info backend is not ascend");
+    TE_CHECK_OR_RETURN(rootInfo.routePolicy == routePolicy_, ErrorCode::kNotSupported,
+                       "hixl route policy mismatch");
+    TE_CHECK_OR_RETURN(rootInfo.engineMode == engineMode_, ErrorCode::kNotSupported,
+                       "hixl engine mode mismatch");
     TE_LOG_INFO << "hixl owner accepted requester root info"
                 << ", requester=" << spec.peerHost << ":" << spec.peerPort
                 << ", requester_device_id=" << spec.peerDeviceId
-                << ", requester_hixl_endpoint=" << rootInfo.endpoint;
+                << ", requester_hixl_endpoint=" << rootInfo.endpoint
+                << ", hixl_engine_mode=" << HixlEngineModeName(rootInfo.engineMode);
     return Result::OK();
 }
 
-Result HixlD2DBackend::PostRecv(const ConnectionSpec &spec, uint64_t localAddr, uint64_t length)
+Result AscendBackend::PostRecv(const ConnectionSpec &spec, uint64_t localAddr, uint64_t length)
 {
     (void)spec;
     (void)localAddr;
     (void)length;
-    return Result(ErrorCode::kNotSupported, "hixl backend uses receiver-driven read");
+    return Result(ErrorCode::kNotSupported, "ascend backend uses receiver-driven read");
 }
 
-Result HixlD2DBackend::PostSend(const ConnectionSpec &spec, uint64_t remoteAddr, uint64_t length)
+Result AscendBackend::PostSend(const ConnectionSpec &spec, uint64_t remoteAddr, uint64_t length)
 {
     (void)spec;
     (void)remoteAddr;
     (void)length;
-    return Result(ErrorCode::kNotSupported, "hixl backend uses receiver-driven read");
+    return Result(ErrorCode::kNotSupported, "ascend backend uses receiver-driven read");
 }
 
-Result HixlD2DBackend::WaitRecv(const ConnectionSpec &spec, uint64_t timeoutMs)
+Result AscendBackend::WaitRecv(const ConnectionSpec &spec, uint64_t timeoutMs)
 {
     (void)spec;
     (void)timeoutMs;
-    return Result(ErrorCode::kNotSupported, "hixl backend uses receiver-driven read");
+    return Result(ErrorCode::kNotSupported, "ascend backend uses receiver-driven read");
 }
 
-Result HixlD2DBackend::TransferSyncRead(const ConnectionSpec &spec, const std::vector<TransferReadOp> &ops,
-                                        uint64_t timeoutMs)
+Result AscendBackend::TransferSyncRead(const ConnectionSpec &spec, const std::vector<TransferReadOp> &ops,
+                                       uint64_t timeoutMs)
 {
     TE_CHECK_OR_RETURN(!ops.empty(), ErrorCode::kInvalid, "read ops is empty");
     std::lock_guard<std::mutex> lock(mutex_);
@@ -467,8 +560,8 @@ Result HixlD2DBackend::TransferSyncRead(const ConnectionSpec &spec, const std::v
     return Result::OK();
 }
 
-Result HixlD2DBackend::TransferReadBatchLocked(const ConnectionSpec &spec, const std::vector<TransferReadOp> &ops,
-                                               size_t base, size_t end, const std::string &endpoint, uint64_t timeoutMs)
+Result AscendBackend::TransferReadBatchLocked(const ConnectionSpec &spec, const std::vector<TransferReadOp> &ops,
+    size_t base, size_t end, const std::string &endpoint, uint64_t timeoutMs)
 {
     std::vector<hixl::TransferOpDesc> descs;
     descs.reserve(end - base);
@@ -503,15 +596,17 @@ Result HixlD2DBackend::TransferReadBatchLocked(const ConnectionSpec &spec, const
                  << ", batch_op_count=" << descs.size() << ", total_op_count=" << ops.size()
                  << ", batch_bytes=" << SaturatingBatchBytes(ops, base, end)
                  << ", transfer_timeout_ms=" << effectiveTimeout << ", hixl_status=" << status;
-    const hixl::Status disconnectStatus =
-        impl_->engine.Disconnect(hixl::AscendString(endpoint.c_str()), connectTimeoutMs_);
-    LogDisconnectFailure(disconnectStatus, "Hixl::Disconnect after transfer failure", endpoint, connectTimeoutMs_);
+    if (!autoConnectEnabled_) {
+        const hixl::Status disconnectStatus =
+            impl_->engine.Disconnect(hixl::AscendString(endpoint.c_str()), connectTimeoutMs_);
+        LogDisconnectFailure(disconnectStatus, "Hixl::Disconnect after transfer failure", endpoint, connectTimeoutMs_);
+    }
     connectedEndpoints_.erase(endpoint);
     peerEndpointByConnection_.erase(ConnectionKey(spec));
     return rc;
 }
 
-void HixlD2DBackend::AbortConnection(const ConnectionSpec &spec)
+void AscendBackend::AbortConnection(const ConnectionSpec &spec)
 {
     std::lock_guard<std::mutex> lock(mutex_);
     const std::string key = ConnectionKey(spec);
@@ -526,55 +621,16 @@ void HixlD2DBackend::AbortConnection(const ConnectionSpec &spec)
     peerEndpointByConnection_.erase(iter);
 }
 
-std::string HixlD2DBackend::ConnectionKey(const ConnectionSpec &spec)
+std::string AscendBackend::ConnectionKey(const ConnectionSpec &spec)
 {
     return spec.localHost + ":" + std::to_string(spec.localPort) + ":" + std::to_string(spec.localDeviceId) + "|" +
            spec.peerHost + ":" + std::to_string(spec.peerPort) + ":" + std::to_string(spec.peerDeviceId);
 }
 
-Result HixlD2DBackend::ParseRootInfo(const std::string &rootInfoBytes, RootInfo *rootInfo)
-{
-    TE_CHECK_PTR_OR_RETURN(rootInfo);
-    std::istringstream input(rootInfoBytes);
-    std::string line;
-    if (!std::getline(input, line) || line != "transfer_engine_hixl_root_info_v1") {
-        return TE_MAKE_STATUS(ErrorCode::kInvalid, "invalid hixl root info header");
-    }
-    while (std::getline(input, line)) {
-        const size_t sep = line.find('=');
-        if (sep == std::string::npos) {
-            continue;
-        }
-        const std::string key = line.substr(0, sep);
-        const std::string value = line.substr(sep + 1);
-        if (key == "backend") {
-            rootInfo->backendKind = value;
-        } else if (key == "endpoint") {
-            rootInfo->endpoint = value;
-        } else if (key == "route") {
-            rootInfo->routePolicy = value;
-        }
-    }
-    TE_CHECK_OR_RETURN(rootInfo->backendKind == "hixl", ErrorCode::kInvalid, "invalid hixl root backend");
-    TE_CHECK_OR_RETURN(!rootInfo->endpoint.empty(), ErrorCode::kInvalid, "hixl root endpoint is empty");
-    TE_CHECK_OR_RETURN(IsSupportedRoute(rootInfo->routePolicy), ErrorCode::kInvalid, "invalid hixl route policy");
-    return Result::OK();
-}
-
-std::string HixlD2DBackend::EncodeRootInfo(const RootInfo &rootInfo)
-{
-    std::ostringstream out;
-    out << "transfer_engine_hixl_root_info_v1\n"
-        << "backend=" << rootInfo.backendKind << "\n"
-        << "endpoint=" << rootInfo.endpoint << "\n"
-        << "route=" << rootInfo.routePolicy << "\n";
-    return out.str();
-}
-
-Result HixlD2DBackend::ParseRoutePolicy(std::string *routePolicy)
+Result AscendBackend::ParseRoutePolicy(std::string *routePolicy)
 {
     TE_CHECK_PTR_OR_RETURN(routePolicy);
-    std::string route = GetEnvOrDefault("TRANSFER_ENGINE_HIXL_ROUTE", "auto");
+    std::string route = GetEnvOrDefault("TRANSFER_ENGINE_HIXL_ROUTE", K_DEFAULT_HIXL_ROUTE);
     std::transform(route.begin(), route.end(), route.begin(), [](unsigned char ch) {
         return static_cast<char>(std::tolower(ch));
     });
@@ -589,7 +645,7 @@ Result HixlD2DBackend::ParseRoutePolicy(std::string *routePolicy)
     return Result::OK();
 }
 
-Result HixlD2DBackend::BuildEndpoint(const std::string &localHost, int32_t localDeviceId, std::string *endpoint)
+Result AscendBackend::BuildEndpoint(const std::string &localHost, int32_t localDeviceId, std::string *endpoint)
 {
     TE_CHECK_PTR_OR_RETURN(endpoint);
     std::string explicitEndpoint;
@@ -623,7 +679,7 @@ Result HixlD2DBackend::BuildEndpoint(const std::string &localHost, int32_t local
     return TE_MAKE_STATUS(ErrorCode::kNotReady, "no available hixl endpoint port in device segment");
 }
 
-int32_t HixlD2DBackend::GetEnvI32(const char *name, int32_t defaultValue)
+int32_t AscendBackend::GetEnvI32(const char *name, int32_t defaultValue)
 {
     const char *env = std::getenv(name);
     if (env == nullptr || env[0] == '\0') {
@@ -632,22 +688,48 @@ int32_t HixlD2DBackend::GetEnvI32(const char *name, int32_t defaultValue)
     int64_t value = 0;
     for (const char *p = env; *p != '\0'; ++p) {
         if (*p < '0' || *p > '9') {
+            TE_LOG_WARNING << "invalid integer environment value, using default, name=" << name;
             return defaultValue;
         }
         value = value * K_DECIMAL_BASE + static_cast<int64_t>(*p - '0');
         if (value > std::numeric_limits<int32_t>::max()) {
+            TE_LOG_WARNING << "integer environment value is out of range, using default, name=" << name;
             return defaultValue;
         }
+    }
+    if (value <= 0) {
+        TE_LOG_WARNING << "integer environment value should be positive, using default, name=" << name;
+        return defaultValue;
     }
     return static_cast<int32_t>(value);
 }
 
-Result HixlD2DBackend::RegisterOneLocked(uint64_t addr, uint64_t length, bool *registeredNew)
+Result AscendBackend::ValidateBackingAlignmentLocked(uint64_t addr, uint64_t length) const
+{
+    if (routePolicy_ == "roce") {
+        return Result::OK();
+    }
+    const uint64_t alignmentRemainder = addr % K_REGISTER_BASE_ALIGNMENT;
+    if (alignmentRemainder == 0) {
+        return Result::OK();
+    }
+    TE_LOG_ERROR << "reject unaligned memory backing before potential HCCS registration"
+                 << ", addr=0x" << std::hex << addr << std::dec << ", length=" << length
+                 << ", alignment_bytes=" << K_REGISTER_BASE_ALIGNMENT
+                 << ", alignment_remainder=" << alignmentRemainder
+                 << ", local_device_id=" << localDeviceId_ << ", hixl_route_policy=" << routePolicy_;
+    return TE_MAKE_STATUS(ErrorCode::kInvalid,
+                          "HCCS-safe HIXL registration requires a 2 MiB-aligned backing base; "
+                          "transfer lengths remain byte-granular");
+}
+
+Result AscendBackend::RegisterOneLocked(uint64_t addr, uint64_t length, bool *registeredNew)
 {
     TE_CHECK_PTR_OR_RETURN(registeredNew);
     *registeredNew = false;
-    TE_CHECK_OR_RETURN(impl_->initialized, ErrorCode::kNotReady, "hixl backend is not initialized");
+    TE_CHECK_OR_RETURN(impl_->initialized, ErrorCode::kNotReady, "ascend backend is not initialized");
     TE_CHECK_OR_RETURN(addr > 0 && length > 0, ErrorCode::kInvalid, "invalid hixl memory region");
+    TE_RETURN_IF_ERROR(ValidateBackingAlignmentLocked(addr, length));
     for (const auto &entry : registeredMems_) {
         if (IsRangeInside(addr, length, entry.second.addr, entry.second.length)) {
             return Result::OK();
@@ -684,12 +766,12 @@ Result HixlD2DBackend::RegisterOneLocked(uint64_t addr, uint64_t length, bool *r
     return Result::OK();
 }
 
-Result HixlD2DBackend::UnregisterOneLocked(uint64_t addr, uint64_t length, bool failIfMissing, bool *unregistered)
+Result AscendBackend::UnregisterOneLocked(uint64_t addr, uint64_t length, bool failIfMissing, bool *unregistered)
 {
     if (unregistered != nullptr) {
         *unregistered = false;
     }
-    TE_CHECK_OR_RETURN(impl_->initialized, ErrorCode::kNotReady, "hixl backend is not initialized");
+    TE_CHECK_OR_RETURN(impl_->initialized, ErrorCode::kNotReady, "ascend backend is not initialized");
     auto iter = registeredMems_.find(addr);
     if (iter == registeredMems_.end()) {
         if (failIfMissing) {
@@ -719,7 +801,7 @@ Result HixlD2DBackend::UnregisterOneLocked(uint64_t addr, uint64_t length, bool 
     return Result::OK();
 }
 
-void HixlD2DBackend::DisconnectAllLocked()
+void AscendBackend::DisconnectAllLocked()
 {
     for (const auto &endpoint : connectedEndpoints_) {
         const hixl::Status status = impl_->engine.Disconnect(hixl::AscendString(endpoint.c_str()), connectTimeoutMs_);
@@ -729,12 +811,20 @@ void HixlD2DBackend::DisconnectAllLocked()
     peerEndpointByConnection_.clear();
 }
 
-Result HixlD2DBackend::ConnectLocked(const std::string &connectionKey, const std::string &endpoint)
+Result AscendBackend::ConnectLocked(const std::string &connectionKey, const std::string &endpoint)
 {
-    TE_CHECK_OR_RETURN(impl_->initialized, ErrorCode::kNotReady, "hixl backend is not initialized");
+    TE_CHECK_OR_RETURN(impl_->initialized, ErrorCode::kNotReady, "ascend backend is not initialized");
     auto existing = peerEndpointByConnection_.find(connectionKey);
     if (existing != peerEndpointByConnection_.end() && existing->second == endpoint &&
         connectedEndpoints_.find(endpoint) != connectedEndpoints_.end()) {
+        return Result::OK();
+    }
+    if (autoConnectEnabled_) {
+        peerEndpointByConnection_[connectionKey] = endpoint;
+        connectedEndpoints_.insert(endpoint);
+        TE_LOG_INFO << "hixl auto-connect route prepared"
+                    << ", connection_key=" << connectionKey
+                    << ", remote_hixl_endpoint=" << endpoint;
         return Result::OK();
     }
     TE_LOG_INFO << "hixl connect begin"

@@ -1,5 +1,6 @@
 #include "internal/control_plane/transfer_control_service.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
@@ -26,7 +27,7 @@ constexpr uint64_t K_DECIMAL_BASE = 10;
 
 std::string NormalizeBackendKind(const std::string &backendKind)
 {
-    return backendKind.empty() ? "hixl" : backendKind;
+    return backendKind.empty() ? "ascend" : backendKind;
 }
 
 uint64_t GetReadLeaseTtlMs()
@@ -66,18 +67,27 @@ public:
 
     ~TransferControlServiceImpl() override
     {
-        {
-            std::lock_guard<std::mutex> lock(ownerInitQueueMutex_);
-            ownerInitStop_ = true;
-        }
-        ownerInitQueueCv_.notify_all();
+        BeginShutdown();
         if (ownerInitThread_.joinable()) {
             ownerInitThread_.join();
         }
     }
 
+    void BeginShutdown() override
+    {
+        shuttingDown_.store(true);
+        registeredMemory_->CloseReadLeaseAdmission();
+        {
+            std::lock_guard<std::mutex> lock(ownerInitQueueMutex_);
+            ownerInitStop_ = true;
+            ownerInitQueue_.clear();
+        }
+        ownerInitQueueCv_.notify_all();
+    }
+
     Result ExchangeRootInfo(const ExchangeRootInfoRequest &req, ExchangeRootInfoResponse *rsp) override
     {
+        TE_CHECK_OR_RETURN(!shuttingDown_.load(), ErrorCode::kNotReady, "transfer control service is shutting down");
         internal::DumpProcessEnvironment("service_exchange_root_info");
         TE_CHECK_PTR_OR_RETURN(rsp);
         TE_CHECK_OR_RETURN(!req.requesterHost.empty(), ErrorCode::kInvalid, "requester_host is empty");
@@ -102,6 +112,7 @@ public:
 
     Result QueryConnReady(const QueryConnReadyRequest &req, QueryConnReadyResponse *rsp) override
     {
+        TE_CHECK_OR_RETURN(!shuttingDown_.load(), ErrorCode::kNotReady, "transfer control service is shutting down");
         TE_CHECK_PTR_OR_RETURN(rsp);
         TE_CHECK_OR_RETURN(!req.requesterHost.empty(), ErrorCode::kInvalid, "requester_host is empty");
         TE_CHECK_OR_RETURN(req.requesterPort > 0, ErrorCode::kInvalid, "requester_port should be positive");
@@ -119,6 +130,7 @@ public:
 
     Result ReadTrigger(const ReadTriggerRequest &req, ReadTriggerResponse *rsp) override
     {
+        TE_CHECK_OR_RETURN(!shuttingDown_.load(), ErrorCode::kNotReady, "transfer control service is shutting down");
         internal::DumpProcessEnvironment("service_read_trigger");
         TE_CHECK_PTR_OR_RETURN(rsp);
         TE_CHECK_OR_RETURN(req.length > 0, ErrorCode::kInvalid, "length should be positive");
@@ -177,6 +189,7 @@ public:
 
     Result BatchReadTrigger(const BatchReadTriggerRequest &req, BatchReadTriggerResponse *rsp) override
     {
+        TE_CHECK_OR_RETURN(!shuttingDown_.load(), ErrorCode::kNotReady, "transfer control service is shutting down");
         internal::DumpProcessEnvironment("service_batch_read_trigger");
         TE_CHECK_PTR_OR_RETURN(rsp);
         TE_CHECK_OR_RETURN(!req.requesterHost.empty(), ErrorCode::kInvalid, "requester_host is empty");
@@ -197,8 +210,12 @@ public:
     Result ReleaseReadLease(const ReleaseReadLeaseRequest &req, ReleaseReadLeaseResponse *rsp) override
     {
         TE_CHECK_PTR_OR_RETURN(rsp);
-        if (req.readLeaseId != 0) {
-            registeredMemory_->ReleaseReadLease(req.readLeaseId);
+        ReadLeaseRequester requester{ req.requesterHost, static_cast<uint16_t>(req.requesterPort),
+                                      req.requesterDeviceId };
+        if (req.readLeaseId != 0 && !registeredMemory_->ReleaseReadLease(req.readLeaseId, requester)) {
+            rsp->code = static_cast<int32_t>(ErrorCode::kNotAuthorized);
+            rsp->msg = "read lease does not belong to requester";
+            return Result::OK();
         }
         rsp->code = kRpcOkCode;
         rsp->msg = "released";
@@ -238,7 +255,7 @@ private:
                          << ", owner_backend=" << backend_->BackendKind();
             return true;
         }
-        if (backend_->BackendKind() == "hixl" && req.hixlRoutePolicy != backend_->RoutePolicy()) {
+        if (backend_->BackendKind() == "ascend" && req.hixlRoutePolicy != backend_->RoutePolicy()) {
             rsp->code = static_cast<int32_t>(ErrorCode::kNotSupported);
             rsp->msg = "hixl route policy mismatch, requester=" + req.hixlRoutePolicy +
                        ", owner=" + backend_->RoutePolicy();
@@ -264,6 +281,11 @@ private:
         task.rootInfo = req.rootInfo;
         {
             std::lock_guard<std::mutex> lock(ownerInitQueueMutex_);
+            if (ownerInitStop_) {
+                rsp->code = static_cast<int32_t>(ErrorCode::kNotReady);
+                rsp->msg = "owner init is shutting down";
+                return Result::OK();
+            }
             if (ownerInitQueue_.size() >= kMaxOwnerInitQueueSize) {
                 rsp->code = static_cast<int32_t>(ErrorCode::kNotReady);
                 rsp->msg = "owner init queue is full";
@@ -275,7 +297,7 @@ private:
             }
             ownerInitQueue_.push_back(std::move(task));
         }
-        TE_LOG_INFO << "exchange root info accepted"
+        TE_VLOG_1 << "exchange root info accepted"
                   << ", requester=" << req.requesterHost << ":" << req.requesterPort
                   << ", requester_device_id=" << req.requesterDeviceId
                   << ", owner_device_id=" << localDeviceId_
@@ -301,7 +323,10 @@ private:
             ranges.push_back(TransferMemoryRegion{ item.remoteAddr, item.length });
         }
         uint64_t leaseId = 0;
-        Result leaseRc = registeredMemory_->AcquireReadLease(ranges, localDeviceId_, GetReadLeaseTtlMs(), &leaseId);
+        ReadLeaseRequester requester{ req.requesterHost, static_cast<uint16_t>(req.requesterPort),
+                                      req.requesterDeviceId };
+        Result leaseRc =
+            registeredMemory_->AcquireReadLease(ranges, localDeviceId_, requester, GetReadLeaseTtlMs(), &leaseId);
         if (leaseRc.IsError()) {
             rsp->code = static_cast<int32_t>(leaseRc.GetCode());
             rsp->msg = leaseRc.GetMsg();
@@ -312,7 +337,7 @@ private:
         rsp->msg = "accepted";
         rsp->readLeaseId = leaseId;
         rsp->ownerMemGeneration = backend_->MemoryGeneration();
-        TE_LOG_INFO << "hixl batch read lease accepted"
+        TE_VLOG_1 << "hixl batch read lease accepted"
                   << ", requester=" << req.requesterHost << ":" << req.requesterPort
                   << ", requester_device_id=" << req.requesterDeviceId
                   << ", item_count=" << req.items.size()
@@ -363,10 +388,10 @@ private:
             {
                 std::unique_lock<std::mutex> lock(ownerInitQueueMutex_);
                 ownerInitQueueCv_.wait(lock, [this]() { return ownerInitStop_ || !ownerInitQueue_.empty(); });
+                if (ownerInitStop_) {
+                    break;
+                }
                 if (ownerInitQueue_.empty()) {
-                    if (ownerInitStop_) {
-                        break;
-                    }
                     continue;
                 }
                 task = std::move(ownerInitQueue_.front());
@@ -402,6 +427,7 @@ private:
     std::shared_ptr<ConnectionManager> connMgr_;
     std::shared_ptr<RegisteredMemoryTable> registeredMemory_;
     std::shared_ptr<IDataPlaneBackend> backend_;
+    std::atomic<bool> shuttingDown_ {false};
 
     std::mutex ownerInitQueueMutex_;
     std::condition_variable ownerInitQueueCv_;

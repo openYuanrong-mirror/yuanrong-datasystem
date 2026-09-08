@@ -1,6 +1,7 @@
 #ifndef TRANSFER_ENGINE_INTERNAL_SOCKET_RPC_TRANSPORT_H
 #define TRANSFER_ENGINE_INTERNAL_SOCKET_RPC_TRANSPORT_H
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -9,6 +10,8 @@
 #include "datasystem/transfer_engine/status.h"
 
 namespace datasystem {
+
+constexpr size_t K_MAX_RPC_PAYLOAD_BYTES = 4 * 1024 * 1024;
 
 class ScopedFd {
 public:
@@ -27,16 +30,16 @@ private:
     int fd_ = -1;
 };
 
-Result ConnectTo(const std::string &host, uint16_t port, int *fd);
+Result ConnectTo(const std::string &host, uint16_t port, int *fd, int timeoutMs = 10000);
 enum class ListenSocketFailureLogLevel { kError, kVlog1 };
 Result CreateListenSocket(const std::string &host, uint16_t port, int backlog, int &listenFd,
                           ListenSocketFailureLogLevel failureLogLevel = ListenSocketFailureLogLevel::kError);
 Result SetSocketTimeoutSec(int fd, int timeoutSec);
 
-Result SendFrame(int fd, RpcMethod method, const std::vector<uint8_t> &payload);
-Result RecvFrame(int fd, RpcMethod *method, std::vector<uint8_t> *payload);
-Result InvokeRpc(const std::string &host, uint16_t port, RpcMethod expectedMethod, const std::vector<uint8_t> &reqPayload,
-                 std::vector<uint8_t> *rspPayload);
+Result SendFrame(int fd, RpcMethod method, const std::vector<uint8_t> &payload, int timeoutMs = 10000);
+Result RecvFrame(int fd, RpcMethod *method, std::vector<uint8_t> *payload, int timeoutMs = 10000);
+Result InvokeRpc(const std::string &host, uint16_t port, RpcMethod expectedMethod,
+                 const std::vector<uint8_t> &reqPayload, std::vector<uint8_t> *rspPayload);
 
 }  // namespace datasystem
 

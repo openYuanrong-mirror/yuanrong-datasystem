@@ -153,15 +153,28 @@ bash build.sh -t run_example
   where `build.sh` auto-enabled HIXL:
 
 ```bash
+export TRANSFER_ENGINE_HIXL_CS_MODE=auto
 export TRANSFER_ENGINE_HIXL_ROUTE=hccs
 export TRANSFER_ENGINE_HIXL_BASE_PORT=21000
 transfer_engine/scripts/run_hixl_d2d_smoke_suite.sh
+```
+
+For the compatibility-only HIXL 8.5.2 through 9.0.x path, disable CS and AutoConnect explicitly. Use vendor route
+matching by default; legacy RoCE instead requires `TRANSFER_ENGINE_HIXL_ROUTE=roce` together with
+`HCCL_INTRA_ROCE_ENABLE=1` on both peers:
+
+```bash
+export TRANSFER_ENGINE_HIXL_CS_MODE=off
+export TRANSFER_ENGINE_HIXL_AUTO_CONNECT=off
+export TRANSFER_ENGINE_HIXL_ROUTE=auto
+unset HCCL_INTRA_ROCE_ENABLE
 ```
 
 Override `OWNER_DEVICE`, `REQUESTER_DEVICE`, and `REQUESTER_DEVICE_STEP` when the smoke should select devices
 explicitly, for example on validation hosts that need zero-based device selection:
 
 ```bash
+export TRANSFER_ENGINE_HIXL_CS_MODE=auto
 export TRANSFER_ENGINE_HIXL_ROUTE=hccs
 export TRANSFER_ENGINE_HIXL_BASE_PORT=21000
 OWNER_DEVICE=0 REQUESTER_DEVICE=1 REQUESTER_DEVICE_STEP=1 \
@@ -170,6 +183,21 @@ OWNER_DEVICE=0 REQUESTER_DEVICE=1 REQUESTER_DEVICE_STEP=1 \
 
 Use the same suite for A3-oriented runs by passing `OWNER_DEVICE`, `REQUESTER_DEVICE`, and
 `REQUESTER_DEVICE_STEP` explicitly when a specific device pair is required.
+For the CANN/HIXL 9.1+ A3 Device RoCE gate, require CS on both peers and leave the legacy HCCL selector unset:
+
+```bash
+export TRANSFER_ENGINE_HIXL_CS_MODE=on
+export TRANSFER_ENGINE_HIXL_ROUTE=roce
+export TRANSFER_ENGINE_HIXL_AUTO_CONNECT=auto
+unset HCCL_INTRA_ROCE_ENABLE
+OWNER_DEVICE=0 REQUESTER_DEVICE=1 REQUESTER_DEVICE_STEP=1 \
+  transfer_engine/scripts/run_hixl_d2d_smoke_suite.sh
+```
+
+The suite rejects a run that transfers data without logging effective `hixl_engine_mode=cs` when CS is required.
+Set `TRANSFER_ENGINE_HIXL_AUTO_CONNECT=off` to validate the explicit-Connect rollback path. Deployments that cannot
+derive the correct device endpoint may set `TRANSFER_ENGINE_HIXL_LOCAL_COMM_RES` to a version 1.3 JSON object containing
+the real `net_instance_id` and endpoint list; do not store real topology values in repository scripts or docs.
 The HIXL suite defaults `TRANSFER_ENGINE_ACL_MALLOC_POLICY=huge_only` so smoke-owned HBM allocations satisfy HIXL
 HCCS D2D registration requirements; set it to `huge_first` to reproduce the older allocation behavior.
 The smoke requester explicitly registers its HIXL read-destination buffers before `BatchTransferSyncRead`; this mirrors
@@ -316,7 +344,8 @@ bazel test --config=release --config=test \
   - `transfer_engine/scripts/run_cross_node_smoke_cases.sh`: manual owner/requester wrapper around
     `transfer_engine_cross_node_smoke`.
   - `transfer_engine/scripts/run_hixl_d2d_smoke_suite.sh`: same-node HIXL D2D suite covering batch reads, reverse
-    direction, concurrent requesters, unregistered-address rejection, and a 4 x 16 MiB transfer.
+    direction, concurrent requesters, unregistered-address rejection, a 4 x 16 MiB transfer, and effective CS-mode
+    log verification for required CS/Device-RoCE runs.
 - URMA send-lane state-machine coverage:
   - `//tests/ut/client:urma_send_lane_test` is hardware-independent and covers lane settlement, force-release
     preconditions and idempotency, retirement precedence, request-generation ownership, and first-timeout context

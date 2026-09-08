@@ -80,7 +80,7 @@ TEST(ControlPlaneCodecLltTest, ExchangeReqRoundTrip)
     in.requesterDeviceId = 3;
     in.ownerDeviceId = -1;
     in.rootInfo = std::string("ab\0cd", 5);
-    in.backendKind = "hixl";
+    in.backendKind = "ascend";
     in.hixlRoutePolicy = "hccs";
 
     const auto payload = EncodeExchangeReq(in);
@@ -103,7 +103,7 @@ TEST(ControlPlaneCodecLltTest, HixlExchangeAndQueryMessagesRoundTrip)
     exchangeIn.msg = "ok";
     exchangeIn.ownerDeviceId = 2;
     exchangeIn.requesterInitRootInfo = "owner_endpoint";
-    exchangeIn.backendKind = "hixl";
+    exchangeIn.backendKind = "ascend";
     exchangeIn.hixlRoutePolicy = "roce";
     exchangeIn.ownerMemGeneration = 42;
     ExchangeRootInfoResponse exchangeOut;
@@ -175,6 +175,19 @@ TEST(ControlPlaneCodecLltTest, BatchReadReqRejectsTruncatedLargeItemCount)
     EXPECT_TRUE(decoded.items.empty());
 }
 
+TEST(ControlPlaneCodecLltTest, BatchReadReqRejectsTooManyItems)
+{
+    BatchReadTriggerRequest req;
+    req.requesterHost = "10.0.0.7";
+    req.requesterPort = 18888;
+    req.requesterDeviceId = 2;
+    req.ownerDeviceId = 7;
+    req.items.resize(4097);
+    BatchReadTriggerRequest decoded;
+    EXPECT_FALSE(DecodeBatchReadReq(EncodeBatchReadReq(req), &decoded));
+    EXPECT_TRUE(decoded.items.empty());
+}
+
 // 中文说明：验证 socket_rpc_transport 的帧收发，确保方法号和 payload 能正确传输。
 TEST(SocketRpcTransportLltTest, SocketPairSendRecv)
 {
@@ -190,6 +203,26 @@ TEST(SocketRpcTransportLltTest, SocketPairSendRecv)
     EXPECT_EQ(method, RpcMethod::kQueryConnReady);
     EXPECT_EQ(recvPayload, sendPayload);
 
+    close(fd[0]);
+    close(fd[1]);
+}
+
+TEST(SocketRpcTransportLltTest, RejectsOversizedPayloadBeforeAllocation)
+{
+    int fd[2] = { -1, -1 };
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fd), 0);
+
+    const std::vector<uint8_t> header{ 0x54, 0x45, 0x52, 0x50, static_cast<uint8_t>(RpcMethod::kQueryConnReady),
+                                       0x00, 0x40, 0x00, 0x01 };
+    ASSERT_EQ(send(fd[0], header.data(), header.size(), 0), static_cast<ssize_t>(header.size()));
+    RpcMethod method;
+    std::vector<uint8_t> payload;
+    Result recvRc = RecvFrame(fd[1], &method, &payload);
+    EXPECT_EQ(recvRc.GetCode(), ErrorCode::kInvalid);
+    EXPECT_TRUE(payload.empty());
+
+    std::vector<uint8_t> oversized(K_MAX_RPC_PAYLOAD_BYTES + 1, 0);
+    EXPECT_EQ(SendFrame(fd[0], RpcMethod::kQueryConnReady, oversized).GetCode(), ErrorCode::kInvalid);
     close(fd[0]);
     close(fd[1]);
 }

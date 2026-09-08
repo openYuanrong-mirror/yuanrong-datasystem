@@ -73,7 +73,9 @@
    counts.
 3. If hetero is on but Ascend toolkit cannot be found, `build.sh` sets `BUILD_HETERO=off`.
 4. For CMake builds with hetero still on, `build.sh` enables `TRANSFER_ENGINE_ENABLE_HIXL=on`; transfer_engine configure
-   then keeps that backend only when detected CANN/HIXL is `8.5.2+`, otherwise it warns and compiles without HIXL D2D.
+   then treats detected CANN/HIXL `9.1.0+` as fully supported. Detected `8.5.2` through `9.0.x` retains a warning-backed
+   legacy compatibility path that requires CS mode off; lower or unknown versions compile without HIXL D2D. HIXL
+   `9.1.0+` independently enables the AutoConnect and CS capability probes.
 5. For CMake, `build.sh` sources `scripts/build_cmake.sh`.
 6. `build_datasystem_cmake` cleans or preserves build/output directories based on `BUILD_INCREMENT`.
 7. `build_datasystem_cmake` assembles CMake options and selects `Ninja` or `Unix Makefiles`.
@@ -115,10 +117,10 @@
 | brpc | `1.15.0` | always | Built as shared brpc with `WITH_GLOG=OFF` against project gflags, leveldb, protobuf, and OpenSSL; applies `avoid-glog-flag-conflicts.patch` so brpc's built-in logging path registers `brpc_*` verbosity flags instead of glog-owned names. |
 | braft | `1.1.2` | always | Reuses the existing brpc, gflags, leveldb, protobuf, OpenSSL, and zlib builds. `modern-toolchain-compat.patch` backports modern compiler/architecture compatibility, fixes the revision to the release tag supplied by DataSystem, and disables unused tools. It builds static PIC `libbraft.a`, which enters the product closure through `coordinator_service_impl` -> `coordinator_election_manager` -> `coordinator_raft_node`. There is no standalone shared braft library or direct braft install/package rule. |
 | jemalloc | `5.3.0` | always | Shared jemalloc is linked into `datasystem_worker_bin`; profiling controlled by `SUPPORT_JEPROF`. |
-| RocksDB | `7.10.2` | always | Used by metadata/replica storage code. |
+| RocksDB | `7.10.2` | always | Used by metadata/replica storage code; built with `WITH_LIBURING=OFF` so its exported target has no undeclared `uring::uring` dependency. |
 | SecureC / libboundscheck | `v1.1.16` | always | Also passed into p2p-transfer build. |
 | TBB | `2020.3-5.oe2203sp1` from `v2020.3` source | always | Patches for GCC 14; adds `TBB_INTERFACE_VERSION` definition. |
-| nlohmann_json | `3.11.3` | always | Header library target. |
+| nlohmann_json | `3.11.3` | always in the root build; standalone transfer_engine pulls it when HIXL is enabled | Header library target; transfer_engine uses it to validate and merge HIXL CS resource JSON during initialization. |
 | OpenSSL | `1.1.1wa` | always | Used by auth, gRPC, curl, package libs. |
 | libcurl | `8.8.0` | always | Depends on OpenSSL. |
 | protobuf | `3.25.5`, found as `25.5.0` config | always | Generates project proto and etcd proto sources. |
@@ -134,7 +136,7 @@
 | JNI | system JNI | `BUILD_JAVA_API=on` | Finds JNI headers for `client_jni_api`. |
 | Ascend CANN | external toolkit | `BUILD_HETERO AND BUILD_HETERO_NPU` | Located via `ASCEND_HOME_PATH`, `ASCEND_CUSTOM_PATH/latest`, or `/usr/local/Ascend/ascend-toolkit/latest`. |
 | p2p-transfer | vendored `third_party/P2P-Transfer`, version `0.1.0` | `BUILD_HETERO AND BUILD_HETERO_NPU` | Built through third-party helper; not treated as DS_PACKAGE open-source package. This dependency is independent of the transfer_engine HIXL D2D version gate. |
-| CANN HIXL | external toolkit libraries `cann_hixl`, `metadef`, `ascendcl` | Enabled by `build.sh` for CMake `-X on`, then passed as `TRANSFER_ENGINE_ENABLE_HIXL=ON`; `transfer_engine/CMakeLists.txt` can force it off | HIXL D2D is compiled only when CANN/HIXL `8.5.2+` is detected. Lower or unknown versions retain the NPU build while disabling this backend. When enabled, root CMake requires `BUILD_TRANSFER_ENGINE AND BUILD_HETERO AND BUILD_HETERO_NPU`; `transfer_engine/CMakeLists.txt` performs final dependency discovery and version gating. |
+| CANN HIXL | external toolkit libraries `cann_hixl`, `metadef`, `ascendcl` | Enabled by `build.sh` for CMake `-X on`, then passed as `TRANSFER_ENGINE_ENABLE_HIXL=ON`; `transfer_engine/CMakeLists.txt` can force it off | HIXL 9.1.0+ is the fully supported TransferEngine baseline. Detected 8.5.2 through 9.0.x retains a warning-backed, CS-off legacy compatibility path; lower or unknown versions retain the NPU build while disabling this backend. HIXL 9.1.0+ independently enables the AutoConnect and CS runtime capability probes. When enabled, root CMake requires `BUILD_TRANSFER_ENGINE AND BUILD_HETERO AND BUILD_HETERO_NPU`; `transfer_engine/CMakeLists.txt` performs final dependency discovery and version gating. |
 | CUDA / NCCL | external toolkit | `BUILD_HETERO AND BUILD_HETERO_GPU` | Located via `CUDA_HOME_PATH`, `CUDA_CUSTOM_PATH`, or `/usr/local/cuda`. |
 | URMA | system package | `BUILD_WITH_URMA=on` | `BUILD_PIPLN_H2D` requires URMA. |
 | UCX | `1.18.0` plus rdma-core headers | `BUILD_WITH_RDMA=on` | Configure build with verbs/rdmacm/multithreading and no Go/Java. |
@@ -231,7 +233,7 @@ coordinator_service_impl -> coordinator_election_manager -> coordinator_raft_nod
 | `acl_plugin` / `cuda_plugin` | shared plugin | external device libs, protobuf, p2p-transfer for Ascend | Hash header generation depends on stripped plugin output. |
 | `common_persistence_api` | static | `common_obs`, `common_sfs_client`, `common_slot_client`, curl | L2 persistence aggregation point. |
 | `dsbench_cpp` | executable | `datasystem`, pthread, `common_util` | Included in wheel payload. |
-| `transfer_engine` / `_transfer_engine` | static library / Python extension | private `ds_spdlog::spdlog`, Threads, `dl`; optional HIXL libraries | Must not link or package glog. Standalone builds compile the same patched `libds-spdlog.so`; the private facade owns file/stderr behavior through `TRANSFER_ENGINE_*` configuration. The production data plane is HIXL-only; the mock backend remains test-only. |
+| `transfer_engine` / `_transfer_engine` | static library / Python extension | private `ds_spdlog::spdlog`, Threads, `dl`; optional HIXL libraries | Must not link or package glog. Standalone builds compile the same patched `libds-spdlog.so`; the private facade owns file/stderr behavior through `TRANSFER_ENGINE_*` configuration. The production data plane is HIXL-only. |
 
 ### Optional Edges That Matter For Optimization
 
@@ -240,7 +242,7 @@ coordinator_service_impl -> coordinator_election_manager -> coordinator_raft_nod
 | `WITH_TESTS` | GTest and test targets, including test-only protos/sources and CTest registration; braft and Coordinator Raft product targets remain unconditional | `cmake/dependency.cmake`, `CMakeLists.txt`, `tests/ut/CMakeLists.txt`, `tests/st/CMakeLists.txt`, `src/datasystem/protos/CMakeLists.txt`, `src/datasystem/worker/CMakeLists.txt` |
 | `ENABLE_PERF` | perf client source, perf service source, perf proto targets, `perf_client.h` included in SDK headers | `src/datasystem/client/CMakeLists.txt`, `src/datasystem/worker/CMakeLists.txt`, `cmake/package.cmake` |
 | `BUILD_HETERO_NPU` | Ascend find, optional root-project p2p-transfer for `acl_plugin`, transfer_engine subproject, and plugin hash generation; TransferEngine itself uses HIXL and links the repository-private `ds_spdlog` target | `cmake/dependency.cmake`, `CMakeLists.txt`, device CMake files, `transfer_engine/CMakeLists.txt` |
-| `TRANSFER_ENGINE_ENABLE_HIXL` | Adds `transfer_engine/src/internal/backend/ascend/hixl_d2d_backend.cpp`, defines `TRANSFER_ENGINE_ENABLE_HIXL=1`, and links `cann_hixl`, `metadef`, `ascendcl` only after CANN/HIXL `8.5.2+` is detected; empty/`ascend`/`hixl` protocol selects HIXL and returns `kNotSupported` when this is off. P2P is rejected, `TRANSFER_ENGINE_BACKEND` only accepts `hixl`, and an empty control-plane `backendKind` is normalized to HIXL. | `build.sh`, `scripts/build_cmake.sh`, `transfer_engine/CMakeLists.txt`, `transfer_engine/cmake/options.cmake`, `transfer_engine/src/transfer_engine.cpp`, `transfer_engine/src/internal/control_plane/transfer_control_service.cpp` |
+| `TRANSFER_ENGINE_ENABLE_HIXL` | Adds `hixl_config.cpp` and `ascend_backend.cpp`, defines `TRANSFER_ENGINE_ENABLE_HIXL=1`, and links `cann_hixl`, `metadef`, `ascendcl`. HIXL `9.1.0+` is fully supported; detected `8.5.2` through `9.0.x` is a CS-off legacy compatibility path. Detected `9.1.0+` independently defines `TRANSFER_ENGINE_HIXL_AUTO_CONNECT_AVAILABLE` and `TRANSFER_ENGINE_HIXL_CS_AVAILABLE`, whose `GetCapability` results decide runtime use. The public protocol only accepts `ascend`; the Ascend backend uses HIXL internally and returns `kNotSupported` when HIXL support is not compiled. Control-plane `backendKind` is `ascend`. | `build.sh`, `scripts/build_cmake.sh`, `transfer_engine/CMakeLists.txt`, `transfer_engine/cmake/options.cmake`, `transfer_engine/src/transfer_engine.cpp`, `transfer_engine/src/internal/backend/ascend/hixl_config.cpp`, `transfer_engine/src/internal/control_plane/transfer_control_service.cpp` |
 | `BUILD_HETERO_GPU` | CUDA find, `common_cuda_device`, `cuda_plugin`, plugin hash generation | `cmake/dependency.cmake`, device CMake files |
 | `BUILD_PIPLN_H2D` | FATAL unless URMA is on; adds `os_transport_pipeline` and links it into SDK/worker | `cmake/dependency.cmake`, `src/datasystem/common/os_transport_pipeline/CMakeLists.txt` |
 | `BUILD_WITH_RDMA` | UCX source/library and rdma-core header check; installs UCX base and IB libs | `cmake/external_libs/ucx.cmake`, `cmake/package.cmake` |

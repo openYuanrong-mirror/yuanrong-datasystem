@@ -2,7 +2,7 @@ import multiprocessing as mp
 import socket
 import unittest
 
-from yr.datasystem import ErrorCode, TransferEngine
+from yr.datasystem import ErrorCode, MemoryRegistration, TransferEngine
 
 try:
     import torch
@@ -20,7 +20,7 @@ def _free_port() -> int:
 def _owner_worker(local_hostname: str, device_id: int, size: int, batch_count: int, ready_queue, stop_event) -> None:
     engine = TransferEngine()
     try:
-        init_rc = engine.initialize(local_hostname, "hixl", f"npu:{device_id}")
+        init_rc = engine.initialize(local_hostname, "P2PHANDSHAKE", "ascend", f"npu:{device_id}")
         if init_rc.is_error():
             ready_queue.put({"ok": False, "error": init_rc.to_string()})
             return
@@ -38,7 +38,7 @@ def _owner_worker(local_hostname: str, device_id: int, size: int, batch_count: i
             lengths.append(size)
             expected_values.append(v)
 
-        reg_rc = engine.batch_register_memory(src_addrs, lengths)
+        reg_rc = engine.batch_register_memory(src_addrs, lengths, "*")
         if reg_rc.is_error():
             ready_queue.put({"ok": False, "error": reg_rc.to_string()})
             return
@@ -61,7 +61,7 @@ def _requester_worker(local_hostname: str, device_id: int, owner_hostname: str, 
                       result_queue) -> None:
     engine = TransferEngine()
     try:
-        init_rc = engine.initialize(local_hostname, "hixl", f"npu:{device_id}")
+        init_rc = engine.initialize(local_hostname, "P2PHANDSHAKE", "ascend", f"npu:{device_id}")
         if init_rc.is_error():
             result_queue.put({"ok": False, "error": init_rc.to_string()})
             return
@@ -70,14 +70,20 @@ def _requester_worker(local_hostname: str, device_id: int, owner_hostname: str, 
         dst_tensors = [torch.zeros((int(lengths[i]),), dtype=torch.uint8, device=dev) for i in range(len(remote_addrs))]
         dst_addrs = [int(t.data_ptr()) for t in dst_tensors]
 
-        batch_rc = engine.batch_transfer_sync_read(owner_hostname, dst_addrs, remote_addrs, lengths)
+        batch_rc = engine.batch_transfer_sync_read(owner_hostname, dst_addrs, remote_addrs, lengths, "")
         if batch_rc.is_error():
             result_queue.put({"ok": False, "error": batch_rc.to_string()})
             return
 
         # Also validate single-transfer API on the first item.
         single_dst = torch.zeros((int(lengths[0]),), dtype=torch.uint8, device=dev)
-        single_rc = engine.transfer_sync_read(owner_hostname, int(single_dst.data_ptr()), int(remote_addrs[0]), int(lengths[0]))
+        single_rc = engine.transfer_sync_read(
+            owner_hostname,
+            int(single_dst.data_ptr()),
+            int(remote_addrs[0]),
+            int(lengths[0]),
+            "",
+        )
         if single_rc.is_error():
             result_queue.put({"ok": False, "error": single_rc.to_string()})
             return
@@ -197,6 +203,16 @@ class PythonApiStTest(unittest.TestCase):
 
     def test_boundary_invalid_arguments(self):
         engine = TransferEngine()
+
+        registration = MemoryRegistration(
+            logical_addr=0x210000,
+            logical_length=16,
+            backing_addr=0x200000,
+            backing_length=0x100000,
+        )
+        self.assertEqual(registration.logical_addr, 0x210000)
+        rc = engine.batch_register_memory_ex([registration], location="*")
+        self.assertEqual(rc.get_code(), ErrorCode.kNotReady)
 
         rc = engine.batch_transfer_sync_read("", [], [], [])
         self.assertEqual(rc.get_code(), ErrorCode.kInvalid)

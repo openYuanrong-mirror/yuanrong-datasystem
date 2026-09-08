@@ -48,7 +48,7 @@ __all__ = [
 
 _PKG_DIR = Path(__file__).resolve().parent
 if any((_PKG_DIR / ("_transfer_engine" + suffix)).exists() for suffix in importlib.machinery.EXTENSION_SUFFIXES):
-    __all__.extend(["TransferEngine", "Result", "ErrorCode"])
+    __all__.extend(["TransferEngine", "Result", "ErrorCode", "MemoryRegistration"])
 
 # Keep public SDK symbols lazy so importing TransferEngine alone does not load
 # libds_client_py/libbrpc before other native logging runtimes enter the process.
@@ -82,6 +82,7 @@ _TRANSFER_ENGINE_EXPORTS = {
     "TransferEngine": "TransferEngine",
     "Result": "Result",
     "ErrorCode": "ErrorCode",
+    "MemoryRegistration": "MemoryRegistration",
 }
 
 

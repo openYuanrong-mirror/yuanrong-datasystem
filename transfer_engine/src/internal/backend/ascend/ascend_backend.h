@@ -2,8 +2,8 @@
  * Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
  */
 
-#ifndef TRANSFER_ENGINE_INTERNAL_HIXL_D2D_BACKEND_H
-#define TRANSFER_ENGINE_INTERNAL_HIXL_D2D_BACKEND_H
+#ifndef TRANSFER_ENGINE_INTERNAL_ASCEND_BACKEND_H
+#define TRANSFER_ENGINE_INTERNAL_ASCEND_BACKEND_H
 
 #include <cstddef>
 #include <cstdint>
@@ -13,17 +13,18 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "internal/backend/ascend/hixl_config.h"
 #include "datasystem/transfer_engine/data_plane_backend.h"
 
 namespace datasystem {
 
-class HixlD2DBackend final : public IDataPlaneBackend {
+class AscendBackend final : public IDataPlaneBackend {
 public:
-    HixlD2DBackend();
-    ~HixlD2DBackend() override;
+    AscendBackend();
+    ~AscendBackend() override;
 
     bool RequiresAclRuntime() const override { return true; }
-    std::string BackendKind() const override { return "hixl"; }
+    std::string BackendKind() const override { return "ascend"; }
     std::string RoutePolicy() const override;
     uint64_t MemoryGeneration() const override;
     bool SupportsReceiverDrivenRead() const override { return true; }
@@ -51,20 +52,13 @@ private:
         uint64_t length = 0;
         void *handle = nullptr;
     };
-    struct RootInfo {
-        std::string backendKind;
-        std::string endpoint;
-        std::string routePolicy;
-    };
-
     static std::string ConnectionKey(const ConnectionSpec &spec);
-    static Result ParseRootInfo(const std::string &rootInfoBytes, RootInfo *rootInfo);
-    static std::string EncodeRootInfo(const RootInfo &rootInfo);
     static Result ParseRoutePolicy(std::string *routePolicy);
     static Result BuildEndpoint(const std::string &localHost, int32_t localDeviceId, std::string *endpoint);
     static int32_t GetEnvI32(const char *name, int32_t defaultValue);
 
     Result RegisterOneLocked(uint64_t addr, uint64_t length, bool *registeredNew);
+    Result ValidateBackingAlignmentLocked(uint64_t addr, uint64_t length) const;
     Result UnregisterOneLocked(uint64_t addr, uint64_t length, bool failIfMissing, bool *unregistered = nullptr);
     void DisconnectAllLocked();
     Result ConnectLocked(const std::string &connectionKey, const std::string &endpoint);
@@ -78,7 +72,9 @@ private:
     std::unordered_set<std::string> connectedEndpoints_;
     int32_t localDeviceId_ = -1;
     std::string hixlEndpoint_;
-    std::string routePolicy_ = "auto";
+    std::string routePolicy_ = K_DEFAULT_HIXL_ROUTE;
+    HixlEngineMode engineMode_ = HixlEngineMode::kLegacy;
+    bool autoConnectEnabled_ = false;
     uint64_t memGeneration_ = 0;
     int32_t connectTimeoutMs_ = 10000;
     int32_t transferTimeoutMs_ = 10000;
@@ -86,4 +82,4 @@ private:
 
 }  // namespace datasystem
 
-#endif  // TRANSFER_ENGINE_INTERNAL_HIXL_D2D_BACKEND_H
+#endif  // TRANSFER_ENGINE_INTERNAL_ASCEND_BACKEND_H
