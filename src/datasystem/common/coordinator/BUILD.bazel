@@ -9,10 +9,21 @@ ds_cc_library(
     copts = ["-std=c++17"],
     deps = [
         "//include/datasystem/utils:utils_headers",
+        "//src/datasystem/common/log:common_log",
         "//src/datasystem/common/util:net_util",
         "//src/datasystem/common/util:status_helper",
-        "//src/datasystem/common/util:uuid_generator",
-        "//src/datasystem/protos:coordinator_cc_proto",
+    ],
+)
+
+ds_cc_library(
+    name = "coordinator_discovery_cache",
+    srcs = ["coordinator_discovery_cache.cpp"],
+    hdrs = ["coordinator_discovery_cache.h"],
+    copts = ["-std=c++17"],
+    deps = [
+        "//include/datasystem/utils:utils_headers",
+        "//src/datasystem/common/log:common_log",
+        "//src/datasystem/common/util:net_util",
     ],
 )
 
@@ -30,7 +41,6 @@ ds_cc_library(
         "//tests/ut/common/coordinator:__pkg__",
     ],
     deps = [
-        ":coordinator_leader_router",
         "//include/datasystem/utils:utils_headers",
         "//src/datasystem/common/util:status_helper",
         "//src/datasystem/common/util:strings_util",
@@ -49,8 +59,9 @@ ds_cc_library(
         "watch_registry.cpp",
     ],
     hdrs=[
-        "coordinator_service_proxy.h",
+        "coordinator_discovery_cache.h",
         "coordinator_leader_router.h",
+        "coordinator_service_proxy.h",
         "event_notify_executor.h",
         "key_value_entry.h",
         "coordinator_store.h",
@@ -63,6 +74,7 @@ ds_cc_library(
     ],
     copts=["-std=c++17"],
     deps=[
+        ":coordinator_discovery_cache",
         ":coordinator_leader_router",
         "//include/datasystem/utils:utils_headers",
         "//src/datasystem/common/flags:ds_flags",

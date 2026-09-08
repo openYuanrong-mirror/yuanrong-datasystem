@@ -129,21 +129,21 @@ TopologyRecoveryReporter::~TopologyRecoveryReporter()
 
 bool TopologyRecoveryReporter::CanReportLocked() const
 {
-    return !stopping_ && runtimeReady_ && membershipIdentity_.hasLeader
+    return !stopping_ && runtimeReady_ && !membershipIdentity_.coordinatorId.empty()
            && !SameRound(membershipIdentity_, completedIdentity_);
 }
 
 bool TopologyRecoveryReporter::SameRound(const CoordinatorLeaderIdentity &left, const CoordinatorLeaderIdentity &right)
 {
-    return left.hasLeader == right.hasLeader && left.routeEpoch == right.routeEpoch
-           && left.leaderTerm == right.leaderTerm && left.coordinatorId == right.coordinatorId;
+    return left.routeEpoch == right.routeEpoch && left.leaderTerm == right.leaderTerm
+           && left.coordinatorId == right.coordinatorId;
 }
 
 void TopologyRecoveryReporter::NotifyMembershipReady(const CoordinatorLeaderIdentity &identity)
 {
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (stopping_ || !identity.hasLeader || identity.coordinatorId.empty()) {
+        if (stopping_ || identity.coordinatorId.empty()) {
             return;
         }
         membershipIdentity_ = identity;
@@ -154,7 +154,7 @@ void TopologyRecoveryReporter::NotifyMembershipReady(const CoordinatorLeaderIden
 
 void TopologyRecoveryReporter::NotifyMembershipReady(const std::string &coordinatorId)
 {
-    NotifyMembershipReady(CoordinatorLeaderIdentity{ HostPort(), coordinatorId, 0, 0, !coordinatorId.empty() });
+    NotifyMembershipReady(CoordinatorLeaderIdentity{ HostPort(), coordinatorId, 0, 0 });
 }
 
 void TopologyRecoveryReporter::NotifyRuntimeReady()

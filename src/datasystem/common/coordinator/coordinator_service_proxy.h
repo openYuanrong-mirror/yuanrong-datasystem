@@ -29,8 +29,9 @@
 #include <utility>
 #include <vector>
 
-#include "datasystem/common/coordinator/key_value_entry.h"
+#include "datasystem/common/coordinator/coordinator_discovery_cache.h"
 #include "datasystem/common/coordinator/coordinator_leader_router.h"
+#include "datasystem/common/coordinator/key_value_entry.h"
 #include "datasystem/common/util/net_util.h"
 #include "datasystem/protos/coordinator.pb.h"
 #include "datasystem/utils/coordinator_discovery.h"
@@ -38,6 +39,8 @@
 
 namespace datasystem {
 class RpcOptions;
+
+using CoordinatorLeaderIdentity = CoordinatorLeaderRouter::LeaderIdentity;
 
 constexpr int32_t DEFAULT_COORDINATOR_RPC_TIMEOUT_MS = 3'000;
 
@@ -241,9 +244,15 @@ public:
         return Status(K_NOT_SUPPORTED, "Coordinator membership ensure is not supported by this proxy");
     }
 
-    virtual ICoordinatorLeaderRouteProvider *GetLeaderRouteProvider()
+    virtual Status GetRouter(CoordinatorLeaderRouter *&router)
     {
-        return nullptr;
+        router = nullptr;
+        return Status(K_NOT_SUPPORTED, "Coordinator Leader router is not supported by this proxy");
+    }
+
+    virtual Status SetLeaderChangeHandler(std::function<void(const CoordinatorLeaderIdentity &)>)
+    {
+        return Status(K_NOT_SUPPORTED, "Coordinator Leader change handler is not supported by this proxy");
     }
 
     /**
@@ -277,7 +286,7 @@ public:
     /**
      * @brief Release proxy-local identity state after all callers stop.
      */
-    ~CoordinatorServiceProxyBase() override = default;
+    ~CoordinatorServiceProxyBase() override;
 
     /**
      * @copydoc ICoordinatorServiceProxy::Init
@@ -363,7 +372,8 @@ public:
     Status EnsureLeaderMembership(const coordinator::EnsureLeaderMembershipReqPb &req,
                                   coordinator::EnsureLeaderMembershipRspPb &rsp, int32_t timeoutMs) override;
 
-    ICoordinatorLeaderRouteProvider *GetLeaderRouteProvider() override;
+    Status GetRouter(CoordinatorLeaderRouter *&router) override;
+    Status SetLeaderChangeHandler(std::function<void(const CoordinatorLeaderIdentity &)> handler) override;
 
     /**
      * @brief Read raw topology and membership facts for one logical cluster.
@@ -445,6 +455,7 @@ private:
      * @return K_OK or K_TRY_AGAIN for a retired identity.
      */
     Status InstallProbedIdentity(const std::string &coordinatorId);
+    void PublishLeaderIdentity(const CoordinatorLeaderIdentity &identity);
 
     /**
      * @brief Release one identity's in-flight reference.
@@ -453,8 +464,11 @@ private:
     void CompleteRpc(const std::string &startedCoordinatorId);
 
     std::shared_ptr<ICoordinatorDiscovery> coordinatorDiscovery_;
-    // Used only by raw identity probing while public calls transition to Router.
+    std::unique_ptr<CoordinatorDiscoveryCache> discoveryCache_;
     std::unique_ptr<CoordinatorLeaderRouter> router_;
+
+    std::mutex leaderCallbackMutex_;
+    std::function<void(const CoordinatorLeaderIdentity &)> leaderChangeHandler_;
 
     // Protects currentCoordinatorId_ and inFlightByCoordinatorId_. Non-current in-flight IDs are retired.
     mutable std::mutex identityMutex_;

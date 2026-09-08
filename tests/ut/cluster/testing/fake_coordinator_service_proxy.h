@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -35,8 +36,47 @@ public:
         int64_t watchId{ 0 };
     };
 
-    FakeCoordinatorServiceProxy() = default;
+    FakeCoordinatorServiceProxy()
+        : router_(CoordinatorLeaderRouter::Dependencies{
+              .getCandidateSnapshot = [] { return std::vector<std::string>{ "127.0.0.1:30001" }; },
+              .refreshCandidates = [] {},
+              .publishLeaderIdentity = [this](const CoordinatorLeaderIdentity &identity) {
+                  PublishLeaderIdentity(identity);
+              },
+              .now = [] { return std::chrono::steady_clock::now(); },
+              .wait = [](std::chrono::milliseconds) {},
+          })
+    {
+        static_cast<void>(router_.Execute(
+            [this](const HostPort &, std::chrono::milliseconds) {
+                CoordinatorLeaderRouter::RpcResponseHeader header;
+                header.state = CoordinatorLeaderRouter::RpcResponseHeader::State::SERVING;
+                header.coordinatorId = coordinatorId_;
+                header.leaderTerm = 1;
+                return CoordinatorLeaderRouter::RpcResult{ Status::OK(), std::move(header) };
+            },
+            std::chrono::steady_clock::now() + std::chrono::seconds(1), std::chrono::seconds(1),
+            std::chrono::milliseconds(1)));
+    }
     ~FakeCoordinatorServiceProxy() override = default;
+
+    CoordinatorLeaderRouter &Router()
+    {
+        return router_;
+    }
+
+    Status GetRouter(CoordinatorLeaderRouter *&router) override
+    {
+        router = &router_;
+        return Status::OK();
+    }
+
+    Status SetLeaderChangeHandler(std::function<void(const CoordinatorLeaderIdentity &)> handler) override
+    {
+        std::lock_guard<std::mutex> lock(leaderCallbackMutex_);
+        leaderChangeHandler_ = std::move(handler);
+        return Status::OK();
+    }
 
     Status Init() override
     {
@@ -313,6 +353,14 @@ public:
     }
 
 private:
+    void PublishLeaderIdentity(const CoordinatorLeaderIdentity &identity)
+    {
+        std::lock_guard<std::mutex> lock(leaderCallbackMutex_);
+        if (leaderChangeHandler_ != nullptr) {
+            leaderChangeHandler_(identity);
+        }
+    }
+
     struct Entry {
         std::string value;
         int64_t version{ 0 };
@@ -385,6 +433,9 @@ private:
     std::string nextWatchFailureKey_;
     StatusCode nextWatchFailureCode_{ K_OK };
     bool requireRecoveryPayload_{ false };
+    CoordinatorLeaderRouter router_;
+    std::mutex leaderCallbackMutex_;
+    std::function<void(const CoordinatorLeaderIdentity &)> leaderChangeHandler_;
 };
 
 }  // namespace datasystem::cluster::testing

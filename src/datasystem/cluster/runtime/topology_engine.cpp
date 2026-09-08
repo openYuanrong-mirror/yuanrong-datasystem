@@ -511,26 +511,24 @@ Status TopologyEngine::InitializeOwnedComponents(std::chrono::seconds nodeDeadTi
         RETURN_IF_NOT_OK(TopologyControllerRuntime::Create(
             std::move(runtimeOptions), *controllerBackend_, *algorithm_, controllerRuntime_));
     }
-    InitializeCoordinatorComponents();
-    return Status::OK();
+    return InitializeCoordinatorComponents();
 }
 
-void TopologyEngine::InitializeCoordinatorComponents()
+Status TopologyEngine::InitializeCoordinatorComponents()
 {
     if (coordinatorProxy_ == nullptr) {
-        return;
+        return Status::OK();
     }
     recoveryReporter_ = std::make_unique<TopologyRecoveryReporter>(
         *coordinatorProxy_, options_.clusterName, options_.localAddress,
         [this](uint64_t &version, std::string &canonical) { return GetRecoveryTopology(version, canonical); });
-    if (coordinatorProxy_->GetLeaderRouteProvider() == nullptr) {
-        return;
-    }
     auto *member = static_cast<DsCoordinationBackend *>(memberBackend_.get());
-    workerLeaderReconciler_ =
-        std::make_unique<WorkerLeaderReconciler>(*coordinatorProxy_, *member, *recoveryReporter_, options_.clusterName);
+    workerLeaderReconciler_ = std::make_unique<WorkerLeaderReconciler>(
+        *coordinatorProxy_, *member, *recoveryReporter_, options_.clusterName);
+    RETURN_IF_NOT_OK(workerLeaderReconciler_->Init());
     member->SetMembershipReconcileHandler(
         [this](bool waitForCompletion) { return workerLeaderReconciler_->Reconcile(waitForCompletion); });
+    return Status::OK();
 }
 
 TopologyEngine::~TopologyEngine()
@@ -765,8 +763,8 @@ Status TopologyEngine::StartMemberRole()
               << " notify_revision=" << (watchRevision == WATCH_FROM_NOW ? "none" : std::to_string(watchRevision))
               << " status=registered";
 
-    rc = executor_.Start();
-    return rc.IsOk() ? StartStateThread() : rc;
+    RETURN_IF_NOT_OK(executor_.Start());
+    return StartStateThread();
 }
 
 Status TopologyEngine::CleanupAfterStartFailure()

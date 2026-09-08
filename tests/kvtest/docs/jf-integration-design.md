@@ -288,16 +288,15 @@ classDiagram
         +GetCoordinators(vector~string~&) Status
     }
 
-    class IDeadlineAwareCoordinatorDiscovery {
-        <<interface>>
-        +GetCoordinators(time_point vector~string~&) Status
-    }
-
     class UserCoordinatorDiscovery {
         -shared_ptr~JfClient~ jfClient_
         -string serviceName_
         +GetCoordinators(vector~string~&) Status
-        +GetCoordinators(time_point vector~string~&) Status
+    }
+
+    class CoordinatorDiscoveryCache {
+        +RefreshAsync() void
+        +GetCandidateSnapshot() vector~string~
     }
 
     class JfClient {
@@ -335,8 +334,8 @@ classDiagram
         +SelectWorker(string& ip int& port) Status
     }
 
-    ICoordinatorDiscovery <|-- IDeadlineAwareCoordinatorDiscovery
-    IDeadlineAwareCoordinatorDiscovery <|.. UserCoordinatorDiscovery
+    ICoordinatorDiscovery <|.. UserCoordinatorDiscovery
+    CoordinatorDiscoveryCache --> ICoordinatorDiscovery
     UserCoordinatorDiscovery --> JfClient
     JfClient ..> CoordinatorServer : onStart/onStop 调用
     JfClient ..> DataWorker : 无 (Worker 不注册到 JF)
@@ -345,7 +344,8 @@ classDiagram
 
 **类图说明**：
 - `JfClient` 模拟 JF SDK 行为：应用层调 `RegisterService`/`UnregisterService`/`GetInstance`，内部自动管理心跳线程
-- `UserCoordinatorDiscovery` 适配 `IDeadlineAwareCoordinatorDiscovery` 公开接口（含 deadline 重载），内部委托 `JfClient::GetInstance`
+- `UserCoordinatorDiscovery` 适配 `ICoordinatorDiscovery`，内部委托 `JfClient::GetInstance`
+- `CoordinatorDiscoveryCache` 在线程中异步刷新候选地址，RPC 路由只读取候选快照
 - `CoordinatorServer`/`DataWorker` 是 KVCache 公开 API（已存在），本模块不修改
 - `CoordinatorServiceDiscovery`（已存在）通过 `coordinatorDiscovery` 字段注入 `UserCoordinatorDiscovery`
 

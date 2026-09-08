@@ -25,6 +25,7 @@
 #include "gtest/gtest.h"
 
 #include "datasystem/cluster/membership/membership_value_codec.h"
+#include "ut/common.h"
 
 namespace datasystem::cluster {
 namespace {
@@ -54,81 +55,51 @@ TEST(WorkerWorkerOCServiceProtocolTest, KeepsLegacyMethodIndexesStable)
     EXPECT_EQ(getPeerHashRing->index(), 7);
 }
 
-class FakeRoutes final : public ICoordinatorLeaderRouteProvider {
+class FakeRoutes final {
 public:
-    class Token final : public Subscription {
-    public:
-        explicit Token(FakeRoutes &owner) : owner_(owner) {}
-        ~Token() override { owner_.Clear(); }
-    private:
-        FakeRoutes &owner_;
-    };
-
-    CoordinatorLeaderIdentity GetLeaderCache() const override
+    explicit FakeRoutes(std::function<void(const CoordinatorLeaderIdentity &)> publishLeaderIdentity)
+        : router_(CoordinatorLeaderRouter::Dependencies{
+              .getCandidateSnapshot = [this] { return std::vector<std::string>{ address_ }; },
+              .refreshCandidates = [] {},
+              .publishLeaderIdentity = std::move(publishLeaderIdentity),
+              .now = [] { return std::chrono::steady_clock::now(); },
+              .wait = [](std::chrono::milliseconds) {},
+          })
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return identity_;
     }
 
-    void Set(CoordinatorLeaderIdentity identity)
+    CoordinatorLeaderRouter &Router()
     {
-        std::function<void(const CoordinatorLeaderIdentity &)> callback;
-        std::lock_guard<std::mutex> lock(mutex_);
-        identity_ = std::move(identity);
-        callback = callback_;
-        if (callback != nullptr) {
-            callback(identity_);
-        }
-    }
-    void SetCacheWithoutCallback(CoordinatorLeaderIdentity identity)
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        identity_ = std::move(identity);
-    }
-    void SetAndWaitBeforeCallback(CoordinatorLeaderIdentity identity, std::mutex &waitMutex,
-                                  std::condition_variable &waitCv, bool &ready, bool &resume)
-    {
-        std::function<void(const CoordinatorLeaderIdentity &)> callback;
-        CoordinatorLeaderIdentity callbackIdentity;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            identity_ = std::move(identity);
-            callback = callback_;
-            callbackIdentity = identity_;
-        }
-        {
-            std::unique_lock<std::mutex> lock(waitMutex);
-            ready = true;
-            waitCv.notify_all();
-            waitCv.wait(lock, [&] { return resume; });
-        }
-        if (callback != nullptr) {
-            callback(callbackIdentity);
-        }
+        return router_;
     }
 
-    std::unique_ptr<Subscription> SubscribeLeaderChanges(
-        std::function<void(const CoordinatorLeaderIdentity &)> callback) override
+    void Set(const CoordinatorLeaderIdentity &identity)
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        callback_ = std::move(callback);
-        return std::make_unique<Token>(*this);
-    }
-
-    void Clear()
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        callback_ = nullptr;
+        address_ = identity.address.ToString();
+        const auto status = router_.Execute(
+            [&identity](const HostPort &, std::chrono::milliseconds) {
+                CoordinatorLeaderRouter::RpcResponseHeader header;
+                header.state = CoordinatorLeaderRouter::RpcResponseHeader::State::SERVING;
+                header.coordinatorId = identity.coordinatorId;
+                header.leaderTerm = identity.leaderTerm;
+                return CoordinatorLeaderRouter::RpcResult{ Status::OK(), std::move(header) };
+            },
+            std::chrono::steady_clock::now() + std::chrono::seconds(1), std::chrono::seconds(1),
+            std::chrono::milliseconds(1));
+        EXPECT_TRUE(status.IsOk()) << status.ToString();
     }
 
 private:
-    mutable std::mutex mutex_;
-    CoordinatorLeaderIdentity identity_;
-    std::function<void(const CoordinatorLeaderIdentity &)> callback_;
+    std::string address_{ "127.0.0.1:30001" };
+    CoordinatorLeaderRouter router_;
 };
 
 class FakeProxy final : public ICoordinatorServiceProxy {
 public:
+    FakeProxy() : routes_([this](const CoordinatorLeaderIdentity &identity) { PublishLeaderIdentity(identity); })
+    {
+    }
+
     Status Init() override { return Status::OK(); }
     Status Put(const std::string &key, const std::string &value, int64_t, int64_t, int64_t &version,
                int64_t &revision, int32_t, std::string *coordinatorId, const std::string &, int64_t) override
@@ -216,7 +187,17 @@ public:
         cv_.notify_all();
         return ensureStatus_;
     }
-    ICoordinatorLeaderRouteProvider *GetLeaderRouteProvider() override { return &routes_; }
+    Status GetRouter(CoordinatorLeaderRouter *&router) override
+    {
+        router = &routes_.Router();
+        return Status::OK();
+    }
+    Status SetLeaderChangeHandler(std::function<void(const CoordinatorLeaderIdentity &)> handler) override
+    {
+        std::lock_guard<std::mutex> lock(callbackMutex_);
+        leaderChangeHandler_ = std::move(handler);
+        return Status::OK();
+    }
     void GetObservedCoordinatorId(std::string &id) const override { id.clear(); }
 
     FakeRoutes routes_;
@@ -295,7 +276,17 @@ public:
     }
 
 private:
+    void PublishLeaderIdentity(const CoordinatorLeaderIdentity &identity)
+    {
+        std::lock_guard<std::mutex> lock(callbackMutex_);
+        if (leaderChangeHandler_ != nullptr) {
+            leaderChangeHandler_(identity);
+        }
+    }
+
     static Status Unused() { return Status(K_RUNTIME_ERROR, "unused fake RPC"); }
+    std::mutex callbackMutex_;
+    std::function<void(const CoordinatorLeaderIdentity &)> leaderChangeHandler_;
     mutable std::mutex mutex_;
     mutable std::condition_variable cv_;
     std::vector<coordinator::EnsureLeaderMembershipReqPb> ensureRequests_;
@@ -322,7 +313,7 @@ TopologyRecoveryReporterOptions ReporterOptions()
 CoordinatorLeaderIdentity Identity(uint64_t term, uint64_t epoch,
                                    const std::string &coordinatorId = kCoordinatorId)
 {
-    return { HostPort("127.0.0.1", 30001), coordinatorId, term, epoch, true };
+    return { HostPort("127.0.0.1", 30001), coordinatorId, term, epoch };
 }
 
 TEST(WorkerLeaderReconcilerTest, EnsureAcceptancePrecedesReporterAndUsesObservedLeaderIdentity)
@@ -336,6 +327,7 @@ TEST(WorkerLeaderReconcilerTest, EnsureAcceptancePrecedesReporterAndUsesObserved
     reporter.NotifyRuntimeReady();
     proxy.routes_.Set(Identity(9, 2));
     WorkerLeaderReconciler reconciler(proxy, backend, reporter, kClusterName);
+    DS_ASSERT_OK(reconciler.Init());
 
     ASSERT_TRUE(proxy.WaitForEnsures(1));
     ASSERT_TRUE(proxy.WaitForReports(1));
@@ -362,6 +354,7 @@ TEST(WorkerLeaderReconcilerTest, RejectedEnsureNeverWakesReporter)
     reporter.NotifyRuntimeReady();
     proxy.routes_.Set(Identity(9, 2));
     WorkerLeaderReconciler reconciler(proxy, backend, reporter, kClusterName);
+    DS_ASSERT_OK(reconciler.Init());
 
     ASSERT_TRUE(proxy.WaitForEnsures(1));
     std::this_thread::sleep_for(20ms);
@@ -383,6 +376,7 @@ TEST(WorkerLeaderReconcilerTest, NewRouteEpochDiscardsOldEnsureCompletion)
     proxy.BlockEnsure();
     proxy.routes_.Set(Identity(9, 1));
     WorkerLeaderReconciler reconciler(proxy, backend, reporter, kClusterName);
+    DS_ASSERT_OK(reconciler.Init());
     ASSERT_TRUE(proxy.WaitForEnsures(1));
     proxy.routes_.Set(Identity(10, 2));
     proxy.ReleaseEnsure();
@@ -409,13 +403,12 @@ TEST(WorkerLeaderReconcilerTest, RouteChangeDuringRecreateGateRetriesWithLatestI
         [](uint64_t &, std::string &) { return Status(K_NOT_FOUND, "no snapshot"); }, ReporterOptions());
     proxy.routes_.Set(Identity(OLD_LEADER_TERM, OLD_ROUTE_EPOCH));
     WorkerLeaderReconciler reconciler(proxy, backend, reporter, kClusterName);
+    DS_ASSERT_OK(reconciler.Init());
     ASSERT_TRUE(backend.InitKeepAlive("/datasystem/cluster/cluster-a", kWorkerAddress, false, true).IsOk());
     std::mutex gateMutex;
     std::condition_variable gateCv;
     bool gateEntered = false;
     bool releaseGate = false;
-    bool routeCacheUpdated = false;
-    bool resumeRouteCallback = false;
     backend.SetMembershipRecreateGate([&] {
         std::unique_lock<std::mutex> lock(gateMutex);
         gateEntered = true;
@@ -429,28 +422,20 @@ TEST(WorkerLeaderReconcilerTest, RouteChangeDuringRecreateGateRetriesWithLatestI
         ASSERT_TRUE(gateCv.wait_for(lock, 2s, [&] { return gateEntered; }));
     }
 
-    std::thread routeChange([&] {
-        proxy.routes_.SetAndWaitBeforeCallback(Identity(NEW_LEADER_TERM, NEW_ROUTE_EPOCH), gateMutex, gateCv,
-                                               routeCacheUpdated, resumeRouteCallback);
-    });
-    {
-        std::unique_lock<std::mutex> lock(gateMutex);
-        ASSERT_TRUE(gateCv.wait_for(lock, 2s, [&] { return routeCacheUpdated; }));
-    }
+    DS_ASSERT_OK(proxy.SetLeaderChangeHandler({}));
+    proxy.routes_.Set(Identity(NEW_LEADER_TERM, NEW_ROUTE_EPOCH));
     {
         std::lock_guard<std::mutex> lock(gateMutex);
         releaseGate = true;
     }
     gateCv.notify_all();
 
-    // The first Rejoin pass fails with K_TRY_AGAIN after the recreate gate because the Leader changed; the queued
-    // route callback installs the successor identity so the retry publishes the latest one.
-    {
-        std::lock_guard<std::mutex> lock(gateMutex);
-        resumeRouteCallback = true;
-    }
-    gateCv.notify_all();
-    routeChange.join();
+    // Reproduce a delayed Router callback after its cache already exposes the successor identity.
+    const auto identity = proxy.routes_.Router().GetLeaderIdentity();
+    ASSERT_TRUE(identity.has_value());
+    reconciler.OnLeaderChanged(*identity);
+    DS_ASSERT_OK(proxy.SetLeaderChangeHandler(
+        [&reconciler](const CoordinatorLeaderIdentity &current) { reconciler.OnLeaderChanged(current); }));
 
     ASSERT_TRUE(proxy.WaitForEnsures(1));
     EXPECT_EQ(proxy.EnsureAt(0).leader_term(), NEW_LEADER_TERM);
@@ -471,6 +456,7 @@ TEST(WorkerLeaderReconcilerTest, SameLeaderIdentityDoesNotSubmitSecondEnsure)
     reporter.NotifyRuntimeReady();
     proxy.routes_.Set(Identity(9, 2));
     WorkerLeaderReconciler reconciler(proxy, backend, reporter, kClusterName);
+    DS_ASSERT_OK(reconciler.Init());
     ASSERT_TRUE(proxy.WaitForEnsures(1));
     proxy.routes_.Set(Identity(9, 2));
     std::this_thread::sleep_for(20ms);
@@ -491,6 +477,7 @@ TEST(WorkerLeaderReconcilerTest, ExplicitMembershipLossResubmitsEnsureForSameLea
     reporter.NotifyRuntimeReady();
     proxy.routes_.Set(Identity(9, 2));
     WorkerLeaderReconciler reconciler(proxy, backend, reporter, kClusterName);
+    DS_ASSERT_OK(reconciler.Init());
     ASSERT_TRUE(proxy.WaitForEnsures(1));
     ASSERT_TRUE(proxy.WaitForReports(1));
 
@@ -514,8 +501,9 @@ TEST(WorkerLeaderReconcilerTest, SynchronousForceEnsureDoesNotPublishRestarting)
     TopologyRecoveryReporter reporter(proxy, kClusterName, kWorkerAddress,
                                       [](uint64_t &, std::string &) { return Status(K_NOT_FOUND, "no snapshot"); },
                                       ReporterOptions());
-    proxy.routes_.SetCacheWithoutCallback(Identity(9, 2));
+    proxy.routes_.Set(Identity(9, 2));
     WorkerLeaderReconciler reconciler(proxy, backend, reporter, kClusterName);
+    DS_ASSERT_OK(reconciler.Init());
 
     ASSERT_TRUE(reconciler.Reconcile(true).IsOk());
     ASSERT_EQ(proxy.EnsureCount(), 1UL);
@@ -539,6 +527,7 @@ TEST(WorkerLeaderReconcilerTest, AsyncRejoinCompletesMembershipReadyAfterEnsure)
     reporter.NotifyRuntimeReady();
     proxy.routes_.Set(Identity(9, 2));
     WorkerLeaderReconciler reconciler(proxy, backend, reporter, kClusterName);
+    DS_ASSERT_OK(reconciler.Init());
     ASSERT_TRUE(proxy.WaitForEnsures(1));
     ASSERT_TRUE(proxy.WaitForReports(1));
 
@@ -562,7 +551,11 @@ TEST(WorkerLeaderReconcilerTest, InflightReconcileDefersQueuedRejoinCleanupToRes
                                       ReporterOptions());
     reporter.NotifyRuntimeReady();
     WorkerLeaderReconciler reconciler(proxy, backend, reporter, kClusterName);
-    proxy.routes_.SetCacheWithoutCallback(Identity(9, 2));
+    DS_ASSERT_OK(reconciler.Init());
+    DS_ASSERT_OK(proxy.SetLeaderChangeHandler({}));
+    proxy.routes_.Set(Identity(9, 2));
+    DS_ASSERT_OK(proxy.SetLeaderChangeHandler(
+        [&reconciler](const CoordinatorLeaderIdentity &identity) { reconciler.OnLeaderChanged(identity); }));
     proxy.BlockEnsure();
     std::mutex gateMutex;
     std::condition_variable gateCv;
@@ -629,6 +622,7 @@ TEST(WorkerLeaderReconcilerTest, ExplicitMembershipLossDuringInflightEnsureResub
     proxy.BlockEnsure();
     proxy.routes_.Set(Identity(9, 2));
     WorkerLeaderReconciler reconciler(proxy, backend, reporter, kClusterName);
+    DS_ASSERT_OK(reconciler.Init());
     ASSERT_TRUE(proxy.WaitForEnsures(1));
 
     ASSERT_TRUE(reconciler.Reconcile(false).IsOk());
@@ -653,6 +647,7 @@ TEST(WorkerLeaderReconcilerTest, ExitingMembershipWinsAgainstInflightLeaderEnsur
     proxy.BlockEnsure();
     proxy.routes_.Set(Identity(9, 2));
     WorkerLeaderReconciler reconciler(proxy, backend, reporter, kClusterName);
+    DS_ASSERT_OK(reconciler.Init());
     ASSERT_TRUE(proxy.WaitForEnsures(1));
 
     Status exitStatus;
@@ -683,6 +678,7 @@ TEST(WorkerLeaderReconcilerTest, ExitingMembershipDeadlineBoundsInflightLeaderEn
     proxy.BlockEnsure();
     proxy.routes_.Set(Identity(9, 2));
     WorkerLeaderReconciler reconciler(proxy, backend, reporter, kClusterName);
+    DS_ASSERT_OK(reconciler.Init());
     ASSERT_TRUE(proxy.WaitForEnsures(1));
 
     const auto start = std::chrono::steady_clock::now();
@@ -715,6 +711,7 @@ TEST(WorkerLeaderReconcilerTest, InitialMembershipPublicationDoesNotTriggerEnsur
                                       [](uint64_t &, std::string &) { return Status(K_NOT_FOUND, "no snapshot"); },
                                       ReporterOptions());
     WorkerLeaderReconciler reconciler(proxy, backend, reporter, kClusterName);
+    DS_ASSERT_OK(reconciler.Init());
 
     // The first successful membership Put owns startup; only a recovering-gate rejection may synchronously Ensure.
     proxy.routes_.Set(Identity(9, 1));
@@ -740,6 +737,7 @@ TEST(WorkerLeaderReconcilerTest, TermfulLeaderInitialMembershipWakesReporterWith
     reporter.NotifyRuntimeReady();
     proxy.routes_.Set(Identity(9, 1));
     WorkerLeaderReconciler reconciler(proxy, backend, reporter, kClusterName);
+    DS_ASSERT_OK(reconciler.Init());
     backend.SetMembershipReadyHandler(
         [&reconciler](const std::string &coordinatorId, bool) { reconciler.NotifyMembershipReady(coordinatorId); });
 
@@ -765,6 +763,7 @@ TEST(WorkerLeaderReconcilerTest, MembershipSuccessForOldLifetimeEnsuresCurrentLe
     reporter.NotifyRuntimeReady();
     proxy.routes_.Set(Identity(10, 2, kNextCoordinatorId));
     WorkerLeaderReconciler reconciler(proxy, backend, reporter, kClusterName);
+    DS_ASSERT_OK(reconciler.Init());
     backend.SetMembershipReadyHandler(
         [&reconciler](const std::string &coordinatorId, bool) { reconciler.NotifyMembershipReady(coordinatorId); });
 
@@ -791,14 +790,18 @@ TEST(WorkerLeaderReconcilerTest, SynchronousMembershipReconcileConvergesAfterSuc
                                       ReporterOptions());
     reporter.NotifyRuntimeReady();
     WorkerLeaderReconciler reconciler(proxy, backend, reporter, kClusterName);
+    DS_ASSERT_OK(reconciler.Init());
+    DS_ASSERT_OK(proxy.SetLeaderChangeHandler({}));
+    bool injectSuccessor = false;
     backend.SetMembershipReadyHandler([&](const std::string &coordinatorId, bool) {
-        if (coordinatorId == kCoordinatorId) {
+        if (injectSuccessor && coordinatorId == kCoordinatorId) {
             // Reproduce a successor Router observation whose callback was delayed or dropped by the startup gate.
-            proxy.routes_.SetCacheWithoutCallback(Identity(10, 2, kNextCoordinatorId));
+            proxy.routes_.Set(Identity(10, 2, kNextCoordinatorId));
         }
         reconciler.NotifyMembershipReady(coordinatorId);
     });
-    proxy.routes_.SetCacheWithoutCallback(Identity(9, 1));
+    proxy.routes_.Set(Identity(9, 1));
+    injectSuccessor = true;
 
     const auto reconcileStatus = reconciler.Reconcile(true);
     ASSERT_TRUE(reconcileStatus.IsOk()) << reconcileStatus.ToString();
@@ -823,6 +826,7 @@ TEST(WorkerLeaderReconcilerTest, TermZeroMembershipForOldLifetimeEnsuresCurrentC
     reporter.NotifyRuntimeReady();
     proxy.routes_.Set(Identity(0, 1, kNextCoordinatorId));
     WorkerLeaderReconciler reconciler(proxy, backend, reporter, kClusterName);
+    DS_ASSERT_OK(reconciler.Init());
     backend.SetMembershipReadyHandler(
         [&reconciler](const std::string &coordinatorId, bool) { reconciler.NotifyMembershipReady(coordinatorId); });
 
@@ -849,6 +853,7 @@ TEST(WorkerLeaderReconcilerTest, TermZeroLeaderInitialMembershipWakesReporterWit
     reporter.NotifyRuntimeReady();
     proxy.routes_.Set(Identity(0, 1));
     WorkerLeaderReconciler reconciler(proxy, backend, reporter, kClusterName);
+    DS_ASSERT_OK(reconciler.Init());
     backend.SetMembershipReadyHandler(
         [&reconciler](const std::string &coordinatorId, bool) { reconciler.NotifyMembershipReady(coordinatorId); });
 

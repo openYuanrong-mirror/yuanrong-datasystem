@@ -349,7 +349,7 @@ TEST(CoordinatorTopologyRecoveryComponentTest, WorkerRebuildsTwoFreshCoordinator
     RecoveryGeneration first(COORDINATOR_A);
     first.manager->ObserveMembershipChange(MembershipKey(), true);
     proxy.SetTarget(COORDINATOR_A, *first.manager);
-    reporter.NotifyMembershipReady(CoordinatorLeaderIdentity{ HostPort(), COORDINATOR_A, 0, 1, true });
+    reporter.NotifyMembershipReady(CoordinatorLeaderIdentity{ HostPort(), COORDINATOR_A, 0, 1 });
     ASSERT_TRUE(proxy.WaitForAttempts(2));
     ASSERT_TRUE(DriveReady(first));
     ExpectInstalled(first, canonical);
@@ -357,7 +357,7 @@ TEST(CoordinatorTopologyRecoveryComponentTest, WorkerRebuildsTwoFreshCoordinator
     RecoveryGeneration second(COORDINATOR_B);
     second.manager->ObserveMembershipChange(MembershipKey(), true);
     proxy.SetTarget(COORDINATOR_B, *second.manager);
-    reporter.NotifyMembershipReady(CoordinatorLeaderIdentity{ HostPort(), COORDINATOR_B, 0, 1, true });
+    reporter.NotifyMembershipReady(CoordinatorLeaderIdentity{ HostPort(), COORDINATOR_B, 0, 1 });
     ASSERT_TRUE(proxy.WaitForAttempts(4));
     ASSERT_TRUE(DriveReady(second));
     ExpectInstalled(second, canonical);
@@ -387,7 +387,7 @@ TEST(CoordinatorTopologyRecoveryComponentTest, CoordinatorSwitchBetweenEvidenceA
     first.manager->ObserveMembershipChange(MembershipKey(), true);
     proxy.SetTarget(COORDINATOR_A, *first.manager);
     proxy.BlockNextResponse();
-    reporter.NotifyMembershipReady(CoordinatorLeaderIdentity{ HostPort(), COORDINATOR_A, 0, 1, true });
+    reporter.NotifyMembershipReady(CoordinatorLeaderIdentity{ HostPort(), COORDINATOR_A, 0, 1 });
     if (!proxy.WaitUntilResponseBlocked()) {
         ADD_FAILURE() << "evidence response was not blocked";
         proxy.ReleaseBlockedResponse();
@@ -398,7 +398,7 @@ TEST(CoordinatorTopologyRecoveryComponentTest, CoordinatorSwitchBetweenEvidenceA
     RecoveryGeneration second(COORDINATOR_B);
     second.manager->ObserveMembershipChange(MembershipKey(), true);
     proxy.SetTarget(COORDINATOR_B, *second.manager);
-    reporter.NotifyMembershipReady(CoordinatorLeaderIdentity{ HostPort(), COORDINATOR_B, 0, 1, true });
+    reporter.NotifyMembershipReady(CoordinatorLeaderIdentity{ HostPort(), COORDINATOR_B, 0, 1 });
     proxy.ReleaseBlockedResponse();
 
     ASSERT_TRUE(proxy.WaitForAttempts(3));

@@ -15,6 +15,7 @@ set(DS_UT_DEPEND_LIBS
         common_etcd
         common_log_proto
         common_coordinator_store
+        coordinator_leader_router
         static_coordinator_discovery
         coordinator_service_impl
         coordinator_raft_peer

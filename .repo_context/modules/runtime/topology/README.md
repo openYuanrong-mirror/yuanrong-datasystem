@@ -41,6 +41,15 @@
   consume its own throttle interval and immediately amplify concurrent failure signals to the maximum backoff. The
   backoff cap is 1 second for the first 10 seconds of an outage, then grows every 10 seconds through 2, 4, and 5 seconds;
   a successful identity probe resets both the outage window and backoff.
+  Worker routing rejects Leader term regression only within the cached Coordinator process lifetime. A different
+  `CoordinatorId` starts a new term fence even when its term is lower, and publishes a new route epoch so a surviving
+  Worker can recreate membership after the Coordinator deployment is rebuilt.
+  Each RPC captures the current route epoch. A response crossing a route change cannot replace the new identity;
+  Router retries the current route within the original deadline, without exposing the conflict as an immediate Proxy
+  failure. Rejected responses never retain a successful status. Every RPC, including RECOVERING retries, shares the
+  remaining budget with the current and unattempted unique candidates.
+  Accepted nonterminal Coordinator results survive candidate rounds and deadline exhaustion. A candidate skipped
+  for lack of budget is not a new RPC result; headerless failures cannot overwrite an accepted Coordinator result.
   Coordinator-side membership loss only re-ensures the current Worker payload and does not publish `RESTARTING` or run
   the local rejoin cleanup. Only `TopologyEngine` confirmation that the local Worker must rejoin uses the explicit
   destructive rejoin path. This keeps a new Coordinator lifetime from being mistaken for a new Worker incarnation.
