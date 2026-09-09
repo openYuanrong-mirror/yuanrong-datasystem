@@ -51,10 +51,12 @@ public:
      * @param[in] enableCrossNode Client is enable cross node connection or not.
      * @param[in] podName Client pod name.
      * @param[in] deviceId pipeline h2d device id
+     * @param[in] auxiliary Marks a routed same-host shared-memory session registered on behalf of a
+     *            primary client; excluded from active_client_count but fully lifecycle-managed.
      */
     ClientInfo(int32_t socketFd, ClientKey clientId, bool uniqueCount, bool shmEnabled = true,
                std::string tenantId = "", bool enableCrossNode = false, const std::string &podName = "",
-               std::string deviceId = "", CompatibilityVersion compatibilityVersion = {})
+               std::string deviceId = "", CompatibilityVersion compatibilityVersion = {}, bool auxiliary = false)
         : socketFd_(socketFd),
           clientId_(std::move(clientId)),
           uniqueCount_(uniqueCount),
@@ -64,7 +66,8 @@ public:
           enableCrossNode_(enableCrossNode),
           podName_(podName),
           deviceId_(std::move(deviceId)),
-          compatibilityVersion_(compatibilityVersion)
+          compatibilityVersion_(compatibilityVersion),
+          auxiliary_(auxiliary)
     {
     }
 
@@ -263,6 +266,15 @@ public:
         return removable_.load(std::memory_order_relaxed);
     }
 
+    /**
+     * @brief Return true if this is an auxiliary routed shared-memory session.
+     * @return True if this entry is an auxiliary session.
+     */
+    bool Auxiliary() const
+    {
+        return auxiliary_.load(std::memory_order_relaxed);
+    }
+
     const CompatibilityVersion &GetCompatibilityVersion() const
     {
         return compatibilityVersion_;
@@ -289,6 +301,7 @@ private:
     const std::string podName_;
     const std::string deviceId_;
     const CompatibilityVersion compatibilityVersion_;
+    std::atomic<bool> auxiliary_{ false };  // Routed same-host shm session of a primary client.
 };
 
 }  // namespace worker

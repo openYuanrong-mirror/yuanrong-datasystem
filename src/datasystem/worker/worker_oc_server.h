@@ -160,6 +160,8 @@ public:
      * @param[in] podName Client pod name.
      * @param[in] supportMultiShmRefCount Indicates whether the client supports multiple shared memory references.
      * @param[in] deviceId pipeline h2d device id
+     * @param[in] auxiliary Marks a routed same-host shared-memory session registered on behalf of a
+     *            primary client; excluded from active_client_count but fully lifecycle-managed.
      * @param[out] lockId The lock id.
      * @param[out] pipelineQueueId The pipeline notify message share memory queue id.
      * @return Status of the call.
@@ -167,7 +169,8 @@ public:
     Status AddClient(const ClientKey &clientId, bool shmEnabled, int32_t socketFd, const std::string &tenantId,
                      bool enableCrossNode, const std::string &podName, bool supportMultiShmRefCount,
                      std::string deviceId, const CompatibilityVersion &compatibilityVersion, uint32_t &lockId,
-                     uint32_t *pipelineQueueId = nullptr, bool socketHeartbeat = false) override;
+                     uint32_t *pipelineQueueId = nullptr, bool socketHeartbeat = false,
+                     bool auxiliary = false) override;
 
     /**
      * @brief Check unfinished asynchronous tasks and active scale-in process if exists.

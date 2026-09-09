@@ -184,6 +184,11 @@ Status RegisterShmClient(const std::shared_ptr<WorkerRpcClient> &rpcClient,
     request.set_tenant_id(context.tenantId);
     request.set_support_multi_shm_ref_count(true);
     request.set_compatibility_version(CompatibilityManager::Instance().GetCurrentCompatibilityVersion().ToString());
+    // Mark this as an auxiliary session of a primary client so the worker excludes it from
+    // active_client_count.
+    if (!context.clientId.empty()) {
+        request.set_auxiliary_session(true);
+    }
     return rpcClient->InvokeRegisterShmClient(request, response);
 }
 

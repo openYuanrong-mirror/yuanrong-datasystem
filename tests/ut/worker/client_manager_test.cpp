@@ -417,5 +417,72 @@ TEST_F(ClientManagerTest, AddClientStoresCompatibilityVersion)
     EXPECT_EQ(clientInfo->GetCompatibilityVersion(), compatibilityVersion);
     manager.RemoveClient(clientId);
 }
+
+// A routed same-host shared-memory session registered on behalf of an already counted
+// primary client must not inflate active_client_count, while keeping its table entry (lockId /
+// pipeline queue / lost-handler lifecycle all stay managed).
+TEST_F(ClientManagerTest, TestAuxiliaryClientCount)
+{
+    FLAGS_max_client_num = 10;
+    ClientManager clientMgr;
+    DS_ASSERT_OK(clientMgr.Init());
+    size_t count = 5;
+    size_t auxCount = 2;
+    uint32_t lockId;
+    for (size_t i = 0; i < count; ++i) {
+        auto clientId = ClientKey::Intern("client_id" + std::to_string(i));
+        ASSERT_TRUE(clientMgr.AddClient(clientId, true, -1, "", true, "", "", CompatibilityVersion(), lockId));
+    }
+    for (size_t i = 0; i < auxCount; ++i) {
+        auto clientId = ClientKey::Intern("aux_client_id" + std::to_string(i));
+        ASSERT_TRUE(clientMgr.AddClient(clientId, true, -1, "", true, "", "", CompatibilityVersion(), lockId,
+                                        nullptr, true));
+    }
+    // Auxiliary sessions live in the table but are excluded from the count.
+    ASSERT_EQ(clientMgr.GetClientCount(), count);
+
+    // Removing an auxiliary client keeps the count unchanged.
+    clientMgr.RemoveClient(ClientKey::Intern("aux_client_id0"));
+    ASSERT_EQ(clientMgr.GetClientCount(), count);
+
+    // Removing a primary client decreases the count.
+    clientMgr.RemoveClient(ClientKey::Intern("client_id0"));
+    ASSERT_EQ(clientMgr.GetClientCount(), count - 1);
+
+    // Removable and auxiliary deductions are orthogonal.
+    DS_ASSERT_OK(clientMgr.UpdateLastHeartbeat(ClientKey::Intern("client_id1"), true));
+    ASSERT_EQ(clientMgr.GetClientCount(), count - 2);
+    DS_ASSERT_OK(clientMgr.UpdateLastHeartbeat(ClientKey::Intern("aux_client_id1"), true));
+    ASSERT_EQ(clientMgr.GetClientCount(), count - 3);
+    DS_ASSERT_OK(clientMgr.UpdateLastHeartbeat(ClientKey::Intern("aux_client_id1"), false));
+    ASSERT_EQ(clientMgr.GetClientCount(), count - 2);
+}
+
+// A duplicate auxiliary registration fails and must not double the auxiliary deduction.
+TEST_F(ClientManagerTest, AddClientDuplicateAuxiliaryIdFailsAndRollsBack)
+{
+    FLAGS_max_client_num = 10;
+    ClientManager clientMgr;
+    DS_ASSERT_OK(clientMgr.Init());
+    const auto clientId = ClientKey::Intern("dup-aux-client");
+    uint32_t lockId = 0;
+    DS_ASSERT_OK(clientMgr.AddClient(clientId, false, -1, "", false, "", "", CompatibilityVersion(), lockId,
+                                     nullptr, true));
+    ASSERT_EQ(clientMgr.GetClientCount(), 0u);
+
+    uint32_t duplicateLockId = 0;
+    ASSERT_FALSE(clientMgr.AddClient(clientId, false, -1, "", false, "", "", CompatibilityVersion(),
+                                     duplicateLockId, nullptr, true));
+    ASSERT_EQ(clientMgr.GetClientCount(), 0u);
+
+    clientMgr.RemoveClient(clientId);
+    ASSERT_EQ(clientMgr.GetClientCount(), 0u);
+
+    // The single auxiliary entry is gone; a same-id primary registration now counts normally.
+    DS_ASSERT_OK(clientMgr.AddClient(clientId, false, -1, "", false, "", "", CompatibilityVersion(), lockId));
+    ASSERT_EQ(clientMgr.GetClientCount(), 1u);
+    clientMgr.RemoveClient(clientId);
+    ASSERT_EQ(clientMgr.GetClientCount(), 0u);
+}
 }  // namespace ut
 }  // namespace datasystem

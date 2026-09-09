@@ -99,7 +99,7 @@ Status ClientManager::AddClient(const ClientKey &clientId, int socketFd, bool un
 Status ClientManager::AddClient(const ClientKey &clientId, bool shmEnabled, int socketFd, const std::string &tenantId,
                                 bool enableCrossNode, const std::string &podName, std::string deviceId,
                                 const CompatibilityVersion &compatibilityVersion, uint32_t &lockId,
-                                uint32_t *pipelineQueueId)
+                                uint32_t *pipelineQueueId, bool auxiliary)
 {
     // Ensure callers never observe a stale lockId on failure paths.
     lockId = 0;
@@ -110,7 +110,8 @@ Status ClientManager::AddClient(const ClientKey &clientId, bool shmEnabled, int 
     std::shared_lock<std::shared_timed_mutex> lck(mutex_);
     bool uniqueCount = true;
     auto clientInfo = std::make_shared<ClientInfo>(socketFd, clientId, uniqueCount, shmEnabled, tenantId,
-                                                   enableCrossNode, podName, std::move(deviceId), compatibilityVersion);
+                                                   enableCrossNode, podName, std::move(deviceId), compatibilityVersion,
+                                                   auxiliary);
     clientInfo->SetLockId(lockId);
 
     // allocate pipeline queue
@@ -133,6 +134,8 @@ Status ClientManager::AddClient(const ClientKey &clientId, bool shmEnabled, int 
             }
         }
         status = Status(StatusCode::K_RUNTIME_ERROR, FormatString("Failed to insert client %s to table", clientId));
+    } else if (auxiliary) {
+        auxiliaryCount_.fetch_add(1, std::memory_order_relaxed);
     }
     return status;
 }
@@ -148,6 +151,9 @@ void ClientManager::RemoveClient(const ClientKey &clientId)
     }
     if (accessor->second->Removable()) {
         removableCount_.fetch_sub(1, std::memory_order_relaxed);
+    }
+    if (accessor->second->Auxiliary()) {
+        auxiliaryCount_.fetch_sub(1, std::memory_order_relaxed);
     }
     if (accessor->second->GetSocketFd() != INVALID_SOCKET_FD) {
         LOG(INFO) << "Close client[socket fd: " << accessor->second->GetSocketFd() << "]";

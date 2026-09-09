@@ -62,6 +62,10 @@ message RegisterClientReqPb {
     // New-flow (enableHeartbeat=false: embedded/readonly) same-host client requests worker-side
     // SOCKET_HEARTBEAT (epoll on the fd-passing socketFd) instead of RPC heartbeat. Old flow always false.
     bool socket_heartbeat = 15;
+    // Same-host routed shared-memory session registration on behalf of an existing primary client
+    // (client_id above). Auxiliary sessions keep their own fd/lockId/queue lifecycle but are excluded
+    // from active_client_count. Only the routed-ShmSession path sets this.
+    bool auxiliary_session = 16;
 
     // DFX required, need to send something to worker when reconnect.
     repeated google.protobuf.Any extend = 50;
