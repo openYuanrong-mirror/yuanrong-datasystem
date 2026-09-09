@@ -216,20 +216,21 @@ class TestCmdStart(unittest.TestCase):
             os.unlink(cfg_path)
 
     @patch('deploy_worker.cmd_start_standalone', return_value=0)
-    def test_standalone_rejects_jemalloc_prof_options(self, mock_start):
+    def test_standalone_accepts_jemalloc_prof_options(self, mock_start):
         args = self._args(standalone=True,
                           jemalloc_prof_options='prof_final:true')
 
         rc = cmd_start(args, [{'name': 'p1', 'ip': '192.0.2.1'}])
 
-        self.assertEqual(rc, 1)
-        mock_start.assert_not_called()
+        self.assertEqual(rc, 0)
+        mock_start.assert_called_once()
+        self.assertEqual(mock_start.call_args[0][0].jemalloc_prof_options, 'prof_final:true')
 
 
 class TestCmdDeploy(unittest.TestCase):
     @patch('deploy_worker.cmd_start_standalone', return_value=0)
     @patch('deploy_worker.cmd_install_shared', return_value=0)
-    def test_standalone_rejects_jemalloc_prof_options_before_install(
+    def test_standalone_accepts_jemalloc_prof_options_during_deploy(
             self, mock_install, mock_start):
         args = SimpleNamespace(
             standalone=True, jemalloc_prof_options='prof_final:true',
@@ -237,9 +238,9 @@ class TestCmdDeploy(unittest.TestCase):
 
         rc = cmd_deploy(args, [{'name': 'p1', 'ip': '192.0.2.1'}])
 
-        self.assertEqual(rc, 1)
-        mock_install.assert_not_called()
-        mock_start.assert_not_called()
+        self.assertEqual(rc, 0)
+        mock_install.assert_called_once()
+        mock_start.assert_called_once()
 
 
 class TestCmdInstall(unittest.TestCase):

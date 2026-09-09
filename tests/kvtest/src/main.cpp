@@ -1,4 +1,5 @@
 #include "common/config.h"
+#include "common/jemalloc_prof.h"
 #include "common/jf_service_discovery.h"
 #include "common/simple_log.h"
 #include "common/cpu_affinity.h"
@@ -589,6 +590,7 @@ int main(int argc, char *argv[])
         std::string arg = argv[i];
         if (arg == "--version" || arg == "-v") {
             std::cout << "kvtest " << BUILD_VERSION << " (commit: " << BUILD_COMMIT << ")" << std::endl;
+            std::cout << "jemalloc_prof_supported=" << (JemallocProfSupported() ? "true" : "false") << std::endl;
             return 0;
         }
     }
@@ -627,6 +629,8 @@ int main(int argc, char *argv[])
         std::cout.rdbuf(logStream.rdbuf());
         std::cerr.rdbuf(logStream.rdbuf());
     }
+
+    std::cout << "jemalloc_prof_supported=" << (JemallocProfSupported() ? "true" : "false") << std::endl;
 
     if (cfg.runMode == RunMode::BENCHMARK) {
         // Log to terminal BEFORE redirect takes effect for SLOG (SLOG uses std::cout)

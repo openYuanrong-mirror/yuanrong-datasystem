@@ -7,6 +7,7 @@
 #
 # The kvtest binary therefore does NOT need libdatasystem.so at runtime; the
 # Makefile `package` step tolerates a missing third_party/sdk/ for this mode.
+# Shared jemalloc is packaged beside kvtest in lib/; --config=jeprof selects its profiling build.
 #
 # Build:
 #   cd <repo root> && bazel build //tests/kvtest:kvtest
@@ -167,11 +168,41 @@ cc_library(
     ],
 )
 
+cc_library(
+    name = "jemalloc_prof_capability",
+    srcs = ["src/common/jemalloc_prof.cpp"],
+    hdrs = ["src/common/jemalloc_prof.h"],
+    strip_include_prefix = "src",
+    local_defines = ["KVTEST_JEMALLOC"],
+    linkopts = ["-Wl,-rpath,$$ORIGIN/lib"],
+    deps = select({
+        "//:enable_jemalloc_prof": ["@jemalloc_kvc//:jemalloc_prof_shared"],
+        "//conditions:default": ["@jemalloc_kvc//:jemalloc_shared"],
+    }),
+)
+
 cc_binary(
     name = "kvtest",
     srcs = ["src/main.cpp"],
-    deps = [":kvtest_lib"],
+    deps = [
+        ":jemalloc_prof_capability",
+        ":kvtest_lib",
+    ],
 )
+
+[sh_test(
+    name = test_name,
+    srcs = ["tests/jemalloc_prof_test.sh"],
+    args = ["$(location :%s)" % binary] + select({
+        "//:enable_jemalloc_prof": ["true", "$(location //:libjemalloc_shared_file)"],
+        "//conditions:default": ["false", "$(location //:libjemalloc_shared_file)"],
+    }),
+    data = [":" + binary, "//:libjemalloc_shared_file"],
+) for binary, test_name in [
+    ("kvtest", "jemalloc_prof_test"),
+    ("coordinator_test", "coordinator_jemalloc_prof_test"),
+    ("worker_test", "worker_jemalloc_prof_test"),
+]]
 
 # JF client library (header-only, shared by coordinator_test and worker_test)
 cc_library(
@@ -192,6 +223,7 @@ cc_binary(
     name = "coordinator_test",
     srcs = ["src/coordinator_main.cpp"],
     deps = [
+        ":jemalloc_prof_capability",
         ":jf_lib",
         ":build_info",
         "//src/datasystem/coordinator:coordinator_server",
@@ -207,6 +239,7 @@ cc_binary(
     name = "worker_test",
     srcs = ["src/data_worker_main.cpp"],
     deps = [
+        ":jemalloc_prof_capability",
         ":jf_lib",
         ":build_info",
         "//src/datasystem/worker:worker",

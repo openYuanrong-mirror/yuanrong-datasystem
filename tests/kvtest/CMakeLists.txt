@@ -42,6 +42,7 @@ option(KVTEST_USE_BRPC "Use brpc control plane + bthread workers (ON) or httplib
 set(KVTEST_COMMON_SOURCES
     src/main.cpp
     src/common/config.cpp
+    src/common/jemalloc_prof.cpp
     src/metrics/metrics.cpp
     src/pipeline/pipeline.cpp
     src/pipeline/kv_worker.cpp
@@ -192,7 +193,7 @@ target_link_options(kvtest PRIVATE -static-libstdc++ -static-libgcc -Wl,--exclud
 # coordinator_test: standalone Coordinator deployment test program
 # Links against libdatasystem_coordinator.so from the SDK.
 # ---------------------------------------------------------------------------
-add_executable(coordinator_test src/coordinator_main.cpp)
+add_executable(coordinator_test src/coordinator_main.cpp src/common/jemalloc_prof.cpp)
 target_include_directories(coordinator_test PRIVATE
     ${DATASYSTEM_SDK_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -208,7 +209,7 @@ target_link_options(coordinator_test PRIVATE -static-libstdc++ -static-libgcc -W
 # worker_test: standalone Worker deployment test program
 # Links against libdatasystem_worker.so from the SDK.
 # ---------------------------------------------------------------------------
-add_executable(worker_test src/data_worker_main.cpp)
+add_executable(worker_test src/data_worker_main.cpp src/common/jemalloc_prof.cpp)
 target_include_directories(worker_test PRIVATE
     ${DATASYSTEM_SDK_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src)
