@@ -218,8 +218,9 @@ bash tests/test_standalone_mode.sh
 |------|------|--------|------|
 | `test_mode` | string | -- | 测试模式（16 种），详见 [benchmark-guide.md](benchmark-guide.md) |
 | `worker_memory_mb` | int | 0 | Worker 共享内存上限（MB），用于计算每轮 key 数 |
-| `duration_seconds` | int | 0 | 总运行时长（秒），0 = 不限时 |
+| `duration_seconds` | int | 0 | Benchmark 轮次启动时限（秒），0 = 不限时；已启动轮次和子进程退出仍会完成 |
 | `total_rounds` | int | 0 | 总轮数，0 = 不限轮 |
+| `round_cleanup_wait_ms` | int | 3000 | `del` 清理后、下一轮开始前的等待时间（毫秒），0 = 不等待；等待不超过剩余运行时长 |
 | `set_api` | string | "string_view" | Set API 路径：`"string_view"` 或 `"create_buffer"` |
 | `cleanup_method` | string | "del" | 清理方式：`"del"`（每轮删除）或 `"ttl"`（TTL 过期） |
 | `remote_worker.host` | string | "" | 远端 Worker 地址（部分模式必填） |

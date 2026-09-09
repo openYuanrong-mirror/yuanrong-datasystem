@@ -28,6 +28,19 @@ TEST(CalcKeysPerRound_ZeroMemory) {
     ASSERT_EQ(keys, 0);
 }
 
+TEST(CalcRoundCleanupWait_UnlimitedDuration) {
+    ASSERT_EQ(CalcRoundCleanupWaitMs(3000, 0, 1000), 3000);
+}
+
+TEST(CalcRoundCleanupWait_CappedByRemainingDuration) {
+    ASSERT_EQ(CalcRoundCleanupWaitMs(3000, 10000, 8500), 1500);
+    ASSERT_EQ(CalcRoundCleanupWaitMs(3000, 10000, 10000), 0);
+}
+
+TEST(CalcRoundCleanupWait_Disabled) {
+    ASSERT_EQ(CalcRoundCleanupWaitMs(0, 10000, 1000), 0);
+}
+
 // --- Key name generation tests ---
 
 TEST(MakeBenchKey_Basic) {
@@ -339,4 +352,3 @@ TEST(GetRoundForGet_Independent_RoundFive) {
 TEST(GetRoundForGet_Independent_RoundHundred) {
     ASSERT_EQ(GetRoundForGet(MixedKeyStrategy::INDEPENDENT, 100), 0);
 }
-

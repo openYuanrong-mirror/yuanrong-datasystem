@@ -313,6 +313,8 @@ bool LoadConfig(const std::string &path, Config &cfg, const std::string &outputD
             cfg.durationSeconds = j["duration_seconds"];
         if (j.contains("total_rounds"))
             cfg.totalRounds = j["total_rounds"];
+        if (j.contains("round_cleanup_wait_ms"))
+            cfg.roundCleanupWaitMs = j["round_cleanup_wait_ms"];
         if (j.contains("set_api"))
             cfg.setApi = j["set_api"].get<std::string>();
         if (j.contains("cleanup_method"))
@@ -579,6 +581,10 @@ bool LoadConfig(const std::string &path, Config &cfg, const std::string &outputD
             SLOG_ERROR("cleanup_method must be 'del' or 'ttl'");
             return false;
         }
+        if (cfg.roundCleanupWaitMs < 0) {
+            SLOG_ERROR("round_cleanup_wait_ms must be >= 0, got " << cfg.roundCleanupWaitMs);
+            return false;
+        }
         if (IsMixedMode(cfg.testMode)) {
             if (cfg.numThreads < 2) {
                 SLOG_ERROR("Mixed mode requires num_threads >= 2, got " << cfg.numThreads);
@@ -642,7 +648,8 @@ bool LoadConfig(const std::string &path, Config &cfg, const std::string &outputD
         log << ", test_mode=" << modeNames[static_cast<int>(cfg.testMode)]
             << ", worker_memory_mb=" << cfg.workerMemoryMb << ", num_threads=" << cfg.numThreads
             << ", total_rounds=" << cfg.totalRounds << ", duration_seconds=" << cfg.durationSeconds
-            << ", set_api=" << cfg.setApi << ", cleanup_method=" << cfg.cleanupMethod;
+            << ", round_cleanup_wait_ms=" << cfg.roundCleanupWaitMs << ", set_api=" << cfg.setApi
+            << ", cleanup_method=" << cfg.cleanupMethod;
         if (NeedsRemoteWorker(cfg.testMode)) {
             log << ", remote_worker=" << cfg.remoteWorker.host << ":" << cfg.remoteWorker.port;
         }
