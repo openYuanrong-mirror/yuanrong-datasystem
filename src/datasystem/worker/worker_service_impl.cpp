@@ -236,7 +236,10 @@ const std::string WorkerServiceImpl::GetLocalStandbyWorker()
 Status WorkerServiceImpl::RegisterClient(const RegisterClientReqPb &req, RegisterClientRspPb &rsp)
 {
     INJECT_POINT("WorkerServiceImpl.RegisterClient.begin");
-    bool remainClient = !req.client_id().empty();
+    // An auxiliary session is a fresh endpoint-scoped shm session of an already-counted primary
+    // client: not a reconnect, only excluded from active_client_count.
+    bool auxiliarySession = req.auxiliary_session();
+    bool remainClient = !req.client_id().empty() && !auxiliarySession;
     auto clientId = ClientKey::Intern(remainClient ? req.client_id() : GetStringUuid());
     std::string tenantId;
     RETURN_IF_NOT_OK(ValidateRegisterClientRequest(req, tenantId));
@@ -325,6 +328,7 @@ Status WorkerServiceImpl::AddRegisteringClient(
               << ", shmEnabled: " << shmEnabled << ", tenantId: " << tenantId
               << ", enable cross node: " << req.enable_cross_node()
               << ", reconnect client: " << !req.client_id().empty() << ", heartbeat: " << req.heartbeat_enabled()
+              << ", auxiliary session: " << req.auxiliary_session()
               << ", supportMultiShmRefCount: " << supportMultiShmRefCount;
     INJECT_POINT("WorkerServiceImpl.RegisterClient.AboveAddClient");
     INJECT_POINT("worker.RegisterClient.multi_shm_ref_count", [&supportMultiShmRefCount](bool multiShmRefCount) {
@@ -335,7 +339,7 @@ Status WorkerServiceImpl::AddRegisteringClient(
     RETURN_IF_NOT_OK_PRINT_ERROR_MSG(
         worker_->AddClient(clientId, shmEnabled, socketFd, tenantId, req.enable_cross_node(), req.pod_name(),
                            supportMultiShmRefCount, req.device_id(), compatibilityVersion, lockId, &pipelineQueueId,
-                           req.socket_heartbeat()),
+                           req.socket_heartbeat(), req.auxiliary_session()),
         "worker add client failed");
     return Status::OK();
 }

@@ -95,6 +95,8 @@ public:
      * @param[in] enableCrossNode Client is enable cross node connection or not.
      * @param[in] podName Client pod name.
      * @param[in] deviceId pipeline h2d device id
+     * @param[in] auxiliary Marks a routed same-host shared-memory session registered on behalf of a
+     *            primary client; excluded from GetClientCount but fully lifecycle-managed.
      * @param[out] lockId Lock id for client.
      * @param[out] pipelineQueueId Pipeline message queue id
      * @return Status of the call.
@@ -102,7 +104,7 @@ public:
     Status AddClient(const ClientKey &clientId, bool shmEnabled, int socketFd, const std::string &tenantId,
                      bool enableCrossNode, const std::string &podName, std::string deviceId,
                      const CompatibilityVersion &compatibilityVersion, uint32_t &lockId,
-                     uint32_t *pipelineQueueId = nullptr);
+                     uint32_t *pipelineQueueId = nullptr, bool auxiliary = false);
 
     /**
      * @brief Remove client information.
@@ -179,13 +181,14 @@ public:
     Status CheckClientId(const ClientKey &clientId) const;
 
     /**
-     * @brief Get the active client count.
+     * @brief Get the active client count. Auxiliary routed shared-memory sessions of an already
+     * counted primary client are excluded so a same-host client is not counted twice.
      * @return size_t The client count.
      */
     size_t GetClientCount() const
     {
         std::shared_lock<std::shared_timed_mutex> lck(mutex_);
-        return tbbClientTable_.size() - removableCount_;
+        return tbbClientTable_.size() - removableCount_ - auxiliaryCount_;
     }
 
     /**
@@ -267,6 +270,7 @@ private:
     std::atomic<bool> healthThreadExit_{ false };
     WaitPost cvLock_;                            // wait for some second to check rpc type heartbeat timeout
     std::atomic<uint64_t> removableCount_{ 0 };  // removable count
+    std::atomic<uint64_t> auxiliaryCount_{ 0 };  // routed same-host shm session count
 };
 }  // namespace worker
 }  // namespace datasystem

@@ -3760,11 +3760,11 @@ Status WorkerOCServer::AddClient(const ClientKey &clientId, bool shmEnabled, int
                                  const std::string &tenantId, bool enableCrossNode, const std::string &podName,
                                  bool supportMultiShmRefCount, std::string deviceId,
                                  const CompatibilityVersion &compatibilityVersion, uint32_t &lockId,
-                                 uint32_t *pipelineQueueId, bool socketHeartbeat)
+                                 uint32_t *pipelineQueueId, bool socketHeartbeat, bool auxiliary)
 {
     RETURN_IF_NOT_OK(ClientManager::Instance().AddClient(clientId, shmEnabled, socketFd, tenantId, enableCrossNode,
                                                          podName, std::move(deviceId), compatibilityVersion, lockId,
-                                                         pipelineQueueId));
+                                                         pipelineQueueId, auxiliary));
     if (objCacheClientWorkerSvc_ != nullptr) {
         objCacheClientWorkerSvc_->InitShmRefForClient(clientId, supportMultiShmRefCount);
     }
