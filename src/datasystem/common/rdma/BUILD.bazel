@@ -22,6 +22,17 @@ ds_cc_library(
 )
 
 ds_cc_library(
+    name="ub_port_health",
+    srcs=["ub_port_health.cpp"],
+    hdrs=["ub_port_health.h"],
+    deps=[
+        "//include/datasystem/utils:utils_headers",
+        "//src/datasystem/common/log:common_log",
+        "//src/datasystem/common/util:status_helper",
+    ],
+)
+
+ds_cc_library(
     name="urma_resource_header",
     hdrs=[
         "rdma_util.h",
@@ -85,7 +96,9 @@ ds_cc_library(
             "urma_dlopen_util.h",
             "urma_info.h",
             "urma_manager.h",
+            "urma_port_status_provider.h",
             "urma_resource.h",
+            "ub_port_health.h",
             "ucp_dlopen_util.h",
             "ucp_endpoint.h",
             "ucp_manager.h",
@@ -142,12 +155,14 @@ ds_cc_library(
         "urma_async_event_handler.cpp",
         "urma_info.cpp",
         "urma_manager.cpp",
+        "urma_port_status_provider.cpp",
         "urma_resource.cpp",
     ],
     hdrs=[
         "urma_async_event_handler.h",
         "urma_info.h",
         "urma_manager.h",
+        "urma_port_status_provider.h",
         "urma_resource.h",
         "rdma_util.h",
     ],
@@ -159,6 +174,7 @@ ds_cc_library(
         ":fast_transport_base_header",
         ":urma_dlopen_util",
         ":urma_send_lane",
+        ":ub_port_health",
         "//src/datasystem/common/device/nvidia:cuda_host_memory",
         "//src/datasystem/common/flags:ds_flags",
         "//src/datasystem/common/log:common_log",

@@ -1458,8 +1458,7 @@ public:
     TestTransportLayer(std::shared_ptr<DataPlaneManager> dataPlaneManager,
                        std::shared_ptr<TransportAdvisor> advisor,
                        std::shared_ptr<ThreadPool> releasePool)
-        : TransportLayer(std::move(dataPlaneManager), std::move(advisor), std::chrono::seconds(1), nullptr,
-                         std::move(releasePool))
+        : TransportLayer(std::move(dataPlaneManager), std::move(advisor), nullptr, std::move(releasePool))
     {
     }
 

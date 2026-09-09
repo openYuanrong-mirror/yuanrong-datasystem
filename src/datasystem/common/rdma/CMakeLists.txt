@@ -10,6 +10,7 @@ set(FAST_TRANSPORT_SRCS "")
 list(APPEND FAST_TRANSPORT_SRCS
     fast_transport_base.cpp
     fast_transport_manager_wrapper.cpp
+    ub_port_health.cpp
 )
 set(URMA_DEPEND_LIBS
     common_rdma_util)
@@ -23,6 +24,7 @@ if (BUILD_WITH_URMA OR BUILD_WITH_URMA_MOCK)
         urma_info.cpp
         urma_resource.cpp
         urma_dlopen_util.cpp
+        urma_port_status_provider.cpp
     )
     # Real URMA: link liburma at compile time (the 44 ds_urma_* shims call
     # symbols resolved by -lurma directly). liburma_ubagg/liburma-udma are

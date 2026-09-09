@@ -247,9 +247,34 @@ typedef enum urma_opt_name_t {
     URMA_OPT_MAX_JETTY = 1,
 } urma_opt_name_t;
 
-// user_ctl input/output — only forward decl is enough
-struct urma_user_ctl_in_t;
-struct urma_user_ctl_out_t;
+struct urma_user_ctl_in_t {
+    uint64_t addr;
+    uint32_t len;
+    uint32_t opcode;
+};
+
+struct urma_user_ctl_out_t {
+    uint64_t addr;
+    uint32_t len;
+};
+
+#define BONDP_USER_CTL_QUERY_PORT_STATUS 0x44535053U
+#define BONDP_PORT_STATUS_GOOD 0
+#define BONDP_PORT_STATUS_BAD 1
+#define BONDP_QUERY_PORT_STATUS_MAX_PORTS 256U
+
+struct bondp_port_status_t {
+    uint32_t chip_id;
+    uint32_t die_id;
+    uint32_t port_idx;
+    uint32_t status;
+    uint64_t reserved;
+};
+
+struct bondp_query_port_status_out_t {
+    uint32_t port_count;
+    bondp_port_status_t port_status[BONDP_QUERY_PORT_STATUS_MAX_PORTS];
+};
 
 // Token (exchanged between peers during import; DS uses { 0xACFE } 2-byte literal)
 struct urma_token {

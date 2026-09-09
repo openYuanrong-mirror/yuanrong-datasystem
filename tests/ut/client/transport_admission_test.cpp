@@ -436,10 +436,8 @@ private:
 class TestTransportLayer : public TransportLayer {
 public:
     TestTransportLayer(std::shared_ptr<DataPlaneManager> manager, std::shared_ptr<TransportAdvisor> advisor,
-                       std::chrono::milliseconds localUbProbeBaseDelay = std::chrono::seconds(1),
                        std::shared_ptr<UbHealthFilter> readSourceFilter = nullptr)
-        : TransportLayer(std::move(manager), std::move(advisor), localUbProbeBaseDelay,
-                         std::move(readSourceFilter))
+        : TransportLayer(std::move(manager), std::move(advisor), std::move(readSourceFilter))
     {
     }
 
@@ -602,7 +600,7 @@ TEST(TransportLayerAdmissionTest, ReadSourceDeniedReportsUbKindWithoutTouchingTr
 
     TestTransportLayer layer(std::make_shared<FakeDataPlaneManager>(),
                              std::make_shared<FixedTransportAdvisor>(TransportHint::UB_CANDIDATE),
-                             std::chrono::seconds(1), filter);
+                             filter);
 
     AccessTransportKind deniedKind = AccessTransportKind::SHM;
     Status rc = layer.CheckReadSource(provider, deniedKind);
@@ -1024,7 +1022,7 @@ TEST(TransportLayerAdmissionTest, ProviderRecoveryDoesNotDependOnHeartbeatSummar
     manager->providerProbeSummary.incarnation = "incarnation-a";
     manager->providerProbeSummary.writable = true;
     TestTransportLayer layer(manager, std::make_shared<FixedTransportAdvisor>(TransportHint::UB_CANDIDATE),
-                             std::chrono::milliseconds(10), filter);
+                             filter);
     ASSERT_TRUE(layer.Init().IsOk());
 
     ASSERT_TRUE(manager->WaitForProviderProbeCount(1, PROBE_OBSERVATION_TIMEOUT));
@@ -1034,7 +1032,7 @@ TEST(TransportLayerAdmissionTest, ProviderRecoveryDoesNotDependOnHeartbeatSummar
     EXPECT_TRUE(filter->IsAvailable(provider));
 }
 
-TEST(TransportLayerAdmissionTest, HardUbSetFailureBlocksLaterSetAndAllocationBeforeTransport)
+TEST(TransportLayerAdmissionTest, Cqe4DoesNotDirectlyCloseAdmission)
 {
     auto manager = std::make_shared<FakeDataPlaneManager>();
     manager->transporterSetStatuses = { { Status(K_URMA_ERROR, "local sender error 4"), Status::OK() } };
@@ -1045,19 +1043,16 @@ TEST(TransportLayerAdmissionTest, HardUbSetFailureBlocksLaterSetAndAllocationBef
     manager->builtTransporters.front()->setUbCqeStatuses = { 4 };
 
     EXPECT_EQ(layer.Set(*buffer, MakeSetParam()).GetCode(), K_URMA_ERROR);
-    EXPECT_EQ(layer.Set(*buffer, MakeSetParam()).GetCode(), K_URMA_WORKER_UNAVAILABLE);
-    std::shared_ptr<ObjectBuffer> blockedBuffer;
-    EXPECT_EQ(layer.Create(MakeAddress(31), "blocked", 64, MakeCreateParam(), blockedBuffer).GetCode(),
-              K_URMA_WORKER_UNAVAILABLE);
+    EXPECT_TRUE(layer.CheckLocalUbSenderAdmission().IsOk());
     ASSERT_EQ(manager->builtTransporters.size(), 2u);
-    EXPECT_EQ(manager->builtTransporters.front()->kind, AccessTransportKind::UB);
     EXPECT_EQ(manager->builtTransporters.back()->kind, AccessTransportKind::TCP);
-    EXPECT_EQ(manager->builtTransporters.front()->setCount, 1);
-    EXPECT_EQ(manager->builtTransporters.front()->createCount, 1);
     EXPECT_EQ(manager->builtTransporters.back()->releaseCount, 1);
+    EXPECT_TRUE(layer.Set(*buffer, MakeSetParam()).IsOk());
+    std::shared_ptr<ObjectBuffer> nextBuffer;
+    EXPECT_TRUE(layer.Create(MakeAddress(31), "next", 64, MakeCreateParam(), nextBuffer).IsOk());
 }
 
-TEST(TransportLayerAdmissionTest, HardUbSenderFailureDoesNotBlockSharedMemoryTransport)
+TEST(TransportLayerAdmissionTest, Cqe4DoesNotDirectlyBlockSharedMemoryTransport)
 {
     auto manager = std::make_shared<FakeDataPlaneManager>();
     manager->transporterSetStatuses = { { Status(K_URMA_ERROR, "local sender error 4") } };
@@ -1077,48 +1072,6 @@ TEST(TransportLayerAdmissionTest, HardUbSenderFailureDoesNotBlockSharedMemoryTra
     EXPECT_EQ(manager->builtTransporters.back()->kind, AccessTransportKind::SHM);
 }
 
-TEST(TransportLayerAdmissionTest, DedicatedProbeRestoresClientLocalSenderWithoutBusinessRetry)
-{
-    auto manager = std::make_shared<FakeDataPlaneManager>();
-    manager->transporterSetStatuses = { { Status(K_URMA_ERROR, "local sender error 4"), Status::OK() } };
-    manager->probeStatuses = { Status::OK() };
-    TestTransportLayer layer(manager, std::make_shared<FixedTransportAdvisor>(TransportHint::UB_CANDIDATE),
-                             std::chrono::milliseconds(100));
-    ASSERT_TRUE(layer.Init().IsOk());
-    WorkerSnapshot admitted;
-    admitted.ringVersion = 1;
-    admitted.remoteTransportAddrs = { MakeAddress(45) };
-    admitted.writeProbeAddrs = admitted.remoteTransportAddrs;
-    ASSERT_TRUE(manager->UpdateWorkerSnapshot(admitted).IsOk());
-    std::shared_ptr<ObjectBuffer> buffer;
-    ASSERT_TRUE(layer.Create(MakeAddress(45), "recover", 64, MakeCreateParam(), buffer).IsOk());
-    manager->builtTransporters.front()->setUbFailureReports = { Status(K_URMA_ERROR, "local sender error 4") };
-    manager->builtTransporters.front()->setUbCqeStatuses = { 4 };
-
-    EXPECT_EQ(layer.Set(*buffer, MakeSetParam()).GetCode(), K_URMA_ERROR);
-    EXPECT_EQ(layer.Set(*buffer, MakeSetParam()).GetCode(), K_URMA_WORKER_UNAVAILABLE);
-    EXPECT_EQ(manager->builtTransporters.front()->setCount, 1);
-    EXPECT_EQ(manager->probeCount, 0);
-    ASSERT_EQ(manager->builtTransporters.size(), 2u);
-    EXPECT_EQ(manager->builtTransporters[0]->kind, AccessTransportKind::UB);
-    EXPECT_EQ(manager->builtTransporters[1]->kind, AccessTransportKind::TCP);
-    ASSERT_TRUE(manager->WaitForProbeCount(1, PROBE_OBSERVATION_TIMEOUT));
-    EXPECT_EQ(manager->builtTransporters.size(), 2u);
-    EXPECT_TRUE(layer.Set(*buffer, MakeSetParam()).IsOk());
-    EXPECT_TRUE(layer.Set(*buffer, MakeSetParam()).IsOk());
-    ASSERT_GE(manager->builtTransporters.size(), 3u);
-    EXPECT_EQ(manager->builtTransporters[0]->kind, AccessTransportKind::UB);
-    EXPECT_EQ(manager->builtTransporters[1]->kind, AccessTransportKind::TCP);
-    EXPECT_EQ(manager->builtTransporters.back()->kind, AccessTransportKind::UB);
-    EXPECT_EQ(manager->builtTransporters[0]->setCount, 1);
-    int recoveredSetCount = 0;
-    for (size_t i = 2; i < manager->builtTransporters.size(); ++i) {
-        EXPECT_EQ(manager->builtTransporters[i]->kind, AccessTransportKind::UB);
-        recoveredSetCount += manager->builtTransporters[i]->setCount;
-    }
-    EXPECT_EQ(recoveredSetCount, 2);
-}
-
 TEST(TransportLayerAdmissionTest, FailureNotificationCannotBeLostAfterDeadlineCheck)
 {
     const auto provider = MakeAddress(46);
@@ -1131,7 +1084,7 @@ TEST(TransportLayerAdmissionTest, FailureNotificationCannotBeLostAfterDeadlineCh
     manager->providerProbeSummary.incarnation = "incarnation-a";
     manager->providerProbeSummary.writable = true;
     TestTransportLayer layer(manager, std::make_shared<FixedTransportAdvisor>(TransportHint::UB_CANDIDATE),
-                             std::chrono::milliseconds(10), filter);
+                             filter);
     ProviderUbFailureDetailPb detail;
     FillProviderUbFailureDetail(Status(K_URMA_ERROR, "provider write failed"), "client-receive-endpoint",
                                 provider.ToString(), 4, 4, detail);
@@ -1150,109 +1103,6 @@ TEST(TransportLayerAdmissionTest, FailureNotificationCannotBeLostAfterDeadlineCh
 
     EXPECT_TRUE(reportFuture.get());
     EXPECT_TRUE(manager->WaitForProviderProbeCount(1, PROBE_OBSERVATION_TIMEOUT));
-}
-
-TEST(TransportLayerAdmissionTest, GlobalSnapshotDenyKeepsClientLocalSenderQuarantinedUntilReadmitted)
-{
-    auto manager = std::make_shared<FakeDataPlaneManager>();
-    manager->transporterSetStatuses = { { Status(K_URMA_ERROR, "local sender error 4") } };
-    TestTransportLayer layer(manager, std::make_shared<FixedTransportAdvisor>(TransportHint::UB_CANDIDATE),
-                             std::chrono::milliseconds(100));
-    ASSERT_TRUE(layer.Init().IsOk());
-    const auto workerAddr = MakeAddress(46);
-    std::shared_ptr<ObjectBuffer> buffer;
-    ASSERT_TRUE(layer.Create(workerAddr, "global-gate", 64, MakeCreateParam(), buffer).IsOk());
-    manager->builtTransporters.front()->setUbFailureReports = { Status(K_URMA_ERROR, "local sender error 4") };
-    manager->builtTransporters.front()->setUbCqeStatuses = { 4 };
-    ASSERT_EQ(layer.Set(*buffer, MakeSetParam()).GetCode(), K_URMA_ERROR);
-
-    WorkerSnapshot denied;
-    denied.ringVersion = 1;
-    ASSERT_TRUE(manager->UpdateWorkerSnapshot(denied).IsOk());
-    std::this_thread::sleep_for(std::chrono::milliseconds(150));
-    EXPECT_EQ(manager->probeCount, 0);
-    EXPECT_EQ(layer.Set(*buffer, MakeSetParam()).GetCode(), K_URMA_WORKER_UNAVAILABLE);
-
-    WorkerSnapshot readmitted;
-    readmitted.ringVersion = 2;
-    readmitted.remoteTransportAddrs = { workerAddr };
-    readmitted.writeProbeAddrs = readmitted.remoteTransportAddrs;
-    ASSERT_TRUE(manager->UpdateWorkerSnapshot(readmitted).IsOk());
-    ASSERT_TRUE(manager->WaitForProbeCount(1, PROBE_OBSERVATION_TIMEOUT));
-    Status recovered = Status(K_URMA_WORKER_UNAVAILABLE, "waiting for probe commit");
-    for (int attempt = 0; attempt < 50 && recovered.IsError(); ++attempt) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-        recovered = layer.Set(*buffer, MakeSetParam());
-    }
-    EXPECT_TRUE(recovered.IsOk()) << recovered.ToString();
-    EXPECT_EQ(manager->probeCount, 1);
-}
-
-TEST(TransportLayerAdmissionTest, RemovedFailureEndpointRecoversThroughAnotherAdmittedWorker)
-{
-    auto manager = std::make_shared<FakeDataPlaneManager>();
-    manager->transporterSetStatuses = { { Status(K_URMA_ERROR, "local sender error 4") } };
-    TestTransportLayer layer(manager, std::make_shared<FixedTransportAdvisor>(TransportHint::UB_CANDIDATE),
-                             std::chrono::milliseconds(100));
-    ASSERT_TRUE(layer.Init().IsOk());
-    const auto removedWorker = MakeAddress(48);
-    const auto replacementWorker = MakeAddress(49);
-    WorkerSnapshot initial;
-    initial.ringVersion = 1;
-    initial.remoteTransportAddrs = { removedWorker, replacementWorker };
-    initial.writeProbeAddrs = initial.remoteTransportAddrs;
-    ASSERT_TRUE(manager->UpdateWorkerSnapshot(initial).IsOk());
-
-    std::shared_ptr<ObjectBuffer> failedBuffer;
-    ASSERT_TRUE(layer.Create(removedWorker, "removed", 64, MakeCreateParam(), failedBuffer).IsOk());
-    manager->builtTransporters.front()->setUbFailureReports = { Status(K_URMA_ERROR, "local sender error 4") };
-    manager->builtTransporters.front()->setUbCqeStatuses = { 4 };
-    ASSERT_EQ(layer.Set(*failedBuffer, MakeSetParam()).GetCode(), K_URMA_ERROR);
-
-    WorkerSnapshot replacementOnly;
-    replacementOnly.ringVersion = 2;
-    replacementOnly.remoteTransportAddrs = { replacementWorker };
-    replacementOnly.writeProbeAddrs = replacementOnly.remoteTransportAddrs;
-    ASSERT_TRUE(manager->UpdateWorkerSnapshot(replacementOnly).IsOk());
-    ASSERT_TRUE(manager->WaitForProbeCount(1, PROBE_OBSERVATION_TIMEOUT));
-    EXPECT_EQ(manager->GetProbedWorkers(), std::vector<HostPort>{ replacementWorker });
-
-    std::shared_ptr<ObjectBuffer> recoveredBuffer;
-    ASSERT_TRUE(layer.Create(replacementWorker, "replacement", 64, MakeCreateParam(), recoveredBuffer).IsOk());
-    EXPECT_TRUE(layer.Set(*recoveredBuffer, MakeSetParam()).IsOk());
-}
-
-TEST(TransportLayerAdmissionTest, FailedRecoveryProbeRotatesAcrossAdmittedWorkers)
-{
-    auto manager = std::make_shared<FakeDataPlaneManager>();
-    manager->transporterSetStatuses = { { Status(K_URMA_ERROR, "local sender error 4") } };
-    manager->probeStatuses = { Status(K_NOT_SUPPORTED, "old worker has no write probe"), Status::OK() };
-    TestTransportLayer layer(manager, std::make_shared<FixedTransportAdvisor>(TransportHint::UB_CANDIDATE),
-                             std::chrono::milliseconds(20));
-    ASSERT_TRUE(layer.Init().IsOk());
-    const auto failedWorker = MakeAddress(50);
-    const auto replacementWorker = MakeAddress(51);
-    WorkerSnapshot admitted;
-    admitted.ringVersion = 1;
-    admitted.remoteTransportAddrs = { failedWorker, replacementWorker };
-    admitted.writeProbeAddrs = admitted.remoteTransportAddrs;
-    ASSERT_TRUE(manager->UpdateWorkerSnapshot(admitted).IsOk());
-
-    std::shared_ptr<ObjectBuffer> failedBuffer;
-    ASSERT_TRUE(layer.Create(failedWorker, "rotate", 64, MakeCreateParam(), failedBuffer).IsOk());
-    manager->builtTransporters.front()->setUbFailureReports = { Status(K_URMA_ERROR, "local sender error 4") };
-    manager->builtTransporters.front()->setUbCqeStatuses = { 4 };
-    ASSERT_EQ(layer.Set(*failedBuffer, MakeSetParam()).GetCode(), K_URMA_ERROR);
-
-    ASSERT_TRUE(manager->WaitForProbeCount(2, PROBE_OBSERVATION_TIMEOUT));
-    const auto probedWorkers = manager->GetProbedWorkers();
-    ASSERT_GE(probedWorkers.size(), 2u);
-    EXPECT_EQ(probedWorkers[0], failedWorker);
-    EXPECT_EQ(probedWorkers[1], replacementWorker);
-
-    std::shared_ptr<ObjectBuffer> recoveredBuffer;
-    ASSERT_TRUE(layer.Create(replacementWorker, "replacement", 64, MakeCreateParam(), recoveredBuffer).IsOk());
-    EXPECT_TRUE(layer.Set(*recoveredBuffer, MakeSetParam()).IsOk());
 }
 
 TEST(DataPlaneManagerAdmissionTest, ProbeRequiresPublishedWorkerSnapshot)
@@ -1391,45 +1241,6 @@ TEST(DataPlaneManagerAdmissionTest, ProbeCommitAndSnapshotPostCheckAreAtomic)
     EXPECT_TRUE(update.get().IsOk());
 }
 
-TEST(TransportLayerAdmissionTest, AdmittedSetCompletesAfterSenderQuarantineBecomesVisible)
-{
-    auto manager = std::make_shared<FakeDataPlaneManager>();
-    manager->transporterSetStatuses = { { Status(K_URMA_ERROR, "local sender error 4"), Status::OK() } };
-    TestTransportLayer layer(manager, std::make_shared<FixedTransportAdvisor>(TransportHint::UB_CANDIDATE));
-    std::shared_ptr<ObjectBuffer> first;
-    std::shared_ptr<ObjectBuffer> second;
-    ASSERT_TRUE(layer.Create(MakeAddress(31), "first", 4, MakeCreateParam(), first).IsOk());
-    ASSERT_TRUE(layer.Create(MakeAddress(31), "second", 4, MakeCreateParam(), second).IsOk());
-    auto transporter = manager->builtTransporters.front();
-    transporter->setUbFailureReports = { Status(K_URMA_ERROR, "local sender error 4") };
-    transporter->setUbCqeStatuses = { 4 };
-    transporter->coordinateConcurrentSets = true;
-
-    auto quarantiningSet = std::async(std::launch::async, [&]() { return layer.Set(*first, MakeSetParam()); });
-    {
-        std::unique_lock<std::mutex> lock(transporter->setMutex);
-        ASSERT_TRUE(
-            transporter->setCv.wait_for(lock, std::chrono::seconds(1), [&]() { return transporter->setCount >= 1; }));
-    }
-    auto admittedSet = std::async(std::launch::async, [&]() { return layer.Set(*second, MakeSetParam()); });
-    {
-        std::unique_lock<std::mutex> lock(transporter->setMutex);
-        ASSERT_TRUE(
-            transporter->setCv.wait_for(lock, std::chrono::seconds(1), [&]() { return transporter->setCount >= 2; }));
-    }
-    EXPECT_EQ(quarantiningSet.get().GetCode(), K_URMA_ERROR);
-    EXPECT_EQ(layer.CheckLocalUbSenderAdmission().GetCode(), K_URMA_WORKER_UNAVAILABLE);
-    EXPECT_EQ(admittedSet.wait_for(std::chrono::milliseconds(50)), std::future_status::timeout);
-    {
-        std::lock_guard<std::mutex> lock(transporter->setMutex);
-        transporter->releaseSecondSet = true;
-    }
-    transporter->setCv.notify_all();
-
-    EXPECT_TRUE(admittedSet.get().IsOk());
-    EXPECT_EQ(layer.Set(*second, MakeSetParam()).GetCode(), K_URMA_WORKER_UNAVAILABLE);
-}
-
 TEST(TransportLayerAdmissionTest, ShutdownWaitsForAdmittedUbOperationsBeforeClosingSender)
 {
     auto manager = std::make_shared<FakeDataPlaneManager>();
@@ -1462,86 +1273,7 @@ TEST(TransportLayerAdmissionTest, ShutdownWaitsForAdmittedUbOperationsBeforeClos
     EXPECT_EQ(shutdown.wait_for(std::chrono::seconds(1)), std::future_status::ready);
 }
 
-TEST(TransportLayerAdmissionTest, RetryAdmissionFailureStillReleasesSetAllocation)
-{
-    auto manager = std::make_shared<FakeDataPlaneManager>();
-    manager->transporterSetStatuses = { { Status(K_URMA_NEED_CONNECT, "reconnect") } };
-    TestTransportLayer layer(manager, std::make_shared<FixedTransportAdvisor>(TransportHint::UB_CANDIDATE));
-    std::shared_ptr<ObjectBuffer> buffer;
-    ASSERT_TRUE(layer.Create(MakeAddress(38), "set", 4, MakeCreateParam(), buffer).IsOk());
-    manager->builtTransporters.front()->setUbFailureReports = { Status(K_URMA_ERROR, "local sender error 4") };
-    manager->builtTransporters.front()->setUbCqeStatuses = { 4 };
-
-    EXPECT_EQ(layer.Set(*buffer, MakeSetParam()).GetCode(), K_URMA_ERROR);
-    ASSERT_EQ(manager->builtTransporters.size(), 2u);
-    EXPECT_EQ(manager->builtTransporters.front()->kind, AccessTransportKind::UB);
-    EXPECT_EQ(manager->builtTransporters.back()->kind, AccessTransportKind::TCP);
-    EXPECT_EQ(manager->builtTransporters.back()->releaseCount, 1);
-}
-
-TEST(TransportLayerAdmissionTest, HardUbMSetFailureBlocksLaterMSetAndRemoteAllocation)
-{
-    auto manager = std::make_shared<FakeDataPlaneManager>();
-    manager->transporterMSetUbFailureReports = { Status(K_URMA_ERROR, "local batch sender error 4") };
-    TestTransportLayer layer(manager, std::make_shared<FixedTransportAdvisor>(TransportHint::UB_CANDIDATE));
-    std::vector<std::shared_ptr<ObjectBuffer>> buffers;
-    ASSERT_TRUE(layer.MCreate(MakeAddress(32), { "first-a", "first-b" }, { 4, 4 }, MakeCreateParam(), buffers).IsOk());
-    TransportMSetResult result;
-
-    ASSERT_TRUE(layer.MSet(buffers, MakeSetParam(), result).IsOk());
-    EXPECT_EQ(layer.MSet(buffers, MakeSetParam(), result).GetCode(), K_URMA_WORKER_UNAVAILABLE);
-    std::vector<std::shared_ptr<ObjectBuffer>> blockedBuffers;
-    EXPECT_EQ(layer.MCreate(MakeAddress(33), { "blocked-a", "blocked-b" }, { 4, 4 }, MakeCreateParam(), blockedBuffers)
-                  .GetCode(),
-              K_URMA_WORKER_UNAVAILABLE);
-    ASSERT_EQ(manager->builtTransporters.size(), 2u);
-    EXPECT_EQ(manager->builtTransporters.front()->kind, AccessTransportKind::UB);
-    EXPECT_EQ(manager->builtTransporters.back()->kind, AccessTransportKind::TCP);
-    EXPECT_EQ(manager->builtTransporters.front()->mSetCount, 1);
-    EXPECT_EQ(manager->builtTransporters.front()->mCreateCount, 1);
-    EXPECT_EQ(manager->builtTransporters.back()->releaseCount, 2);
-}
-
-TEST(TransportLayerAdmissionTest, RetryAdmissionFailureStillReleasesEveryMSetAllocation)
-{
-    auto manager = std::make_shared<FakeDataPlaneManager>();
-    TestTransportLayer layer(manager, std::make_shared<FixedTransportAdvisor>(TransportHint::UB_CANDIDATE));
-    std::vector<std::shared_ptr<ObjectBuffer>> buffers;
-    ASSERT_TRUE(layer.MCreate(MakeAddress(39), { "a", "b" }, { 4, 4 }, MakeCreateParam(), buffers).IsOk());
-    manager->builtTransporters.front()->mSetStatus = Status(K_URMA_NEED_CONNECT, "reconnect");
-    manager->builtTransporters.front()->mSetUbFailureReportRc = Status(K_URMA_ERROR, "local sender error 4");
-    manager->builtTransporters.front()->mSetUbCqeStatus = 4;
-    TransportMSetResult result;
-
-    EXPECT_EQ(layer.MSet(buffers, MakeSetParam(), result).GetCode(), K_URMA_ERROR);
-    ASSERT_EQ(manager->builtTransporters.size(), 2u);
-    EXPECT_EQ(manager->builtTransporters.front()->kind, AccessTransportKind::UB);
-    EXPECT_EQ(manager->builtTransporters.back()->kind, AccessTransportKind::TCP);
-    EXPECT_EQ(manager->builtTransporters.back()->releaseCount, 2);
-}
-
-TEST(TransportLayerAdmissionTest, ClientLocalSenderFailureDoesNotAffectAnotherClient)
-{
-    auto failedManager = std::make_shared<FakeDataPlaneManager>();
-    failedManager->transporterSetStatuses = { { Status(K_URMA_ERROR, "client one error 4") } };
-    TestTransportLayer failedClient(failedManager,
-                                    std::make_shared<FixedTransportAdvisor>(TransportHint::UB_CANDIDATE));
-    std::shared_ptr<ObjectBuffer> failedBuffer;
-    ASSERT_TRUE(failedClient.Create(MakeAddress(34), "failed", 4, MakeCreateParam(), failedBuffer).IsOk());
-    failedManager->builtTransporters.front()->setUbFailureReports = { Status(K_URMA_ERROR, "client one error 4") };
-    failedManager->builtTransporters.front()->setUbCqeStatuses = { 4 };
-    EXPECT_EQ(failedClient.Set(*failedBuffer, MakeSetParam()).GetCode(), K_URMA_ERROR);
-    EXPECT_EQ(failedClient.Set(*failedBuffer, MakeSetParam()).GetCode(), K_URMA_WORKER_UNAVAILABLE);
-
-    auto healthyManager = std::make_shared<FakeDataPlaneManager>();
-    TestTransportLayer healthyClient(healthyManager,
-                                     std::make_shared<FixedTransportAdvisor>(TransportHint::UB_CANDIDATE));
-    std::shared_ptr<ObjectBuffer> healthyBuffer;
-    EXPECT_TRUE(healthyClient.Create(MakeAddress(34), "healthy", 4, MakeCreateParam(), healthyBuffer).IsOk());
-    EXPECT_TRUE(healthyClient.Set(*healthyBuffer, MakeSetParam()).IsOk());
-}
-
-TEST(TransportLayerAdmissionTest, LateCqe4AfterTimeoutBlocksNextSetWithoutAnotherWrite)
+TEST(TransportLayerAdmissionTest, LateCqe4DoesNotDirectlyCloseAdmission)
 {
     const auto worker = MakeAddress(40);
     auto manager = std::make_shared<FakeDataPlaneManager>();
@@ -1562,10 +1294,9 @@ TEST(TransportLayerAdmissionTest, LateCqe4AfterTimeoutBlocksNextSetWithoutAnothe
         UrmaLateCompletion{ 4001, URMA_PORT_UNAVAILABLE_STATUS, worker.ToString(), "worker-incarnation" },
         lateContext->ownerToken, lateContext->peerToken);
 
-    const auto isolated = layer.Set(*buffer, MakeSetParam());
-    EXPECT_EQ(isolated.GetCode(), K_URMA_WORKER_UNAVAILABLE) << isolated.ToString();
-    EXPECT_NE(isolated.GetMsg().find("Client-local UB sender is unavailable"), std::string::npos);
-    EXPECT_EQ(manager->builtTransporters.front()->setCount, 1);
+    EXPECT_TRUE(layer.CheckLocalUbSenderAdmission().IsOk());
+    EXPECT_TRUE(layer.Set(*buffer, MakeSetParam()).IsOk());
+    EXPECT_EQ(manager->builtTransporters.front()->setCount, 2);
 }
 
 TEST(TransportLayerAdmissionTest, LateCqe9DoesNotCloseClientLocalSender)
@@ -1574,7 +1305,7 @@ TEST(TransportLayerAdmissionTest, LateCqe9DoesNotCloseClientLocalSender)
     auto manager = std::make_shared<FakeDataPlaneManager>();
     auto filter = std::make_shared<UbHealthFilter>();
     TestTransportLayer layer(manager, std::make_shared<FixedTransportAdvisor>(TransportHint::UB_CANDIDATE),
-                             std::chrono::seconds(1), filter);
+                             filter);
     std::shared_ptr<ObjectBuffer> buffer;
     ASSERT_TRUE(layer.Create(worker, "late-cqe9", 4, MakeCreateParam(), buffer).IsOk());
     ASSERT_TRUE(layer.Set(*buffer, MakeSetParam()).IsOk());
@@ -1597,7 +1328,7 @@ TEST(TransportLayerAdmissionTest, SynchronousCqe9ReportsSafeWriteTargetReplay)
     auto manager = std::make_shared<FakeDataPlaneManager>();
     auto filter = std::make_shared<UbHealthFilter>();
     TestTransportLayer layer(manager, std::make_shared<FixedTransportAdvisor>(TransportHint::UB_CANDIDATE),
-                             std::chrono::seconds(1), filter);
+                             filter);
     std::shared_ptr<ObjectBuffer> buffer;
     ASSERT_TRUE(layer.Create(worker, "sync-cqe9", 4, MakeCreateParam(), buffer).IsOk());
     auto transporter = manager->builtTransporters.front();
@@ -1621,7 +1352,7 @@ TEST(TransportLayerAdmissionTest, MSetCqe9ReportsSafeWriteTargetReplay)
     manager->transporterMSetUbCqeStatuses = { URMA_REMOTE_ACK_TIMEOUT_STATUS };
     auto filter = std::make_shared<UbHealthFilter>();
     TestTransportLayer layer(manager, std::make_shared<FixedTransportAdvisor>(TransportHint::UB_CANDIDATE),
-                             std::chrono::seconds(1), filter);
+                             filter);
     std::vector<std::shared_ptr<ObjectBuffer>> buffers;
     ASSERT_TRUE(layer.MCreate(worker, { "mset-cqe9" }, { 4 }, MakeCreateParam(), buffers).IsOk());
 

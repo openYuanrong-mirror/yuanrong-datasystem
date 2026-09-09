@@ -95,6 +95,12 @@ void SetClientUbNumaConfig(bool affinityEnabled, uint32_t rrType, uint32_t srcCh
  */
 Status InitializeFastTransportManager(const HostPort &hostport = HostPort());
 
+/** @brief Reject client Host data APIs only when every local UB port is confirmed BAD. */
+Status CheckClientLocalUbPortHealth();
+
+/** @brief Request an asynchronous local port query after a client-side CQE 4. */
+void TriggerClientLocalUbPortHealthQuery();
+
 /**
  * @brief Verify one established worker UB path with a dedicated one-byte URMA WRITE.
  * @param[in] response Worker handshake response containing the reserved probe address.

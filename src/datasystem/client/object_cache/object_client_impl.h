@@ -1043,6 +1043,8 @@ private:
 
     void ConstructTreadPool();
 
+    Status CheckLocalUbNodeAdmission() const;
+
     Status ApplyRoutingWorkerSnapshot(uint64_t ringVersion, const ::datasystem::ClusterTopologyPb &ring,
                                       const std::unordered_map<std::string, std::string> &hostIdMap,
                                       const std::string &sdkHostId);

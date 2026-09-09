@@ -168,29 +168,33 @@
     Worker path even if routing was initialized for cross-node failover.
     Unavailable workers are excluded during bounded pre-Publish retries. With local cache enabled, both APIs preserve
     the legacy current-worker data path and do not initialize Routing. When URMA is enabled, they initialize the
-    TransportLayer runtime only to share the same process-local UB sender admission and dedicated recovery probe used
-    by routed writes. A raw provider/CQE status 4 from a legacy UB write therefore quarantines the sender before the
-    next Create/MultiCreate and returns `K_URMA_WORKER_UNAVAILABLE` until the probe succeeds.
+    TransportLayer runtime to share one process-local UB port-health admission gate. A raw provider/CQE status 4 from
+    a client UB write requests an asynchronous `urma_user_ctl` port query; it does not itself quarantine the sender.
+    Only a valid all-BAD result closes the eight Host data entry paths: `Create`, `Put`, `Get`, buffer `Set`, buffer
+    `MSet`, `MCreate`, key/value `MSet`, and `Publish`; rejection uses `K_URMA_WORKER_UNAVAILABLE`. This node-level gate
+    intentionally applies before SHM/UB/TCP selection: after the client process confirms that every local UB port is
+    BAD, it rejects all Host object data APIs rather than allowing a request that will later require the unavailable
+    local UB endpoint. The foreground request that supplied CQE 4 keeps its existing fallback/result semantics because
+    the port query is asynchronous; cleanup of that request uses TCP rather than the failed UB path.
   - With `enableLocalCache=true` and `enableCrossNodeConnection=true`, `ObjectClientImpl` constructs its
     `TransportLayer` before client initialization completes even when the initially selected same-host Worker does not
     advertise URMA. A later same-host SHM-to-remote UB failover therefore reuses an already-published transport object
     and Routing's full Worker snapshot; the switch path does not lazily replace `transportLayer_`. This preserves the
-    existing UB sender admission and reconcile-probe recovery path without adding synchronization to Set/Get. This
+    existing UB sender admission path without adding locking to Set/Get. This
     eager construction is transport-neutral for a non-URMA initial Worker: `DataPlaneManager` initializes its generic
     lifecycle without activating the process-local UB runtime. For this compatibility path, later UB activation remains
     owned by a Worker handshake that advertises UB; client-direct pipeline initialization continues to request UB setup
     eagerly. The `TransportLayerOptions` default remains UB-eager, so routed clients with local cache disabled retain
     their existing initialization behavior.
   - Timed-out UB writes retain the transport Event, whose late-completion context holds only a weak reference to that
-    originating TransportLayer's sender state plus its generation; the foreground waiter is detached at timeout. If a
-    status-4 CQE arrives later, it quarantines that same Client sender and releases the retained Event. Shutdown or a
-    completed recovery invalidates the generation, so an old CQE cannot quarantine a replacement sender and the
-    retained Event cannot extend the Client or payload lifetime. Client write admission captures that generation under
-    the sender-state lock but releases the lock before transport I/O; both synchronous and late failure reports validate
-    the captured generation, so the URMA poller never waits behind a foreground completion wait. A stack-owned operation
+    originating TransportLayer's sender state; the foreground waiter is detached at timeout. If a
+    status-4 CQE arrives later, it requests the same process-local port query and releases the retained Event. The
+    shutdown gate prevents an old CQE from affecting a destroyed transport, and the
+    retained Event cannot extend the Client or payload lifetime. Client write admission releases the sender-state lock
+    before transport I/O, so the URMA poller never waits behind a foreground completion wait. A stack-owned operation
     token tracks admitted UB Create/Set/MCreate/MSet work without holding the state lock. One atomic gate stores both
-    the closing bit and active-token count, so shutdown closes new admission and drains existing tokens through one
-    linearized state before destroying the data plane.
+    the closing bit and active-token count, so shutdown closes new UB operations and drains existing tokens through
+    one linearized state before destroying the data plane.
   - Client CQE-9 write-target isolation applies to UB writes in routed-only and local-cache modes. A quarantined bound
     Worker remains eligible when its same-host SHM capability keeps the Set off UB; a bound Worker without SHM
     capability joins the routing exclusion set and Set selects another eligible Worker. Request-local retry exclusions
