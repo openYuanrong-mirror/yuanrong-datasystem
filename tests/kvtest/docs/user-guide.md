@@ -362,6 +362,20 @@ python3 parse_resource.py collected_worker_logs/<pod>/resource_monitor.csv \
   -o resource_monitor.html
 ```
 
+每张图表底部都有带全量趋势预览的时间滑块，与 `kvcache_trace_report.py` 的横轴选择方式一致：
+拖动左右两端调整起止时间，拖动滑块中间平移区间；图内滚轮缩放、按住鼠标拖动平移。
+所有图表及滑块同步更新，点击“重置为全部时间”恢复全量视图。单击仍可锁定采样点，再次单击解锁。
+时间范围包含两端；横轴使用浏览器本地时区，悬停仍显示原始采样时间。
+也可在生成报告时指定初始范围，完整数据仍会保留在 HTML 中：
+
+```bash
+python3 parse_resource.py collected_worker_logs/<pod>/resource_monitor.csv \
+  --start-time "2026-09-08T22:10:00+08:00" \
+  --end-time "2026-09-08T22:30:00+08:00" -o resource_monitor.html
+```
+
+`--start-time` 和 `--end-time` 可以单独使用；不带时区偏移时，按生成报告的机器本地时区解释。
+
 CSV 默认包含 CPU、RSS、匿名/共享内存、文件描述符、TCP 失败率和吞吐量。Worker 配置同时启用
 `jemalloc_stats=true` 与 `brpc_enable_builtin_services=true` 时，还会按秒采集 jemalloc 的
 allocated、active、resident、metadata、mapped、retained、dirty 和 muzzy 指标。读取失败时
