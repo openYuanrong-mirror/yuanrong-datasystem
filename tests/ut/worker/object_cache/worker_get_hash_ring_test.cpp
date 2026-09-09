@@ -42,28 +42,23 @@ Status MakeSnapshot(std::shared_ptr<const cluster::TopologySnapshot> &snapshot)
         cluster::Member{ { std::string(16, 'a'), WORKER_A }, cluster::MemberState::ACTIVE, { 100u } },
         cluster::Member{ { std::string(16, 'b'), WORKER_B }, cluster::MemberState::JOINING, { 200u } },
     };
-    return cluster::TopologySnapshot::Create(std::move(state), TOPOLOGY_VERSION, std::string(64, 'a'), snapshot);
+    return cluster::TopologySnapshot::Create(std::move(state), TOPOLOGY_VERSION, std::string(64, 'a'), snapshot,
+                                             { { WORKER_A, "host-a" }, { WORKER_B, "host-b" } });
 }
 }  // namespace
 
 class WorkerGetHashRingTest : public ::datasystem::ut::CommonTest {};
 
-TEST_F(WorkerGetHashRingTest, MatchingVersionSkipsHostIdLoadAndClearsPayload)
+TEST_F(WorkerGetHashRingTest, MatchingVersionClearsPayload)
 {
     std::shared_ptr<const cluster::TopologySnapshot> snapshot;
     DS_ASSERT_OK(MakeSnapshot(snapshot));
-    int loadCount = 0;
-    RoutingHostIdLoader loader = [&loadCount](RoutingHostIdMap &) {
-        ++loadCount;
-        return Status(K_RUNTIME_ERROR, "must not load host IDs");
-    };
     GetHashRingRspPb rsp;
     (*rsp.mutable_host_id_map())["stale"] = "stale";
     (*rsp.mutable_hash_ring()->mutable_members())["stale"];
 
-    DS_ASSERT_OK(BuildGetHashRingResponse(*snapshot, TOPOLOGY_VERSION, "127.0.0.1:9000", loader, rsp));
+    DS_ASSERT_OK(BuildGetHashRingResponse(*snapshot, TOPOLOGY_VERSION, "127.0.0.1:9000", rsp));
 
-    EXPECT_EQ(loadCount, 0);
     EXPECT_FALSE(rsp.hash_ring_changed());
     EXPECT_EQ(rsp.version(), TOPOLOGY_VERSION);
     EXPECT_EQ(rsp.master_address(), "127.0.0.1:9000");
@@ -75,18 +70,10 @@ TEST_F(WorkerGetHashRingTest, DifferentVersionReturnsTopologyAndHostIdMap)
 {
     std::shared_ptr<const cluster::TopologySnapshot> snapshot;
     DS_ASSERT_OK(MakeSnapshot(snapshot));
-    int loadCount = 0;
-    RoutingHostIdLoader loader = [&loadCount](RoutingHostIdMap &hostIdMap) {
-        ++loadCount;
-        hostIdMap[WORKER_A] = "host-a";
-        hostIdMap[WORKER_B] = "host-b";
-        return Status::OK();
-    };
     GetHashRingRspPb rsp;
 
-    DS_ASSERT_OK(BuildGetHashRingResponse(*snapshot, 0, "127.0.0.1:9000", loader, rsp));
+    DS_ASSERT_OK(BuildGetHashRingResponse(*snapshot, 0, "127.0.0.1:9000", rsp));
 
-    EXPECT_EQ(loadCount, 1);
     EXPECT_TRUE(rsp.hash_ring_changed());
     EXPECT_EQ(rsp.version(), TOPOLOGY_VERSION);
     EXPECT_EQ(rsp.hash_ring().version(), TOPOLOGY_VERSION);
@@ -102,18 +89,52 @@ TEST_F(WorkerGetHashRingTest, DifferentVersionReturnsTopologyAndHostIdMap)
     EXPECT_EQ(rsp.host_id_map().at(WORKER_B), "host-b");
 }
 
-TEST_F(WorkerGetHashRingTest, HostIdLoadFailureIsReturned)
+TEST_F(WorkerGetHashRingTest, ResponseRetainsHeldSnapshotGeneration)
 {
     std::shared_ptr<const cluster::TopologySnapshot> snapshot;
     DS_ASSERT_OK(MakeSnapshot(snapshot));
-    RoutingHostIdLoader loader = [](RoutingHostIdMap &) {
-        return Status(K_NOT_READY, "membership table unavailable");
-    };
+    const auto held = snapshot;
+    auto updated = snapshot->CopyState();
+    ++updated.version;
+    DS_ASSERT_OK(cluster::TopologySnapshot::Create(std::move(updated), TOPOLOGY_VERSION + 1,
+                                                   std::string(64, 'b'), snapshot,
+                                                   { { WORKER_A, "new-host" } }));
     GetHashRingRspPb rsp;
 
-    auto rc = BuildGetHashRingResponse(*snapshot, 1, "127.0.0.1:9000", loader, rsp);
+    DS_ASSERT_OK(BuildGetHashRingResponse(*held, 1, "127.0.0.1:9000", rsp));
 
-    EXPECT_EQ(rc.GetCode(), K_NOT_READY);
+    EXPECT_EQ(rsp.version(), TOPOLOGY_VERSION);
+    EXPECT_EQ(rsp.hash_ring().version(), TOPOLOGY_VERSION);
+    EXPECT_EQ(rsp.host_id_map().at(WORKER_A), "host-a");
+}
+
+TEST_F(WorkerGetHashRingTest, SameVersionHostIdChangesReturnCompleteSnapshot)
+{
+    std::shared_ptr<const cluster::TopologySnapshot> snapshot;
+    DS_ASSERT_OK(MakeSnapshot(snapshot));
+    const auto original = snapshot;
+    GetHashRingRspPb rsp;
+    DS_ASSERT_OK(BuildGetHashRingResponse(*snapshot, TOPOLOGY_VERSION, "", rsp, snapshot->HostIdsDigest()));
+    EXPECT_FALSE(rsp.hash_ring_changed());
+    EXPECT_FALSE(rsp.has_hash_ring());
+    EXPECT_EQ(rsp.host_ids_digest(), snapshot->HostIdsDigest());
+
+    DS_ASSERT_OK(cluster::TopologySnapshot::Create(original->CopyState(), TOPOLOGY_VERSION,
+                                                  original->CanonicalDigest(), snapshot, {}, 1));
+    DS_ASSERT_OK(BuildGetHashRingResponse(*snapshot, TOPOLOGY_VERSION, "", rsp, original->HostIdsDigest()));
+    EXPECT_TRUE(rsp.hash_ring_changed());
+    EXPECT_TRUE(rsp.has_hash_ring());
+    EXPECT_TRUE(rsp.host_id_map().empty());
+    EXPECT_EQ(rsp.version(), TOPOLOGY_VERSION);
+    const auto emptyDigest = rsp.host_ids_digest();
+    EXPECT_NE(emptyDigest, original->HostIdsDigest());
+
+    DS_ASSERT_OK(BuildGetHashRingResponse(*original, TOPOLOGY_VERSION, "", rsp, emptyDigest));
+    EXPECT_TRUE(rsp.hash_ring_changed());
+    EXPECT_EQ(rsp.host_id_map().at(WORKER_A), "host-a");
+    DS_ASSERT_OK(BuildGetHashRingResponse(*original, TOPOLOGY_VERSION, "", rsp, original->HostIdsDigest()));
+    EXPECT_FALSE(rsp.hash_ring_changed());
+    EXPECT_TRUE(rsp.host_id_map().empty());
 }
 
 }  // namespace datasystem::object_cache

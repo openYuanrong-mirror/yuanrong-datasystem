@@ -46,6 +46,18 @@ namespace client {
 namespace {
 
 constexpr uint32_t TRANSPORT_STATE_LOG_RATE = 100;
+// Ring-health grace: admission keeps rejecting unknown endpoints while a confirmed publish is this
+// recent; a longer gap means the ring refresh itself is lost.
+constexpr int64_t SNAPSHOT_REFRESH_GRACE_MS = 60'000;
+// Upper bound on how long admission may degrade (allow unknown endpoints) while the ring is lost.
+constexpr int64_t DEGRADED_ADMISSION_TTL_MS = 120'000;
+
+int64_t SteadyNowMs()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
 
 AccessTransportKind KindForHint(TransportHint hint)
 {
@@ -529,10 +541,15 @@ Status DataPlaneManager::GetOrCreateEntry(const std::string &workerKey,
 {
     CHECK_FAIL_RETURN_STATUS(!shutdown_.load(std::memory_order_acquire), K_SHUTTING_DOWN,
                              "DataPlaneManager is shutting down");
-    if (requireSnapshotAdmission && hasWorkerSnapshot_.load(std::memory_order_acquire)) {
-        auto live = std::atomic_load(&liveWorkers_);
+    auto admission = std::atomic_load(&endpointAdmissionSnapshot_);
+    if (requireSnapshotAdmission && admission != nullptr && !admission->provisional) {
+        const auto &live = admission->liveWorkers;
         if (live == nullptr || live->find(workerKey) == live->end()) {
-            return Status(K_NOT_READY, "Worker endpoint is absent from latest transport snapshot: " + workerKey);
+            const bool degraded = AllowDegradedEndpointAdmission(*admission);
+            INJECT_POINT_NO_RETURN("DataPlaneManager.GetOrCreateEntry.afterDegradedAdmission");
+            if (!degraded || std::atomic_load(&endpointAdmissionSnapshot_) != admission) {
+                return Status(K_NOT_READY, "Worker endpoint is absent from latest transport snapshot: " + workerKey);
+            }
         }
     }
     EntryMap::const_accessor constAccessor;
@@ -759,23 +776,42 @@ void DataPlaneManager::Teardown(const HostPort &workerAddr)
     staleRpcClient.reset();
 }
 
+bool DataPlaneManager::AllowDegradedEndpointAdmission(const EndpointAdmissionSnapshot &snapshot)
+{
+    const auto nowMs = SteadyNowMs();
+    const auto lastConfirmedMs = snapshot.lastConfirmedMs;
+    if (lastConfirmedMs > 0 && nowMs - lastConfirmedMs < SNAPSHOT_REFRESH_GRACE_MS) {
+        // Ring is healthy: an absent endpoint was removed by a confirmed ring, keep rejecting.
+        return false;
+    }
+    int64_t expected = 0;
+    if (snapshot.degradedDeadlineMs.compare_exchange_strong(expected, nowMs + DEGRADED_ADMISSION_TTL_MS)) {
+        LOG(WARNING) << "[TransportGet][Reconcile] Ring refresh is lost, degrade endpoint admission for "
+                     << DEGRADED_ADMISSION_TTL_MS << "ms";
+        return true;
+    }
+    return nowMs < expected;
+}
+
 Status DataPlaneManager::UpdateWorkerSnapshot(const WorkerSnapshot &snapshot)
 {
     auto liveWorkers = BuildLiveWorkerSet(snapshot);
     auto writeProbeWorkers = BuildWriteProbeWorkers(snapshot, liveWorkers);
     CHECK_FAIL_RETURN_STATUS(!shutdown_.load(std::memory_order_acquire), K_SHUTTING_DOWN,
                              "DataPlaneManager is shutting down");
+    // A version regression is legal only for a cross-confirmed epoch reset (rebuilt membership
+    // table); see HashRingRefresher lower-version cross confirmation.
     CHECK_FAIL_RETURN_STATUS(!hasWorkerSnapshot_.load(std::memory_order_acquire)
-                             || snapshot.ringVersion >= workerSnapshotVersion_.load(std::memory_order_acquire),
+                                 || snapshot.epochResetConfirmed
+                                 || snapshot.ringVersion >= workerSnapshotVersion_.load(std::memory_order_acquire),
                              K_INVALID,
                              "Transport worker snapshot version regressed from "
                                  + std::to_string(workerSnapshotVersion_.load()) + " to "
                                  + std::to_string(snapshot.ringVersion));
     auto newLiveWorkers = std::make_shared<const std::unordered_set<std::string>>(std::move(liveWorkers));
     auto endpointAdmission = std::make_shared<const EndpointAdmissionSnapshot>(
-        EndpointAdmissionSnapshot{ snapshot.ringVersion, newLiveWorkers });
+        snapshot.ringVersion, newLiveWorkers, snapshot.provisional, snapshot.provisional ? 0 : SteadyNowMs());
     std::atomic_store(&endpointAdmissionSnapshot_, std::move(endpointAdmission));
-    std::atomic_store(&liveWorkers_, newLiveWorkers);
     {
         std::lock_guard<bthread::Mutex> lock(probeMutex_);
         writeProbeWorkers_ = std::move(writeProbeWorkers);
@@ -788,8 +824,21 @@ Status DataPlaneManager::UpdateWorkerSnapshot(const WorkerSnapshot &snapshot)
     workerSnapshotVersion_.store(snapshot.ringVersion, std::memory_order_release);
     hasWorkerSnapshot_.store(true, std::memory_order_release);
     VLOG(1) << "[TransportGet][Reconcile] Published worker snapshot, version: " << workerSnapshotVersion_.load()
-            << ", worker count: " << newLiveWorkers->size();
+            << ", worker count: " << newLiveWorkers->size() << ", provisional: " << snapshot.provisional;
     return Status::OK();
+}
+
+void DataPlaneManager::RecordRoutingRefresh(uint64_t ringVersion)
+{
+    auto current = std::atomic_load(&endpointAdmissionSnapshot_);
+    if (current == nullptr || current->provisional || current->ringVersion != ringVersion
+        || shutdown_.load(std::memory_order_acquire)) {
+        return;
+    }
+    auto refreshed = std::make_shared<const EndpointAdmissionSnapshot>(
+        current->ringVersion, current->liveWorkers, false, SteadyNowMs());
+    // A concurrent publication wins; old refresh evidence must not rearm the new generation.
+    (void)std::atomic_compare_exchange_strong(&endpointAdmissionSnapshot_, &current, std::move(refreshed));
 }
 
 void DataPlaneManager::ReconcileWithSnapshot(const WorkerSnapshot &snapshot)

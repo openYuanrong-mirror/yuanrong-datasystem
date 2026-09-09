@@ -20,6 +20,7 @@
 #include <utility>
 
 #include "datasystem/client/object_cache/routing/routing_rpc_client.h"
+#include "datasystem/common/ak_sk/hasher.h"
 #include "datasystem/common/log/log.h"
 #include "datasystem/common/util/status_helper.h"
 #include "datasystem/common/util/strings_util.h"
@@ -29,16 +30,19 @@ namespace client {
 
 Routing::Routing(BrpcChannelConfig channelConfig, std::shared_ptr<Signature> signature,
                  HashRingRefresher::RingUpdateHook ringUpdateHook,
-                 std::vector<std::shared_ptr<IWorkerFilter>> additionalFilters, int64_t refreshIntervalMs)
+                 std::vector<std::shared_ptr<IWorkerFilter>> additionalFilters, int64_t refreshIntervalMs,
+                 std::function<void(uint64_t)> refreshConfirmedHook)
     : router_(std::make_shared<WorkerRouter>("", std::move(additionalFilters))),
       rpcClient_(std::make_shared<RoutingRpcClient>(std::move(channelConfig), std::move(signature))),
-      refreshIntervalMs_(refreshIntervalMs)
+      refreshIntervalMs_(refreshIntervalMs),
+      refreshConfirmedHook_(std::move(refreshConfirmedHook))
 {
     auto applyRingUpdate = [this, ringUpdateHook = std::move(ringUpdateHook)](
                                uint64_t newVersion, const ::datasystem::ClusterTopologyPb &ring,
-                               const std::unordered_map<std::string, std::string> &hostIdMap) {
+                               const std::unordered_map<std::string, std::string> &hostIdMap,
+                               bool epochResetConfirmed) {
         if (ringUpdateHook) {
-            RETURN_IF_NOT_OK(ringUpdateHook(newVersion, ring, hostIdMap));
+            RETURN_IF_NOT_OK(ringUpdateHook(newVersion, ring, hostIdMap, epochResetConfirmed));
         }
         rpcClient_->PruneConnections(ring);
         return Status::OK();
@@ -89,19 +93,18 @@ Status Routing::FetchHashRing(const HostPort &workerAddr, uint64_t currentVersio
 {
     RETURN_RUNTIME_ERROR_IF_NULL(rpcClient_);
     GetHashRingRspPb response;
-    RETURN_IF_NOT_OK(rpcClient_->GetHashRing(workerAddr, currentVersion, response, timeoutMs));
+    RETURN_IF_NOT_OK(rpcClient_->GetHashRing(workerAddr, currentVersion, response, timeoutMs,
+                                             refresher_->GetHostIdsDigest(currentVersion)));
     newVersion = response.version();
     changed = response.hash_ring_changed();
     masterAddress = response.master_address();
     if (!changed) {
+        if (newVersion == currentVersion && refreshConfirmedHook_) {
+            refreshConfirmedHook_(newVersion);
+        }
         return Status::OK();
     }
-    // Resolve the SDK host_id from the bound worker's entry in hostIdMap. Unlike a one-shot flag,
-    // this retries on every ring change until the host_id is resolved: if the first ring fetch lands
-    // before the bound worker's keepalive has populated host_id_map (or the worker started without
-    // --host_id_env_name and the operator fixes it later), a later ring change must still be able to
-    // adopt the host_id. hostIdResolutionAttempted_ is set only on a successful resolution, so the
-    // missing-host_id WARNING below is retried rather than permanently disabling same-node affinity.
+    // Retry unresolved local host identity on any full response, including hostId-only updates.
     const bool resolveInitialHostId = initialWorkerIsLocal_ && !hostIdResolutionAttempted_.load();
     CHECK_FAIL_RETURN_STATUS(response.has_hash_ring(), K_RUNTIME_ERROR,
                              "GetHashRing response is missing the changed hash ring");
@@ -110,22 +113,23 @@ Status Routing::FetchHashRing(const HostPort &workerAddr, uint64_t currentVersio
     for (const auto &entry : response.host_id_map()) {
         hostIdMap.emplace(entry.first, entry.second);
     }
+    if (!response.host_ids_digest().empty()) {
+        Hasher hasher;
+        std::string digest;
+        RETURN_IF_NOT_OK(hasher.GetStringMapSha256Hex(hostIdMap, digest));
+        CHECK_FAIL_RETURN_STATUS(digest == response.host_ids_digest(), K_INVALID,
+                                 "GetHashRing host ID digest does not match its payload");
+    }
     if (resolveInitialHostId) {
         auto iter = hostIdMap.find(initialWorkerAddr_.ToString());
         if (iter != hostIdMap.end() && !iter->second.empty()) {
             router_->SetHostId(iter->second);
             hostIdResolutionAttempted_.store(true, std::memory_order_release);
         } else {
-            // The initial worker's host_id is absent from this GetHashRing response. It may appear on a
-            // later ring change (keepalive propagation lag) or it may never appear (worker started
-            // without --host_id_env_name). Do NOT set hostIdResolutionAttempted_ here so a subsequent
-            // ring change retries the resolution. With sdk_data_placement_policy=PREFERRED_SAME_NODE,
-            // until resolved every key degrades to the hash ring (cross-node routing), which can time
-            // out for large payloads. Check the worker startup log for "host_id_env_name is not set".
             LOG(WARNING) << "[Routing] Initial worker host ID is absent from GetHashRing response, endpoint="
                          << initialWorkerAddr_.ToString()
-                         << "; same-node worker affinity stays degraded (cross-node) until a later ring "
-                            "change resolves it; verify --host_id_env_name is set on workers.";
+                         << "; same-node worker affinity stays degraded until a routing snapshot "
+                            "update resolves it; verify --host_id_env_name is set on workers.";
         }
     }
     return Status::OK();

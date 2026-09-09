@@ -723,15 +723,7 @@ Status ObjectClientImpl::InitTransportLayer()
     options.allowUbRuntimeFailure = workerApi_[currentNode_]->IsShmEnable();
     options.readSourceFilter = ubHealthFilter_;
     options.metadataFailureHandler = [this](const HostPort &owner, const Status &status) {
-        if (!ShouldRefreshRoutingAfterFailure(status.GetCode())
-            && !client::IsTransportSnapshotStaleLocation(status)) {
-            return;
-        }
-        auto routing = std::atomic_load(&routing_);
-        if (routing != nullptr && routing->ForceRefresh()) {
-            LOG(INFO) << "[Routing] Force hash ring refresh after metadata owner access failure, metadata owner: "
-                      << owner.ToString() << ", status: " << status.ToString();
-        }
+        HandleMetadataOwnerFailure(owner, status);
     };
     options.drainingFallbackHandler = [this](const HostPort &worker, const Status &status) {
         auto routing = std::atomic_load(&routing_);
@@ -751,12 +743,13 @@ Status ObjectClientImpl::InitTransportLayer()
 Status ObjectClientImpl::ApplyRoutingWorkerSnapshot(uint64_t ringVersion,
                                                     const ::datasystem::ClusterTopologyPb &ring,
                                                     const std::unordered_map<std::string, std::string> &hostIdMap,
-                                                    const std::string &sdkHostId)
+                                                    const std::string &sdkHostId, bool epochResetConfirmed)
 {
     RETURN_RUNTIME_ERROR_IF_NULL(transportLayer_);
     RETURN_RUNTIME_ERROR_IF_NULL(ubHealthFilter_);
     client::WorkerSnapshot snapshot;
     RETURN_IF_NOT_OK(client::BuildWorkerSnapshot(ringVersion, ring, hostIdMap, sdkHostId, snapshot));
+    snapshot.epochResetConfirmed = epochResetConfirmed;
     ubHealthFilter_->ApplyTopologyIncarnations(ring);
     RETURN_IF_NOT_OK(transportLayer_->ApplyWorkerSnapshot(std::move(snapshot)));
     MaybeSwitchWorkerRemovedFromRing(ring);
@@ -781,6 +774,24 @@ Status ObjectClientImpl::InitDataPlacementPolicy()
     }
     LOG(INFO) << "Data placement policy initialized: " << policyName;
     return Status::OK();
+}
+
+void ObjectClientImpl::ResolveRoutingSdkHostId(
+    const HostPort &initialWorker, bool initialWorkerIsLocal,
+    const std::unordered_map<std::string, std::string> &hostIdMap, std::string &sdkHostId, bool &warned)
+{
+    if (!sdkHostId.empty()) {
+        return;
+    }
+    // Only a bound worker confirmed local by discovery can supply the SDK host ID.
+    sdkHostId = client::ResolveSdkHostId(initialWorkerIsLocal, initialWorker, hostIdMap);
+    if (sdkHostId.empty() && !warned) {
+        warned = true;
+        LOG(WARNING) << "[Routing] SDK host_id is unresolved and the bound worker is not confirmed"
+                     << " same-host (initialWorker=" << initialWorker.ToString()
+                     << "); same-host SHM partitioning is disabled and cross-node workers route"
+                     << " via UB/TCP. Set host_id_env_name on the client process to enable SHM.";
+    }
 }
 
 Status ObjectClientImpl::InitRouting(const HostPort &initialWorker, bool initialWorkerIsLocal)
@@ -808,32 +819,24 @@ Status ObjectClientImpl::InitRouting(const HostPort &initialWorker, bool initial
     auto hostIdUnresolvedWarned = std::make_shared<bool>(false);
     auto ringUpdateHook = [this, initialWorker, initialWorkerIsLocal, sdkHostIdCache, hostIdUnresolvedWarned](
                               uint64_t ringVersion, const ::datasystem::ClusterTopologyPb &ring,
-                              const std::unordered_map<std::string, std::string> &hostIdMap) {
-        if (sdkHostIdCache->empty()) {
-            // initialWorkerIsLocal must reflect the real locality of the bound worker (threaded from
-            // service-discovery selection), not a hardcoded default. When it is false, a cross-node
-            // bound worker's hostId is NOT adopted, so cross-node workers use remote transport and
-            // GetTransportHint selects UB/TCP instead of timing out on the SHM/UDS path.
-            const auto resolved = client::ResolveSdkHostId(initialWorkerIsLocal, initialWorker, hostIdMap);
-            if (!resolved.empty()) {
-                *sdkHostIdCache = resolved;
-            } else if (!*hostIdUnresolvedWarned) {
-                *hostIdUnresolvedWarned = true;
-                LOG(WARNING) << "[Routing] SDK host_id is unresolved and the bound worker is not confirmed"
-                             << " same-host (initialWorker=" << initialWorker.ToString()
-                             << "); same-host SHM partitioning is disabled and cross-node workers route"
-                             << " via UB/TCP. Set host_id_env_name on the client process to enable SHM.";
-            }
-        }
+                              const std::unordered_map<std::string, std::string> &hostIdMap,
+                              bool epochResetConfirmed) {
+        ResolveRoutingSdkHostId(initialWorker, initialWorkerIsLocal, hostIdMap,
+                                *sdkHostIdCache, *hostIdUnresolvedWarned);
         if (transportLayer_ != nullptr) {
-            return ApplyRoutingWorkerSnapshot(ringVersion, ring, hostIdMap, *sdkHostIdCache);
+            return ApplyRoutingWorkerSnapshot(ringVersion, ring, hostIdMap, *sdkHostIdCache, epochResetConfirmed);
         }
         ubHealthFilter_->ApplyTopologyIncarnations(ring);
         return Status::OK();
     };
     auto routing = std::make_shared<client::Routing>(
         std::move(channelConfig), transportSignature_, std::move(ringUpdateHook),
-        std::vector<std::shared_ptr<client::IWorkerFilter>>{ ubHealthFilter_ });
+        std::vector<std::shared_ptr<client::IWorkerFilter>>{ ubHealthFilter_ },
+        client::Routing::DEFAULT_REFRESH_INTERVAL_MS, [this](uint64_t version) {
+            if (transportLayer_ != nullptr) {
+                transportLayer_->RecordRoutingRefresh(version);
+            }
+        });
     RETURN_IF_NOT_OK(routing->Init(*sdkHostIdCache, initialWorker, initialWorkerIsLocal));
     std::atomic_store(&routing_, std::move(routing));
     LOG(INFO) << "[Routing] Object client routing initialized from worker " << initialWorker.ToString();
@@ -885,6 +888,40 @@ bool ObjectClientImpl::ShouldRefreshRoutingAfterFailure(StatusCode code)
            || code == K_CLIENT_WORKER_DISCONNECT || code == K_METADATA_OWNER_UNAVAILABLE;
 }
 
+void ObjectClientImpl::HandleMetadataOwnerFailure(const HostPort &owner, const Status &status)
+{
+    if (!ShouldRefreshRoutingAfterFailure(status.GetCode()) && !client::IsTransportSnapshotStaleLocation(status)) {
+        return;
+    }
+    auto routing = std::atomic_load(&routing_);
+    if (routing == nullptr || !ShouldForceRefreshRouting(owner)) {
+        return;
+    }
+    if (routing->ForceRefresh()) {
+        LOG(INFO) << "[Routing] Force hash ring refresh after metadata owner access failure, metadata owner: "
+                  << owner.ToString() << ", status: " << status.ToString();
+    }
+}
+
+bool ObjectClientImpl::ShouldForceRefreshRouting(const HostPort &owner, std::chrono::steady_clock::time_point now)
+{
+    constexpr size_t MAX_TRACKED_REFRESH_OWNERS = 64;
+    const auto window = std::chrono::milliseconds(client::HashRingRefresher::FORCED_REFRESH_WINDOW_MS);
+    std::lock_guard<std::mutex> lock(forcedRefreshRateMutex_);
+    const auto key = owner.ToString();
+    auto iter = lastForcedRefreshAt_.find(key);
+    if (iter != lastForcedRefreshAt_.end() && now - iter->second < window) {
+        return false;
+    }
+    lastForcedRefreshAt_[key] = now;
+    if (lastForcedRefreshAt_.size() > MAX_TRACKED_REFRESH_OWNERS) {
+        for (auto it = lastForcedRefreshAt_.begin(); it != lastForcedRefreshAt_.end();) {
+            it = now - it->second >= window ? lastForcedRefreshAt_.erase(it) : ++it;
+        }
+    }
+    return true;
+}
+
 void ObjectClientImpl::MaybeSwitchWorkerRemovedFromRing(const ::datasystem::ClusterTopologyPb &ring)
 {
     if (!enableLocalCache_ || std::atomic_load(&routing_) == nullptr) {
@@ -932,6 +969,8 @@ Status ObjectClientImpl::InitClientRuntimeAt(WorkerNode node, bool initWithWorke
             snapshot.remoteTransportAddrs.emplace_back(workerApi->hostPort_);
         }
         snapshot.writeProbeAddrs.emplace_back(workerApi->hostPort_);
+        // Single-worker bootstrap view: it must not reject endpoints until the first full ring lands.
+        snapshot.provisional = true;
         RETURN_IF_NOT_OK(transportLayer_->ApplyWorkerSnapshot(std::move(snapshot)));
     }
     const bool needsRouting = !enableLocalCache_ || enableCrossNodeConnection_;

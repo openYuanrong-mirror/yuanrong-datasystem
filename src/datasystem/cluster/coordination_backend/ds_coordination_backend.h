@@ -81,6 +81,9 @@ public:
     Status GetAll(const std::string &tableName,
                   std::vector<std::pair<std::string, std::string>> &outKeyValues) override;
 
+    Status GetAll(const std::string &tableName, std::vector<std::pair<std::string, std::string>> &outKeyValues,
+                  int64_t &responseRevision) override;
+
     /**
      * @brief Read one value from a logical table.
      * @param[in] tableName Logical table name.

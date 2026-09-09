@@ -16,6 +16,7 @@
 
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "datasystem/cluster/coordination_backend/coordination_backend.h"
@@ -116,6 +117,15 @@ public:
      * @return Backend or validation status.
      */
     Status ReadMemberships(std::vector<MembershipRecord> &members, int64_t *responseRevision = nullptr) const;
+
+    /**
+     * @brief Read the membership collection projected to a worker-address to host-id map.
+     * @param[out] hostIds Address-keyed host-id map; unchanged on failure.
+     * @param[out] responseRevision Optional membership read revision; unchanged on failure.
+     * @return Backend or validation status.
+     */
+    Status ReadHostIds(std::unordered_map<std::string, std::string> &hostIds,
+                       int64_t *responseRevision = nullptr) const;
 
     /**
      * @brief Exact-read one task with active-batch context.

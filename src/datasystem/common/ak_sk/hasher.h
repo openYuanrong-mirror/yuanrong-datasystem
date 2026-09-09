@@ -22,6 +22,7 @@
 
 #include <memory>
 #include <string>
+#include <unordered_map>
 
 #include "datasystem/common/util/status_helper.h"
 #include "datasystem/utils/sensitive_value.h"
@@ -138,6 +139,9 @@ public:
      * @return Status of the call.
      */
     Status GetSha256Hex(const std::string &str, std::string &hashVal);
+
+    // Sort by key and length-prefix each key/value byte string, including empty strings.
+    Status GetStringMapSha256Hex(const std::unordered_map<std::string, std::string> &values, std::string &hashVal);
 
     /**
      * @brief Get HMAC SHA1. Used by OBS V2 signing.

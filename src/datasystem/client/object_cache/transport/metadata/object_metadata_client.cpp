@@ -38,11 +38,26 @@ namespace datasystem {
 namespace client {
 
 namespace {
+// Confirmed owner migration: the route is known stale, wrap immediately so the outer retry reroutes.
+bool IsConfirmedMetadataOwnerRouteFailure(StatusCode code)
+{
+    return code == K_RPC_PEER_DEAD || code == K_METADATA_OWNER_UNAVAILABLE;
+}
+
+// Ambiguous owner degradation: the same owner may still answer; retry it in place a bounded number
+// of times before wrapping, so transient worker degradation does not cascade into route churn.
+bool IsAmbiguousMetadataOwnerRouteFailure(StatusCode code)
+{
+    return code == K_RPC_DEADLINE_EXCEEDED || code == K_RPC_UNAVAILABLE || code == K_CLIENT_WORKER_DISCONNECT;
+}
+
 bool IsMetadataOwnerRouteFailure(StatusCode code)
 {
-    return code == K_RPC_UNAVAILABLE || code == K_RPC_DEADLINE_EXCEEDED || code == K_RPC_PEER_DEAD
-           || code == K_CLIENT_WORKER_DISCONNECT || code == K_METADATA_OWNER_UNAVAILABLE;
+    return IsConfirmedMetadataOwnerRouteFailure(code) || IsAmbiguousMetadataOwnerRouteFailure(code);
 }
+
+constexpr int32_t ROUTE_DEGRADATION_INNER_RETRIES = 2;
+constexpr int64_t ROUTE_DEGRADATION_RETRY_BACKOFF_MS = 100;
 
 Status ValidateAndResetItems(const ObjectMetadataBatch &items)
 {
@@ -299,6 +314,7 @@ Status ObjectMetadataClient::QueryWithRetry(const HostPort &address, const Objec
     RETURN_RUNTIME_ERROR_IF_NULL(retry_);
     CHECK_FAIL_RETURN_STATUS(!items.empty(), K_INVALID, "Metadata query items are empty");
     int64_t backoffMs = 1;
+    int32_t routeDegradationRetries = 0;
     size_t attempt = 0;
     // The context keeps prepared data-plane state reusable across RPC retries.
     while (true) {
@@ -313,13 +329,16 @@ Status ObjectMetadataClient::QueryWithRetry(const HostPort &address, const Objec
         bool rpcDispatched = false;
         Status rc = InvokeQueryAndGet(address, request, response, payloads, context, rpcDispatched, recorder);
         RETURN_OK_IF_TRUE(rc.IsOk());
-        RETURN_IF_NOT_OK(PrepareQueryRetry(address, items, rc, rpcDispatched, context, backoffMs, recorder));
+        RETURN_IF_NOT_OK(
+            PrepareQueryRetry(address, items, rc, rpcDispatched, context, backoffMs, routeDegradationRetries,
+                              recorder));
     }
 }
 
 Status ObjectMetadataClient::PrepareQueryRetry(const HostPort &address, const ObjectMetadataBatch &items,
                                                const Status &rc, bool rpcDispatched, InlineRequestContext &context,
-                                               int64_t &backoffMs, TransportPhaseLatencyRecorder *recorder)
+                                               int64_t &backoffMs, int32_t &routeDegradationRetries,
+                                               TransportPhaseLatencyRecorder *recorder)
 {
     const bool quarantineUbBuffers =
         rpcDispatched && context.mode == InlineTransportMode::UB && NeedDelayReleaseShmUnit(rc);
@@ -328,15 +347,30 @@ Status ObjectMetadataClient::PrepareQueryRetry(const HostPort &address, const Ob
         context.DisableInlineData();
     }
     const bool routeFailure = IsMetadataOwnerRouteFailure(rc.GetCode());
-    if (routeFailure && metadataFailureHandler_) {
-        metadataFailureHandler_(address, rc);
-    }
+    // UNAVAILABLE invalidates the channel, not necessarily the owner. Read-only non-SHM queries
+    // may still use the bounded owner retry below, but must reconnect rather than reuse that channel.
     const bool teardownWarranted = IsNonRetryableRpcError(rc) || rc.GetCode() == K_RPC_UNAVAILABLE
                                    || (IsRetryableRpcError(rc) && IsBrpcRequestDefinitelyNotSent(rc));
     if (teardownWarranted) {
         manager_->Teardown(address);
     }
     if (routeFailure) {
+        if (IsAmbiguousMetadataOwnerRouteFailure(rc.GetCode())
+            && routeDegradationRetries < ROUTE_DEGRADATION_INNER_RETRIES) {
+            ++routeDegradationRetries;
+            VLOG(1) << "[TransportGet][Metadata] Retry degraded meta owner in place, meta owner: "
+                    << address.ToString() << ", inner retry: " << routeDegradationRetries
+                    << ", status: " << rc.ToString();
+            int64_t degradationBackoffMs = ROUTE_DEGRADATION_RETRY_BACKOFF_MS * routeDegradationRetries;
+            RETURN_IF_NOT_OK(retry_->Backoff(degradationBackoffMs));
+            if (quarantineUbBuffers) {
+                RETURN_IF_NOT_OK(PrepareUbInlineRequest(address, items, context, recorder));
+            }
+            return Status::OK();
+        }
+        if (metadataFailureHandler_) {
+            metadataFailureHandler_(address, rc);
+        }
         VLOG(1) << "[TransportGet][Metadata] Return stale route for outer retry, meta owner: "
                 << address.ToString() << ", dispatched: " << rpcDispatched << ", status: " << rc.ToString();
         return Status(K_NOT_READY, STALE_TRANSPORT_SNAPSHOT_MESSAGE);

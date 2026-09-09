@@ -116,7 +116,7 @@ private:
                                   InlineRequestContext &context) const;
     Status PrepareQueryRetry(const HostPort &address, const ObjectMetadataBatch &items, const Status &rc,
                              bool rpcDispatched, InlineRequestContext &context, int64_t &backoffMs,
-                             TransportPhaseLatencyRecorder *recorder);
+                             int32_t &routeDegradationRetries, TransportPhaseLatencyRecorder *recorder);
     void DelayReleaseUbBuffers(InlineRequestContext &context, const Status &reason,
                                const std::string &reasonSource) const;
     bool HandleUbTransportStatus(ObjectMetadataItem &item, const QueryAndGetResultPb &result,

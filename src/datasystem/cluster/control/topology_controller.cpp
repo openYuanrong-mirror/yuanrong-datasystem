@@ -482,7 +482,7 @@ Status TopologyController::ResyncExternalFacts()
 
         TopologyReader reader(repository_);
         std::shared_ptr<const TopologySnapshot> topology;
-        auto rc = reader.Read(CONTROLLER_READ_TIMEOUT_MS, topology);
+        auto rc = reader.ReadTopologyOnly(CONTROLLER_READ_TIMEOUT_MS, topology);
         if (rc.GetCode() == K_NOT_FOUND) {
             CHECK_FAIL_RETURN_STATUS(membershipRevisionFloor_ == 0, K_INVALID,
                                      "external topology authority disappeared");
@@ -525,7 +525,8 @@ Status TopologyController::ApplyExternalEvent(const CoordinationEvent &event)
             return Status::OK();
         }
         std::shared_ptr<const TopologySnapshot> candidate;
-        RETURN_IF_NOT_OK(TopologyReader::BuildFromEncodedTopology(event.value, event.revision, candidate));
+        RETURN_IF_NOT_OK(
+            TopologyReader::BuildFromEncodedTopology(event.value, event.revision, {}, candidate));
         RETURN_IF_NOT_OK(PublishExternalTopology(std::move(candidate), false));
         topologyEventRevision_ = event.revision;
         return Status::OK();
@@ -815,11 +816,11 @@ Status TopologyController::RecoverFromLatestTopology()
         }
     } else {
         TopologyReader reader(repository_);
-        auto readStatus = reader.Read(CONTROLLER_READ_TIMEOUT_MS, latest);
+        auto readStatus = reader.ReadTopologyOnly(CONTROLLER_READ_TIMEOUT_MS, latest);
         if (readStatus.GetCode() == K_NOT_FOUND) {
             readStatus = EnsureTopologyAuthority();
             if (readStatus.IsOk()) {
-                readStatus = reader.Read(CONTROLLER_READ_TIMEOUT_MS, latest);
+                readStatus = reader.ReadTopologyOnly(CONTROLLER_READ_TIMEOUT_MS, latest);
             }
         }
         if (readStatus.IsError()) {
@@ -2754,7 +2755,7 @@ Status TopologyController::CommitAndReadBack(uint64_t expectedVersion, const Top
     CHECK_FAIL_RETURN_STATUS(result.outcome == TopologyCasOutcome::COMMITTED, K_TRY_AGAIN,
                              "topology CAS lost to another Controller");
     TopologyReader reader(repository_);
-    RETURN_IF_NOT_OK(reader.Read(CONTROLLER_READ_TIMEOUT_MS, committed));
+    RETURN_IF_NOT_OK(reader.ReadTopologyOnly(CONTROLLER_READ_TIMEOUT_MS, committed));
     CHECK_FAIL_RETURN_STATUS(committed->Version() >= desired.version, K_TRY_AGAIN,
                              "topology exact read-back is older than committed candidate");
     if (options_.eventSourceMode == TopologyEventSourceMode::EXTERNAL_ETCD) {

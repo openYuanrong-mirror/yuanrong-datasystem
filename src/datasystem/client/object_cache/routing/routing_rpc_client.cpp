@@ -53,7 +53,7 @@ Status RoutingRpcClient::Init()
 }
 
 Status RoutingRpcClient::GetHashRing(const HostPort &workerAddr, uint64_t currentVersion, GetHashRingRspPb &response,
-                                     int32_t timeoutMs)
+                                     int32_t timeoutMs, const std::string &hostIdsDigest)
 {
     CHECK_FAIL_RETURN_STATUS(initialized_.load(std::memory_order_acquire), K_NOT_READY,
                              "Routing RPC client is not initialized");
@@ -61,6 +61,7 @@ Status RoutingRpcClient::GetHashRing(const HostPort &workerAddr, uint64_t curren
     RETURN_IF_NOT_OK(GetOrCreateConnection(workerAddr, connection));
     GetHashRingReqPb request;
     request.set_version(currentVersion);
+    request.set_host_ids_digest(hostIdsDigest);
     RETURN_IF_NOT_OK(signature_->GenerateSignature(request));
     RpcOptions options;
     options.SetTimeout(timeoutMs > 0 ? timeoutMs : channelConfig_.timeout_ms);

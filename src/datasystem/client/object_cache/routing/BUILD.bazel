@@ -31,6 +31,7 @@ ds_cc_library(
     deps = [
         ":data_placement_policy",
         "//include/datasystem/utils:utils_headers",
+        "//src/datasystem/common/ak_sk:hasher",
         "//src/datasystem/common/ak_sk:signature",
         "//src/datasystem/common/inject:common_inject",
         "//src/datasystem/common/log:common_log",

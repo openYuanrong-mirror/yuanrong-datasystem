@@ -22,6 +22,7 @@
 #include <utility>
 
 #include "datasystem/cluster/model/topology_diagnostics.h"
+#include "datasystem/common/ak_sk/hasher.h"
 #include "datasystem/common/util/hash_ring_token.h"
 #include "datasystem/common/util/net_util.h"
 #include "datasystem/common/util/status_helper.h"
@@ -158,20 +159,29 @@ Status ValidateAndCanonicalizeTopologyState(TopologyState &state)
 }
 
 Status TopologySnapshot::Create(TopologyState state, int64_t authorityRevision, std::string canonicalDigest,
-                                std::shared_ptr<const TopologySnapshot> &snapshot)
+                                std::shared_ptr<const TopologySnapshot> &snapshot,
+                                std::unordered_map<std::string, std::string> hostIds, int64_t hostIdsRevision)
 {
-    CHECK_FAIL_RETURN_STATUS(authorityRevision >= 0 && IsSha256Hex(canonicalDigest), K_INVALID,
+    CHECK_FAIL_RETURN_STATUS(authorityRevision >= 0 && hostIdsRevision >= 0 && IsSha256Hex(canonicalDigest), K_INVALID,
                              "invalid topology evidence");
     RETURN_IF_NOT_OK(ValidateAndCanonicalizeTopologyState(state));
-    auto candidate = std::shared_ptr<TopologySnapshot>(
-        new TopologySnapshot(std::move(state), authorityRevision, std::move(canonicalDigest)));
+    auto candidate = std::make_shared<TopologySnapshot>(
+        ConstructionKey{}, std::move(state), authorityRevision, std::move(canonicalDigest), std::move(hostIds));
+    Hasher hasher;
+    RETURN_IF_NOT_OK(hasher.GetStringMapSha256Hex(candidate->hostIds_, candidate->hostIdsDigest_));
+    candidate->hostIdsRevision_ = hostIdsRevision;
     candidate->BuildIndexes();
     snapshot = std::move(candidate);
     return Status::OK();
 }
 
-TopologySnapshot::TopologySnapshot(TopologyState state, int64_t authorityRevision, std::string canonicalDigest)
-    : state_(std::move(state)), authorityRevision_(authorityRevision), canonicalDigest_(std::move(canonicalDigest))
+TopologySnapshot::TopologySnapshot(ConstructionKey, TopologyState state, int64_t authorityRevision,
+                                   std::string canonicalDigest,
+                                   std::unordered_map<std::string, std::string> hostIds)
+    : state_(std::move(state)),
+      authorityRevision_(authorityRevision),
+      canonicalDigest_(std::move(canonicalDigest)),
+      hostIds_(std::move(hostIds))
 {
 }
 
@@ -255,6 +265,11 @@ uint32_t TopologySnapshot::TokensPerMember() const noexcept
 TopologyState TopologySnapshot::CopyState() const
 {
     return state_;
+}
+
+const std::unordered_map<std::string, std::string> &TopologySnapshot::HostIds() const noexcept
+{
+    return hostIds_;
 }
 
 const std::optional<ActiveBatch> &TopologySnapshot::GetActiveBatch() const noexcept

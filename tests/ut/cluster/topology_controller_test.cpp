@@ -3348,10 +3348,11 @@ TEST(TopologyControllerTest, ExternalEtcdOwnerRoundTripInvalidatesCollectiveProb
     DS_ASSERT_OK(controller.SubmitCoordinationEvent(
         { CoordinationEventType::PUT, keys->EtcdMembershipTablePrefix() + "/" + ownerA,
           EncodeMembership(MemberLifecycleState::READY), 0, backend.CurrentRevision() }));
-    ASSERT_TRUE(WaitForCondition([&] { return probeCalls.load() == 2U; }));
+    // Later probes may finish before the polling thread runs; only the first probe after owner return tests the reset.
+    ASSERT_TRUE(WaitForCondition([&] { return probeCalls.load() >= 2U; }));
     DS_ASSERT_OK(controller.Stop(std::chrono::steady_clock::now() + RECOVERY_STOP_TIMEOUT));
 
-    ASSERT_EQ(probedAddresses.size(), 2U);
+    ASSERT_GE(probedAddresses.size(), 2U);
     EXPECT_EQ(probedAddresses[0], probedAddresses[1]);
 }
 

@@ -48,10 +48,12 @@ public:
         return Status(K_RUNTIME_ERROR, "unused fake Put");
     }
 
-    Status Range(const std::string &, const std::string &, std::vector<KeyValueEntry> &, int64_t &, int32_t,
-                 std::string *) override
+    Status Range(const std::string &, const std::string &, std::vector<KeyValueEntry> &values,
+                 int64_t &revision, int32_t, std::string *) override
     {
-        return Status(K_RUNTIME_ERROR, "unused fake Range");
+        values = initialKvs_;
+        revision = 7;
+        return Status::OK();
     }
 
     Status DeleteRange(const std::string &, const std::string &, int64_t &, int64_t &, int32_t, int64_t) override
@@ -175,15 +177,28 @@ TEST(CoordinationBackendContractTest, NullStoreFailsOperationsAndShutsDownIdempo
     EXPECT_TRUE(backend.Shutdown().IsOk());
 }
 
-TEST(CoordinationBackendContractTest, RevisionReadFailsExplicitlyWhenBackendDoesNotSupportIt)
+TEST(CoordinationBackendContractTest, DefaultRevisionReadFailsExplicitly)
 {
     DsCoordinationBackend backend(nullptr, "127.0.0.1:1");
     ICoordinationBackend &contract = backend;
     std::vector<std::pair<std::string, std::string>> values;
     int64_t revision = 1;
 
-    EXPECT_EQ(contract.GetAll("cluster", values, revision).GetCode(), K_NOT_SUPPORTED);
+    EXPECT_EQ(contract.ICoordinationBackend::GetAll("cluster", values, revision).GetCode(), K_NOT_SUPPORTED);
     EXPECT_EQ(revision, 0);
+}
+
+TEST(CoordinationBackendContractTest, DsBackendReturnsRangeRevision)
+{
+    FakeCoordinatorServiceProxy proxy;
+    DsCoordinationBackend backend(&proxy, "127.0.0.1:1");
+    ICoordinationBackend &contract = backend;
+    std::vector<std::pair<std::string, std::string>> values;
+    int64_t revision = 0;
+
+    EXPECT_TRUE(contract.GetAll("cluster", values, revision).IsOk());
+    EXPECT_EQ(revision, 7);
+    EXPECT_TRUE(values.empty());
 }
 
 TEST(CoordinationBackendContractTest, MembershipDeleteFenceFailsClosedByDefault)

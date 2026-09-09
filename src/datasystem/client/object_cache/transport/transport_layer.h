@@ -169,6 +169,8 @@ public:
      */
     Status ApplyWorkerSnapshot(WorkerSnapshot snapshot);
 
+    void RecordRoutingRefresh(uint64_t ringVersion);
+
     void Shutdown();
 
 protected:

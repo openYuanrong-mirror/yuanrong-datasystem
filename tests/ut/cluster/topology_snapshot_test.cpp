@@ -309,5 +309,20 @@ TEST(TopologySnapshotTest, BuildsTenThousandMemberFortyThousandTokenIndexes)
     EXPECT_EQ(tokenCount, LARGE_TOPOLOGY_MEMBER_COUNT * TOKENS_PER_LARGE_MEMBER);
 }
 
+TEST(TopologySnapshotTest, StoresAndReturnsMembershipHostIds)
+{
+    TopologyState state;
+    state.version = 1;
+    state.members = { MakeMember('a', "127.0.0.1:1", MemberState::ACTIVE, { 0 }) };
+    std::unordered_map<std::string, std::string> hostIds;
+    hostIds.emplace("127.0.0.1:1", "host-a");
+    std::shared_ptr<const TopologySnapshot> snapshot;
+
+    DS_ASSERT_OK(TopologySnapshot::Create(std::move(state), 1, std::string(64, 'a'), snapshot, std::move(hostIds)));
+
+    ASSERT_EQ(snapshot->HostIds().size(), 1UL);
+    EXPECT_EQ(snapshot->HostIds().at("127.0.0.1:1"), "host-a");
+}
+
 }  // namespace
 }  // namespace datasystem::cluster

@@ -12,6 +12,24 @@
   - `src/datasystem/worker/metadata_route_resolver.{h,cpp}`
 - The module owns authoritative cluster membership state, immutable routing snapshots, topology planning, task
   materialization/execution, and the backend-specific control loop.
+- `TopologySnapshot` carries the membership hostId projection and its read revision separately from the canonical
+  topology digest. Revision zero means no successful membership read. Background readers retry this projection even
+  when topology authority revision is unchanged; a successful empty map clears old mappings.
+  A failed read does not block a newer topology: publication retains last-good hostIds only for unchanged member
+  identities. Same-version, same-topology publication can atomically replace the projection without replaying topology
+  callbacks. Exact reads and publication are serialized by the owning runtime; membership revision numbers are not
+  compared across Coordinator lifetimes.
+- Controller uses topology-only reads for planning and CAS read-back; it owns membership facts separately.
+  External topology watch values do not trigger membership Range reads. HostId projection reads remain owned by
+  routing snapshot readers, preserving Controller watch watermarks and bounded resync/backoff behavior.
+- Worker `GetHashRing` builds the ring and hostId map from the same held snapshot. `GetRoutingHostIds` only reads the
+  published snapshot, with no foreground membership Range, cache miss or failure retry. Coordinator and ETCD adapters
+  expose the membership Range revision through the existing revision-bearing `GetAll` overload.
+  Snapshots precompute a separate SHA256 hostId content digest through `Hasher::GetStringMapSha256Hex`: sort by key,
+  then encode decimal byte length, colon and bytes for each key and value. Empty maps have a nonempty digest.
+  GetHashRing compares both topology version and the SDK's accepted hostId digest, returning a complete
+  `hash_ring_changed=true` payload when either differs. Empty request digests preserve legacy version-only behavior.
+  The request extension follows authentication fields so old-schema protobuf reserialization preserves signed bytes.
 - Headers under `src/datasystem/cluster` are repository-internal composition interfaces, not installed SDK headers or
   a cross-release source-compatibility surface. Bazel visibility and CMake public include propagation support monorepo
   consumers; external client compatibility is owned by installed headers under `include/datasystem`.

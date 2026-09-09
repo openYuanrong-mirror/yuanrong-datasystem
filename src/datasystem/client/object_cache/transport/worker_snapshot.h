@@ -41,6 +41,12 @@ struct WorkerSnapshot {
     std::vector<HostPort> remoteTransportAddrs;
     // ACTIVE GlobalFact candidates eligible to receive a client sender recovery WRITE probe.
     std::vector<HostPort> writeProbeAddrs;
+    // Single-worker bootstrap snapshot published before the first complete ring; it never drives
+    // endpoint admission rejection.
+    bool provisional = false;
+    // Ring accepted after a version-epoch reset (cross-confirmed lower version); publishing it may
+    // regress the snapshot version.
+    bool epochResetConfirmed = false;
 };
 
 /**

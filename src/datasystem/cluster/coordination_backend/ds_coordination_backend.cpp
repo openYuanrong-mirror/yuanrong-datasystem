@@ -213,6 +213,14 @@ DsCoordinationBackend::~DsCoordinationBackend()
 Status DsCoordinationBackend::GetAll(const std::string &tableName,
                                      std::vector<std::pair<std::string, std::string>> &outKeyValues)
 {
+    int64_t revision = 0;
+    return GetAll(tableName, outKeyValues, revision);
+}
+
+Status DsCoordinationBackend::GetAll(const std::string &tableName,
+                                     std::vector<std::pair<std::string, std::string>> &outKeyValues,
+                                     int64_t &responseRevision)
+{
     CHECK_FAIL_RETURN_STATUS(proxy_ != nullptr, K_RUNTIME_ERROR, "Coordinator service proxy is null");
     std::string prefix;
     RETURN_IF_NOT_OK(GetStorePrefix(tableName, prefix));
@@ -226,6 +234,7 @@ Status DsCoordinationBackend::GetAll(const std::string &tableName,
     for (auto &kv : kvs) {
         outKeyValues.emplace_back(RemoveTablePrefix(kv.key, prefix), std::move(kv.value));
     }
+    responseRevision = revision;
     return Status::OK();
 }
 
