@@ -44,6 +44,11 @@ public:
         return engine.ReloadTopology(true);
     }
 
+    static std::chrono::seconds CoordinatorReadyTimeout(const TopologyEngine &engine)
+    {
+        return engine.options_.coordinatorReadyTimeout;
+    }
+
     static Status ApplyCoordinatorTopologyEvent(TopologyEngine &engine, const CoordinationEvent &event)
     {
         return engine.ApplyCoordinatorTopologyEvent(event);
@@ -534,6 +539,40 @@ TEST(TopologyEngineTest, CoordinatorNotReadyTopologyContinuesToWatchAndStart)
     EXPECT_EQ(engine->GetState(), TopologyEngineState::RUNNING);
     EXPECT_TRUE(ingress.IsBound());
     EXPECT_GE(proxy.WatchCalls().size(), 2U);
+    DS_ASSERT_OK(engine->Shutdown(std::chrono::steady_clock::now() + TEST_WAIT));
+}
+
+TEST(TopologyEngineTest, ShutdownCancelsCoordinatorReadyWait)
+{
+    testing::FakeCoordinatorServiceProxy proxy;
+    TestWatchIngress ingress;
+    NoopTopologyCallbacks callbacks;
+    const std::string clusterName = "cancel-ready-wait";
+    auto keys = MakeKeys(clusterName);
+    auto engine = BuildEngine(proxy, ingress, callbacks, clusterName);
+    proxy.FailRangeForKeyTimes(TopologyStorageKey(*keys), K_NOT_READY, 1'000);
+
+    auto start = std::async(std::launch::async, [&] { return engine->Start(); });
+    ASSERT_EQ(start.wait_for(std::chrono::milliseconds(200)), std::future_status::timeout);
+
+    DS_ASSERT_OK(engine->Shutdown(std::chrono::steady_clock::now() + TEST_WAIT));
+    EXPECT_EQ(start.get().GetCode(), K_SHUTTING_DOWN);
+    EXPECT_EQ(engine->GetState(), TopologyEngineState::STOPPED);
+}
+
+TEST(TopologyEngineTest, CoordinatorReadyWaitContinuesStartupAfterServing)
+{
+    testing::FakeCoordinatorServiceProxy proxy;
+    TestWatchIngress ingress;
+    NoopTopologyCallbacks callbacks;
+    const std::string clusterName = "resume-ready-wait";
+    auto keys = MakeKeys(clusterName);
+    PutTopology(proxy, clusterName, MakeTopology());
+    auto engine = BuildEngine(proxy, ingress, callbacks, clusterName);
+    proxy.FailRangeForKeyTimes(TopologyStorageKey(*keys), K_NOT_READY, 2);
+
+    DS_ASSERT_OK(engine->Start());
+    EXPECT_EQ(engine->GetState(), TopologyEngineState::RUNNING);
     DS_ASSERT_OK(engine->Shutdown(std::chrono::steady_clock::now() + TEST_WAIT));
 }
 
@@ -1113,11 +1152,17 @@ TEST(TopologyEngineTest, BuilderRejectsInvalidAddressAndTimeout)
     invalidTimeout.SetNodeDeadTimeout(std::chrono::seconds(-1));
     EXPECT_EQ(invalidTimeout.Build(output).GetCode(), K_INVALID);
 
+    TopologyEngine::Builder invalidCoordinatorReadyTimeout;
+    ConfigureBuilder(invalidCoordinatorReadyTimeout, proxy, ingress, callbacks, "invalid-coordinator-ready-timeout");
+    invalidCoordinatorReadyTimeout.SetCoordinatorReadyTimeout(std::chrono::seconds(-1));
+    EXPECT_EQ(invalidCoordinatorReadyTimeout.Build(output).GetCode(), K_INVALID);
+
     TopologyEngine::Builder zeroTimeout;
     ConfigureBuilder(zeroTimeout, proxy, ingress, callbacks, "zero-timeout");
     zeroTimeout.SetNodeDeadTimeout(std::chrono::seconds(0));
     DS_ASSERT_OK(zeroTimeout.Build(output));
     ASSERT_NE(output, nullptr);
+    EXPECT_EQ(TopologyEngineTestPeer::CoordinatorReadyTimeout(*output), std::chrono::seconds(10));
 
     TopologyEngine::Builder invalidIsolationTimeout;
     ConfigureBuilder(invalidIsolationTimeout, proxy, ingress, callbacks, "invalid-isolation-timeout");

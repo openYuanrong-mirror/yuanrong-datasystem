@@ -227,7 +227,6 @@ constexpr auto TOPOLOGY_STOP_GRACE = std::chrono::seconds(10);
 constexpr uint64_t HEAT_MAINTENANCE_INTERVAL_MS = 30'000;
 constexpr mode_t EVICTION_POLICY_STATE_DIR_MODE = 0700;
 constexpr int EVICTION_WATERMARK_LOG_LEVEL = 2;
-constexpr char EVICTION_POLICY_ROLLOUT_KEY[] = "eviction-policy-rollout";
 constexpr auto EVICTION_POLICY_BARRIER_TIMEOUT = std::chrono::seconds(30);
 #ifdef WITH_TESTS
 constexpr auto LOSSLESS_EXIT_GRACE = std::chrono::seconds(10);
@@ -1933,6 +1932,7 @@ Status WorkerOCServer::ConstructTopologyRuntime()
         .SetLocalAddress(hostPort_.ToString())
         .SetPhaseCallbacks(*topologyTaskCallbacks_)
         .SetNodeDeadTimeout(std::chrono::seconds(classifierAbsenceS))
+        .SetCoordinatorReadyTimeout(std::chrono::seconds(FLAGS_node_dead_timeout_s))
         // Local backend isolation starts at the first positive peer observation, so it owns the full dead timeout.
         .SetLocalIsolationTimeout(std::chrono::seconds(FLAGS_node_dead_timeout_s))
         .SetScaleInCollectWindow(std::chrono::milliseconds(FLAGS_scale_in_collect_window_ms))

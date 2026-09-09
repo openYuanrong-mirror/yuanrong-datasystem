@@ -40,6 +40,7 @@ constexpr char kRemotePeer[] = "127.0.0.1:18481";
 constexpr char kDataDir[] = "/raft-data";
 constexpr int kHeartbeatIntervalMs = 100;
 constexpr int kElectionTimeoutMs = 1'000;
+constexpr uint64_t kLeadershipTerm = 42;
 constexpr int64_t kElectionTimeoutBelowMinimumMs =
     static_cast<int64_t>(kCoordinatorRaftMinElectionTimeoutMs) - 1;
 constexpr int64_t kElectionTimeoutAboveMaximumMs =
@@ -81,6 +82,25 @@ void ExpectStatusCodeForEveryStartPlan(RaftMetadataState metadataState, StatusCo
     ExpectStatusCode(MakeOptions(RaftStartPlan{ WaitingToJoinPlan{} }), metadataState, expectedCode);
 }
 }  // namespace
+
+TEST(CoordinatorRaftTypesTest, LeadershipSnapshotDefaultsToNoLeader)
+{
+    const CoordinatorLeadershipSnapshot snapshot;
+
+    EXPECT_FALSE(snapshot.isLeader);
+    EXPECT_TRUE(snapshot.leaderAddress.empty());
+    EXPECT_EQ(snapshot.term, 0U);
+}
+
+TEST(CoordinatorRaftTypesTest, LeadershipSnapshotCopiesAllFields)
+{
+    const CoordinatorLeadershipSnapshot original{ true, kRemotePeer, kLeadershipTerm };
+    const CoordinatorLeadershipSnapshot copy = original;
+
+    EXPECT_TRUE(copy.isLeader);
+    EXPECT_EQ(copy.leaderAddress, kRemotePeer);
+    EXPECT_EQ(copy.term, kLeadershipTerm);
+}
 
 TEST(CoordinatorRaftTypesTest, NormalizesStableIpv4PeerWithoutBraftIndex)
 {

@@ -17,6 +17,7 @@
 #include <string>
 #include <unordered_map>
 
+#include "datasystem/cluster/membership/membership_types.h"
 #include "datasystem/utils/status.h"
 
 namespace datasystem {
@@ -38,19 +39,20 @@ enum class TopologyRecoveryReportResult : uint8_t {
     STALE_LEADER_TERM,
 };
 enum class TopologyCoordinationKeyKind : uint8_t {
-    OTHER,
     TOPOLOGY,
     MIGRATE_TASK,
     DELETE_TASK,
     NOTIFY,
     PROBE,
     MEMBERSHIP,
-    SCALE_IN_METADATA_DONE
+    SCALE_IN_METADATA_DONE,
+    EVICTION_POLICY_ROLLOUT,
+    MASTER_ADDRESS
 };
 
 struct ParsedTopologyCoordinationKey {
     std::string clusterName;
-    TopologyCoordinationKeyKind kind{ TopologyCoordinationKeyKind::OTHER };
+    TopologyCoordinationKeyKind kind{ TopologyCoordinationKeyKind::TOPOLOGY };
     std::string relativeKey;
 };
 
@@ -83,6 +85,11 @@ struct TopologyRecoveryRoundIdentity {
     }
 };
 
+struct TopologyRecoveryRound {
+    TopologyRecoveryRoundIdentity identity;
+    std::chrono::steady_clock::time_point hardDeadline;
+};
+
 struct TopologyRecoveryRoundSummary {
     size_t contextCount{ 0 };
     size_t recoveringCount{ 0 };
@@ -107,6 +114,7 @@ struct TopologyRecoveryOptions {
     size_t maxClusters{ 1'024 };
     size_t maxMembersPerCluster{ 10'000 };
     size_t maxCandidateMemoryBytes{ DEFAULT_MAX_CANDIDATE_MEMORY_BYTES };
+    std::function<void()> beforeInstall;
 };
 
 class TopologyRecoveryManager final {
@@ -164,9 +172,10 @@ public:
     /**
      * @brief Observe one committed membership presence change.
      * @param[in] physicalKey Exact membership key.
-     * @param[in] present True for Put and false for Delete.
+     * @param[in] lifecycleState Committed membership state for Put, or empty for Delete.
      */
-    void ObserveMembershipChange(const std::string &physicalKey, bool present);
+    void ObserveMembershipChange(const std::string &physicalKey,
+                                 std::optional<cluster::MemberLifecycleState> lifecycleState);
 
     /**
      * @brief Re-admit a committed member and schedule reconciliation.
@@ -174,7 +183,22 @@ public:
      */
     void NotifyMembershipActivity(const std::string &physicalKey);
 
-    void BeginLeaderRound(TopologyRecoveryRoundIdentity identity);
+    /**
+     * @brief Re-admit a parsed committed member and schedule reconciliation.
+     * @param[in] parsed Existing parsed membership key.
+     */
+    void NotifyMembershipActivity(const ParsedTopologyCoordinationKey &parsed);
+
+    /**
+     * @brief Replace current recovery state with one fixed-deadline Leader round.
+     * @param[in] identity Leader term and process identity owning the round.
+     * @param[in] nodeDeadTimeout Timeout snapshotted once at round start; later activity cannot extend it.
+     */
+    void BeginLeaderRound(TopologyRecoveryRoundIdentity identity, std::chrono::milliseconds nodeDeadTimeout);
+
+    /**
+     * @brief End and discard the matching Leader round and all of its cluster contexts.
+     */
     void EndLeaderRound(const TopologyRecoveryRoundIdentity &identity);
 
     void SetLeaderRoundFence(std::shared_mutex *fenceMutex,
@@ -209,6 +233,7 @@ public:
 
 private:
     struct ClusterRecoveryContext;
+    enum class MembershipObservation : uint8_t { REMOVED, KEEPALIVE, STARTING, EXISTING };
 
     /**
      * @brief Validate one operation and apply its recovery gate.
@@ -222,17 +247,19 @@ private:
     /**
      * @brief Find or create one bounded context while mutex_ is held.
      * @param[in] clusterName Cluster scope.
+     * @param[in] enableFastRecovery Whether a newly created context receives the fast deadline.
      * @param[out] context Borrowed context protected by mutex_.
      * @return Admission status.
      */
-    Status EnsureContext(const std::string &clusterName, ClusterRecoveryContext *&context);
+    Status EnsureContext(const std::string &clusterName, bool enableFastRecovery,
+                         ClusterRecoveryContext *&context);
 
     /**
      * @brief Add, refresh or remove one parsed member.
      * @param[in] parsed Parsed membership key.
-     * @param[in] present True to admit or refresh the member.
+     * @param[in] observation Membership mutation or keepalive classification.
      */
-    void UpdateMembership(const ParsedTopologyCoordinationKey &parsed, bool present);
+    void UpdateMembership(const ParsedTopologyCoordinationKey &parsed, MembershipObservation observation);
 
     /**
      * @brief Validate lightweight candidate evidence.
@@ -316,8 +343,9 @@ private:
     /**
      * @brief Submit one per-cluster deduplicated arbitration attempt.
      * @param[in] clusterName Cluster scope.
+     * @return True when one new reconcile task was accepted.
      */
-    void ScheduleReconcile(const std::string &clusterName);
+    bool ScheduleReconcile(const std::string &clusterName);
 
     /**
      * @brief Submit one delayed arbitration attempt for the current discovery deadline.
@@ -348,9 +376,25 @@ private:
         std::vector<std::string> &dueClusters);
 
     /**
-     * @brief Whether any cluster has a delayed reconcile deadline while mutex_ is held.
+     * @brief Check whether identity still owns the active round while mutex_ is held.
      */
-    bool HasDelayedReconcileLocked() const;
+    bool IsCurrentRoundLocked(const TopologyRecoveryRoundIdentity &identity) const;
+
+    /**
+     * @brief Check whether the active round hard deadline has elapsed while mutex_ is held.
+     */
+    bool IsHardDeadlineReachedLocked(std::chrono::steady_clock::time_point now) const;
+
+    /**
+     * @brief Return the earlier cluster stabilization or round hard deadline while mutex_ is held.
+     */
+    std::chrono::steady_clock::time_point GetReconcileDeadlineLocked(
+        const ClusterRecoveryContext &context) const;
+
+    /**
+     * @brief Force one unresolved cluster to READY at an eligible recovery deadline while mutex_ is held.
+     */
+    void ForceReadyLocked(const std::string &clusterName, ClusterRecoveryContext &context, const char *reason);
 
     /**
      * @brief Reuse a legal topology already owned by the current process Store.
@@ -384,8 +428,8 @@ private:
      * @return Arbitration status.
      */
     Status PrepareInstallationLocked(const std::string &clusterName, const TopologyRecoveryRoundIdentity &identity,
-                                     std::shared_ptr<const std::string> &payload, uint64_t &version,
-                                     TraceContext &traceContext);
+                                     bool hardDeadlineReached, std::shared_ptr<const std::string> &payload,
+                                     uint64_t &version, TraceContext &traceContext);
 
     /**
      * @brief Apply an installation result while mutex_ is held.
@@ -417,6 +461,16 @@ private:
      */
     void CompleteRecoveryWorkLocked();
 
+    void RunReconcile(const std::string &clusterName, const TopologyRecoveryRoundIdentity &identity,
+                      const TraceContext &traceContext);
+
+    void RestoreStoredAuthorityCheck(const std::string &clusterName,
+                                     const TopologyRecoveryRoundIdentity &identity, uint64_t contextGeneration);
+
+    bool ResolveCandidateSelectionLocked(const std::string &clusterName, ClusterRecoveryContext &context,
+                                         bool hardDeadlineReached, uint64_t &highestVersion,
+                                         std::string &highestDigest);
+
     const std::string coordinatorId_;
     CoordinatorStore &store_;
     std::shared_ptr<SteadyClock> clock_;
@@ -433,7 +487,7 @@ private:
     size_t retainedCandidateBytes_{ 0 };
     size_t admittedReportBytes_{ 0 };
     uint64_t nextContextGeneration_{ 1 };
-    std::optional<TopologyRecoveryRoundIdentity> activeRound_;
+    std::optional<TopologyRecoveryRound> activeRound_;
     // Owned by CoordinatorServiceImpl; serializes a Store installation with leader-stop revocation.
     std::shared_mutex *leaderRoundFenceMutex_{ nullptr };
     std::function<bool(const TopologyRecoveryRoundIdentity &)> isLeaderRoundCurrent_;

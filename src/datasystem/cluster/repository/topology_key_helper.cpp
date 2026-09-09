@@ -39,8 +39,8 @@ constexpr size_t HEX_HIGH_NIBBLE_SHIFT = 4;
 constexpr unsigned char HEX_LOW_NIBBLE_MASK = 0x0f;
 constexpr char LOWER_HEX[] = "0123456789abcdef";
 constexpr char ROOT_PREFIX[] = "/datasystem";
-constexpr std::array<const char *, 6> RESERVED_CLUSTER_NAMES = {
-    "topology", "tasks", "notify", "probe", "cluster", "scale-in-metadata-done"
+constexpr std::array<const char *, 7> RESERVED_CLUSTER_NAMES = {
+    "topology", "tasks", "notify", "probe", "cluster", "scale-in-metadata-done", COORDINATION_CONTROL_TABLE
 };
 const std::string EMPTY_KEY;
 
@@ -166,6 +166,7 @@ TopologyKeyHelper::TopologyKeyHelper(std::string clusterName) : clusterName_(std
     etcdMembershipTablePrefix_ =
         clusterName_.empty() ? legacyMembershipTable : "/" + clusterName_ + legacyMembershipTable;
     scaleInMetadataDoneTable_ = root + "/scale-in-metadata-done";
+    rolloutTable_ = root + "/" + COORDINATION_CONTROL_TABLE;
 }
 
 const std::string &TopologyKeyHelper::ClusterName() const noexcept
@@ -236,6 +237,11 @@ TopologyPhysicalKeyKind TopologyKeyHelper::ClassifyPhysicalKey(const std::string
 const std::string &TopologyKeyHelper::ScaleInMetadataDoneTable() const noexcept
 {
     return scaleInMetadataDoneTable_;
+}
+
+const std::string &TopologyKeyHelper::RolloutTable() const noexcept
+{
+    return rolloutTable_;
 }
 
 const std::string &TopologyKeyHelper::TopologyKey() noexcept

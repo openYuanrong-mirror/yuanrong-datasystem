@@ -36,9 +36,11 @@
 #include "datasystem/common/coordinator/event_notify_executor.h"
 #include "datasystem/common/coordinator/coordinator_store.h"
 #include "datasystem/common/flags/common_flags.h"
-#include "datasystem/coordinator/coordinator_service_impl.h"
-#include "datasystem/coordinator/watch_dispatcher_impl.h"
 #include "datasystem/coordinator/topology_recovery_manager.h"
+#define private public
+#include "datasystem/coordinator/coordinator_service_impl.h"
+#undef private
+#include "datasystem/coordinator/watch_dispatcher_impl.h"
 #include "datasystem/common/coordinator/memory_kv_store.h"
 #include "datasystem/common/coordinator/steady_clock.h"
 #include "datasystem/common/coordinator/ttl_manager.h"
@@ -60,6 +62,11 @@ constexpr int64_t MAX_RETRY_SHUTDOWN_MS = 1000;
 constexpr uint16_t OVERSIZED_RECOVERY_TEST_PORT = 18486;
 constexpr uint16_t WATCH_RANGE_VALIDATION_TEST_PORT = 18487;
 constexpr uint16_t RAW_SNAPSHOT_TEST_PORT = 18488;
+
+void SetRecoveryReady(coordinator::CoordinatorServiceImpl &service)
+{
+    service.recoveryStateProvider_ = [](const std::string &) { return coordinator::TopologyRecoveryState::READY; };
+}
 
 TEST(WatchDispatcherImplTest, ExpiredProbeDeadlineIsNeutralAndUndispatched)
 {
@@ -402,6 +409,7 @@ TEST_F(CoordinatorIdTest, RawSnapshotReturnsMembershipWithoutTopology)
 {
     coordinator::CoordinatorServiceImpl service(HostPort("127.0.0.1", RAW_SNAPSHOT_TEST_PORT));
     DS_ASSERT_OK(service.Init());
+    SetRecoveryReady(service);
     DS_ASSERT_OK(service.Start());
     coordinator::PutReqPb putReq;
     putReq.set_key("/datasystem/cluster/127.0.0.1:31501");
@@ -430,6 +438,7 @@ TEST_F(CoordinatorIdTest, ReservesControllerCapacityBeforeMembershipCommit)
     Raii restoreLimit([previousLimit] { FLAGS_coordinator_topology_max_active_clusters = previousLimit; });
     coordinator::CoordinatorServiceImpl service(HostPort("127.0.0.1", 18489));
     DS_ASSERT_OK(service.Init());
+    SetRecoveryReady(service);
     DS_ASSERT_OK(service.Start());
     auto putMembership = [&service](const std::string &clusterName, const std::string &address,
                                     coordinator::PutRspPb &response) {
@@ -467,17 +476,18 @@ TEST_F(CoordinatorIdTest, AddsStableCoordinatorIdToResponses)
 {
     coordinator::CoordinatorServiceImpl service(HostPort("127.0.0.1", 18482));
     DS_ASSERT_OK(service.Init());
+    SetRecoveryReady(service);
     DS_ASSERT_OK(service.Start());
 
     coordinator::PutReqPb putReq;
-    putReq.set_key("/coordinator/id/key");
+    putReq.set_key("/datasystem/id/probe/127.0.0.1:31521");
     putReq.set_value("value");
     coordinator::PutRspPb putRsp;
     DS_ASSERT_OK(service.Put(putReq, putRsp));
     ASSERT_EQ(putRsp.header().coordinator_id().size(), UUID_SIZE);
 
     coordinator::RangeReqPb rangeReq;
-    rangeReq.set_key("/coordinator/id/key");
+    rangeReq.set_key(putReq.key());
     coordinator::RangeRspPb rangeRsp;
     DS_ASSERT_OK(service.Range(rangeReq, rangeRsp));
     ASSERT_EQ(rangeRsp.header().coordinator_id(), putRsp.header().coordinator_id());
@@ -496,7 +506,7 @@ TEST_F(CoordinatorIdTest, ExactRangeOmitsUnchangedValueByModificationRevision)
     DS_ASSERT_OK(service.Start());
 
     coordinator::PutReqPb put;
-    put.set_key("/conditional/key");
+    put.set_key("/datasystem/conditional/probe/127.0.0.1:31521");
     put.set_value("large-value");
     coordinator::PutRspPb firstPut;
     DS_ASSERT_OK(service.Put(put, firstPut));
@@ -510,7 +520,7 @@ TEST_F(CoordinatorIdTest, ExactRangeOmitsUnchangedValueByModificationRevision)
     EXPECT_TRUE(unchanged.kvs().empty());
 
     coordinator::PutReqPb unrelatedPut;
-    unrelatedPut.set_key("/conditional/unrelated");
+    unrelatedPut.set_key("/datasystem/conditional/probe/127.0.0.1:31522");
     unrelatedPut.set_value("other");
     coordinator::PutRspPb unrelatedResponse;
     DS_ASSERT_OK(service.Put(unrelatedPut, unrelatedResponse));
@@ -558,13 +568,14 @@ TEST_F(CoordinatorIdTest, PutRejectsAStaleCoordinatorIdBeforeMutation)
 {
     coordinator::CoordinatorServiceImpl service(HostPort("127.0.0.1", 18483));
     DS_ASSERT_OK(service.Init());
+    SetRecoveryReady(service);
     DS_ASSERT_OK(service.Start());
     coordinator::GetCoordinatorIdReqPb idReq;
     coordinator::GetCoordinatorIdRspPb idRsp;
     DS_ASSERT_OK(service.GetCoordinatorId(idReq, idRsp));
 
     coordinator::PutReqPb request;
-    request.set_key("/coordinator/fenced-put");
+    request.set_key("/datasystem/fenced-put/probe/127.0.0.1:31522");
     request.set_value("value");
     request.set_expected_coordinator_id(std::string(UUID_SIZE, 'x'));
     coordinator::PutRspPb response;
@@ -579,6 +590,7 @@ TEST_F(CoordinatorIdTest, MembershipPutRejectsAStaleModificationRevision)
 {
     coordinator::CoordinatorServiceImpl service(HostPort("127.0.0.1", 18491));
     DS_ASSERT_OK(service.Init());
+    SetRecoveryReady(service);
     DS_ASSERT_OK(service.Start());
     coordinator::PutReqPb request;
     request.set_key("/datasystem/incarnation/cluster/127.0.0.1:31501");
@@ -611,6 +623,7 @@ TEST_F(CoordinatorIdTest, KeepAliveRejectsAStaleMembershipIncarnation)
 {
     coordinator::CoordinatorServiceImpl service(HostPort("127.0.0.1", 18492));
     DS_ASSERT_OK(service.Init());
+    SetRecoveryReady(service);
     DS_ASSERT_OK(service.Start());
     coordinator::PutReqPb put;
     put.set_key("/datasystem/keepalive-incarnation/cluster/127.0.0.1:31501");
@@ -642,6 +655,7 @@ TEST_F(CoordinatorIdTest, DeleteRejectsAStaleMembershipIncarnation)
 {
     coordinator::CoordinatorServiceImpl service(HostPort("127.0.0.1", 18493));
     DS_ASSERT_OK(service.Init());
+    SetRecoveryReady(service);
     DS_ASSERT_OK(service.Start());
     coordinator::PutReqPb put;
     put.set_key("/datasystem/delete-incarnation/cluster/127.0.0.1:31501");
@@ -676,9 +690,10 @@ TEST_F(CoordinatorIdTest, DeleteRejectsAStaleCoordinatorIdBeforeMutation)
 {
     coordinator::CoordinatorServiceImpl service(HostPort("127.0.0.1", 18484));
     DS_ASSERT_OK(service.Init());
+    SetRecoveryReady(service);
     DS_ASSERT_OK(service.Start());
     coordinator::PutReqPb putReq;
-    putReq.set_key("/coordinator/fenced-delete");
+    putReq.set_key("/datasystem/fenced-delete/probe/127.0.0.1:31523");
     putReq.set_value("value");
     coordinator::PutRspPb putRsp;
     DS_ASSERT_OK(service.Put(putReq, putRsp));
@@ -698,6 +713,7 @@ TEST_F(CoordinatorIdTest, RejectsOversizedRecoveryPayloadAtServiceBoundary)
 {
     coordinator::CoordinatorServiceImpl service(HostPort("127.0.0.1", OVERSIZED_RECOVERY_TEST_PORT));
     DS_ASSERT_OK(service.Init());
+    SetRecoveryReady(service);
     DS_ASSERT_OK(service.Start());
     coordinator::ReportTopologyRecoveryCandidateReqPb request;
     request.set_result(coordinator::TOPOLOGY_RECOVERY_SNAPSHOT);
@@ -712,6 +728,7 @@ TEST_F(CoordinatorIdTest, WatchRejectsADeletedTopologyMember)
 {
     coordinator::CoordinatorServiceImpl service(HostPort("127.0.0.1", 18485));
     DS_ASSERT_OK(service.Init());
+    SetRecoveryReady(service);
     DS_ASSERT_OK(service.Start());
     coordinator::PutReqPb putReq;
     putReq.set_key("/datasystem/watch-race/cluster/127.0.0.1:31501");
@@ -737,6 +754,7 @@ TEST_F(CoordinatorIdTest, WatchRangeCannotCrossClusterOrTopologyRoot)
 {
     coordinator::CoordinatorServiceImpl service(HostPort("127.0.0.1", WATCH_RANGE_VALIDATION_TEST_PORT));
     DS_ASSERT_OK(service.Init());
+    SetRecoveryReady(service);
     DS_ASSERT_OK(service.Start());
     coordinator::PutReqPb putReq;
     putReq.set_key("/datasystem/a/cluster/127.0.0.1:31502");
@@ -768,25 +786,26 @@ TEST_F(CoordinatorStoreTest, CoordinatorServiceForwardsStoreOperationsAndMarksLe
 {
     coordinator::CoordinatorServiceImpl service(HostPort("127.0.0.1", 18480));
     DS_ASSERT_OK(service.Init());
+    SetRecoveryReady(service);
     DS_ASSERT_OK(service.Start());
 
     coordinator::PutReqPb putReq;
-    putReq.set_key("/svc/key");
+    putReq.set_key("/datasystem/store-forwarding/cluster/127.0.0.1:31501");
     putReq.set_value("value");
     coordinator::PutRspPb putRsp;
     DS_ASSERT_OK(service.Put(putReq, putRsp));
-    ASSERT_TRUE(putRsp.header().is_leader());
+    ASSERT_EQ(putRsp.header().state(), coordinator::ResponseHeader::SERVING);
     ASSERT_TRUE(putRsp.header().leader_address().empty());
     ASSERT_EQ(putRsp.version(), 1);
     ASSERT_GT(putRsp.revision(), 0);
 
     coordinator::RangeReqPb rangeReq;
-    rangeReq.set_key("/svc/key");
+    rangeReq.set_key(putReq.key());
     coordinator::RangeRspPb rangeRsp;
     DS_ASSERT_OK(service.Range(rangeReq, rangeRsp));
-    ASSERT_TRUE(rangeRsp.header().is_leader());
+    ASSERT_EQ(rangeRsp.header().state(), coordinator::ResponseHeader::SERVING);
     ASSERT_EQ(rangeRsp.kvs_size(), 1);
-    ASSERT_EQ(rangeRsp.kvs(0).key(), "/svc/key");
+    ASSERT_EQ(rangeRsp.kvs(0).key(), putReq.key());
     ASSERT_EQ(rangeRsp.kvs(0).value(), "value");
     ASSERT_EQ(rangeRsp.kvs(0).version(), putRsp.version());
 }
@@ -2499,19 +2518,20 @@ TEST_F(CoordinatorStoreTest, CoordinatorServiceBrpcModeInitAndStartAndShutdown)
 
     coordinator::CoordinatorServiceImpl service(HostPort("127.0.0.1", 18481));
     DS_ASSERT_OK(service.Init());
+    SetRecoveryReady(service);
     DS_ASSERT_OK(service.Start());
 
     // Verify the service can handle RPC in brpc mode.
     coordinator::PutReqPb putReq;
-    putReq.set_key("/brpc/key");
+    putReq.set_key("/datasystem/brpc/probe/127.0.0.1:31524");
     putReq.set_value("brpc_value");
     coordinator::PutRspPb putRsp;
     DS_ASSERT_OK(service.Put(putReq, putRsp));
-    ASSERT_TRUE(putRsp.header().is_leader());
+    ASSERT_EQ(putRsp.header().state(), coordinator::ResponseHeader::SERVING);
     ASSERT_EQ(putRsp.version(), 1);
 
     coordinator::RangeReqPb rangeReq;
-    rangeReq.set_key("/brpc/key");
+    rangeReq.set_key(putReq.key());
     coordinator::RangeRspPb rangeRsp;
     DS_ASSERT_OK(service.Range(rangeReq, rangeRsp));
     ASSERT_EQ(rangeRsp.kvs_size(), 1);

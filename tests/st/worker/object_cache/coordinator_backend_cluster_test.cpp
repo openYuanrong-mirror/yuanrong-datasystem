@@ -236,7 +236,7 @@ public:
         opts.workerGflagParams =
             " -shared_memory_size_mb=64 -node_timeout_s=2 -node_dead_timeout_s=4 -add_node_wait_time_s=1"
             " -log_async=false -enable_reconciliation=false -enable_lossless_data_exit_mode=true";
-        opts.coordinatorGflagParams = " -v=1 -node_timeout_s=1 -node_dead_timeout_s=2 -scale_in_collect_window_ms=1000";
+        opts.coordinatorGflagParams = " -v=1 -node_dead_timeout_s=4 -scale_in_collect_window_ms=1000";
         coordinatorCount_ = opts.numCoordinators;
     }
 
@@ -1222,6 +1222,7 @@ public:
         opts.workerGflagParams =
             " -shared_memory_size_mb=64 -node_timeout_s=8 -node_dead_timeout_s=12 -add_node_wait_time_s=1"
             " -log_async=false -enable_reconciliation=true -enable_lossless_data_exit_mode=true";
+        opts.coordinatorGflagParams = " -v=1 -node_dead_timeout_s=12 -scale_in_collect_window_ms=1000";
         coordinatorCount_ = opts.numCoordinators;
     }
 };

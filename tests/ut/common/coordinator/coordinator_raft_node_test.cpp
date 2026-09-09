@@ -53,6 +53,7 @@ constexpr char kLocalPeer[] = "127.0.0.1:18480";
 constexpr char kDataDir[] = "coordinator-raft-node-test-data";
 constexpr int kHeartbeatIntervalMs = 100;
 constexpr int kElectionTimeoutMs = 1'000;
+constexpr uint64_t kStaleLeadershipTerm = 99;
 
 constexpr int64_t kValidConfigurationIndex = 1;
 constexpr std::chrono::seconds kCoordinationDeadline{ 2 };
@@ -335,12 +336,25 @@ TEST(RaftOperationDrainStateTest, AdmitsOnlyOneInFlightOperation)
     EXPECT_TRUE(state->HasInFlight());
 }
 
+TEST(CoordinatorRaftNodeTest, LightweightBraftLeadershipStatusHasSafeDefaults)
+{
+    braft::LeadershipStatus status;
+    EXPECT_EQ(status.state, braft::STATE_END);
+    EXPECT_TRUE(status.leader_id.is_empty());
+    EXPECT_EQ(status.term, 0);
+}
+
 TEST(CoordinatorRaftNodeTest, StartFromConstructedValidatesOptionsWithoutRegistration)
 {
     auto options = MakeOneNodeOptions();
     options.dataDir.clear();
     CoordinatorRaftNode node(std::move(options), {});
 
+    CoordinatorLeadershipSnapshot snapshot{ true, kLocalPeer, kStaleLeadershipTerm };
+    EXPECT_EQ(node.GetLeadershipSnapshot(snapshot).GetCode(), K_NOT_READY);
+    EXPECT_FALSE(snapshot.isLeader);
+    EXPECT_TRUE(snapshot.leaderAddress.empty());
+    EXPECT_EQ(snapshot.term, 0U);
     EXPECT_EQ(node.Start(RaftMetadataState::ABSENT).GetCode(), K_INVALID);
     EXPECT_EQ(node.state_, CoordinatorRaftNode::LifecycleState::CONSTRUCTED);
 }

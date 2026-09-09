@@ -201,7 +201,7 @@ protected:
         recoveryOptions.maxClusters = TEST_CLUSTER_LIMIT;
         recovery_ =
             std::make_unique<TopologyRecoveryManager>(COORDINATOR_ID, *store_, clock_, recoveryOptions);
-        recovery_->BeginLeaderRound({ 0, COORDINATOR_ID });
+        recovery_->BeginLeaderRound({ 0, COORDINATOR_ID }, std::chrono::seconds(10));
     }
 
     void TearDown() override
@@ -266,7 +266,7 @@ protected:
         int64_t revision = 0;
         const auto key = PhysicalMembershipKey(clusterName, address);
         DS_ASSERT_OK(store_->Put(key, encoded, 0, COORDINATOR_NO_VERSION_CHECK, version, revision));
-        recovery_->ObserveMembershipChange(key, true);
+        recovery_->ObserveMembershipChange(key, cluster::MemberLifecycleState::STARTING);
         NotifyHost(key, WatchEvent::Type::PUT);
     }
 
@@ -1111,7 +1111,7 @@ TEST_F(TopologyControlHostTest, DoesNotReleaseClusterWhileTopologyStillOwnsMembe
     DS_ASSERT_OK(inject::Set(injectPoint, "pause"));
     Raii clearInject([&] { (void)inject::Clear(injectPoint); });
     DS_ASSERT_OK(store_->DeleteRange(membershipKey, "", deleted, revision));
-    recovery_->ObserveMembershipChange(membershipKey, false);
+    recovery_->ObserveMembershipChange(membershipKey, std::nullopt);
     NotifyHost(membershipKey, WatchEvent::Type::DELETE);
     ASSERT_TRUE(WaitUntil([&] { return inject::GetExecuteCount(injectPoint) > 0; }));
     EXPECT_EQ(host_->PrepareMembershipPut("red").GetCode(), K_TRY_AGAIN);
@@ -1169,7 +1169,7 @@ TEST_F(TopologyControlHostTest, EmptyObservationCannotEraseConcurrentMembershipA
     int64_t revision = 0;
     const auto membershipKey = PhysicalMembershipKey("blue");
     DS_ASSERT_OK(store_->Put(membershipKey, encoded, 0, COORDINATOR_NO_VERSION_CHECK, version, revision));
-    recovery_->ObserveMembershipChange(membershipKey, true);
+    recovery_->ObserveMembershipChange(membershipKey, cluster::MemberLifecycleState::STARTING);
     NotifyHost(membershipKey, WatchEvent::Type::PUT);
     host_->CompleteMembershipPut("blue", true);
     DS_ASSERT_OK(inject::Clear(injectPoint));

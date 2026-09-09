@@ -26,6 +26,8 @@ namespace datasystem {
 static constexpr char COORDINATION_CLUSTER_TABLE[] = "datasystem/cluster";  // Keep without leading '/'.
 static constexpr char COORDINATION_MASTER_ADDRESS_TABLE[] = "/datasystem";
 static constexpr char COORDINATION_MASTER_ADDRESS_KEY[] = "master_address";
+static constexpr char COORDINATION_CONTROL_TABLE[] = "control";
+static constexpr char EVICTION_POLICY_ROLLOUT_KEY[] = "eviction-policy-rollout";
 
 inline bool IsCoordinationKeyUnderPrefix(const std::string &key, const std::string &prefix)
 {

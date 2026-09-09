@@ -120,6 +120,12 @@ public:
     const std::string &ScaleInMetadataDoneTable() const noexcept;
 
     /**
+     * @brief Return the eviction-policy rollout control table.
+     * @return Stable table-name reference.
+     */
+    const std::string &RolloutTable() const noexcept;
+
+    /**
      * @brief Return the singleton topology relative key.
      * @return Stable empty-key reference.
      */
@@ -193,6 +199,7 @@ private:
     std::string membershipTable_;
     std::string etcdMembershipTablePrefix_;
     std::string scaleInMetadataDoneTable_;
+    std::string rolloutTable_;
 };
 
 }  // namespace datasystem::cluster

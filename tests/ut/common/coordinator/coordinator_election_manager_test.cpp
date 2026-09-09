@@ -233,8 +233,8 @@ CoordinatorElectionManager::Dependencies MakeDependencies(const std::shared_ptr<
         state->cv.notify_all();
         return Status::OK();
     };
-    dependencies.isLeader = [](const CoordinatorElectionManager::NodeHandle &) { return false; };
-    dependencies.getLeader = [](const CoordinatorElectionManager::NodeHandle &, std::string &) {
+    dependencies.getLeadershipSnapshot =
+        [](const CoordinatorElectionManager::NodeHandle &, CoordinatorLeadershipSnapshot &) {
         return Status(K_NOT_READY, "No leader");
     };
     return dependencies;

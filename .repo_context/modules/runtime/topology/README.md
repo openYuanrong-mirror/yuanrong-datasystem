@@ -90,7 +90,10 @@
 - Every ETCD Worker may run a `TopologyController`. Controllers contend through the single authoritative topology-key
   CAS; controller identity is not persisted, and deterministic batch/task identities make duplicate reconciliation safe.
 - `CoordinatorStoreBackend` adapts one cluster-scoped view of the existing in-memory `CoordinatorStore` to the unchanged
-  `ICoordinationBackend` KV/CAS contract. It owns no thread, watch, lease, or recovery state.
+  `ICoordinationBackend` KV/CAS contract. It owns no thread, watch, lease, or recovery state. Coordinator RPC ingress
+  accepts only physical keys that strictly parse into one of the seven topology keyspaces; there is no `OTHER` kind or
+  generic-RPC bypass. This policy stays above `CoordinatorStore`, whose internal KV/range/watch/TTL semantics remain
+  generic.
 - `TopologyControlHost` is the Coordinator-process lifecycle owner for `cluster_name -> TopologyControllerRuntime`.
   It admits only clusters whose membership mutation has committed, waits for `TopologyRecoveryManager` to report READY,
   starts/stops Runtime dependencies outside its mutex, enforces the active-cluster cap, and keeps each cluster's
@@ -303,8 +306,10 @@
   FIFO event queue and in-flight count, plus the Store/Proxy and callback resources borrowed by the Engine.
   `ConstructTopologyRuntime` sets classifier `nodeDeadTimeout` to
   `max(0, FLAGS_node_dead_timeout_s - FLAGS_node_timeout_s)` so confirmed failure tracks wall-clock
-  `node_dead_timeout_s` after lease expiry (`node_timeout_s`), not a second full `node_timeout_s`. A zero budget
-  confirms on the first successful membership-absence observation. Shutdown drains business RPC ingress, stops accepting
+  `node_dead_timeout_s` after lease expiry (`node_timeout_s`), not a second full `node_timeout_s`. Its independent
+  Coordinator-ready startup timeout uses the full `FLAGS_node_dead_timeout_s`; the Builder default is 10 seconds for
+  non-production composition. A zero classifier budget confirms on the first successful membership-absence observation.
+  Shutdown drains business RPC ingress, stops accepting
   probe events, clears pending probes, shuts down Engine ingress, waits for in-flight probe/report work, and only then
   destroys the joined probe pool. In ETCD mode Engine closes the shared watch and keepalive event sources once, drains
   Worker execution, stops the externally-fed Controller/Janitor, and fully shuts down the Store once. Coordinator mode
@@ -313,17 +318,19 @@
   component destructors safely stop and join as a final fallback and never call `std::terminate`, detach a live thread,
   or kill the process. The process manager owns the outer hard termination bound.
 - Coordinator exposes `GetClusterRawSnapshot` as a cold, read-only diagnostic RPC. The handler validates a logical
-  cluster name, reads the exact topology key and membership prefix through the existing `CoordinatorStore::Range`, and
-  returns only raw KV facts. It bypasses the ordinary recovery read gate, but never decodes topology, derives
-  health/ranges/routes, retries, or mutates state. Those operations belong to the dscli-local `client/cluster_query`
-  layer.
+  cluster name, applies the same per-cluster Leader/recovery admission as ordinary RPCs, reads the exact topology key and
+  membership prefix through the existing `CoordinatorStore::Range`, and returns only raw KV facts. It never decodes
+  topology, derives health/ranges/routes, retries, or mutates state. Those operations belong to the dscli-local
+  `client/cluster_query` layer.
 
 ## Persistence And Recovery
 
 - Keyspace supports an optional cluster scope. A non-empty validated name uses
   `/datasystem/{cluster_name}/...`; an empty name uses `/datasystem/...` without an empty path segment. Multi-cluster
   deployments sharing one backend must use non-empty distinct names. The seven logical paths are topology,
-  tasks/migrate, tasks/delete, notify, probe, cluster membership, and ScaleIn metadata-done markers. Each probe PUT is a
+  tasks/migrate, tasks/delete, notify, probe, cluster membership, and ScaleIn metadata-done markers. Coordinator Service
+  parses the physical start key and validates exact/prefix range boundaries before response-header admission or Store
+  access, so unknown, malformed, or cross-keyspace requests have no recovery or Store side effect. Each probe PUT is a
   non-authoritative, overwriteable single-target event under `root/probe/<witness_address>`. Normal watch delivery handles
   each revision independently. The protocol does not require historical event recovery; Coordinator rewatch may redeliver
   the key's latest value as a duplicate event, which epoch/member/round fencing safely tolerates. Multiple witnesses provide
@@ -337,9 +344,19 @@
 - There is no persisted Worker-local topology authority. ETCD restart recovery reads the latest legal topology and
   reconstructs deterministic work. The in-memory Coordinator backend recovers only the latest topology from Workers;
   task/notify records are treated as absent and regenerated. Candidate arbitration is cluster-scoped and resource
-  bounded; conflicting same-version digests block only that cluster until membership/evidence changes. If all
-  memberships briefly disappear without a Coordinator restart, a later returning member reuses a legal topology already
-  present in the current process Store as the local authority; Worker evidence cannot overwrite or block it.
+  bounded. Each Coordinator Leader round snapshots `node_dead_timeout_s` into one fixed monotonic hard deadline; valid
+  Store authority remains first priority, while unresolved missing reporters/evidence/payload, conflict, invalid or
+  unavailable Store state, and failed installation converge to `READY` without replacing topology at that deadline.
+  Discovery activity cannot slide the round deadline, and the current implementation does not vote among conflicting
+  deadline candidates. If all memberships briefly disappear without a Coordinator restart, a later returning member
+  reuses a legal topology already present in the current process Store as the local authority; Worker evidence cannot
+  overwrite or block it.
+- Coordinator-mode Worker startup opens recovery reporting before membership keepalive initialization. Once membership
+  is ensured, the reporter can submit the current candidate or `NO_SNAPSHOT` while the Engine waits for that cluster's
+  Coordinator admission to leave `RECOVERING`. Topology read, Watch registration, executor startup, state-thread startup,
+  and Worker readiness continue only after the cluster is serving. This wait owns an absolute startup deadline equal to
+  the independent Coordinator-ready timeout plus one topology-read RPC allowance; a transient recovering read no longer
+  rolls back the Worker startup.
 - Worker startup calls membership keepalive initialization, then its external Controller ranges membership at revision
   `R` and accepts an exact topology only when its modification revision is no newer than `R`. A concurrent newer
   topology causes a bounded retry. Unified topology/membership watches start from `R + 1`; a Worker exact-read
@@ -431,6 +448,11 @@
 - Coordinator watches bind both `CoordinatorId` and `watch_id`. Watch registration uses a client registration ID so an
   ambiguous WatchRange result retries idempotently. Initial/recreated membership invalidates both Worker and Controller
   role plans using O(1) RESET doorbells; lease threads never wait for watch-registration RPCs.
+- For every cluster-scoped request, a known follower returns `NOT_LEADER` without reading recovery state. A Leader reads
+  that cluster's state once through O(1) `TopologyRecoveryManager::GetState`: `READY` maps to `SERVING`, while
+  `RECOVERING`, `INSTALLING`, and `BLOCKED` map to `RECOVERING`. Only membership `KeepAlive`,
+  `EnsureLeaderMembership`, and topology recovery-candidate reporting are recovery-control RPCs. Ordinary `Put`,
+  including membership `Put`, has no Store/reservation side effect while `RECOVERING`.
 - An ETCD canceled watch, including compaction cancellation, exits the producer and enters the existing whole-stream
   `WatchRun` recovery path. A RESET first makes both serialized consumers rebuild or retain last-good state; active
   compensation then reads current state, emits value-bearing fake PUT/DELETE events, advances every unified target
@@ -549,6 +571,13 @@
 
 - Main contract/component binary: `cluster_topology_contract_ut`.
 - Coordinator host/adapter coverage: `CoordinatorStoreBackendTest` and `TopologyControlHostTest` in `ds_ut`.
+- Coordinator admission/key-boundary coverage: `CoordinatorServiceImplTest` exercises per-cluster header mapping,
+  typed control admission, and side-effect-free ordinary RPC rejection; `TopologyRecoveryManagerTest` covers the seven
+  key kinds, default/named cluster parsing, malformed keys, and cross-keyspace ranges; `CoordinatorStoreTest` keeps the
+  generic Store contract independent of ingress policy.
+- Router/consumer coverage: `CoordinatorLeaderRouterTest` and `CoordinatorServiceProxyTest` cover follower redirects,
+  ordinary `RECOVERING` fast `K_NOT_READY`, recovery-control/`SERVING` route hits, business-status propagation, header
+  validation, and identity fencing.
 - Manual scale/performance coverage: `topology_control_perf_test`.
 - Core CTest selection:
   - `ctest -R 'ClusterTopology|TopologyRepository|TopologyObserver|PlacementFacade'`

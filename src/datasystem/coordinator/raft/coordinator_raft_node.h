@@ -73,6 +73,7 @@ public:
 
     Status Start(RaftMetadataState metadataState);
 
+    Status GetLeadershipSnapshot(CoordinatorLeadershipSnapshot &snapshot) const;
     bool IsLeader() const;
     Status GetLeader(std::string &leaderAddress) const;
     Status GetCommittedConfiguration(std::vector<std::string> &peers, int64_t &index) const;
