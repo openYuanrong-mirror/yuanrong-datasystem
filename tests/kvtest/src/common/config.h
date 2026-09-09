@@ -38,6 +38,8 @@ enum class MixedKeyStrategy { SAME_KEYS = 0, READ_PREV = 1, INDEPENDENT = 2 };
 
 enum class RunMode { PIPELINE, CACHE, BENCHMARK };
 
+constexpr int DEFAULT_ROUND_CLEANUP_WAIT_MS = 3000;
+
 TestMode ParseTestMode(const std::string &s);
 bool NeedsRemoteWorker(TestMode mode);
 bool IsGetMode(TestMode mode);
@@ -102,6 +104,7 @@ struct Config {
     int workerMemoryMb = 0;
     int durationSeconds = 0;
     int totalRounds = 0;
+    int roundCleanupWaitMs = DEFAULT_ROUND_CLEANUP_WAIT_MS;
     std::string setApi = "string_view";
     std::string cleanupMethod = "del";
     struct {

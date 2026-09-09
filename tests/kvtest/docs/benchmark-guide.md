@@ -226,8 +226,9 @@ Benchmark 模式通过 ServiceDiscovery 连接 etcd 发现 Worker。以下参数
 | `test_mode` | string | **必填** | 测试模式：`set_local` / `set_remote` / `get_local` / `get_cross_node` / `get_remote_direct` / `get_remote_cross` / `mixed_local_set_get` / `mixed_remote_set_get` / `mixed_local_set_cross_get` / `mixed_remote_set_remote_cross_get` / `mset_local` / `mset_remote` / `mget_local` / `mget_cross_node` / `mget_remote_direct` / `mget_remote_cross` |
 | `worker_memory_mb` | int | **必填** | Worker 共享内存上限（MB），用于计算每轮 key 数 |
 | `num_threads` | int | 4 | 并发线程数（所有模式共用，Pipeline 模式亦使用此参数） |
-| `duration_seconds` | int | 0 | 总运行时长（秒），0 = 不限时 |
+| `duration_seconds` | int | 0 | Benchmark 轮次启动时限（秒），0 = 不限时；已启动轮次和子进程退出仍会完成 |
 | `total_rounds` | int | 0 | 总轮数，0 = 不限轮 |
+| `round_cleanup_wait_ms` | int | 3000 | `del` 清理后、下一轮开始前的等待时间（毫秒），0 = 不等待；等待不超过剩余运行时长 |
 | `set_api` | string | "string_view" | Set API 路径：`"string_view"` / `"create_buffer"` / `"create_buffer_raw"`（MSet/MGet 模式忽略） |
 | `cleanup_method` | string | "del" | 清理方式：`"del"`（每轮删除）或 `"ttl"`（TTL 过期） |
 | `remote_worker.host` | string | "" | 远端 Worker 地址，见下方说明 |
@@ -340,7 +341,7 @@ Benchmark 模式**不使用 `target_qps` 限速**——每轮全速执行，测�
 | 参数组合 | 行为 |
 |---------|------|
 | `total_rounds=5` | 运行 5 轮后停止 |
-| `duration_seconds=60` | 运行 60 秒后停止（可能跑不满整轮） |
+| `duration_seconds=60` | 60 秒后不再启动新一轮；当前轮次和子进程退出仍会完成 |
 | `total_rounds=5, duration_seconds=120` | 任意条件先满足则停止 |
 | `total_rounds=0, duration_seconds=0` | 无限运行，需 `Ctrl+C` 停止 |
 

@@ -15,6 +15,12 @@ int CalcKeysPerRound(int workerMemoryMb, uint64_t dataSize) {
     return static_cast<int>(std::max(keys64, static_cast<uint64_t>(1)));
 }
 
+int64_t CalcRoundCleanupWaitMs(int configuredWaitMs, int64_t maxDurationMs, int64_t elapsedMs) {
+    if (configuredWaitMs <= 0) return 0;
+    if (maxDurationMs <= 0) return configuredWaitMs;
+    return std::max<int64_t>(0, std::min<int64_t>(configuredWaitMs, maxDurationMs - elapsedMs));
+}
+
 std::string MakeBenchKey(int instanceId, int round, int index) {
     return "bench_" + std::to_string(instanceId) + "_" + std::to_string(round) + "_" + std::to_string(index);
 }

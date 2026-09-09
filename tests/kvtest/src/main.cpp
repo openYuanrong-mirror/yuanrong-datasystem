@@ -345,6 +345,18 @@ static int RunBenchmarkMode(Config &cfg, const std::string &configPath)
         SLOG_INFO("Round " << round << " complete: set=" << setRes.successCount << " get=" << getRes.successCount
                            << " del=" << delRes.successCount << " setMs=" << setPhaseMs << " getMs=" << getPhaseMs
                            << " delMs=" << delPhaseMs);
+
+        bool hasMoreRounds = cfg.totalRounds == 0 || stats.roundsCompleted.load() < cfg.totalRounds;
+        if (cfg.cleanupMethod == "del" && hasMoreRounds && gRunning) {
+            auto elapsedMs =
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - benchStart)
+                    .count();
+            int64_t waitMs = CalcRoundCleanupWaitMs(cfg.roundCleanupWaitMs, maxDurationMs, elapsedMs);
+            if (waitMs > 0) {
+                SLOG_INFO("Waiting " << waitMs << "ms after round cleanup...");
+                std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
+            }
+        }
     }
 
     // --- Final cleanup for delayed-deletion strategies ---

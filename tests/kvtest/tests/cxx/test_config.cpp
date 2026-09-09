@@ -416,7 +416,32 @@ TEST(LoadConfig_DurationAndRounds) {
     ASSERT_TRUE(LoadConfig(path, cfg));
     ASSERT_EQ(cfg.durationSeconds, 30);
     ASSERT_EQ(cfg.totalRounds, 5);
+    ASSERT_EQ(cfg.roundCleanupWaitMs, DEFAULT_ROUND_CLEANUP_WAIT_MS);
     CleanupDir(cfg.outputDir);
+    std::remove(path.c_str());
+}
+
+TEST(LoadConfig_RoundCleanupWait) {
+    auto path = WriteTempConfig(R"({
+        "etcd_address":"x:1","listen_port":9000,
+        "test_mode":"set_local","worker_memory_mb":4096,
+        "round_cleanup_wait_ms":1500
+    })");
+    Config cfg;
+    ASSERT_TRUE(LoadConfig(path, cfg));
+    ASSERT_EQ(cfg.roundCleanupWaitMs, 1500);
+    CleanupDir(cfg.outputDir);
+    std::remove(path.c_str());
+}
+
+TEST(LoadConfig_NegativeRoundCleanupWait) {
+    auto path = WriteTempConfig(R"({
+        "etcd_address":"x:1","listen_port":9000,
+        "test_mode":"set_local","worker_memory_mb":4096,
+        "round_cleanup_wait_ms":-1
+    })");
+    Config cfg;
+    ASSERT_FALSE(LoadConfig(path, cfg));
     std::remove(path.c_str());
 }
 

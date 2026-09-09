@@ -15,6 +15,16 @@
 
 // Key calculation utilities
 int CalcKeysPerRound(int workerMemoryMb, uint64_t dataSize);
+
+/**
+ * @brief Calculate the cleanup wait before the next benchmark round.
+ * @param[in] configuredWaitMs Configured cleanup wait in milliseconds.
+ * @param[in] maxDurationMs Benchmark duration limit in milliseconds, or zero when unlimited.
+ * @param[in] elapsedMs Elapsed benchmark time in milliseconds.
+ * @return Cleanup wait capped by the remaining benchmark duration.
+ */
+int64_t CalcRoundCleanupWaitMs(int configuredWaitMs, int64_t maxDurationMs, int64_t elapsedMs);
+
 std::string MakeBenchKey(int instanceId, int round, int index);
 std::pair<int, int> ThreadKeyRange(int totalKeys, int numThreads, int threadId);
 
