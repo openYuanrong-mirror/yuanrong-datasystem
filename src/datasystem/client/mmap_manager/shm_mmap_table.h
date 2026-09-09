@@ -60,8 +60,6 @@ public:
     Status MmapAndStoreFd(const int &clientFd, const int &workerFd, const uint64_t &mmapSize,
                           const std::string &tenantId, const std::string &clientId = "") override;
 
-    void MarkVoluntaryScaleDown();
-
 private:
     std::shared_ptr<HostMemoryPinManager> pinManager_;
 };

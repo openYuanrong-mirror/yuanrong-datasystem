@@ -212,11 +212,6 @@ bool ShmMmapTableEntry::IsCudaHostMemoryRegistrationDone() const
     return pinCompleted_.load(std::memory_order_acquire);
 }
 
-void ShmMmapTableEntry::MarkVoluntaryScaleDown()
-{
-    voluntaryScaleDown_.store(true, std::memory_order_release);
-}
-
 bool ShmMmapTableEntry::Contains(const void *pointer) const
 {
     const auto address = reinterpret_cast<uintptr_t>(pointer);
@@ -272,19 +267,18 @@ void ShmMmapTableEntry::UnpinHostMemory()
     const auto begin = std::chrono::steady_clock::now();
     const size_t totalFragmentCount = GetPinFragmentCount();
     const size_t pinnedFragmentCount = pinnedFragmentCount_.load(std::memory_order_acquire);
-    const bool voluntaryScaleDown = voluntaryScaleDown_.load(std::memory_order_acquire);
     const bool initialClientExiting = clientExiting_ != nullptr && clientExiting_->load(std::memory_order_acquire);
-    const bool initialSkipFragmentInterval = voluntaryScaleDown || initialClientExiting;
+    const bool initialSkipFragmentInterval = initialClientExiting;
     LOG(INFO) << "[CudaHostMemory] Worker shared memory unpin started, clientId: " << clientId_
               << ", pointer: " << static_cast<void *>(pointer_) << ", size: " << size_
               << ", fragmentCount: " << totalFragmentCount << ", pinnedFragmentCount: " << pinnedFragmentCount
               << ", fragmentIntervalMs: "
               << (initialSkipFragmentInterval ? 0 : HOST_MEMORY_FRAGMENT_INTERVAL.count())
-              << ", voluntaryScaleDown: " << voluntaryScaleDown << ", clientExiting: " << initialClientExiting;
+              << ", clientExiting: " << initialClientExiting;
     size_t failedCount = 0;
     for (size_t i = 0; i < pinnedFragmentCount; ++i) {
         const bool clientExiting = clientExiting_ != nullptr && clientExiting_->load(std::memory_order_acquire);
-        if (i > 0 && !voluntaryScaleDown && !clientExiting) {
+        if (i > 0 && !clientExiting) {
             std::this_thread::sleep_for(HOST_MEMORY_FRAGMENT_INTERVAL);
         }
         if (!UnpinHostMemoryFragment(i)) {
@@ -301,7 +295,7 @@ void ShmMmapTableEntry::UnpinHostMemory()
               << ", fragmentCount: " << totalFragmentCount << ", pinnedFragmentCount: " << pinnedFragmentCount
               << ", attemptedCount: " << pinnedFragmentCount
               << ", successCount: " << pinnedFragmentCount - failedCount << ", failedCount: " << failedCount
-              << ", voluntaryScaleDown: " << voluntaryScaleDown << ", clientExiting: " << finalClientExiting
+              << ", clientExiting: " << finalClientExiting
               << ", completed: true, elapsedUs: " << elapsedUs.count();
 }
 
