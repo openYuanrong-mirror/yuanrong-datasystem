@@ -116,5 +116,32 @@ TEST_F(EvictionWatermarkTest, ActiveSpillHwmThresholdUsesHighFactorNotLowFactor)
     RestoreWatermarkFlags(saved);
     RefreshWatermarkFactors();
 }
+
+TEST_F(EvictionWatermarkTest, EvictionPretriggerAppliesMarginAboveLowWatermark)
+{
+    auto saved = SaveWatermarkFlags();
+    FLAGS_eviction_high_watermark_ratio = 0.68;
+    FLAGS_eviction_low_watermark_ratio = 0.50;
+    RefreshWatermarkFactors();
+    constexpr uint64_t gib = 1024UL * 1024UL * 1024UL;
+    EXPECT_EQ(GetEvictionTriggerWatermark(50 * gib, 20 * 1024, 5 * 1024), 29 * gib);
+    RestoreWatermarkFlags(saved);
+    RefreshWatermarkFactors();
+}
+
+TEST_F(EvictionWatermarkTest, EvictionPretriggerIsDisabledByDefaultOrWhenNotAboveLowWatermark)
+{
+    auto saved = SaveWatermarkFlags();
+    FLAGS_eviction_high_watermark_ratio = 0.68;
+    FLAGS_eviction_low_watermark_ratio = 0.60;
+    RefreshWatermarkFactors();
+    constexpr uint64_t gib = 1024UL * 1024UL * 1024UL;
+    EXPECT_EQ(GetEvictionTriggerWatermark(50 * gib, 20 * 1024, 0), 34 * gib);
+    EXPECT_EQ(GetEvictionTriggerWatermark(50 * gib, 20 * 1024, 5 * 1024), 34 * gib);
+    EXPECT_EQ(GetEvictionTriggerWatermark(50 * gib, 20 * 1024, 40 * 1024), 34 * gib);
+    EXPECT_EQ(GetEvictionTriggerWatermark(0, 20 * 1024, 5 * 1024), 0U);
+    RestoreWatermarkFlags(saved);
+    RefreshWatermarkFactors();
+}
 }  // namespace ut
 }  // namespace datasystem

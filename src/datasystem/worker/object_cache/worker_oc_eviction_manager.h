@@ -1329,6 +1329,13 @@ bool EvictWhenMemoryExceedThrehold(const std::string &keyInfo, uint64_t needSize
                                    const std::shared_ptr<WorkerOcEvictionManager> &evictionManager,
                                    ServiceType type = ServiceType::OBJECT, CacheType cacheType = CacheType::MEMORY);
 
+/**
+ * @brief Try to evict object memory using the background pretrigger watermark.
+ * @param[in] evictionManager The class of eviction process.
+ * @return True if eviction is triggered.
+ */
+bool EvictWhenMemoryExceedPretriggerWatermark(const std::shared_ptr<WorkerOcEvictionManager> &evictionManager);
+
 }  // namespace object_cache
 }  // namespace datasystem
 #endif  // DATASYSTEM_WORKER_OC_EVICTION_MANAGER_H

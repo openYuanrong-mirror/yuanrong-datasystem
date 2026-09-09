@@ -20,6 +20,8 @@
 #ifndef DATASYSTEM_COMMON_FLAGS_EVICTION_WATERMARK_H
 #define DATASYSTEM_COMMON_FLAGS_EVICTION_WATERMARK_H
 
+#include <cstdint>
+
 namespace datasystem {
 
 void RefreshWatermarkFactors();
@@ -28,6 +30,9 @@ double GetEvictionHighWaterFactor();
 double GetEvictionLowWaterFactor();
 double GetSpillHighWaterFactor();
 double GetSpillLowWaterFactor();
+
+uint64_t GetEvictionTriggerWatermark(uint64_t maxAvailableMemorySize, uint32_t reserveMemoryThresholdMb,
+                                     uint32_t pretriggerMarginMb);
 
 }  // namespace datasystem
 
