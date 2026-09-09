@@ -24,6 +24,8 @@
 #include <vector>
 
 #include <gtest/gtest.h>
+#include <google/protobuf/descriptor.pb.h>
+#include <google/protobuf/dynamic_message.h>
 
 #include "datasystem/client/object_cache/routing/hash_ring_refresher.h"
 #include "datasystem/client/object_cache/routing/routing.h"
@@ -66,6 +68,36 @@ protected:
 
 class RoutingRpcClientTest : public CommonTest {
 };
+
+TEST_F(RoutingRpcClientTest, HostIdDigestPreservesLegacyRequestSerialization)
+{
+    google::protobuf::FileDescriptorProto file;
+    file.set_name("legacy_get_hash_ring.proto");
+    file.set_syntax("proto3");
+    auto *descriptor = file.add_message_type();
+    GetHashRingReqPb::descriptor()->CopyTo(descriptor);
+    ASSERT_EQ(descriptor->field(descriptor->field_size() - 1).number(), 103);
+    descriptor->mutable_field()->RemoveLast();
+    google::protobuf::DescriptorPool pool;
+    const auto *legacyFile = pool.BuildFile(file);
+    ASSERT_NE(legacyFile, nullptr);
+    google::protobuf::DynamicMessageFactory factory(&pool);
+    std::unique_ptr<google::protobuf::Message> legacy(factory.GetPrototype(legacyFile->message_type(0))->New());
+    GetHashRingReqPb request;
+    request.set_version(7);
+    request.set_timestamp(100);
+    request.set_signature("test-signature");
+    request.set_access_key("test-access-key");
+    request.set_host_ids_digest(std::string(64, 'a'));
+    ASSERT_TRUE(legacy->ParseFromString(request.SerializeAsString()));
+    EXPECT_EQ(legacy->SerializeAsString(), request.SerializeAsString());
+    for (const auto *name : { "signature", "access_key" }) {
+        legacy->GetReflection()->ClearField(legacy.get(), legacy->GetDescriptor()->FindFieldByName(name));
+    }
+    request.clear_signature();
+    request.clear_access_key();
+    EXPECT_EQ(legacy->SerializeAsString(), request.SerializeAsString());
+}
 
 TEST_F(RoutingFacadeTest, TestInitFetchesRingAndStartsFacade)
 {
@@ -179,7 +211,7 @@ TEST_F(RoutingFacadeTest, TestHostIdResolvesOnLaterRingChangeWhenFirstFetchMisse
         return Status::OK();
     };
     auto resolveHostId = [&localWorker, &router](uint64_t, const ::datasystem::ClusterTopologyPb &,
-                                                 const std::unordered_map<std::string, std::string> &hostIdMap) {
+                                                 const std::unordered_map<std::string, std::string> &hostIdMap, bool) {
         const auto iter = hostIdMap.find(localWorker.ToString());
         if (iter != hostIdMap.end()) {
             router->SetHostId(iter->second);

@@ -16,8 +16,11 @@
 
 #include "datasystem/common/ak_sk/hasher.h"
 
+#include <algorithm>
 #include <climits>
 #include <cstring>
+#include <string_view>
+#include <vector>
 #include "datasystem/common/util/format.h"
 #include "datasystem/common/util/status_helper.h"
 #include "datasystem/utils/status.h"
@@ -189,6 +192,20 @@ Status Hasher::GetSha256Hex(const std::string &str, std::string &hashVal)
     RETURN_IF_NOT_OK(HashSHA256(str.c_str(), str.size(), outHashData, outHashSize));
     RETURN_IF_NOT_OK(HexEncode(outHashData, outHashSize, hashVal));
     return Status::OK();
+}
+
+Status Hasher::GetStringMapSha256Hex(const std::unordered_map<std::string, std::string> &values, std::string &hashVal)
+{
+    std::vector<std::pair<std::string_view, std::string_view>> sorted(values.begin(), values.end());
+    std::sort(sorted.begin(), sorted.end());
+    std::string canonical;
+    for (const auto &[key, value] : sorted) {
+        canonical += std::to_string(key.size()) + ":";
+        canonical.append(key);
+        canonical += std::to_string(value.size()) + ":";
+        canonical.append(value);
+    }
+    return GetSha256Hex(canonical, hashVal);
 }
 
 Status Hasher::GetHMACSha1(const SensitiveValue &key, const std::string &data, std::string &output)

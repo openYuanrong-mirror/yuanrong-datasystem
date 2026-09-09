@@ -276,6 +276,19 @@
     open the existing six-second forced-refresh window; retries inside that window use a 250 ms interval. Force requests
     coalesce through the refresher deadline and never replay an ambiguous Create. Shutdown checks cancellation between
     probes, so it waits for at most one bounded refresh RPC.
+  - Lower-version routing responses are accepted when two different Workers report the same version and sorted ACTIVE
+    address digest within the current or previous refresh round. The ACTIVE set must be nonempty but need not overlap
+    known members. This cross-confirmation also accepts two Workers with the same stale view; refresh still needs
+    reachable known responders and does not discover arbitrary replacement addresses.
+  - GetHashRing requests carry the hostId content digest of the last successfully applied snapshot alongside the
+    topology version. Either changing returns a complete same-snapshot ring/hostId payload, including successful empty
+    maps. Same-version hostId updates refresh same-node placement and Transport SHM candidates without epoch reset.
+    Publication failures retain the previous digest for retry. Legacy requests without a digest retain version-only
+    behavior; old Workers cannot provide hostId-only updates.
+  - Metadata-owner failure hooks admit at most one force-refresh request per owner per six seconds. Different owners
+    have independent quotas; when the tracking map exceeds 64 entries, expired entries are reclaimed. A refresher
+    result of false means its global wakeup was coalesced, not that the request had no effect: it can still extend the
+    global retry deadline. The owner quota therefore measures attempts rather than new wakeups.
   - A direct local-cache Get that observes `K_RPC_PEER_DEAD` submits one deduplicated switch task per concrete Worker API
     to the existing single-thread switch pool. Client shutdown first stops heartbeat producers, atomically closes that
     pool to new peer-dead submissions, and drains queued tasks before Worker APIs and pending-switch state are released.
@@ -607,8 +620,13 @@ handler. Clearing the Router handler synchronously excludes later callback acces
     ScaleIn fallback performs UB establishment in the foreground. Ordinary transport changes may later rebuild SHM on
     demand, but an entry that has observed an explicit ScaleIn draining response rejects every stale SHM hint until the
     endpoint is removed from the authoritative snapshot.
-    After the first `WorkerSnapshot` is published, endpoints absent from the latest snapshot are rejected before cache
-    lookup so delayed requests cannot recreate removed entries. A dedicated transport reconcile thread coalesces
+    Ordinary endpoint admission loads one snapshot containing the live set, ring version, provisional flag and last
+    confirmed-refresh time. Provisional snapshots allow unknown endpoints. A confirmed snapshot rejects absent
+    endpoints before cache lookup while healthy. After 60 seconds without a confirmed refresh, the first absent-endpoint
+    request may open one 120-second grace window; expiry restores rejection until another confirmed refresh.
+    A matching-version `changed=false` response renews health without reconciliation. Grace state belongs to its
+    snapshot generation, and the exceptional admission rechecks publication after granting grace.
+    A dedicated transport reconcile thread coalesces
     pending updates with latest-wins semantics, erases absent entries through TBB map accessors, and closes their data
     planes afterward. Shutdown stops and joins this reconcile thread before closing the manager.
     Worker incarnation changes that reuse the same endpoint are intentionally outside this mechanism. A metadata-only
@@ -658,11 +676,14 @@ handler. Clearing the Router handler synchronously excludes later callback acces
     metadata was not created are never transitioned to the published state and are returned through
     `failed_object_keys` when either retry budget is exhausted. Seal metadata requests remain non-retryable after the
     master call is attempted; only route-resolution failures before that call may refresh the route and retry.
-  - A worker absent from the latest transport snapshot returns `K_NOT_READY`, not object-level `K_NOT_FOUND`. Because
+  - An absent worker rejected by transport snapshot admission returns `K_NOT_READY`, not object-level `K_NOT_FOUND`. Because
     no RPC was sent, routed Set and MSet may safely exclude that worker and rebuild the request on a current route.
     Routed direct Get uses the same narrow signal to recover from topology/metadata skew during scale or rolling
     changes; do not broaden this to all `K_NOT_READY` statuses, because SDK startup, shutdown, and non-snapshot
     readiness failures are different conditions.
+    `K_RPC_UNAVAILABLE` both invalidates the cached channel and permits the existing bounded, non-SHM metadata-owner
+    read retry. These decisions are independent: a retry reconnects rather than reusing the failed channel. Dispatched
+    SHM queries remain non-replayable.
   - Transport MSet preserves worker-reported partial failures and performs at most one same-worker UB recovery attempt.
     Routed `MultiCreateReqPb` and `MultiPublishReqPb` requests carry `is_routed=true`; target workers authenticate their
     signatures and tenant IDs without requiring the client to register separately on every metadata-owner worker.

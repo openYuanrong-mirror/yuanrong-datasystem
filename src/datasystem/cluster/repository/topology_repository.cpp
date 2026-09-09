@@ -293,6 +293,26 @@ Status TopologyRepository::ReadMemberships(std::vector<MembershipRecord> &member
     return Status::OK();
 }
 
+Status TopologyRepository::ReadHostIds(std::unordered_map<std::string, std::string> &hostIds,
+                                       int64_t *responseRevision) const
+{
+    std::vector<MembershipRecord> members;
+    int64_t revision = 0;
+    RETURN_IF_NOT_OK(ReadMemberships(members, &revision));
+    std::unordered_map<std::string, std::string> decoded;
+    decoded.reserve(members.size());
+    for (const auto &member : members) {
+        if (!member.hostId.empty()) {
+            decoded.emplace(member.address, member.hostId);
+        }
+    }
+    hostIds = std::move(decoded);
+    if (responseRevision != nullptr) {
+        *responseRevision = revision;
+    }
+    return Status::OK();
+}
+
 const std::string &TopologyRepository::TaskTable(TopologyTaskKind kind) const
 {
     return kind == TopologyTaskKind::MIGRATE ? keys_.MigrateTaskTable() : keys_.DeleteTaskTable();

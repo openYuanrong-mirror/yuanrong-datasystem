@@ -17,6 +17,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -37,6 +38,21 @@
 #include "ut/common.h"
 
 namespace datasystem {
+namespace client {
+class HashRingRefresherTestPeer {
+public:
+    static std::string Digest(const ClusterTopologyPb &ring)
+    {
+        return HashRingRefresher::BuildRingDigest(ring);
+    }
+
+    static Status Refresh(HashRingRefresher &refresher)
+    {
+        return refresher.DoRefresh(false);
+    }
+};
+}  // namespace client
+
 namespace ut {
 
 class RecordingFilter : public client::IWorkerFilter {
@@ -399,7 +415,7 @@ TEST_F(HashRingRefresherTest, TestRingUpdateHookRunsBeforeRoutePublication)
     bool routeWasUnpublished = false;
     auto hook = [router, &hookVersion, &routeWasUnpublished](
         uint64_t version, const ::datasystem::ClusterTopologyPb &ring,
-        const std::unordered_map<std::string, std::string> &) {
+        const std::unordered_map<std::string, std::string> &, bool) {
         hookVersion = version;
         EXPECT_EQ(ring.members_size(), 1);
         HostPort selected;
@@ -431,7 +447,7 @@ TEST_F(HashRingRefresherTest, InvalidTopologyDoesNotRunUpdateHook)
     };
     int hookCount = 0;
     auto hook = [&hookCount](uint64_t, const ::datasystem::ClusterTopologyPb &,
-                             const std::unordered_map<std::string, std::string> &) {
+                             const std::unordered_map<std::string, std::string> &, bool) {
         ++hookCount;
         return Status::OK();
     };
@@ -464,7 +480,7 @@ TEST_F(HashRingRefresherTest, TestFailedRingUpdateHookRetainsVersionAndRetries)
         return Status::OK();
     };
     auto hook = [&mutex, &cv, &hookCount](uint64_t, const ::datasystem::ClusterTopologyPb &,
-                                         const std::unordered_map<std::string, std::string> &) {
+                                         const std::unordered_map<std::string, std::string> &, bool) {
         std::lock_guard<std::mutex> lock(mutex);
         ++hookCount;
         cv.notify_all();
@@ -830,6 +846,239 @@ TEST_F(HashRingRefresherTest, TestInitialFetchValidatesDependencies)
     client::HashRingRefresher invalidAddress(router, fetch);
     EXPECT_EQ(invalidAddress.InitialFetch(HostPort()).GetCode(), K_INVALID);
 }
+
+namespace {
+bool WaitUntil(const std::function<bool()> &predicate, std::chrono::milliseconds timeout)
+{
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (predicate()) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return predicate();
+}
+
+void FillTwoWorkerRing(::datasystem::ClusterTopologyPb &ring, std::unordered_map<std::string, std::string> &hostIdMap)
+{
+    ring.set_tokens_per_member(1);
+    for (const auto *address : { "127.0.0.1:1000", "127.0.0.1:1001" }) {
+        auto &worker = (*ring.mutable_members())[address];
+        worker.set_state(::datasystem::MembershipPb::ACTIVE);
+        hostIdMap[address] = "host-a";
+    }
+}
+
+using EpochFetchScript = std::function<Status(const HostPort &, uint64_t, ::datasystem::ClusterTopologyPb &,
+                                              std::string &, uint64_t &, bool &,
+                                              std::unordered_map<std::string, std::string> &, int32_t)>;
+
+// Round 1 (InitialFetch) publishes a two-worker ring at a high version; later rounds follow script.
+std::unique_ptr<client::HashRingRefresher> BuildEpochResetRefresher(std::shared_ptr<client::WorkerRouter> &router,
+                                                                    const EpochFetchScript &script,
+                                                                    uint64_t &hookVersion, bool &hookEpochReset,
+                                                                    std::atomic<int> &hookCalls)
+{
+    auto first = [script](const HostPort &workerAddr, uint64_t currentVersion,
+                          ::datasystem::ClusterTopologyPb &ring, std::string &masterAddress, uint64_t &newVersion,
+                          bool &changed, std::unordered_map<std::string, std::string> &hostIdMap, int32_t timeoutMs) {
+        if (currentVersion == 0) {
+            FillTwoWorkerRing(ring, hostIdMap);
+            newVersion = 31;
+            changed = true;
+            return Status::OK();
+        }
+        return script(workerAddr, currentVersion, ring, masterAddress, newVersion, changed, hostIdMap, timeoutMs);
+    };
+    auto hook = [&hookVersion, &hookEpochReset, &hookCalls](uint64_t version, const ::datasystem::ClusterTopologyPb &,
+                                                            const std::unordered_map<std::string, std::string> &,
+                                                            bool epochResetConfirmed) {
+        hookVersion = version;
+        hookEpochReset = epochResetConfirmed;
+        ++hookCalls;
+        return Status::OK();
+    };
+    auto refresher = std::make_unique<client::HashRingRefresher>(router, first, hook);
+    if (!refresher->InitialFetch(HostPort("127.0.0.1", 1000)).IsOk()) {
+        return nullptr;
+    }
+    return refresher;
+}
+
+TEST_F(HashRingRefresherTest, TestCrossConfirmedLowerVersionAcceptsEpochReset)
+{
+    auto router = std::make_shared<client::WorkerRouter>("host-a");
+    uint64_t hookVersion = 0;
+    bool hookEpochReset = false;
+    std::atomic<int> hookCalls{ 0 };
+    auto script = [](const HostPort &, uint64_t, ::datasystem::ClusterTopologyPb &ring, std::string &,
+                     uint64_t &newVersion, bool &changed,
+                     std::unordered_map<std::string, std::string> &hostIdMap, int32_t) {
+        FillTwoWorkerRing(ring, hostIdMap);
+        newVersion = 3;
+        changed = true;
+        return Status::OK();
+    };
+    auto refresher = BuildEpochResetRefresher(router, script, hookVersion, hookEpochReset, hookCalls);
+    ASSERT_NE(refresher, nullptr);
+    ASSERT_EQ(hookCalls, 1);
+    ASSERT_EQ(hookVersion, 31);
+
+    DS_ASSERT_OK(refresher->StartPeriodicRefresh(60'000));
+    const bool published = WaitUntil([&hookCalls] { return hookCalls.load() > 1; }, std::chrono::seconds(2));
+    refresher->Stop();
+
+    ASSERT_TRUE(published);
+    EXPECT_EQ(hookCalls, 2);
+    EXPECT_EQ(hookVersion, 3);
+    EXPECT_TRUE(hookEpochReset);
+    HostPort selected;
+    EXPECT_TRUE(router->SelectWorker("key", client::DataPlacementPolicy::PREFERRED_META_OWNER, selected).IsOk());
+}
+
+TEST_F(HashRingRefresherTest, TestLowerVersionDigestIsCanonicalActiveAddressSet)
+{
+    ClusterTopologyPb first;
+    ClusterTopologyPb reversed;
+    const std::vector<std::string> addresses{ "127.0.0.1:1000", "127.0.0.1:2000", "127.0.0.1:3000" };
+    for (const auto &address : addresses) {
+        (*first.mutable_members())[address].set_state(MembershipPb::ACTIVE);
+    }
+    for (auto it = addresses.rbegin(); it != addresses.rend(); ++it) {
+        (*reversed.mutable_members())[*it].set_state(MembershipPb::ACTIVE);
+    }
+    (*reversed.mutable_members())["127.0.0.1:4000"].set_state(MembershipPb::FAILED);
+    EXPECT_EQ(client::HashRingRefresherTestPeer::Digest(first), "127.0.0.1:1000,127.0.0.1:2000,127.0.0.1:3000,");
+    EXPECT_EQ(client::HashRingRefresherTestPeer::Digest(first), client::HashRingRefresherTestPeer::Digest(reversed));
+}
+
+TEST_F(HashRingRefresherTest, TestDisjointReorderedLowerVersionResponsesConfirmWithoutBatchEpoch)
+{
+    auto router = std::make_shared<client::WorkerRouter>("host-a");
+    uint64_t version = 0;
+    bool reset = false;
+    std::atomic<int> calls{ 0 };
+    auto script = [](const HostPort &worker, uint64_t, ClusterTopologyPb &ring, std::string &,
+                     uint64_t &newVersion, bool &changed,
+                     std::unordered_map<std::string, std::string> &hostIds, int32_t) {
+        ring.set_tokens_per_member(1);
+        std::vector<std::string> addresses{ "127.0.0.1:2000", "127.0.0.1:3000" };
+        if (worker.Port() != 1000) {
+            std::reverse(addresses.begin(), addresses.end());
+        }
+        for (const auto &address : addresses) {
+            (*ring.mutable_members())[address].set_state(MembershipPb::ACTIVE);
+            hostIds[address] = "host-a";
+        }
+        newVersion = 3;
+        changed = true;
+        return Status::OK();
+    };
+    auto refresher = BuildEpochResetRefresher(router, script, version, reset, calls);
+    ASSERT_NE(refresher, nullptr);
+    DS_ASSERT_OK(client::HashRingRefresherTestPeer::Refresh(*refresher));
+    EXPECT_EQ(calls.load(), 2);
+    EXPECT_EQ(version, 3U);
+    EXPECT_TRUE(reset);
+}
+
+TEST_F(HashRingRefresherTest, SameVersionHostIdsAreAcknowledgedOnlyAfterSuccessfulPublication)
+{
+    auto router = std::make_shared<client::WorkerRouter>("host-a");
+    bool changedHost = false;
+    bool reject = false;
+    auto fetch = [&](const HostPort &, uint64_t, ClusterTopologyPb &ring, std::string &,
+                     uint64_t &version, bool &changed, std::unordered_map<std::string, std::string> &hostIds) {
+        FillTwoWorkerRing(ring, hostIds);
+        for (auto &[address, host] : hostIds) {
+            (void)address;
+            host = changedHost ? "host-b" : "host-a";
+        }
+        version = 31;
+        changed = true;
+        return Status::OK();
+    };
+    auto hook = [&](uint64_t, const ClusterTopologyPb &, const auto &, bool reset) {
+        EXPECT_FALSE(reset);
+        return reject ? Status(K_NOT_READY, "injected snapshot rejection") : Status::OK();
+    };
+    client::HashRingRefresher refresher(router, fetch, hook);
+    DS_ASSERT_OK(refresher.InitialFetch(HostPort("127.0.0.1", 1000)));
+    const auto original = refresher.GetHostIdsDigest(31);
+    ASSERT_FALSE(original.empty());
+    ASSERT_FALSE(router->GetAvailableSameNodeWorkers().empty());
+    changedHost = true;
+    reject = true;
+    EXPECT_EQ(client::HashRingRefresherTestPeer::Refresh(refresher).GetCode(), K_NOT_READY);
+    EXPECT_EQ(refresher.GetHostIdsDigest(31), original);
+    EXPECT_FALSE(router->GetAvailableSameNodeWorkers().empty());
+    reject = false;
+    DS_ASSERT_OK(client::HashRingRefresherTestPeer::Refresh(refresher));
+    EXPECT_NE(refresher.GetHostIdsDigest(31), original);
+    EXPECT_TRUE(router->GetAvailableSameNodeWorkers().empty());
+    EXPECT_TRUE(refresher.GetHostIdsDigest(30).empty());
+}
+
+TEST_F(HashRingRefresherTest, TestSingleWorkerLowerVersionIsStillIgnored)
+{
+    auto router = std::make_shared<client::WorkerRouter>("host-a");
+    uint64_t hookVersion = 0;
+    bool hookEpochReset = false;
+    std::atomic<int> hookCalls{ 0 };
+    auto script = [](const HostPort &workerAddr, uint64_t, ::datasystem::ClusterTopologyPb &ring, std::string &,
+                     uint64_t &newVersion, bool &changed,
+                     std::unordered_map<std::string, std::string> &hostIdMap, int32_t) {
+        if (workerAddr.ToString() != "127.0.0.1:1000") {
+            return Status::OK();
+        }
+        FillTwoWorkerRing(ring, hostIdMap);
+        newVersion = 3;
+        changed = true;
+        return Status::OK();
+    };
+    auto refresher = BuildEpochResetRefresher(router, script, hookVersion, hookEpochReset, hookCalls);
+    ASSERT_NE(refresher, nullptr);
+    const int callsAfterInitial = hookCalls;
+
+    DS_ASSERT_OK(refresher->StartPeriodicRefresh(60'000));
+    ASSERT_TRUE(refresher->ForceRefresh());
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    refresher->Stop();
+
+    EXPECT_EQ(hookCalls, callsAfterInitial);
+    EXPECT_EQ(hookVersion, 31);
+    EXPECT_FALSE(hookEpochReset);
+}
+
+TEST_F(HashRingRefresherTest, TestDifferentLowerVersionsAreNotConfirmed)
+{
+    auto router = std::make_shared<client::WorkerRouter>("host-a");
+    uint64_t hookVersion = 0;
+    bool hookEpochReset = false;
+    std::atomic<int> hookCalls{ 0 };
+    auto script = [](const HostPort &workerAddr, uint64_t, ::datasystem::ClusterTopologyPb &ring, std::string &,
+                     uint64_t &newVersion, bool &changed,
+                     std::unordered_map<std::string, std::string> &hostIdMap, int32_t) {
+        FillTwoWorkerRing(ring, hostIdMap);
+        newVersion = workerAddr.ToString() == "127.0.0.1:1000" ? 2 : 3;
+        changed = true;
+        return Status::OK();
+    };
+    auto refresher = BuildEpochResetRefresher(router, script, hookVersion, hookEpochReset, hookCalls);
+    ASSERT_NE(refresher, nullptr);
+    const int callsAfterInitial = hookCalls;
+
+    DS_ASSERT_OK(refresher->StartPeriodicRefresh(60'000));
+    ASSERT_TRUE(refresher->ForceRefresh());
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    refresher->Stop();
+
+    EXPECT_EQ(hookCalls, callsAfterInitial);
+    EXPECT_EQ(hookVersion, 31);
+    EXPECT_FALSE(hookEpochReset);
+}
+}  // namespace
 
 }  // namespace ut
 }  // namespace datasystem

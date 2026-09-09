@@ -3048,10 +3048,12 @@ TEST(ObjectMetadataClientTest, DoesNotReportDeadlineExpiredBeforeAccess)
     EXPECT_EQ(failureCount, 0u);
 }
 
-TEST(ObjectMetadataClientTest, ConnectionFailureRequestsRerouteWithoutFixedOwnerRetry)
+TEST(ObjectMetadataClientTest, ConnectionFailureRetriesBoundedThenReroutes)
 {
     ApiDeadlineGuard deadline(1000);
     auto manager = std::make_shared<FakeDataPlaneManager>();
+    manager->rpcBuildStatuses.emplace_back(K_RPC_UNAVAILABLE, "unavailable before dispatch");
+    manager->rpcBuildStatuses.emplace_back(K_RPC_UNAVAILABLE, "unavailable before dispatch");
     manager->rpcBuildStatuses.emplace_back(K_RPC_UNAVAILABLE, "unavailable before dispatch");
     std::vector<std::pair<HostPort, Status>> failures;
     ObjectMetadataClient metadata(
@@ -3063,13 +3065,39 @@ TEST(ObjectMetadataClientTest, ConnectionFailureRequestsRerouteWithoutFixedOwner
     const auto rc = metadata.QueryAndGet(MakeAddress(41), batch, nullptr);
 
     EXPECT_TRUE(IsTransportSnapshotStaleLocation(rc));
-    EXPECT_EQ(manager->rpcBuildCount, 1);
+    EXPECT_EQ(manager->rpcBuildCount, 3);
     ASSERT_EQ(failures.size(), 1u);
     EXPECT_EQ(failures[0].first, MakeAddress(41));
     EXPECT_EQ(failures[0].second.GetCode(), K_RPC_UNAVAILABLE);
 }
 
-TEST(ObjectMetadataClientTest, DispatchedDeadlineRequestsRerouteWithoutFixedOwnerRetry)
+TEST(ObjectMetadataClientTest, TransientOwnerDegradationRetriesInPlaceWithoutWrap)
+{
+    ApiDeadlineGuard deadline(1000);
+    auto manager = std::make_shared<FakeDataPlaneManager>();
+    int invokeCount = 0;
+    manager->queryAndGetHandler = [&invokeCount](const HostPort &, const QueryAndGetReqPb &,
+                                                 QueryAndGetRspPb &response, std::vector<RpcMessage> &) {
+        ++invokeCount;
+        if (invokeCount == 1) {
+            return Status(K_RPC_DEADLINE_EXCEEDED, "transient metadata owner deadline");
+        }
+        AddLocation(response, "key", MakeAddress(41));
+        return Status::OK();
+    };
+    std::vector<std::pair<HostPort, Status>> failures;
+    ObjectMetadataClient metadata(
+        manager, std::make_shared<DeadlineRetry>(), nullptr, nullptr, 0,
+        [&failures](const HostPort &address, const Status &status) { failures.emplace_back(address, status); });
+    auto results = MakeMetadataItems({ { 0, "key", MakeAddress(41) } });
+    auto batch = MakeMetadataBatch(results);
+
+    EXPECT_TRUE(metadata.QueryAndGet(MakeAddress(41), batch, nullptr).IsOk());
+    EXPECT_EQ(invokeCount, 2);
+    EXPECT_TRUE(failures.empty());
+}
+
+TEST(ObjectMetadataClientTest, PersistentOwnerDeadlineWrapsAfterBoundedInnerRetries)
 {
     ApiDeadlineGuard deadline(1000);
     auto manager = std::make_shared<FakeDataPlaneManager>();
@@ -3089,7 +3117,7 @@ TEST(ObjectMetadataClientTest, DispatchedDeadlineRequestsRerouteWithoutFixedOwne
     const auto rc = metadata.QueryAndGet(MakeAddress(41), batch, nullptr);
 
     EXPECT_TRUE(IsTransportSnapshotStaleLocation(rc));
-    EXPECT_EQ(invokeCount, 1);
+    EXPECT_EQ(invokeCount, 3);
     ASSERT_EQ(failures.size(), 1u);
     EXPECT_EQ(failures[0].first, MakeAddress(41));
     EXPECT_EQ(failures[0].second.GetCode(), K_RPC_DEADLINE_EXCEEDED);
@@ -3636,6 +3664,63 @@ TEST(ObjectReadFlowTest, BatchMixedDataOutcomesKeepInputOrderAndPartialSuccess)
     EXPECT_TRUE(result.items[1].status.IsOk());
     EXPECT_EQ(result.items[2].requestIndex, 8u);
     EXPECT_EQ(result.items[2].status.GetCode(), K_INVALID);
+}
+
+TEST(ObjectClientTransportTest, MetadataFailureHandlerSuppressesRepeatedForceRefreshCalls)
+{
+    ConnectOptions options;
+    options.host = "127.0.0.1";
+    options.port = 31000;
+    object_cache::ObjectClientImpl client(options);
+    const auto owner = MakeAddress(31001);
+    const auto routing = MakeSingleWorkerRouting(owner);
+    std::atomic_store(&client.routing_, routing);
+    client.HandleMetadataOwnerFailure(owner, Status(K_INVALID, "business error"));
+    EXPECT_EQ(routing->refresher_->forceRefreshDeadlineMs_.load(), 0);
+    client.HandleMetadataOwnerFailure(owner, Status(K_METADATA_OWNER_UNAVAILABLE, "owner unavailable"));
+    EXPECT_GT(routing->refresher_->forceRefreshDeadlineMs_.load(), 0);
+    routing->refresher_->forceRefreshDeadlineMs_.store(0);
+    client.HandleMetadataOwnerFailure(owner, Status(K_METADATA_OWNER_UNAVAILABLE, "owner unavailable"));
+    EXPECT_EQ(routing->refresher_->forceRefreshDeadlineMs_.load(), 0);
+    client.HandleMetadataOwnerFailure(MakeAddress(31002), Status(K_METADATA_OWNER_UNAVAILABLE, "owner unavailable"));
+    EXPECT_GT(routing->refresher_->forceRefreshDeadlineMs_.load(), 0);
+}
+
+TEST(ObjectClientTransportTest, ForcedRoutingRefreshIsWindowedPerOwner)
+{
+    ConnectOptions options;
+    options.host = "127.0.0.1";
+    options.port = 31000;
+    object_cache::ObjectClientImpl client(options);
+    const auto now = std::chrono::steady_clock::time_point{};
+    const auto window = std::chrono::milliseconds(HashRingRefresher::FORCED_REFRESH_WINDOW_MS);
+    const auto workerA = MakeAddress(31001);
+    const auto workerB = MakeAddress(31002);
+
+    EXPECT_TRUE(client.ShouldForceRefreshRouting(workerA, now));
+    EXPECT_FALSE(client.ShouldForceRefreshRouting(workerA, now + std::chrono::milliseconds(1)));
+    EXPECT_TRUE(client.ShouldForceRefreshRouting(workerB, now + std::chrono::milliseconds(1)));
+    EXPECT_FALSE(client.ShouldForceRefreshRouting(workerA, now + window - std::chrono::milliseconds(1)));
+    EXPECT_TRUE(client.ShouldForceRefreshRouting(workerA, now + window));
+}
+
+TEST(ObjectClientTransportTest, ForcedRoutingRefreshReclaimsExpiredOwnersWithoutEvictingActiveQuota)
+{
+    ConnectOptions options;
+    options.host = "127.0.0.1";
+    options.port = 31000;
+    object_cache::ObjectClientImpl client(options);
+    const auto now = std::chrono::steady_clock::time_point{};
+    const auto window = std::chrono::milliseconds(HashRingRefresher::FORCED_REFRESH_WINDOW_MS);
+    constexpr int OWNER_COUNT = 64;
+    for (int i = 0; i < OWNER_COUNT; ++i) {
+        EXPECT_TRUE(client.ShouldForceRefreshRouting(MakeAddress(31000 + i), now));
+    }
+    const auto active = MakeAddress(32000);
+    EXPECT_TRUE(client.ShouldForceRefreshRouting(active, now + window - std::chrono::milliseconds(1)));
+    EXPECT_TRUE(client.ShouldForceRefreshRouting(MakeAddress(32001), now + window));
+    EXPECT_EQ(client.lastForcedRefreshAt_.size(), 2U);
+    EXPECT_FALSE(client.ShouldForceRefreshRouting(active, now + window));
 }
 
 TEST(ObjectClientTransportTest, ReadTransportRoundPreservesMixedItemStatusesWhenAggregateIsStale)

@@ -19,10 +19,11 @@
 #include <algorithm>
 #include <utility>
 
+#include "datasystem/common/ak_sk/hasher.h"
 #include "datasystem/common/inject/inject_point.h"
 #include "datasystem/common/log/log.h"
-#include "datasystem/common/util/status_helper.h"
 #include "datasystem/common/log/trace.h"
+#include "datasystem/common/util/status_helper.h"
 #include "datasystem/common/util/uuid_generator.h"
 
 namespace datasystem {
@@ -91,10 +92,11 @@ Status HashRingRefresher::InitialFetch(const HostPort &initialWorkerAddr)
     RETURN_RUNTIME_ERROR_IF_NULL(router_);
     CHECK_FAIL_RETURN_STATUS(static_cast<bool>(fetchRpc_), K_INVALID, "Hash ring fetch callback must be set");
     CHECK_FAIL_RETURN_STATUS(!initialWorkerAddr.Empty(), K_INVALID, "Initial worker address must not be empty");
-    currentVersion_.store(0);
     {
         std::lock_guard<std::mutex> lock(workerListMutex_);
+        currentVersion_.store(0);
         workerList_.clear();
+        hostIdsDigest_.clear();
         workerList_.push_back(initialWorkerAddr);
         nextWorkerIndex_ = 0;
     }
@@ -152,11 +154,11 @@ bool HashRingRefresher::ForceRefresh()
     return true;
 }
 
-Status HashRingRefresher::DoRefresh(bool stopAware)
+std::vector<HostPort> HashRingRefresher::BeginRefreshRound(size_t &startIndex)
 {
     // Copy worker list under lock to avoid data race with InitialFetch
     std::vector<HostPort> workers;
-    size_t startIndex = 0;
+    startIndex = 0;
     {
         std::lock_guard<std::mutex> lock(workerListMutex_);
         workers = workerList_;
@@ -165,7 +167,20 @@ Status HashRingRefresher::DoRefresh(bool stopAware)
             nextWorkerIndex_ = (startIndex + 1) % workers.size();
         }
     }
+    {
+        std::lock_guard<std::mutex> lock(lowerVersionObsMutex_);
+        ++refreshRound_;
+        for (auto iter = lowerVersionObs_.begin(); iter != lowerVersionObs_.end();) {
+            iter = iter->second.round + 1 < refreshRound_ ? lowerVersionObs_.erase(iter) : ++iter;
+        }
+    }
+    return workers;
+}
 
+Status HashRingRefresher::DoRefresh(bool stopAware)
+{
+    size_t startIndex = 0;
+    const auto workers = BeginRefreshRound(startIndex);
     const auto probeCount = stopAware ? std::min(workers.size(), MAX_BACKGROUND_PROBES_PER_ROUND) : workers.size();
     bool reachedWorker = false;
     for (size_t offset = 0; offset < probeCount; ++offset) {
@@ -189,20 +204,25 @@ Status HashRingRefresher::DoRefresh(bool stopAware)
         }
         reachedWorker = true;
 
-        if (changed) {
-            if (newVersion < requestedVersion) {
-                LOG(WARNING) << "Ignore stale hash ring response from " << worker.ToString()
-                             << ", requested version: " << requestedVersion
-                             << ", response version: " << newVersion;
-                continue;
-            }
-            auto publish = PublishHashRing(newVersion, std::move(ring), std::move(hostIdMap));
-            if (publish.IsError()) {
-                LogTopologyPublishFailure(worker, requestedVersion, newVersion,
-                                          currentVersion_.load(std::memory_order_acquire), publish);
-            }
-            return publish;
+        if (!changed) {
+            continue;
         }
+        if (newVersion < requestedVersion) {
+            Status publish;
+            if (TryPublishEpochReset(worker, requestedVersion, newVersion, ring, hostIdMap, publish)) {
+                return publish;
+            }
+            LOG(WARNING) << "Ignore stale hash ring response from " << worker.ToString()
+                         << ", requested version: " << requestedVersion
+                         << ", response version: " << newVersion;
+            continue;
+        }
+        auto publish = PublishHashRing(newVersion, std::move(ring), std::move(hostIdMap), false);
+        if (publish.IsError()) {
+            LogTopologyPublishFailure(worker, requestedVersion, newVersion,
+                                      currentVersion_.load(std::memory_order_acquire), publish);
+        }
+        return publish;
     }
     if (reachedWorker) {
         return Status::OK();
@@ -210,18 +230,86 @@ Status HashRingRefresher::DoRefresh(bool stopAware)
     return Status(K_NOT_FOUND, "No reachable worker for hash ring refresh");
 }
 
+bool HashRingRefresher::TryPublishEpochReset(const HostPort &worker, uint64_t requestedVersion, uint64_t newVersion,
+                                             ::datasystem::ClusterTopologyPb &ring,
+                                             std::unordered_map<std::string, std::string> &hostIdMap,
+                                             Status &result)
+{
+    const auto digest = BuildRingDigest(ring);
+    if (digest.empty() || !RecordLowerVersionAndCheckConfirmation(worker, newVersion, digest)) {
+        return false;
+    }
+    LOG(WARNING) << "[Routing] Accept epoch-reset hash ring from " << worker.ToString()
+                 << ", previous version: " << requestedVersion << ", reset version: " << newVersion;
+    {
+        std::lock_guard<std::mutex> lock(lowerVersionObsMutex_);
+        lowerVersionObs_.clear();
+    }
+    result = PublishHashRing(newVersion, std::move(ring), std::move(hostIdMap), true);
+    if (result.IsError()) {
+        LogTopologyPublishFailure(worker, requestedVersion, newVersion,
+                                  currentVersion_.load(std::memory_order_acquire), result);
+    }
+    return true;
+}
+
+std::string HashRingRefresher::BuildRingDigest(const ::datasystem::ClusterTopologyPb &ring)
+{
+    std::vector<std::string> activeAddresses;
+    for (const auto &[address, member] : ring.members()) {
+        if (member.state() == ::datasystem::MembershipPb::ACTIVE) {
+            activeAddresses.emplace_back(address);
+        }
+    }
+    std::sort(activeAddresses.begin(), activeAddresses.end());
+    std::string digest;
+    for (const auto &address : activeAddresses) {
+        digest += address;
+        digest += ',';
+    }
+    return digest;
+}
+
+std::string HashRingRefresher::GetHostIdsDigest(uint64_t version)
+{
+    std::lock_guard<std::mutex> lock(workerListMutex_);
+    return version == currentVersion_.load(std::memory_order_acquire) ? hostIdsDigest_ : "";
+}
+
+bool HashRingRefresher::RecordLowerVersionAndCheckConfirmation(const HostPort &worker, uint64_t newVersion,
+                                                               const std::string &digest)
+{
+    const auto workerKey = worker.ToString();
+    std::lock_guard<std::mutex> lock(lowerVersionObsMutex_);
+    for (const auto &[address, observation] : lowerVersionObs_) {
+        if (address != workerKey && observation.version == newVersion && observation.digest == digest) {
+            return true;
+        }
+    }
+    lowerVersionObs_[workerKey] = LowerVersionObservation{ newVersion, digest, refreshRound_ };
+    return false;
+}
+
 Status HashRingRefresher::PublishHashRing(uint64_t newVersion, ::datasystem::ClusterTopologyPb &&ring,
-                                          std::unordered_map<std::string, std::string> &&hostIdMap)
+                                          std::unordered_map<std::string, std::string> &&hostIdMap,
+                                          bool epochResetConfirmed)
 {
     std::unique_ptr<PreparedClusterTopology> prepared;
     RETURN_IF_NOT_OK(PreparedClusterTopology::Create(std::move(ring), prepared));
+    std::string hostIdsDigest;
+    Hasher hasher;
+    RETURN_IF_NOT_OK(hasher.GetStringMapSha256Hex(hostIdMap, hostIdsDigest));
     const auto &topology = prepared->GetTopology();
     if (ringUpdateHook_) {
-        RETURN_IF_NOT_OK(ringUpdateHook_(newVersion, topology, hostIdMap));
+        RETURN_IF_NOT_OK(ringUpdateHook_(newVersion, topology, hostIdMap, epochResetConfirmed));
     }
-    currentVersion_.store(newVersion, std::memory_order_release);
-    UpdateWorkerList(topology);
     router_->UpdateHashRing(*prepared, hostIdMap);
+    UpdateWorkerList(topology);
+    {
+        std::lock_guard<std::mutex> lock(workerListMutex_);
+        hostIdsDigest_ = std::move(hostIdsDigest);
+        currentVersion_.store(newVersion, std::memory_order_release);
+    }
     return Status::OK();
 }
 

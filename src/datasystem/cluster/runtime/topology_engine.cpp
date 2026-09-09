@@ -1157,21 +1157,9 @@ bool TopologyEngine::IsPeerRpcFailureReported(const HostPort &target) const
 
 Status TopologyEngine::GetRoutingHostIds(std::unordered_map<std::string, std::string> &hostIds) const
 {
-    std::vector<std::pair<std::string, std::string>> members;
-    RETURN_IF_NOT_OK(memberBackend_->GetAll(keys_->MembershipTable(), members));
-    std::unordered_map<std::string, std::string> candidate;
-    candidate.reserve(members.size());
-    for (const auto &entry : members) {
-        MembershipValue membership;
-        auto rc = MembershipValueCodec::Decode(entry.second, membership);
-        if (rc.IsError()) {
-            LOG(WARNING) << "CLUSTER_MEMBERSHIP skip invalid host-id record, address=" << entry.first
-                         << ", status=" << rc.ToString();
-            continue;
-        }
-        candidate.emplace(entry.first, std::move(membership.hostId));
-    }
-    hostIds = std::move(candidate);
+    std::shared_ptr<const TopologySnapshot> snapshot;
+    RETURN_IF_NOT_OK(snapshots_.Load(snapshot));
+    hostIds = snapshot->HostIds();
     return Status::OK();
 }
 
@@ -1235,10 +1223,10 @@ Status TopologyEngine::ReloadTopology(bool fullRebuildAllowed)
 {
     std::shared_ptr<const TopologySnapshot> previous;
     const bool hasPrevious = snapshots_.Load(previous).IsOk();
-    std::shared_ptr<const TopologySnapshot> candidate;
+    auto candidate = previous;
     bool unchanged = false;
     auto rc = !options_.unifiedEtcdWatch && hasPrevious && previous->AuthorityRevision() > 0
-                  ? reader_.ReadIfChanged(ENGINE_READ_TIMEOUT_MS, previous->AuthorityRevision(), candidate, unchanged)
+                  ? reader_.ReadIfChanged(ENGINE_READ_TIMEOUT_MS, *previous, candidate, unchanged)
                   : reader_.Read(ENGINE_READ_TIMEOUT_MS, candidate);
     if (rc.IsError()) {
         std::shared_ptr<const TopologySnapshot> lastGood;
@@ -1280,7 +1268,12 @@ Status TopologyEngine::ApplyCoordinatorTopologyEvent(const CoordinationEvent &ev
                                  && member->OwnsWatchIdentity(event.sourceAuthorityId, event.sourceWatchId),
                              K_NOT_READY, "Coordinator topology event requires an exact rebuild");
     std::shared_ptr<const TopologySnapshot> candidate;
-    RETURN_IF_NOT_OK(TopologyReader::BuildFromEncodedTopology(event.value, event.revision, candidate));
+    std::unordered_map<std::string, std::string> hostIds;
+    int64_t hostIdsRevision = 0;
+    (void)repository_.ReadHostIds(hostIds, &hostIdsRevision);
+    RETURN_IF_NOT_OK(
+        TopologyReader::BuildFromEncodedTopology(event.value, event.revision, std::move(hostIds), candidate,
+                                                 hostIdsRevision));
     INJECT_POINT("TopologyEngine.ApplyCoordinatorTopologyEvent.beforeCommit");
     std::shared_ptr<const TopologySnapshot> previous;
     (void)snapshots_.Load(previous);

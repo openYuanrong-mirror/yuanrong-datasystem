@@ -34,6 +34,27 @@ struct ThreadSnapshotCache {
     std::weak_ptr<const TopologySnapshot> snapshot;
 };
 
+Status RetainLastGoodHostIds(const std::shared_ptr<const TopologySnapshot> &previous,
+                             std::shared_ptr<const TopologySnapshot> &candidate)
+{
+    if (previous == nullptr || candidate->HostIdsRevision() > 0 || previous->HostIdsRevision() == 0) {
+        return Status::OK();
+    }
+    std::unordered_map<std::string, std::string> hostIds;
+    for (const auto &member : candidate->Members()) {
+        const Member *oldMember = nullptr;
+        auto host = previous->HostIds().find(member.identity.address);
+        if (host != previous->HostIds().end()
+            && previous->FindMemberByAddress(member.identity.address, oldMember).IsOk()
+            && oldMember->identity.id == member.identity.id) {
+            hostIds.emplace(*host);
+        }
+    }
+    return TopologySnapshot::Create(candidate->CopyState(), candidate->AuthorityRevision(),
+                                    candidate->CanonicalDigest(), candidate, std::move(hostIds),
+                                    previous->HostIdsRevision());
+}
+
 std::vector<TokenRange> MergeRanges(std::vector<TokenRange> ranges)
 {
     std::sort(ranges.begin(), ranges.end(), [](const auto &left, const auto &right) {
@@ -86,6 +107,7 @@ Status TopologySnapshotState::Publish(std::shared_ptr<const TopologySnapshot> sn
     std::unique_lock<bthread::Mutex> lock(publicationSync_->mutex);
     auto current = std::atomic_load(&current_);
     if (current == nullptr || snapshot->Version() == current->Version() + 1) {
+        RETURN_IF_NOT_OK(RetainLastGoodHostIds(current, snapshot));
         ResetScaleOutHandoffIfBatchChanged(*snapshot);
         std::atomic_store_explicit(&current_, std::move(snapshot), std::memory_order_release);
         publicationGeneration_.fetch_add(1, std::memory_order_release);
@@ -99,6 +121,12 @@ Status TopologySnapshotState::Publish(std::shared_ptr<const TopologySnapshot> sn
     } else if (snapshot->Version() > current->Version()) {
         outcome = SnapshotUpdateOutcome::VERSION_GAP;
     } else if (snapshot->CanonicalDigest() == current->CanonicalDigest()) {
+        // Owners serialize exact reads. Membership revisions can restart with a new Coordinator lifetime.
+        if (snapshot->HostIdsRevision() > 0
+            && (snapshot->HostIds() != current->HostIds() || current->HostIdsRevision() == 0)) {
+            std::atomic_store_explicit(&current_, std::move(snapshot), std::memory_order_release);
+            publicationGeneration_.fetch_add(1, std::memory_order_release);
+        }
         outcome = SnapshotUpdateOutcome::IDEMPOTENT;
         return Status::OK();
     } else {
@@ -114,6 +142,7 @@ Status TopologySnapshotState::PublishAfterFullRebuild(std::shared_ptr<const Topo
     auto current = std::atomic_load(&current_);
     CHECK_FAIL_RETURN_STATUS(current == nullptr || snapshot->Version() > current->Version(), K_INVALID,
                              "full rebuild must advance cluster topology version");
+    RETURN_IF_NOT_OK(RetainLastGoodHostIds(current, snapshot));
     ResetScaleOutHandoffIfBatchChanged(*snapshot);
     std::atomic_store_explicit(&current_, std::move(snapshot), std::memory_order_release);
     publicationGeneration_.fetch_add(1, std::memory_order_release);

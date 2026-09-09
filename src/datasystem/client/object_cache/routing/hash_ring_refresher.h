@@ -52,7 +52,8 @@ public:
                              std::unordered_map<std::string, std::string> &hostIdMap, int32_t timeoutMs)>;
     using RingUpdateHook = std::function<Status(uint64_t newVersion,
                                                 const ::datasystem::ClusterTopologyPb &ring,
-                                                const std::unordered_map<std::string, std::string> &hostIdMap)>;
+                                                const std::unordered_map<std::string, std::string> &hostIdMap,
+                                                bool epochResetConfirmed)>;
     using WaitFn = std::function<void(std::condition_variable &cv, std::unique_lock<std::mutex> &lock,
                                       std::chrono::milliseconds duration,
                                       const std::function<bool()> &wakePredicate)>;
@@ -68,18 +69,41 @@ public:
     void Stop();
     bool ForceRefresh();
 
+    std::string GetHostIdsDigest(uint64_t version);
+
+    // Cover the online 3s isolation target plus reconciliation and publication margin. Public for
+    // callers that rate-limit their own forced-refresh triggers against the same window.
+    static constexpr int64_t FORCED_REFRESH_WINDOW_MS = 6'000;
+
 private:
+    friend class HashRingRefresherTestPeer;
+
     void RefreshLoop();
+    std::vector<HostPort> BeginRefreshRound(size_t &startIndex);
     Status DoRefresh(bool stopAware);
     Status PublishHashRing(uint64_t newVersion, ::datasystem::ClusterTopologyPb &&ring,
-                           std::unordered_map<std::string, std::string> &&hostIdMap);
+                           std::unordered_map<std::string, std::string> &&hostIdMap, bool epochResetConfirmed);
     void UpdateWorkerList(const ::datasystem::ClusterTopologyPb &ring);
-
-    // Cover the online 3s isolation target plus reconciliation and publication margin.
-    static constexpr int64_t FORCED_REFRESH_WINDOW_MS = 6'000;
+    static std::string BuildRingDigest(const ::datasystem::ClusterTopologyPb &ring);
+    bool RecordLowerVersionAndCheckConfirmation(const HostPort &worker, uint64_t newVersion,
+                                                const std::string &digest);
+    bool TryPublishEpochReset(const HostPort &worker, uint64_t requestedVersion, uint64_t newVersion,
+                              ::datasystem::ClusterTopologyPb &ring,
+                              std::unordered_map<std::string, std::string> &hostIdMap, Status &result);
     static constexpr int64_t FORCED_REFRESH_RETRY_INTERVAL_MS = 250;
     static constexpr int32_t BACKGROUND_REFRESH_RPC_TIMEOUT_MS = 250;
     static constexpr size_t MAX_BACKGROUND_PROBES_PER_ROUND = 4;
+
+    // Lower-version responses observed in the current or previous refresh round, keyed by worker.
+    // Two different workers reporting the same lower ring within the window confirm an epoch reset.
+    struct LowerVersionObservation {
+        uint64_t version{ 0 };
+        std::string digest;
+        uint64_t round{ 0 };
+    };
+    std::mutex lowerVersionObsMutex_;
+    std::unordered_map<std::string, LowerVersionObservation> lowerVersionObs_;
+    uint64_t refreshRound_{ 0 };
 
     std::shared_ptr<WorkerRouter> router_;
     TimedFetchRpc fetchRpc_;
@@ -90,6 +114,8 @@ private:
     std::vector<HostPort> workerList_;
     size_t nextWorkerIndex_{ 0 };
     std::atomic<uint64_t> currentVersion_{ 0 };
+    // Published with currentVersion_ under workerListMutex_, only after both routing consumers accept the snapshot.
+    std::string hostIdsDigest_;
 
     std::atomic<bool> running_{ false };
     std::atomic<bool> forceRefresh_{ false };

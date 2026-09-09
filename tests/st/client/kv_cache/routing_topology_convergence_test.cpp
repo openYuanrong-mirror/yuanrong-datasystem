@@ -17,6 +17,9 @@
 /** Description: U6 topology convergence and leaving-write interception system test. */
 
 #include <chrono>
+#include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -28,6 +31,9 @@
 #include "client/object_cache/oc_client_common.h"
 #include "common_distributed_ext.h"
 #include "datasystem/client/object_cache/routing/routing.h"
+#include "datasystem/client/object_cache/transport/transport_advisor.h"
+#include "datasystem/client/object_cache/transport/worker_snapshot.h"
+#include "datasystem/cluster/membership/membership_value_codec.h"
 #include "datasystem/client/object_cache/transport/rpc/worker_rpc_client.h"
 #include "datasystem/common/ak_sk/signature.h"
 #include "datasystem/common/flags/flags.h"
@@ -48,6 +54,8 @@ constexpr size_t KEY_SEARCH_LIMIT = 100'000;
 constexpr char CREATE_INJECT[] = "worker.Create.begin";
 constexpr char PUBLISH_INJECT[] = "worker.PublishObjectWithLock.begin";
 constexpr char ROUTED_KEY_PREFIX[] = "u6_topology_convergence_";
+constexpr char HOST_ID_ENV_NAME[] = "DS_U6_TOPOLOGY_HOST_ID";
+constexpr char HOST_ID_VALUE[] = "u6-topology-host";
 }  // namespace
 
 class RoutingTopologyConvergenceTest : public OCClientCommon, public CommonDistributedExt {
@@ -61,11 +69,12 @@ public:
             " -shared_memory_size_mb=512 -ipc_through_shared_memory=true -oc_shm_transfer_threshold_kb=1"
             " -arena_per_tenant=1"
             " -enable_urma=false -enable_leaving_intercept=true"
-            " -enable_lossless_data_exit_mode=true";
+            " -enable_lossless_data_exit_mode=true -host_id_env_name=" + std::string(HOST_ID_ENV_NAME);
     }
 
     void SetUp() override
     {
+        ASSERT_EQ(setenv(HOST_ID_ENV_NAME, HOST_ID_VALUE, 1), 0);
         ExternalClusterTest::SetUp();
         externalCluster_ = dynamic_cast<ExternalCluster *>(cluster_.get());
         ASSERT_NE(externalCluster_, nullptr);
@@ -88,6 +97,7 @@ public:
         }
         etcd_.reset();
         ExternalClusterTest::TearDown();
+        EXPECT_EQ(unsetenv(HOST_ID_ENV_NAME), 0);
     }
 
 protected:
@@ -115,6 +125,36 @@ protected:
         InitTestKVClient(LEAVING_WORKER_INDEX, multiPublishClient_);
         InitTestKVClient(LEAVING_WORKER_INDEX, createClient_);
         InitTestKVClient(LEAVING_WORKER_INDEX, multiCreateClient_);
+    }
+
+    Status RewriteMemberHostId(const HostPort &worker, const std::string &hostId)
+    {
+        return etcd_->CAS(GetMembershipTableName(), worker.ToString(),
+                          [&hostId](const std::string &old, std::unique_ptr<std::string> &updated, bool &retry) {
+            cluster::MembershipValue value;
+            RETURN_IF_NOT_OK(cluster::MembershipValueCodec::Decode(old, value));
+            value.hostId = hostId;
+            updated = std::make_unique<std::string>();
+            retry = false;
+            return cluster::MembershipValueCodec::Encode(value, *updated);
+        });
+    }
+
+    bool WaitForLocality(client::Routing &routing, const client::TransportAdvisor &advisor,
+                         const HostPort &worker, bool local)
+    {
+        const auto deadline = std::chrono::steady_clock::now()
+                              + std::chrono::milliseconds(ROUTING_CONVERGENCE_TIMEOUT_MS);
+        do {
+            const auto workers = routing.GetAvailableSameNodeWorkers();
+            const bool sameNode = std::find(workers.begin(), workers.end(), worker) != workers.end();
+            const bool shm = advisor.GetTransportHint(worker) == client::TransportHint::SHM_CANDIDATE;
+            if (sameNode == local && shm == local) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        } while (std::chrono::steady_clock::now() < deadline);
+        return false;
     }
 
     BrpcChannelConfig MakeRpcConfig() const
@@ -264,6 +304,36 @@ protected:
     std::shared_ptr<KVClient> createClient_;
     std::shared_ptr<KVClient> multiCreateClient_;
 };
+
+TEST_F(RoutingTopologyConvergenceTest, HostIdOnlyUpdatesRestoreExistingClientLocality)
+{
+    HostPort worker;
+    DS_ASSERT_OK(cluster_->GetWorkerAddr(INITIAL_WORKER_INDEX, worker));
+    ConnectOptions options;
+    InitConnectOpt(INITIAL_WORKER_INDEX, options);
+    auto signature = std::make_shared<Signature>(options.accessKey, options.secretKey);
+    client::TransportAdvisor advisor;
+    std::atomic<uint64_t> publishedVersion{ 0 };
+    auto hook = [&](uint64_t version, const ClusterTopologyPb &ring, const auto &hostIds, bool reset) {
+        EXPECT_FALSE(reset);
+        client::WorkerSnapshot snapshot;
+        RETURN_IF_NOT_OK(client::BuildWorkerSnapshot(version, ring, hostIds, HOST_ID_VALUE, snapshot));
+        advisor.SetShmCandidateWorkers(snapshot.shmCandidateAddrs);
+        publishedVersion.store(version);
+        return Status::OK();
+    };
+    client::Routing routing(MakeRpcConfig(), signature, hook, {}, 50);
+    DS_ASSERT_OK(routing.Init(HOST_ID_VALUE, worker, true));
+    ASSERT_TRUE(WaitForLocality(routing, advisor, worker, true));
+    const auto version = publishedVersion.load();
+    DS_ASSERT_OK(RewriteMemberHostId(worker, ""));
+    ASSERT_TRUE(WaitForLocality(routing, advisor, worker, false));
+    EXPECT_EQ(publishedVersion.load(), version);
+    DS_ASSERT_OK(RewriteMemberHostId(worker, HOST_ID_VALUE));
+    ASSERT_TRUE(WaitForLocality(routing, advisor, worker, true));
+    EXPECT_EQ(publishedVersion.load(), version);
+    routing.Shutdown();
+}
 
 TEST_F(RoutingTopologyConvergenceTest, U6ScaleDownRejectsWritesAndConvergesRouting)
 {

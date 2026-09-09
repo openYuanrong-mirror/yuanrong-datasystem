@@ -31,6 +31,36 @@
 namespace datasystem {
 namespace ut {
 
+TEST(HasherTest, StringMapDigestIsCanonicalAndContentSensitive)
+{
+    Hasher hasher;
+    std::unordered_map<std::string, std::string> first{ { "b", "host-b" }, { "a", "host-a" } };
+    std::unordered_map<std::string, std::string> reordered{ { "a", "host-a" }, { "b", "host-b" } };
+    std::string expected;
+    std::string actual;
+    ASSERT_TRUE(hasher.GetStringMapSha256Hex(first, expected).IsOk());
+    ASSERT_TRUE(hasher.GetStringMapSha256Hex(reordered, actual).IsOk());
+    EXPECT_EQ(expected, actual);
+    reordered["a"] = "host-c";
+    ASSERT_TRUE(hasher.GetStringMapSha256Hex(reordered, actual).IsOk());
+    EXPECT_NE(expected, actual);
+    ASSERT_TRUE(hasher.GetStringMapSha256Hex({}, actual).IsOk());
+    EXPECT_EQ(actual, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+}
+
+TEST(HasherTest, StringMapDigestLengthPrefixesPreventAmbiguity)
+{
+    Hasher hasher;
+    std::string first;
+    std::string second;
+    ASSERT_TRUE(hasher.GetStringMapSha256Hex({ { "a", "bc" } }, first).IsOk());
+    ASSERT_TRUE(hasher.GetStringMapSha256Hex({ { "ab", "c" } }, second).IsOk());
+    EXPECT_NE(first, second);
+    ASSERT_TRUE(hasher.GetStringMapSha256Hex({ { "", std::string("a\0b", 3) } }, first).IsOk());
+    ASSERT_TRUE(hasher.GetStringMapSha256Hex({ { std::string("\0a", 2), "b" } }, second).IsOk());
+    EXPECT_NE(first, second);
+}
+
 // --------------- GetHMACSha1 ---------------
 
 TEST(HasherTest, GetHMACSha1OutputLength)

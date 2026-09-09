@@ -26,6 +26,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <tbb/concurrent_hash_map.h>
@@ -170,6 +171,9 @@ public:
      */
     Status UpdateWorkerSnapshot(const WorkerSnapshot &snapshot);
 
+    /** @brief Renew matching confirmed-ring health without scheduling topology reconciliation. */
+    void RecordRoutingRefresh(uint64_t ringVersion);
+
     /**
      * @brief Remove cached worker entries that are absent from the current snapshot.
      * @param[in] snapshot Current reachable-worker snapshot.
@@ -190,10 +194,22 @@ protected:
 
 private:
     friend class ObjectMetadataClient;
+    friend class DataPlaneManagerAdmissionTestPeer;
 
     struct EndpointAdmissionSnapshot {
+        EndpointAdmissionSnapshot(uint64_t version, std::shared_ptr<const std::unordered_set<std::string>> workers,
+                                  bool isProvisional, int64_t confirmedMs)
+            : ringVersion(version), liveWorkers(std::move(workers)), provisional(isProvisional),
+              lastConfirmedMs(confirmedMs)
+        {
+        }
+
         uint64_t ringVersion;
         std::shared_ptr<const std::unordered_set<std::string>> liveWorkers;
+        bool provisional{ false };
+        int64_t lastConfirmedMs{ 0 };
+        // One grace window per confirmed-refresh generation; readers never rearm an expired window.
+        mutable std::atomic<int64_t> degradedDeadlineMs{ 0 };
     };
 
     struct WorkerTransportEntry {
@@ -226,6 +242,7 @@ private:
 
     Status GetOrCreateEntry(const std::string &workerKey, std::shared_ptr<WorkerTransportEntry> &entry,
                             bool requireSnapshotAdmission = true);
+    bool AllowDegradedEndpointAdmission(const EndpointAdmissionSnapshot &snapshot);
 
     Status GetOrCreateLocationEntry(const std::string &workerKey, uint64_t topologyVersion,
                                     std::shared_ptr<WorkerTransportEntry> &entry);
@@ -261,7 +278,6 @@ private:
                               TransportPhaseLatencyRecorder *recorder, std::shared_ptr<IDataTransporter> &out);
 
     EntryMap entries_;
-    std::shared_ptr<const std::unordered_set<std::string>> liveWorkers_;
     std::shared_ptr<const EndpointAdmissionSnapshot> endpointAdmissionSnapshot_;
     bthread::Mutex probeMutex_;
     std::vector<std::string> writeProbeWorkers_;

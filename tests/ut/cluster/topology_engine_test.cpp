@@ -1584,8 +1584,8 @@ TEST(TopologyEngineTest, CoordinatorTopologyWatchPublishesCompletePayloadWithout
     auto engine = BuildEngine(proxy, ingress, callbacks, "direct-topology-watch");
     DS_ASSERT_OK(engine->Start());
 
-    PutTopology(proxy, "direct-topology-watch", MakeTopology(3));
     proxy.FailRangeForKeyTimes(TopologyStorageKey(*keys), K_RPC_UNAVAILABLE, 100);
+    PutTopology(proxy, "direct-topology-watch", MakeTopology(3));
     DS_ASSERT_OK(EmitCompleteTopologyEvent(proxy, ingress, *keys, MakeTopology(3), 10));
     std::shared_ptr<const TopologySnapshot> snapshot;
     ASSERT_TRUE(WaitFor([&] {
@@ -1779,6 +1779,79 @@ TEST(TopologyEngineTest, ShutdownRejectsConcurrentStartWithoutCorruptingLifecycl
     ingress.ReleaseBind();
     DS_ASSERT_OK(start.get());
     DS_ASSERT_OK(engine->Shutdown(std::chrono::steady_clock::now() + TEST_WAIT));
+}
+
+TEST(TopologyEngineTest, GetRoutingHostIdsReadsPublishedSnapshotWithoutCoordinatorAccess)
+{
+    constexpr char CLUSTER_NAME[] = "host-id-from-snapshot";
+    testing::FakeCoordinatorServiceProxy proxy;
+    TestWatchIngress ingress;
+    NoopTopologyCallbacks callbacks;
+    PutTopology(proxy, CLUSTER_NAME, MakeTopology());
+    auto keys = MakeKeys(CLUSTER_NAME);
+    MembershipValue membership;
+    membership.lifecycleState = MemberLifecycleState::READY;
+    membership.hostId = "host-a";
+    std::string encoded;
+    DS_ASSERT_OK(MembershipValueCodec::Encode(membership, encoded));
+    DS_ASSERT_OK(proxy.PutRaw(keys->MembershipTable() + "/" + LOCAL_ADDRESS, encoded));
+
+    auto engine = BuildEngine(proxy, ingress, callbacks, CLUSTER_NAME);
+    ASSERT_NE(engine, nullptr);
+    DS_ASSERT_OK(TopologyEngineTestPeer::ReloadTopology(*engine));
+
+    // After the snapshot carries host ids, a coordinator membership read failure must not affect
+    // GetRoutingHostIds, which now serves from the local snapshot instead of re-reading the backend.
+    proxy.FailRangeForKeyTimes(keys->MembershipTable() + "/", K_RPC_UNAVAILABLE, 1);
+    std::unordered_map<std::string, std::string> hostIds;
+    DS_ASSERT_OK(engine->GetRoutingHostIds(hostIds));
+    ASSERT_EQ(hostIds.size(), 1UL);
+    EXPECT_EQ(hostIds.at(LOCAL_ADDRESS), "host-a");
+}
+
+TEST(TopologyEngineTest, HostIdsRecoverAtTheSameTopologyVersion)
+{
+    constexpr char CLUSTER_NAME[] = "host-id-recovery";
+    testing::FakeCoordinatorServiceProxy proxy;
+    TestWatchIngress ingress;
+    NoopTopologyCallbacks callbacks;
+    PutTopology(proxy, CLUSTER_NAME, MakeTopology());
+    const auto keys = MakeKeys(CLUSTER_NAME);
+    MembershipValue membership;
+    membership.lifecycleState = MemberLifecycleState::READY;
+    membership.hostId = "host-a";
+    std::string encoded;
+    DS_ASSERT_OK(MembershipValueCodec::Encode(membership, encoded));
+    DS_ASSERT_OK(proxy.PutRaw(keys->MembershipTable() + "/" + LOCAL_ADDRESS, encoded));
+    auto engine = BuildEngine(proxy, ingress, callbacks, CLUSTER_NAME);
+    ASSERT_NE(engine, nullptr);
+    proxy.FailRangeForKeyTimes(keys->MembershipTable() + "/", K_RPC_UNAVAILABLE, 1);
+    DS_ASSERT_OK(TopologyEngineTestPeer::ReloadTopology(*engine));
+    std::unordered_map<std::string, std::string> hostIds;
+    DS_ASSERT_OK(engine->GetRoutingHostIds(hostIds));
+    EXPECT_TRUE(hostIds.empty());
+    std::shared_ptr<const TopologySnapshot> first;
+    DS_ASSERT_OK(engine->GetSnapshot(first));
+
+    DS_ASSERT_OK(TopologyEngineTestPeer::ReloadTopology(*engine));
+    DS_ASSERT_OK(engine->GetRoutingHostIds(hostIds));
+    EXPECT_EQ(hostIds.at(LOCAL_ADDRESS), "host-a");
+    membership.hostId = "host-b";
+    DS_ASSERT_OK(MembershipValueCodec::Encode(membership, encoded));
+    DS_ASSERT_OK(proxy.PutRaw(keys->MembershipTable() + "/" + LOCAL_ADDRESS, encoded));
+    DS_ASSERT_OK(TopologyEngineTestPeer::ReloadTopology(*engine));
+    DS_ASSERT_OK(engine->GetRoutingHostIds(hostIds));
+    EXPECT_EQ(hostIds.at(LOCAL_ADDRESS), "host-b");
+    std::shared_ptr<const TopologySnapshot> latest;
+    DS_ASSERT_OK(engine->GetSnapshot(latest));
+    EXPECT_EQ(latest->Version(), first->Version());
+    EXPECT_EQ(latest->CanonicalDigest(), first->CanonicalDigest());
+
+    proxy.FailRangeForKeyTimes(keys->MembershipTable() + "/", K_RPC_UNAVAILABLE, 1);
+    DS_ASSERT_OK(engine->GetRoutingHostIds(hostIds));
+    DS_ASSERT_OK(TopologyEngineTestPeer::ReloadTopology(*engine));
+    DS_ASSERT_OK(engine->GetRoutingHostIds(hostIds));
+    EXPECT_EQ(hostIds.at(LOCAL_ADDRESS), "host-b");
 }
 
 }  // namespace

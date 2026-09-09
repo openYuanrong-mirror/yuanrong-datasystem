@@ -39,17 +39,33 @@ class HashAlgorithm;
 Status ValidateAndCanonicalizeTopologyState(TopologyState &state);
 
 class TopologySnapshot final {
+    class ConstructionKey {
+        friend class TopologySnapshot;
+        // A user-provided constructor prevents aggregate initialization from bypassing access checks in C++17.
+        ConstructionKey() {}
+
+    public:
+        ~ConstructionKey() = default;
+    };
+
 public:
+    // Only Create can supply the key, so make_shared cannot bypass state validation.
+    TopologySnapshot(ConstructionKey, TopologyState state, int64_t authorityRevision, std::string canonicalDigest,
+                     std::unordered_map<std::string, std::string> hostIds);
+
     /**
      * @brief Validate state and build address/id/token indexes.
      * @param[in] state Domain topology state to validate and consume.
      * @param[in] authorityRevision Revision of the authoritative exact read.
      * @param[in] canonicalDigest Digest of canonical topology bytes.
+     * @param[in] hostIds Worker-address to host-id map carried from the membership table; empty when unknown.
+     * @param[in] hostIdsRevision Membership read revision, or zero when the projection is unknown.
      * @param[out] snapshot New snapshot; unchanged on failure.
      * @return K_OK on success; K_INVALID for illegal state or evidence.
      */
     static Status Create(TopologyState state, int64_t authorityRevision, std::string canonicalDigest,
-                         std::shared_ptr<const TopologySnapshot> &snapshot);
+                         std::shared_ptr<const TopologySnapshot> &snapshot,
+                         std::unordered_map<std::string, std::string> hostIds = {}, int64_t hostIdsRevision = 0);
 
     ~TopologySnapshot() = default;
     TopologySnapshot(const TopologySnapshot &) = delete;
@@ -66,6 +82,23 @@ public:
      * @return Mutable state containing every cluster-level and member-level field.
      */
     TopologyState CopyState() const;
+
+    /**
+     * @brief Return the worker-address to host-id map carried from the membership table.
+     * @return Stable snapshot-lifetime map reference; empty when unknown.
+     */
+    const std::unordered_map<std::string, std::string> &HostIds() const noexcept;
+
+    const std::string &HostIdsDigest() const noexcept
+    {
+        return hostIdsDigest_;
+    }
+
+    // Zero means no successful membership read; it is distinct from a successfully read empty map.
+    int64_t HostIdsRevision() const noexcept
+    {
+        return hostIdsRevision_;
+    }
 
     /**
      * @brief Return the minimal active batch.
@@ -143,12 +176,14 @@ public:
 private:
     friend class HashAlgorithm;
 
-    TopologySnapshot(TopologyState state, int64_t authorityRevision, std::string canonicalDigest);
     void BuildIndexes();
 
     TopologyState state_;
     int64_t authorityRevision_{ 0 };
     std::string canonicalDigest_;
+    std::unordered_map<std::string, std::string> hostIds_;
+    int64_t hostIdsRevision_{ 0 };
+    std::string hostIdsDigest_;
     // Views reference immutable strings in state_.members and avoid duplicating every address/id in the indexes.
     std::unordered_map<std::string_view, size_t> addressIndex_;
     std::unordered_map<std::string_view, size_t> idIndex_;

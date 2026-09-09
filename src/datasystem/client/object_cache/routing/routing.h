@@ -23,6 +23,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -42,10 +43,13 @@ namespace client {
 
 class Routing {
 public:
+    static constexpr int64_t DEFAULT_REFRESH_INTERVAL_MS = 5'000;
+
     Routing(BrpcChannelConfig channelConfig, std::shared_ptr<Signature> signature,
             HashRingRefresher::RingUpdateHook ringUpdateHook = {},
             std::vector<std::shared_ptr<IWorkerFilter>> additionalFilters = {},
-            int64_t refreshIntervalMs = DEFAULT_REFRESH_INTERVAL_MS);
+            int64_t refreshIntervalMs = DEFAULT_REFRESH_INTERVAL_MS,
+            std::function<void(uint64_t)> refreshConfirmedHook = {});
 
     // Dependency-injection seam used by focused routing tests.
     Routing(std::shared_ptr<WorkerRouter> router, std::shared_ptr<HashRingRefresher> refresher,
@@ -75,11 +79,11 @@ private:
                          std::string &masterAddress, uint64_t &newVersion, bool &changed,
                          std::unordered_map<std::string, std::string> &hostIdMap, int32_t timeoutMs);
 
-    static constexpr int64_t DEFAULT_REFRESH_INTERVAL_MS = 5'000;
     std::shared_ptr<WorkerRouter> router_;
     std::shared_ptr<HashRingRefresher> refresher_;
     std::shared_ptr<RoutingRpcClient> rpcClient_;
     int64_t refreshIntervalMs_;
+    std::function<void(uint64_t)> refreshConfirmedHook_;
     HostPort initialWorkerAddr_;
     bool initialWorkerIsLocal_{ false };
     std::atomic<bool> hostIdResolutionAttempted_{ false };

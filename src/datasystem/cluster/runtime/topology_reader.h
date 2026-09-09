@@ -11,6 +11,7 @@
 
 #include <memory>
 #include <string>
+#include <unordered_map>
 
 #include "datasystem/cluster/model/topology_snapshot.h"
 #include "datasystem/cluster/repository/topology_repository.h"
@@ -43,30 +44,38 @@ public:
      */
     Status Read(int32_t timeoutMs, std::shared_ptr<const TopologySnapshot> &snapshot) const;
 
+    // Controller owns membership facts separately; topology reads must not trigger another membership Range.
+    Status ReadTopologyOnly(int32_t timeoutMs, std::shared_ptr<const TopologySnapshot> &snapshot) const;
+
     /**
      * @brief Conditionally exact-read and build an immutable Snapshot.
      * @param[in] timeoutMs Positive backend timeout in milliseconds.
-     * @param[in] knownAuthorityRevision Authority revision already held by the caller.
+     * @param[in] knownSnapshot Snapshot already held by the caller, including its membership projection.
      * @param[out] snapshot New Snapshot when changed; unchanged otherwise.
-     * @param[out] unchanged Whether topology still has knownAuthorityRevision.
+     * @param[out] unchanged Whether both topology and the membership projection are unchanged.
      * @return Repository, digest, or Snapshot validation status.
      */
-    Status ReadIfChanged(int32_t timeoutMs, int64_t knownAuthorityRevision,
+    Status ReadIfChanged(int32_t timeoutMs, const TopologySnapshot &knownSnapshot,
                          std::shared_ptr<const TopologySnapshot> &snapshot, bool &unchanged) const;
 
     /**
      * @brief Validate an encoded complete topology and build an immutable Snapshot.
      * @param[in] value Complete encoded topology value.
      * @param[in] authorityRevision Authority revision carried with the value.
+     * @param[in] hostIds Worker-address to host-id map read from the membership table.
      * @param[out] snapshot Snapshot unchanged on failure.
+     * @param[in] hostIdsRevision Membership read revision, or zero when the projection is unknown.
      * @return Decode, digest, or Snapshot validation status.
      */
     static Status BuildFromEncodedTopology(const std::string &value, int64_t authorityRevision,
-                                           std::shared_ptr<const TopologySnapshot> &snapshot);
+                                           std::unordered_map<std::string, std::string> hostIds,
+                                           std::shared_ptr<const TopologySnapshot> &snapshot,
+                                           int64_t hostIdsRevision = 0);
 
 private:
     static Status BuildFromState(TopologyState state, int64_t authorityRevision,
-                                 std::shared_ptr<const TopologySnapshot> &snapshot);
+                                 std::unordered_map<std::string, std::string> hostIds,
+                                 std::shared_ptr<const TopologySnapshot> &snapshot, int64_t hostIdsRevision);
 
     TopologyRepository &repository_;
 };

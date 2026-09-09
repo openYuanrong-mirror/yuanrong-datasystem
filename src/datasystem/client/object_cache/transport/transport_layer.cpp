@@ -1277,6 +1277,13 @@ Status TransportLayer::ApplyWorkerSnapshot(WorkerSnapshot snapshot)
     return Status::OK();
 }
 
+void TransportLayer::RecordRoutingRefresh(uint64_t ringVersion)
+{
+    if (manager_ != nullptr) {
+        manager_->RecordRoutingRefresh(ringVersion);
+    }
+}
+
 bool TransportLayer::WaitForSnapshotOrStop(std::unique_lock<bthread::Mutex> &lock)
 {
     // bthread::ConditionVariable has no predicate overloads and its wait_until takes a CLOCK_REALTIME

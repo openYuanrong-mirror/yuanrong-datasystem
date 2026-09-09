@@ -22,6 +22,7 @@
 #define DATASYSTEM_CLIENT_OBJECT_CACHE_OBJECT_CLIENT_IMPL_H
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -1047,9 +1048,13 @@ private:
 
     Status ApplyRoutingWorkerSnapshot(uint64_t ringVersion, const ::datasystem::ClusterTopologyPb &ring,
                                       const std::unordered_map<std::string, std::string> &hostIdMap,
-                                      const std::string &sdkHostId);
+                                      const std::string &sdkHostId, bool epochResetConfirmed = false);
 
     Status InitRouting(const HostPort &initialWorker, bool initialWorkerIsLocal);
+
+    void ResolveRoutingSdkHostId(const HostPort &initialWorker, bool initialWorkerIsLocal,
+                                 const std::unordered_map<std::string, std::string> &hostIdMap,
+                                 std::string &sdkHostId, bool &warned);
 
     Status InitDataPlacementPolicy();
 
@@ -1072,6 +1077,10 @@ private:
 
     static bool ShouldRefreshRoutingAfterFailure(StatusCode code);
 
+    void HandleMetadataOwnerFailure(const HostPort &owner, const Status &status);
+
+    bool ShouldForceRefreshRouting(
+        const HostPort &owner, std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now());
 
     void MaybeSwitchWorkerRemovedFromRing(const ::datasystem::ClusterTopologyPb &ring);
 
@@ -1327,6 +1336,9 @@ private:
     std::condition_variable perfCv_;
     std::atomic<bool> perfExitFlag_{ false };
     std::unique_ptr<Thread> perfThread_{ nullptr };
+    // Per-owner forced-refresh gate; expired entries are pruned past a bound so churn does not grow the map.
+    std::mutex forcedRefreshRateMutex_;
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> lastForcedRefreshAt_;
     std::mutex metricsMutex_;
     std::condition_variable metricsCv_;
     std::atomic<bool> metricsExitFlag_{ false };

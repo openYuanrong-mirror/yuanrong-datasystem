@@ -44,7 +44,7 @@ public:
     Status Init();
 
     Status GetHashRing(const HostPort &workerAddr, uint64_t currentVersion, GetHashRingRspPb &response,
-                       int32_t timeoutMs = 0);
+                       int32_t timeoutMs = 0, const std::string &hostIdsDigest = "");
 
     void Shutdown();
 

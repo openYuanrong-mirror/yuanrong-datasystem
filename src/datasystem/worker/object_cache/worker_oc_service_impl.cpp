@@ -207,22 +207,24 @@ Status BuildClusterTopologyPb(const cluster::TopologySnapshot &snapshot, ::datas
 }  // namespace
 
 Status BuildGetHashRingResponse(const cluster::TopologySnapshot &snapshot, uint64_t requestedVersion,
-                                const std::string &masterAddress, const RoutingHostIdLoader &loadHostIds,
-                                GetHashRingRspPb &rsp)
+                                const std::string &masterAddress, GetHashRingRspPb &rsp,
+                                const std::string &requestedHostIdsDigest)
 {
     rsp.Clear();
     rsp.set_version(snapshot.Version());
     rsp.set_master_address(masterAddress);
-    if (requestedVersion != 0 && requestedVersion == snapshot.Version()) {
+    rsp.set_host_ids_digest(snapshot.HostIdsDigest());
+    if (requestedVersion != 0 && requestedVersion == snapshot.Version()
+        && (requestedHostIdsDigest.empty() || requestedHostIdsDigest == snapshot.HostIdsDigest())) {
         rsp.set_hash_ring_changed(false);
         return Status::OK();
     }
 
     rsp.set_hash_ring_changed(true);
     RETURN_IF_NOT_OK(BuildClusterTopologyPb(snapshot, *rsp.mutable_hash_ring()));
-    CHECK_FAIL_RETURN_STATUS(static_cast<bool>(loadHostIds), K_NOT_READY,
-                             "Host ID loader is unavailable for hash ring refresh");
-    return loadHostIds(*rsp.mutable_host_id_map());
+    const auto &hostIds = snapshot.HostIds();
+    rsp.mutable_host_id_map()->insert(hostIds.begin(), hostIds.end());
+    return Status::OK();
 }
 
 static constexpr int DEBUG_LOG_LEVEL = 2;
@@ -3245,13 +3247,7 @@ Status WorkerOCServiceImpl::GetHashRing(const GetHashRingReqPb &req, GetHashRing
     RETURN_RUNTIME_ERROR_IF_NULL(topologyEngine_);
     std::shared_ptr<const cluster::TopologySnapshot> snapshot;
     RETURN_IF_NOT_OK(membership_.GetSnapshot(snapshot));
-    auto loadHostIds = [this](RoutingHostIdMap &hostIdMap) {
-        std::unordered_map<std::string, std::string> hostIds;
-        RETURN_IF_NOT_OK(topologyEngine_->GetRoutingHostIds(hostIds));
-        hostIdMap.insert(hostIds.begin(), hostIds.end());
-        return Status::OK();
-    };
-    return BuildGetHashRingResponse(*snapshot, req.version(), FLAGS_master_address, loadHostIds, rsp);
+    return BuildGetHashRingResponse(*snapshot, req.version(), FLAGS_master_address, rsp, req.host_ids_digest());
 }
 
 Status WorkerOCServiceImpl::DeleteDevObjects(const DeleteAllCopyReqPb &req, DeleteAllCopyRspPb &resp)

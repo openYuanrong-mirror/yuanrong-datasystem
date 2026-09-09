@@ -1391,5 +1391,123 @@ TEST(TransportLayerAdmissionTest, UbTransporterBusinessErrorWithoutLocalWriteEvi
 }
 
 }  // namespace
+
+class DataPlaneManagerAdmissionTestPeer {
+public:
+    static void SetLastConfirmedPublishMs(DataPlaneManager &manager, int64_t ms)
+    {
+        auto current = std::atomic_load(&manager.endpointAdmissionSnapshot_);
+        auto replacement = std::make_shared<const DataPlaneManager::EndpointAdmissionSnapshot>(
+            current->ringVersion, current->liveWorkers, current->provisional, ms);
+        std::atomic_store(&manager.endpointAdmissionSnapshot_, std::move(replacement));
+    }
+
+    static void SetDegradedAdmissionDeadlineMs(DataPlaneManager &manager, int64_t ms)
+    {
+        std::atomic_load(&manager.endpointAdmissionSnapshot_)->degradedDeadlineMs.store(ms);
+    }
+};
+
+TEST(DataPlaneManagerAdmissionTest, ProvisionalSnapshotDoesNotRejectAbsentWorker)
+{
+    auto manager = std::make_shared<FakeDataPlaneManager>();
+    ASSERT_TRUE(manager->Init().IsOk());
+    WorkerSnapshot snapshot;
+    snapshot.remoteTransportAddrs = { MakeAddress(60) };
+    snapshot.provisional = true;
+    ASSERT_TRUE(manager->UpdateWorkerSnapshot(snapshot).IsOk());
+
+    std::shared_ptr<IDataTransporter> out;
+    EXPECT_TRUE(manager->GetOrCreate(MakeAddress(61), TransportHint::TCP_ONLY, out).IsOk());
+}
+
+TEST(DataPlaneManagerAdmissionTest, HealthyRingRejectsAbsentWorker)
+{
+    auto manager = std::make_shared<FakeDataPlaneManager>();
+    ASSERT_TRUE(manager->Init().IsOk());
+    WorkerSnapshot snapshot;
+    snapshot.ringVersion = 1;
+    snapshot.remoteTransportAddrs = { MakeAddress(62) };
+    ASSERT_TRUE(manager->UpdateWorkerSnapshot(snapshot).IsOk());
+
+    std::shared_ptr<IDataTransporter> out;
+    EXPECT_EQ(manager->GetOrCreate(MakeAddress(63), TransportHint::TCP_ONLY, out).GetCode(), K_NOT_READY);
+}
+
+TEST(DataPlaneManagerAdmissionTest, LostRingDegradesAdmissionThenRestoresAfterTtl)
+{
+    auto manager = std::make_shared<FakeDataPlaneManager>();
+    ASSERT_TRUE(manager->Init().IsOk());
+    WorkerSnapshot snapshot;
+    snapshot.ringVersion = 1;
+    snapshot.remoteTransportAddrs = { MakeAddress(64) };
+    ASSERT_TRUE(manager->UpdateWorkerSnapshot(snapshot).IsOk());
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
+    DataPlaneManagerAdmissionTestPeer::SetLastConfirmedPublishMs(*manager, nowMs - 65'000);
+
+    std::shared_ptr<IDataTransporter> out;
+    EXPECT_TRUE(manager->GetOrCreate(MakeAddress(65), TransportHint::TCP_ONLY, out).IsOk());
+
+    DataPlaneManagerAdmissionTestPeer::SetDegradedAdmissionDeadlineMs(*manager, nowMs - 1);
+    out.reset();
+    EXPECT_EQ(manager->GetOrCreate(MakeAddress(65), TransportHint::TCP_ONLY, out).GetCode(), K_NOT_READY);
+}
+
+TEST(DataPlaneManagerAdmissionTest, MatchingRefreshRestoresStrictAdmissionAndRearmsOnlyAfterAnotherOutage)
+{
+    auto manager = std::make_shared<FakeDataPlaneManager>();
+    ASSERT_TRUE(manager->Init().IsOk());
+    WorkerSnapshot snapshot;
+    snapshot.ringVersion = 2;
+    snapshot.remoteTransportAddrs = { MakeAddress(66) };
+    ASSERT_TRUE(manager->UpdateWorkerSnapshot(snapshot).IsOk());
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now().time_since_epoch()).count();
+    DataPlaneManagerAdmissionTestPeer::SetLastConfirmedPublishMs(*manager, nowMs - 65'000);
+    std::shared_ptr<IDataTransporter> out;
+    EXPECT_TRUE(manager->GetOrCreate(MakeAddress(67), TransportHint::TCP_ONLY, out).IsOk());
+
+    manager->RecordRoutingRefresh(1);
+    EXPECT_TRUE(manager->GetOrCreate(MakeAddress(67), TransportHint::TCP_ONLY, out).IsOk());
+    manager->RecordRoutingRefresh(2);
+    EXPECT_EQ(manager->GetOrCreate(MakeAddress(67), TransportHint::TCP_ONLY, out).GetCode(), K_NOT_READY);
+
+    DataPlaneManagerAdmissionTestPeer::SetLastConfirmedPublishMs(*manager, nowMs - 65'000);
+    EXPECT_TRUE(manager->GetOrCreate(MakeAddress(67), TransportHint::TCP_ONLY, out).IsOk());
+    DataPlaneManagerAdmissionTestPeer::SetDegradedAdmissionDeadlineMs(*manager, nowMs - 1);
+    EXPECT_EQ(manager->GetOrCreate(MakeAddress(67), TransportHint::TCP_ONLY, out).GetCode(), K_NOT_READY);
+    EXPECT_EQ(manager->GetOrCreate(MakeAddress(68), TransportHint::TCP_ONLY, out).GetCode(), K_NOT_READY);
+}
+
+TEST(DataPlaneManagerAdmissionTest, ConfirmedPublicationRevokesAnInFlightGraceDecision)
+{
+    auto manager = std::make_shared<FakeDataPlaneManager>();
+    ASSERT_TRUE(manager->Init().IsOk());
+    WorkerSnapshot snapshot;
+    snapshot.ringVersion = 1;
+    snapshot.remoteTransportAddrs = { MakeAddress(69) };
+    ASSERT_TRUE(manager->UpdateWorkerSnapshot(snapshot).IsOk());
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now().time_since_epoch()).count();
+    DataPlaneManagerAdmissionTestPeer::SetLastConfirmedPublishMs(*manager, nowMs - 65'000);
+    constexpr char POINT[] = "DataPlaneManager.GetOrCreateEntry.afterDegradedAdmission";
+    ASSERT_TRUE(inject::Set(POINT, "1*pause()").IsOk());
+    Raii clearInject([&] { (void)inject::Clear(POINT); });
+    auto reader = std::async(std::launch::async, [&] {
+        std::shared_ptr<IDataTransporter> out;
+        return manager->GetOrCreate(MakeAddress(70), TransportHint::TCP_ONLY, out);
+    });
+    for (size_t retry = 0; retry < 2'000 && inject::GetExecuteCount(POINT) == 0; ++retry) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_GT(inject::GetExecuteCount(POINT), 0);
+    snapshot.ringVersion = 2;
+    EXPECT_TRUE(manager->UpdateWorkerSnapshot(snapshot).IsOk());
+    EXPECT_TRUE(inject::Clear(POINT).IsOk());
+    EXPECT_EQ(reader.get().GetCode(), K_NOT_READY);
+}
+
 }  // namespace client
 }  // namespace datasystem
