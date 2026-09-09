@@ -256,13 +256,5 @@ void MmapManager::CleanInvalidMmapTable()
     mmapTable_->CleanInvalidMmapTable();
 }
 
-void MmapManager::MarkVoluntaryScaleDown()
-{
-    bthread::RWLockRdGuard lck(mutex_);
-    auto *shmMmapTable = dynamic_cast<ShmMmapTable *>(mmapTable_.get());
-    if (shmMmapTable != nullptr) {
-        shmMmapTable->MarkVoluntaryScaleDown();
-    }
-}
 }  // namespace client
 }  // namespace datasystem

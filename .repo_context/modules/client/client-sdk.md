@@ -99,11 +99,10 @@
   - Routed same-host Get uses one endpoint-scoped SHM session per target Worker. Object metadata, reference acquisition,
     and `DecreaseReference` use the client-facing `WorkerOCService`; only fd-session bootstrap and control
     (`GetSocketPath`, `RegisterClient`, `GetClientFd`, `DisconnectClient`) use `WorkerService`.
-    A successful heartbeat reporting voluntary scale-down marks that Worker's current mmap entries before connection
-    cleanup. Their CUDA host-memory unregister loop skips the normal five-millisecond inter-fragment interval, while
-    restart, heartbeat failure, and other non-voluntary cleanup paths retain the interval.
-    Normal Object/KV/Stream Client shutdown also sets a Client-wide exit flag before SHM transport cleanup, so every
-    entry owned by that Client skips the unregister interval even when a Buffer delays entry destruction.
+    Voluntary scale-down, restart, heartbeat failure, and other Worker cleanup paths retain the normal five-millisecond
+    CUDA host-memory unregister interval. Normal Object/KV Client shutdown sets a Client-wide exit flag before SHM
+    transport cleanup, so every entry owned by that Client skips the unregister interval even when a Buffer delays entry
+    destruction.
     `ShmTransporter` never falls back to `WorkerWorkerOCService.GetObjectRemote` for an SHM candidate. Each session owns
     its fd-passing socket and private `MmapManager`, while returned Buffers retain a session/mmap owner that releases the
     reference to the actual data Worker. Session failure closes the socket so Worker client-lost cleanup resolves any
@@ -134,7 +133,8 @@
     destructor-driven unregistration cannot overlap. An mmap is usable immediately: KV `Create`/`MCreate` and both
     Buffer-returning `Get` variants expose the Worker SHM directly without waiting for registration or allocating a
     temporary Host buffer. Registration and unregistration divide each Worker mapping into fixed 64 MiB fragments
-    (with a smaller tail fragment when needed) and wait 5 ms between fragments. Client
+    (with a smaller tail fragment when needed) and wait 5 ms between fragments during normal Worker cleanup, including
+    voluntary scale-down. Object/KV Client shutdown skips the unregister interval. Client
     `DsCudaMemcpyAsync` splits H2D/D2H ranges at those planned fragment boundaries only when the Host pointer belongs to
     a Worker SHM mapping; other Host memory is submitted as one copy. The pin task retains the mmap entry, so shutdown
     cannot unpin or unmap it while registration is still running. Per-fragment register/unregister start and finish
@@ -708,7 +708,9 @@
     transport reconcile thread restores a quarantined target only after an exact Client-to-Worker UB WRITE probe and
     current topology-incarnation fencing succeed.
   - standby failover candidate order is randomized per switch attempt, so when one worker fails a batch of clients can spread across the remaining ready workers instead of stampeding to the first candidate in a shared list.
-  - preferred same-node Worker replacement stops and joins the retired listener outside the switch mutex before releasing its mmap manager; rejected candidates follow the same listener-before-manager teardown order because listener callbacks retain a raw manager pointer.
+  - preferred same-node Worker replacement moves the retired listener and mmap manager out while holding the switch
+    mutex, then lets them destruct after releasing the mutex so listener shutdown never joins while holding the switch
+    mutex.
   - after a standby switch publishes the new current worker, cleanup of the previous worker's mmap fds captured at switch commit runs immediately when that worker API has no pending invocations; otherwise cleanup is deferred until its invocation count reaches zero. Cleanup removes only the captured fds, so mappings added for another worker before the deferred callback runs are preserved.
   - Python `DsTensorClient` depends on `HeteroClient`; tensor features are not an independent transport stack.
 - Useful debug points:

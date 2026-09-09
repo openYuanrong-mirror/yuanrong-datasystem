@@ -50,16 +50,5 @@ Status ShmMmapTable::MmapAndStoreFd(const int &clientFd, const int &workerFd, co
     return Status::OK();
 }
 
-void ShmMmapTable::MarkVoluntaryScaleDown()
-{
-    bthread::RWLockRdGuard l(mutex_);
-    for (const auto &entry : mmapTable_) {
-        auto *shmEntry = dynamic_cast<ShmMmapTableEntry *>(entry.second.get());
-        if (shmEntry != nullptr) {
-            shmEntry->MarkVoluntaryScaleDown();
-        }
-    }
-}
-
 }  // namespace client
 }  // namespace datasystem

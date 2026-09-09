@@ -150,11 +150,6 @@ public:
      */
     void CleanInvalidMmapTable();
 
-    /**
-     * @brief Mark current mappings so their unpin skips the fragment interval during voluntary scale-down.
-     */
-    void MarkVoluntaryScaleDown();
-
 private:
     // Closes every non-negative fd in clientFds[fromIdx..]. Extracted from LookupUnitsAndMmapFds error
     // paths to keep that function within the codecheck nesting-depth limit.

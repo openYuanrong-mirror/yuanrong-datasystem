@@ -67,8 +67,6 @@ public:
 
     bool IsCudaHostMemoryRegistrationDone() const override;
 
-    void MarkVoluntaryScaleDown();
-
     bool Contains(const void *pointer) const;
 
     Status GetMemcpySegmentSizes(const void *pointer, size_t size, std::vector<size_t> &segmentSizes) const;
@@ -106,7 +104,6 @@ private:
     std::atomic<bool> pinCompleted_{ false };
     std::atomic<bool> pinAttempted_{ false };
     std::atomic<size_t> pinnedFragmentCount_{ 0 };
-    std::atomic<bool> voluntaryScaleDown_{ false };
 };
 }  // namespace client
 }  // namespace datasystem

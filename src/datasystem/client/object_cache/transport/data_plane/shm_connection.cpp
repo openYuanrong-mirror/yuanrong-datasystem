@@ -539,9 +539,6 @@ void ShmSession::Close(bool notifyWorker)
 void ShmSession::CloseForScaleIn()
 {
     scaleInDraining_->store(true, std::memory_order_release);
-    if (mmapManager_ != nullptr) {
-        mmapManager_->MarkVoluntaryScaleDown();
-    }
     Close(false);
     ScheduleDisconnect();
 }

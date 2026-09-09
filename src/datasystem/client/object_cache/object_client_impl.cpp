@@ -965,7 +965,6 @@ Status ObjectClientImpl::InitListenWorkerAt(WorkerNode node, bool isLocalWorker)
         listenWorker_[node]->SetWorkerTimeoutHandle([this] { failover_->ProcessWorkerTimeout(); });
         listenWorker_[node]->SetReleaseFdCallBack(
             [this](const std::vector<int64_t> &fds) { mmapManager_->ClearExpiredFds(fds); });
-        listenWorker_[node]->SetVoluntaryScaleDownHandle([this] { mmapManager_->MarkVoluntaryScaleDown(); });
     } else {
         listenWorker_[node]->AddRecoveryCallback(
             this,
