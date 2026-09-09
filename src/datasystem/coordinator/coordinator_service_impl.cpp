@@ -155,6 +155,29 @@ Status ReadMembershipRecord(CoordinatorStore &store, const std::string &physical
     return Status::OK();
 }
 
+Status ValidateTopologyCoordinationRange(const ParsedTopologyCoordinationKey &parsed, const std::string &key,
+                                         const std::string &rangeEnd, bool allowKeyspaceRange)
+{
+    const bool keyspaceRange =
+        allowKeyspaceRange && parsed.relativeKey.empty() && rangeEnd == StringPlusOne(key);
+    CHECK_FAIL_RETURN_STATUS(rangeEnd.empty() || keyspaceRange,
+                             K_INVALID, "topology coordination range crosses a keyspace boundary");
+    return Status::OK();
+}
+
+Status ValidateTopologyCoordinationMutationKey(const ParsedTopologyCoordinationKey &parsed)
+{
+    CHECK_FAIL_RETURN_STATUS(parsed.kind == TopologyCoordinationKeyKind::TOPOLOGY || !parsed.relativeKey.empty(),
+                             K_INVALID, "topology collection root cannot be mutated as an exact key");
+    return Status::OK();
+}
+
+bool UsesLeadershipOnlyAdmission(TopologyCoordinationKeyKind kind)
+{
+    return kind == TopologyCoordinationKeyKind::EVICTION_POLICY_ROLLOUT
+           || kind == TopologyCoordinationKeyKind::MASTER_ADDRESS;
+}
+
 bool BuildEnsureMembershipPhysicalKey(const EnsureLeaderMembershipReqPb &req, std::string &physicalKey)
 {
     std::unique_ptr<cluster::TopologyKeyHelper> keys;
@@ -219,7 +242,7 @@ CoordinatorServiceImpl::CoordinatorServiceImpl(const HostPort &localAddress,
 CoordinatorServiceImpl::~CoordinatorServiceImpl() noexcept
 {
     (void)Shutdown();
-    servingState_.store(ServingState::STOPPED, std::memory_order_release);
+    lifecycleState_.store(LifecycleState::STOPPED, std::memory_order_release);
 }
 
 bool CoordinatorServiceImpl::IsElectionConfigured() const noexcept
@@ -260,59 +283,74 @@ CoordinatorRaftEventCallbacks CoordinatorServiceImpl::BuildRaftEventCallbacks()
     return callbacks;
 }
 
-Status CoordinatorServiceImpl::CheckServing() const
+Status CoordinatorServiceImpl::PrepareResponseHeader(ResponseHeader *header) const
 {
-    switch (servingState_.load(std::memory_order_acquire)) {
-        case ServingState::CREATED:
-            return Status(K_NOT_READY, "Coordinator service is not initialized");
-        case ServingState::INITIALIZED:
-            return Status(K_NOT_READY, "Coordinator service is initialized but has not started");
-        case ServingState::STARTING:
-            return Status(K_NOT_READY, "Coordinator service is starting and not ready to serve requests");
-        case ServingState::FOLLOWER_SERVING:
-            return Status(K_NOT_READY, "Coordinator is not the active Leader");
-        case ServingState::LEADER_RECOVERING:
-            return Status(K_NOT_READY, "Coordinator Leader is recovering topology state");
-        case ServingState::LEADER_SERVING: {
-            // Raft can revoke local leadership before its stop callback closes the service state gate.
-            std::lock_guard<std::mutex> lock(lifecycleMutex_);
-            if (IsElectionConfigured() && (electionManager_ == nullptr || !electionManager_->IsLeader())) {
-                return Status(K_NOT_READY, "Coordinator is not the active Leader");
-            }
-            return Status::OK();
-        }
-        case ServingState::STOPPING:
-            return Status(K_SHUTTING_DOWN, "Coordinator service is shutting down");
-        case ServingState::STOPPED:
-            return Status(K_SHUTTING_DOWN, "Coordinator service is stopped");
+    CHECK_FAIL_RETURN_STATUS(header != nullptr, K_INVALID, "response header is null");
+    header->Clear();
+    CoordinatorLeadershipSnapshot snapshot;
+    RETURN_IF_NOT_OK(GetLeadershipSnapshot(snapshot));
+
+    if (snapshot.isLeader && IsElectionConfigured()) {
+        const auto publishedTerm = leaderTerm_.load(std::memory_order_acquire);
+        CHECK_FAIL_RETURN_STATUS(publishedTerm != 0 && publishedTerm == snapshot.term, K_NOT_READY,
+                                 "Coordinator Leader callback has not published the observed term");
     }
-    return Status(K_NOT_READY, "Coordinator service is in an unknown serving state");
+    header->set_coordinator_id(coordinatorId_);
+    header->set_leader_term(snapshot.term);
+    if (!snapshot.isLeader) {
+        header->set_state(ResponseHeader::NOT_LEADER);
+        header->set_leader_address(std::move(snapshot.leaderAddress));
+        return Status::OK();
+    }
+    header->set_state(ResponseHeader::SERVING);
+    return Status::OK();
 }
 
-Status CoordinatorServiceImpl::PrepareRpcResponse(bool allowLeaderRecovering, ResponseHeader *header,
-                                                  bool &businessAllowed) const
+Status CoordinatorServiceImpl::PrepareResponseHeader(const std::string &clusterName, ResponseHeader *header) const
 {
-    FillResponseHeader(header);
-    const auto servingStatus = CheckServing();
-    businessAllowed = servingStatus.IsOk();
-    if (businessAllowed) {
+    RETURN_IF_NOT_OK(PrepareResponseHeader(header));
+    if (header->state() != ResponseHeader::SERVING) {
+        return Status::OK();
+    }
+    if (!IsElectionConfigured()) {
+        // A single-node non-election Coordinator never switches Leaders and has no competing authorities, so the
+        // per-cluster topology recovery gate does not apply; the base header already reports SERVING.
         return Status::OK();
     }
 
-    // A recovering Leader is the recovery-control route. A Follower is routable only with an explicit redirect.
-    // No known Leader and lifecycle states preserve their original failure status.
-    const auto state = servingState_.load(std::memory_order_acquire);
-    if (IsElectionConfigured() && state == ServingState::LEADER_RECOVERING) {
-        if (allowLeaderRecovering) {
-            businessAllowed = true;
-        }
+    TopologyRecoveryState recoveryState;
+#ifdef WITH_TESTS
+    if (recoveryStateProvider_) {
+        recoveryState = recoveryStateProvider_(clusterName);
+    } else {
+#endif
+        CHECK_FAIL_RETURN_STATUS(topologyRecoveryManager_ != nullptr, K_NOT_READY,
+                                 "topology recovery manager is not bound");
+        recoveryState = topologyRecoveryManager_->GetState(clusterName);
+#ifdef WITH_TESTS
+    }
+#endif
+    switch (recoveryState) {
+        case TopologyRecoveryState::READY:
+            return Status::OK();
+        case TopologyRecoveryState::RECOVERING:
+        case TopologyRecoveryState::INSTALLING:
+        case TopologyRecoveryState::BLOCKED:
+            header->set_state(ResponseHeader::RECOVERING);
+            return Status::OK();
+    }
+    return Status(K_RUNTIME_ERROR, "topology recovery manager returned an unknown state");
+}
+
+Status CoordinatorServiceImpl::RequireTopologyRecoveryManager() const
+{
+    if (topologyRecoveryManager_ != nullptr) {
         return Status::OK();
     }
-    if (IsElectionConfigured() && state == ServingState::FOLLOWER_SERVING && header != nullptr
-        && !header->leader_address().empty()) {
-        return Status::OK();
-    }
-    return servingStatus;
+    CHECK_FAIL_RETURN_STATUS(
+        lifecycleState_.load(std::memory_order_acquire) != LifecycleState::STOPPED, K_SHUTTING_DOWN,
+        "Coordinator recovery manager is unavailable during shutdown");
+    RETURN_STATUS(K_NOT_READY, "Coordinator service is not ready to report leadership");
 }
 
 Status CoordinatorServiceImpl::RequireRecoveryLeader(uint64_t term, std::string_view coordinatorId) const
@@ -322,9 +360,6 @@ Status CoordinatorServiceImpl::RequireRecoveryLeader(uint64_t term, std::string_
     if (!IsElectionConfigured()) {
         return Status::OK();
     }
-    const auto state = servingState_.load(std::memory_order_acquire);
-    CHECK_FAIL_RETURN_STATUS(state == ServingState::LEADER_RECOVERING || state == ServingState::LEADER_SERVING,
-                             K_NOT_READY, "Coordinator is not the active Leader");
     CHECK_FAIL_RETURN_STATUS(leaderTerm_.load(std::memory_order_acquire) == term, K_TRY_AGAIN,
                              "Coordinator recovery request has a stale term");
     return Status::OK();
@@ -332,12 +367,13 @@ Status CoordinatorServiceImpl::RequireRecoveryLeader(uint64_t term, std::string_
 
 bool CoordinatorServiceImpl::IsCurrentLeaderRound(uint64_t term, std::string_view coordinatorId) const
 {
+    if (lifecycleState_.load(std::memory_order_acquire) != LifecycleState::RUNNING) {
+        return false;
+    }
     if (!IsElectionConfigured()) {
         return term == 0 && coordinatorId == coordinatorId_;
     }
-    const auto state = servingState_.load(std::memory_order_acquire);
-    return coordinatorId == coordinatorId_ && leaderTerm_.load(std::memory_order_acquire) == term
-           && (state == ServingState::LEADER_RECOVERING || state == ServingState::LEADER_SERVING);
+    return coordinatorId == coordinatorId_ && leaderTerm_.load(std::memory_order_acquire) == term && IsLeader();
 }
 
 void CoordinatorServiceImpl::OnLeaderStart(int64_t term)
@@ -346,132 +382,35 @@ void CoordinatorServiceImpl::OnLeaderStart(int64_t term)
         return;
     }
     const auto leaderTerm = static_cast<uint64_t>(term);
-    {
-        std::unique_lock<std::shared_mutex> operationLock(leaderOperationMutex_);
-        const auto state = servingState_.load(std::memory_order_acquire);
-        if (state != ServingState::STARTING && state != ServingState::FOLLOWER_SERVING) {
-            return;
-        }
-        leaderTerm_.store(leaderTerm, std::memory_order_release);
-        servingState_.store(ServingState::LEADER_RECOVERING, std::memory_order_release);
-        recoveryTraceId_ = Trace::Instance().GetTraceID();
-        if (recoveryTraceId_.empty()) {
-            recoveryTraceId_ = "CoordinatorRecovery;" + GetStringUuid();
-        }
-        if (topologyRecoveryManager_ != nullptr) {
-            topologyRecoveryManager_->BeginLeaderRound({ leaderTerm, coordinatorId_ });
-        }
+    std::unique_lock<std::shared_mutex> operationLock(leaderOperationMutex_);
+    if (lifecycleState_.load(std::memory_order_acquire) == LifecycleState::STOPPED
+        || leaderTerm_.load(std::memory_order_acquire) != 0) {
+        return;
     }
-
-    // The recovery timeout bounds late reports; it must not delay a round with no pending recovery work.
-    CompleteRecoveryWindow(leaderTerm);
-    recoveryGateCv_.notify_all();
+    leaderTerm_.store(leaderTerm, std::memory_order_release);
+    if (topologyRecoveryManager_ != nullptr) {
+        topologyRecoveryManager_->BeginLeaderRound({ leaderTerm, coordinatorId_ },
+                                                   std::chrono::seconds(FLAGS_node_dead_timeout_s));
+    }
 }
 
 void CoordinatorServiceImpl::OnLeaderStop(const Status &status)
 {
     std::unique_lock<std::shared_mutex> operationLock(leaderOperationMutex_);
     const uint64_t leaderTerm = leaderTerm_.exchange(0, std::memory_order_acq_rel);
-    const auto state = servingState_.load(std::memory_order_acquire);
-    if (IsElectionConfigured() && (state == ServingState::LEADER_RECOVERING || state == ServingState::LEADER_SERVING)) {
-        servingState_.store(ServingState::FOLLOWER_SERVING, std::memory_order_release);
-    }
     if (topologyRecoveryManager_ != nullptr && leaderTerm != 0) {
         topologyRecoveryManager_->EndLeaderRound({ leaderTerm, coordinatorId_ });
     }
-    recoveryTraceId_.clear();
-    recoveryGateCv_.notify_all();
     LOG(WARNING) << "CLUSTER_COORDINATOR_LEADER_STOP status=" << status.ToString();
-}
-
-void CoordinatorServiceImpl::RunRecoveryGate()
-{
-    std::unique_lock<std::mutex> lock(recoveryGateMutex_);
-    while (!recoveryGateStopping_) {
-        recoveryGateCv_.wait(lock, [this] {
-            return recoveryGateStopping_
-                   || servingState_.load(std::memory_order_acquire) == ServingState::LEADER_RECOVERING;
-        });
-        if (recoveryGateStopping_) {
-            break;
-        }
-        const uint64_t term = leaderTerm_.load(std::memory_order_acquire);
-        auto delay = std::chrono::seconds(FLAGS_node_dead_timeout_s);
-        while (!recoveryGateStopping_
-               && servingState_.load(std::memory_order_acquire) == ServingState::LEADER_RECOVERING
-               && leaderTerm_.load(std::memory_order_acquire) == term) {
-            if (recoveryGateCv_.wait_for(lock, delay, [this, term] {
-                    return recoveryGateStopping_
-                           || servingState_.load(std::memory_order_acquire) != ServingState::LEADER_RECOVERING
-                           || leaderTerm_.load(std::memory_order_acquire) != term;
-                })) {
-                break;
-            }
-            lock.unlock();
-            CompleteRecoveryWindow(term);
-            lock.lock();
-            delay = std::chrono::seconds(1);
-        }
-    }
-}
-
-void CoordinatorServiceImpl::StopRecoveryGate()
-{
-    {
-        std::lock_guard<std::mutex> lock(recoveryGateMutex_);
-        recoveryGateStopping_ = true;
-    }
-    recoveryGateCv_.notify_all();
-    if (recoveryGateThread_.joinable()) {
-        recoveryGateThread_.join();
-    }
-}
-
-void CoordinatorServiceImpl::CompleteRecoveryWindow(uint64_t term)
-{
-    std::unique_lock<std::shared_mutex> operationLock(leaderOperationMutex_);
-    TraceGuard traceGuard(TraceGuardType::INVALID);
-    if (Trace::Instance().GetTraceID().empty()) {
-        traceGuard = Trace::Instance().SetTraceNewID(recoveryTraceId_);
-    }
-#ifdef WITH_TESTS
-    if (recoveryWindowTraceHook_) {
-        recoveryWindowTraceHook_();
-    }
-#endif
-    if (topologyRecoveryManager_ == nullptr) {
-        return;
-    }
-    const auto summary = topologyRecoveryManager_->GetRoundSummary();
-    if (servingState_.load(std::memory_order_acquire) != ServingState::LEADER_RECOVERING
-        || leaderTerm_.load(std::memory_order_acquire) != term) {
-        return;
-    }
-    if (summary.AllDiscoveredClustersReady()) {
-        servingState_.store(ServingState::LEADER_SERVING, std::memory_order_release);
-        LOG(INFO) << "CLUSTER_COORDINATOR_RECOVERY_COMPLETE term=" << term
-                  << ", discovered_clusters=" << summary.contextCount;
-    } else {
-        const int logTimeLimit = 30;
-        LOG_EVERY_T(ERROR, logTimeLimit)
-            << "CLUSTER_COORDINATOR_RECOVERY_BLOCKED term=" << term << ", recovering=" << summary.recoveringCount
-            << ", installing=" << summary.installingCount << ", blocked=" << summary.blockedCount;
-    }
 }
 
 Status CoordinatorServiceImpl::Init()
 {
-    return Init(false);
-}
-
-Status CoordinatorServiceImpl::Init(bool publishStarting)
-{
     std::unique_lock<std::mutex> lock(lifecycleMutex_);
-    const auto state = servingState_.load(std::memory_order_acquire);
-    if (state == ServingState::STOPPING || state == ServingState::STOPPED) {
+    if (lifecycleState_.load(std::memory_order_acquire) == LifecycleState::STOPPED) {
         return Status(K_SHUTTING_DOWN, "Coordinator service cannot initialize after shutdown has started");
     }
-    if (state != ServingState::CREATED) {
+    if (initialized_) {
         return Status(K_INVALID, "Coordinator service can only be initialized once");
     }
     Status initStatus = InitInternal();
@@ -479,8 +418,7 @@ Status CoordinatorServiceImpl::Init(bool publishStarting)
         LOG_IF_ERROR(ShutdownInternal(lock), "Coordinator cleanup after initialization failure also failed");
         return initStatus;
     }
-    servingState_.store(publishStarting ? ServingState::FOLLOWER_SERVING : ServingState::INITIALIZED,
-                        std::memory_order_release);
+    initialized_ = true;
     return initStatus;
 }
 
@@ -495,12 +433,6 @@ Status CoordinatorServiceImpl::InitInternal()
               << BytesUuidToString(coordinatorId_).substr(0, COORDINATOR_ID_LOG_PREFIX_SIZE) << " state=created";
     RETURN_IF_NOT_OK(RpcStubCacheMgr::Instance().Init(FLAGS_coordinator_rpc_stub_cache_size, coordinatorAddr_));
     RETURN_IF_NOT_OK(BuildComponentTree());
-    try {
-        recoveryGateThread_ = Thread(&CoordinatorServiceImpl::RunRecoveryGate, this);
-        recoveryGateThread_.set_name("coord-recovery");
-    } catch (const std::exception &error) {
-        RETURN_STATUS(K_RUNTIME_ERROR, std::string("start Coordinator recovery gate failed: ") + error.what());
-    }
     ConfigureRpcService();
     return Status::OK();
 }
@@ -537,12 +469,11 @@ void CoordinatorServiceImpl::ConfigureTopologyHostOptions(TopologyControlHost::O
 std::optional<uint64_t> CoordinatorServiceImpl::GetCollectiveControlEpoch() const
 {
     std::shared_lock<std::shared_mutex> leaderLock(leaderOperationMutex_);
-    const auto state = servingState_.load(std::memory_order_acquire);
+    const auto state = lifecycleState_.load(std::memory_order_acquire);
     if (!IsElectionConfigured()) {
-        return state == ServingState::STOPPING || state == ServingState::STOPPED ? std::nullopt
-                                                                                 : std::optional<uint64_t>{ 1 };
+        return state == LifecycleState::STOPPED ? std::nullopt : std::optional<uint64_t>{ 1 };
     }
-    if ((state != ServingState::LEADER_RECOVERING && state != ServingState::LEADER_SERVING) || !IsLeader()) {
+    if (state != LifecycleState::RUNNING || !IsLeader()) {
         return std::nullopt;
     }
     const auto term = leaderTerm_.load(std::memory_order_acquire);
@@ -553,17 +484,15 @@ Status CoordinatorServiceImpl::RunUnderCollectiveReplacementFence(
     uint64_t expectedEpoch, const std::function<Status()> &mutation) const
 {
     std::shared_lock<std::shared_mutex> leaderLock(leaderOperationMutex_);
-    const auto state = servingState_.load(std::memory_order_acquire);
+    const auto state = lifecycleState_.load(std::memory_order_acquire);
     if (!IsElectionConfigured()) {
-        CHECK_FAIL_RETURN_STATUS(
-            expectedEpoch == 1 && state != ServingState::STOPPING && state != ServingState::STOPPED, K_NOT_READY,
-            "Coordinator collective control epoch is stale");
+        CHECK_FAIL_RETURN_STATUS(expectedEpoch == 1 && state != LifecycleState::STOPPED, K_NOT_READY,
+                                 "Coordinator collective control epoch is stale");
         return mutation();
     }
-    CHECK_FAIL_RETURN_STATUS(
-        expectedEpoch != 0 && leaderTerm_.load(std::memory_order_acquire) == expectedEpoch
-            && (state == ServingState::LEADER_RECOVERING || state == ServingState::LEADER_SERVING) && IsLeader(),
-        K_NOT_READY, "Coordinator collective control term is stale");
+    CHECK_FAIL_RETURN_STATUS(expectedEpoch != 0 && state == LifecycleState::RUNNING
+                                 && leaderTerm_.load(std::memory_order_acquire) == expectedEpoch && IsLeader(),
+                             K_NOT_READY, "Coordinator collective control term is stale");
     return mutation();
 }
 
@@ -637,7 +566,8 @@ Status CoordinatorServiceImpl::BuildComponentTree()
             return IsCurrentLeaderRound(identity.leaderTerm, identity.coordinatorId);
         });
     if (!IsElectionConfigured()) {
-        topologyRecoveryManager_->BeginLeaderRound({ 0, coordinatorId_ });
+        topologyRecoveryManager_->BeginLeaderRound({ 0, coordinatorId_ },
+                                                   std::chrono::seconds(FLAGS_node_dead_timeout_s));
     }
     store_->SetCommittedMutationObserver(
         [this](WatchEvent::Type type, const std::string &key) { HandleCommittedMutation(type, key); });
@@ -657,20 +587,17 @@ void CoordinatorServiceImpl::HandleCommittedMutation(WatchEvent::Type type, cons
         return;
     }
     if (parsed.kind == TopologyCoordinationKeyKind::MEMBERSHIP) {
-        HandleCommittedMembershipMutation(key);
+        HandleCommittedMembershipMutation(key, parsed);
     }
     if (topologyControlHost_ != nullptr) {
         topologyControlHost_->NotifyStoreMutation(type, parsed);
     }
 }
 
-void CoordinatorServiceImpl::HandleCommittedMembershipMutation(const std::string &key)
+void CoordinatorServiceImpl::HandleCommittedMembershipMutation(const std::string &key,
+                                                               const ParsedTopologyCoordinationKey &parsed)
 {
-    if (topologyRecoveryManager_ == nullptr || store_ == nullptr) {
-        return;
-    }
-    ParsedTopologyCoordinationKey parsed;
-    if (topologyRecoveryManager_->ParseKey(key, parsed).IsError()
+    if (topologyRecoveryManager_ == nullptr || store_ == nullptr
         || parsed.kind != TopologyCoordinationKeyKind::MEMBERSHIP) {
         return;
     }
@@ -682,9 +609,19 @@ void CoordinatorServiceImpl::HandleCommittedMembershipMutation(const std::string
         LOG(WARNING) << "CLUSTER_MEMBERSHIP_OBSERVER_READ_FAILED, key=" << key << ", status=" << rangeStatus.ToString();
         return;
     }
-    const bool present = !current.empty();
-    topologyRecoveryManager_->ObserveMembershipChange(key, present);
-    if (!present && watchDispatcher_ != nullptr) {
+    std::optional<cluster::MemberLifecycleState> lifecycleState;
+    if (!current.empty()) {
+        cluster::MembershipValue value;
+        auto decodeStatus = cluster::MembershipValueCodec::Decode(current.front().value, value);
+        if (decodeStatus.IsError()) {
+            LOG(WARNING) << "CLUSTER_MEMBERSHIP_OBSERVER_DECODE_FAILED, key=" << key
+                         << ", status=" << decodeStatus.ToString();
+            return;
+        }
+        lifecycleState = value.lifecycleState;
+    }
+    topologyRecoveryManager_->ObserveMembershipChange(key, lifecycleState);
+    if (!lifecycleState.has_value() && watchDispatcher_ != nullptr) {
         std::unique_ptr<cluster::TopologyKeyHelper> keys;
         if (cluster::TopologyKeyHelper::Create(parsed.clusterName, keys).IsOk()) {
             const std::vector<std::string> scopes = {
@@ -713,34 +650,29 @@ void CoordinatorServiceImpl::ConfigureRpcService()
 Status CoordinatorServiceImpl::FinishSuccessfulStart()
 {
     const auto listenAddress = coordinatorAddr_.ToString();
-    Status readyStatus = Status::OK();
     LOG(INFO) << "datasystem coordinator started at " << listenAddress << " (brpc)";
-    if (IsElectionConfigured()) {
-        auto expected = ServingState::STARTING;
-        servingState_.compare_exchange_strong(expected, ServingState::FOLLOWER_SERVING, std::memory_order_acq_rel);
-    } else {
-        servingState_.store(ServingState::LEADER_SERVING, std::memory_order_release);
-    }
-    return readyStatus;
+    lifecycleState_.store(LifecycleState::RUNNING, std::memory_order_release);
+    return Status::OK();
 }
 
 Status CoordinatorServiceImpl::Start()
 {
     std::unique_lock<std::mutex> lock(lifecycleMutex_);
-    const auto state = servingState_.load(std::memory_order_acquire);
-    if (state == ServingState::CREATED) {
-        return Status(K_NOT_READY, "Coordinator service must be initialized before it can start");
-    }
-    if (state == ServingState::STOPPING || state == ServingState::STOPPED) {
+    if (lifecycleState_.load(std::memory_order_acquire) == LifecycleState::STOPPED) {
         return Status(K_SHUTTING_DOWN, "Coordinator service cannot start after shutdown has started");
     }
-    if (state != ServingState::INITIALIZED) {
+    if (!initialized_) {
+        return Status(K_NOT_READY, "Coordinator service must be initialized before it can start");
+    }
+    if (rpcStartInProgress_ || rpcStarted_) {
         return Status(K_INVALID, "Coordinator service is already starting or running");
     }
-    servingState_.store(ServingState::STARTING, std::memory_order_release);
+    rpcStartInProgress_ = true;
 
     Status startStatus = StartInternal();
+    rpcStartInProgress_ = false;
     if (startStatus.IsOk()) {
+        rpcStarted_ = true;
         return IsElectionConfigured() ? startStatus : FinishSuccessfulStart();
     }
     LOG_IF_ERROR(ShutdownInternal(lock), "Coordinator cleanup after startup failure also failed");
@@ -794,17 +726,16 @@ Status CoordinatorServiceImpl::StartElectionManager()
 {
     {
         std::lock_guard<std::mutex> lock(lifecycleMutex_);
-        const auto state = servingState_.load(std::memory_order_acquire);
-        if (state == ServingState::STOPPING || state == ServingState::STOPPED) {
+        if (lifecycleState_.load(std::memory_order_acquire) == LifecycleState::STOPPED) {
             return Status(K_SHUTTING_DOWN, "Coordinator election manager cannot start after shutdown has started");
         }
         if (!IsElectionConfigured()) {
             return Status::OK();
         }
-        if (state == ServingState::CREATED || state == ServingState::INITIALIZED) {
+        if (!rpcStarted_) {
             return Status(K_NOT_READY, "Coordinator RPC services must be started before the election manager");
         }
-        if (state != ServingState::STARTING) {
+        if (lifecycleState_.load(std::memory_order_acquire) == LifecycleState::RUNNING) {
             return Status(K_INVALID, "Coordinator election manager is already running");
         }
         if (electionStartAttempted_ || electionStartInProgress_) {
@@ -834,93 +765,98 @@ Status CoordinatorServiceImpl::StartElectionManager()
     }
 
     if (startStatus.IsOk()) {
-        std::lock_guard<std::mutex> lock(lifecycleMutex_);
-        startStatus = FinishSuccessfulStart();
-    }
-
-    if (startStatus.IsError()) {
-        std::unique_ptr<CoordinatorElectionManager> failedManager;
         {
             std::lock_guard<std::mutex> lock(lifecycleMutex_);
-            failedManager = std::move(electionManager_);
+            startStatus = FinishSuccessfulStart();
+            electionStartInProgress_ = false;
         }
-        const auto cleanupStatus = ShutdownElectionManager(std::move(failedManager));
-        if (cleanupStatus.IsError()) {
-            LOG(ERROR) << "Coordinator election manager cleanup after startup failure also failed, status="
-                       << cleanupStatus.ToString();
-        }
+        lifecycleCv_.notify_all();
+        return startStatus;
     }
 
+    std::unique_ptr<CoordinatorElectionManager> failedManager;
     {
         std::lock_guard<std::mutex> lock(lifecycleMutex_);
-        electionStartInProgress_ = false;
+        failedManager = std::move(electionManager_);
     }
-    lifecycleCv_.notify_all();
+    const auto cleanupStatus = ShutdownElectionManager(std::move(failedManager));
+    if (cleanupStatus.IsError()) {
+        LOG(ERROR) << "Coordinator election manager cleanup after startup failure also failed, status="
+                   << cleanupStatus.ToString();
+    }
+
+    std::unique_lock<std::mutex> lock(lifecycleMutex_);
+    electionStartInProgress_ = false;
+    LOG_IF_ERROR(ShutdownInternal(lock), "Coordinator cleanup after election startup failure also failed");
     return startStatus;
+}
+
+Status CoordinatorServiceImpl::GetLeadershipSnapshot(CoordinatorLeadershipSnapshot &snapshot) const
+{
+    snapshot = {};
+    std::lock_guard<std::mutex> lock(lifecycleMutex_);
+    const auto state = lifecycleState_.load(std::memory_order_acquire);
+    if (state == LifecycleState::CREATED) {
+        return Status(K_NOT_READY, "Coordinator service is not ready to report leadership");
+    }
+    if (state == LifecycleState::STOPPED) {
+        return Status(K_SHUTTING_DOWN, "Coordinator service cannot report leadership during shutdown");
+    }
+#ifdef WITH_TESTS
+    if (leadershipSnapshotProvider_) {
+        return leadershipSnapshotProvider_(snapshot);
+    }
+#endif
+    if (!IsElectionConfigured()) {
+        snapshot.isLeader = true;
+        return Status::OK();
+    }
+    if (electionManager_ == nullptr) {
+        return Status(K_NOT_READY, "Coordinator election manager is not running");
+    }
+
+    CoordinatorLeadershipSnapshot observedSnapshot;
+    const auto status = electionManager_->GetLeadershipSnapshot(observedSnapshot);
+    if (status.IsError()) {
+        return status;
+    }
+    snapshot = std::move(observedSnapshot);
+    return Status::OK();
 }
 
 bool CoordinatorServiceImpl::IsLeader() const
 {
-    std::lock_guard<std::mutex> lock(lifecycleMutex_);
-    const auto state = servingState_.load(std::memory_order_acquire);
-    return (state == ServingState::LEADER_RECOVERING || state == ServingState::LEADER_SERVING)
-           && electionManager_ != nullptr && electionManager_->IsLeader();
+    CoordinatorLeadershipSnapshot snapshot;
+    return GetLeadershipSnapshot(snapshot).IsOk() && snapshot.isLeader;
 }
 
 Status CoordinatorServiceImpl::GetLeader(std::string &leaderAddress) const
 {
     leaderAddress.clear();
-    std::lock_guard<std::mutex> lock(lifecycleMutex_);
-    const auto state = servingState_.load(std::memory_order_acquire);
-    if (state == ServingState::STOPPING || state == ServingState::STOPPED) {
-        return Status(K_SHUTTING_DOWN, "Coordinator service cannot report a leader during shutdown");
-    }
+    CoordinatorLeadershipSnapshot snapshot;
+    RETURN_IF_NOT_OK(GetLeadershipSnapshot(snapshot));
     if (!IsElectionConfigured()) {
         return Status(K_INVALID, "Coordinator election is disabled");
     }
-    if ((state != ServingState::FOLLOWER_SERVING && state != ServingState::LEADER_RECOVERING
-         && state != ServingState::LEADER_SERVING)
-        || electionManager_ == nullptr) {
-        return Status(K_NOT_READY, "Coordinator election manager is not running");
+    if (snapshot.leaderAddress.empty()) {
+        return Status(K_NOT_READY, "Coordinator raft leader is not known yet");
     }
-    return electionManager_->GetLeader(leaderAddress);
+    leaderAddress = std::move(snapshot.leaderAddress);
+    return Status::OK();
 }
 
 Status CoordinatorServiceImpl::Shutdown()
 {
-    std::unique_ptr<CoordinatorElectionManager> electionManager;
-    {
-        std::unique_lock<std::mutex> lock(lifecycleMutex_);
-        lifecycleCv_.wait(lock, [this] { return !electionStartInProgress_; });
-        if (shutdownComplete_) {
-            return shutdownStatus_;
-        }
-        if (shutdownInProgress_) {
-            lifecycleCv_.wait(lock, [this] { return shutdownComplete_; });
-            return shutdownStatus_;
-        }
-        if (servingState_.load(std::memory_order_acquire) == ServingState::STOPPED) {
-            return Status::OK();
-        }
-
-        shutdownInProgress_ = true;
-        servingState_.store(ServingState::STOPPING, std::memory_order_release);
-        electionManager = std::move(electionManager_);
+    std::unique_lock<std::mutex> lock(lifecycleMutex_);
+    lifecycleCv_.wait(lock, [this] { return !electionStartInProgress_; });
+    if (shutdownComplete_) {
+        return shutdownStatus_;
     }
-
-    OnLeaderStop(Status(K_SHUTTING_DOWN, "Coordinator service is shutting down"));
-    StopRecoveryGate();
-    auto firstError = ShutdownElectionManager(std::move(electionManager));
-    auto result = ShutdownRemainingComponents(std::move(firstError));
-    {
-        std::lock_guard<std::mutex> lock(lifecycleMutex_);
-        servingState_.store(ServingState::STOPPED, std::memory_order_release);
-        shutdownStatus_ = result;
-        shutdownComplete_ = true;
-        shutdownInProgress_ = false;
+    if (shutdownInProgress_) {
+        lifecycleCv_.wait(lock, [this] { return shutdownComplete_; });
+        return shutdownStatus_;
     }
-    lifecycleCv_.notify_all();
-    return result;
+    return ShutdownInternal(lock);
 }
 
 Status CoordinatorServiceImpl::ShutdownElectionManager(std::unique_ptr<CoordinatorElectionManager> electionManager)
@@ -1005,24 +941,16 @@ Status CoordinatorServiceImpl::ShutdownRemainingComponents(Status firstError)
 
 Status CoordinatorServiceImpl::ShutdownInternal(std::unique_lock<std::mutex> &lifecycleLock)
 {
-    lifecycleLock.unlock();
-    OnLeaderStop(Status(K_SHUTTING_DOWN, "Coordinator service is shutting down"));
-    StopRecoveryGate();
-    lifecycleLock.lock();
-    if (servingState_.load(std::memory_order_acquire) == ServingState::STOPPED) {
-        return Status::OK();
-    }
-
     shutdownInProgress_ = true;
-    servingState_.store(ServingState::STOPPING, std::memory_order_release);
+    lifecycleState_.store(LifecycleState::STOPPED, std::memory_order_release);
     auto electionManager = std::move(electionManager_);
     lifecycleLock.unlock();
 
+    OnLeaderStop(Status(K_SHUTTING_DOWN, "Coordinator service is shutting down"));
     auto firstError = ShutdownElectionManager(std::move(electionManager));
     auto result = ShutdownRemainingComponents(std::move(firstError));
 
     lifecycleLock.lock();
-    servingState_.store(ServingState::STOPPED, std::memory_order_release);
     shutdownStatus_ = result;
     shutdownComplete_ = true;
     shutdownInProgress_ = false;
@@ -1034,24 +962,26 @@ Status CoordinatorServiceImpl::Put(const PutReqPb &req, PutRspPb &rsp)
 {
     METRIC_INC(metrics::KvMetricId::COORDINATOR_RPC_PUT_REQUEST_TOTAL);
     std::shared_lock<std::shared_mutex> leaderLock(leaderOperationMutex_);
-    bool businessAllowed = false;
-    RETURN_IF_NOT_OK(PrepareRpcResponse(false, rsp.mutable_header(), businessAllowed));
-    RETURN_OK_IF_TRUE(!businessAllowed);
+    RETURN_IF_NOT_OK(RequireTopologyRecoveryManager());
+    ParsedTopologyCoordinationKey parsed;
+    RETURN_IF_NOT_OK(topologyRecoveryManager_->ParseKey(req.key(), parsed));
+    RETURN_IF_NOT_OK(ValidateTopologyCoordinationMutationKey(parsed));
+    RETURN_IF_NOT_OK(UsesLeadershipOnlyAdmission(parsed.kind)
+                         ? PrepareResponseHeader(rsp.mutable_header())
+                         : PrepareResponseHeader(parsed.clusterName, rsp.mutable_header()));
+    RETURN_OK_IF_TRUE(!AllowContinue<PutReqPb>(rsp.header()));
     RETURN_IF_NOT_OK(CheckCoordinatorStore(store_));
     CHECK_FAIL_RETURN_STATUS(req.expected_coordinator_id().empty() || req.expected_coordinator_id() == coordinatorId_,
                              K_TRY_AGAIN, "Put CoordinatorId fence no longer matches this process");
-    std::string clusterName;
     bool reserved = false;
-    RETURN_IF_NOT_OK(PrepareTopologyMembershipPut(req.key(), clusterName, reserved));
+    RETURN_IF_NOT_OK(PrepareTopologyMembershipPut(parsed, reserved));
     int64_t version = 0;
     int64_t revision = 0;
-    Raii reservationCompletion([this, &clusterName, &reserved, &version, &revision] {
+    Raii reservationCompletion([this, &parsed, &reserved, &version, &revision] {
         if (reserved && topologyControlHost_ != nullptr) {
-            topologyControlHost_->CompleteMembershipPut(clusterName, version > 0 && revision > 0);
+            topologyControlHost_->CompleteMembershipPut(parsed.clusterName, version > 0 && revision > 0);
         }
     });
-    CHECK_FAIL_RETURN_STATUS(topologyRecoveryManager_ != nullptr, K_NOT_READY, "recovery manager is not bound");
-    RETURN_IF_NOT_OK(topologyRecoveryManager_->CheckMutationAllowed(req.key(), ""));
 
     RETURN_IF_NOT_OK(store_->Put(req.key(), req.value(), req.ttl(), req.expected_version(), version, revision,
                                  req.expected_mod_revision()));
@@ -1060,19 +990,15 @@ Status CoordinatorServiceImpl::Put(const PutReqPb &req, PutRspPb &rsp)
     return Status::OK();
 }
 
-Status CoordinatorServiceImpl::PrepareTopologyMembershipPut(const std::string &key, std::string &clusterName,
+Status CoordinatorServiceImpl::PrepareTopologyMembershipPut(const ParsedTopologyCoordinationKey &parsed,
                                                             bool &reserved)
 {
     reserved = false;
-    CHECK_FAIL_RETURN_STATUS(topologyRecoveryManager_ != nullptr && topologyControlHost_ != nullptr, K_NOT_READY,
-                             "topology control components are not bound");
-    ParsedTopologyCoordinationKey parsed;
-    RETURN_IF_NOT_OK(topologyRecoveryManager_->ParseKey(key, parsed));
+    CHECK_FAIL_RETURN_STATUS(topologyControlHost_ != nullptr, K_NOT_READY, "topology Control Host is not bound");
     if (parsed.kind != TopologyCoordinationKeyKind::MEMBERSHIP) {
         return Status::OK();
     }
     RETURN_IF_NOT_OK(topologyControlHost_->PrepareMembershipPut(parsed.clusterName));
-    clusterName = std::move(parsed.clusterName);
     reserved = true;
     return Status::OK();
 }
@@ -1081,12 +1007,15 @@ Status CoordinatorServiceImpl::Range(const RangeReqPb &req, RangeRspPb &rsp)
 {
     METRIC_INC(metrics::KvMetricId::COORDINATOR_RPC_RANGE_REQUEST_TOTAL);
     std::shared_lock<std::shared_mutex> leaderLock(leaderOperationMutex_);
-    bool businessAllowed = false;
-    RETURN_IF_NOT_OK(PrepareRpcResponse(false, rsp.mutable_header(), businessAllowed));
-    RETURN_OK_IF_TRUE(!businessAllowed);
+    RETURN_IF_NOT_OK(RequireTopologyRecoveryManager());
+    ParsedTopologyCoordinationKey parsed;
+    RETURN_IF_NOT_OK(topologyRecoveryManager_->ParseKey(req.key(), parsed));
+    RETURN_IF_NOT_OK(ValidateTopologyCoordinationRange(parsed, req.key(), req.range_end(), true));
+    RETURN_IF_NOT_OK(UsesLeadershipOnlyAdmission(parsed.kind)
+                         ? PrepareResponseHeader(rsp.mutable_header())
+                         : PrepareResponseHeader(parsed.clusterName, rsp.mutable_header()));
+    RETURN_OK_IF_TRUE(!AllowContinue<RangeReqPb>(rsp.header()));
     RETURN_IF_NOT_OK(CheckCoordinatorStore(store_));
-    CHECK_FAIL_RETURN_STATUS(topologyRecoveryManager_ != nullptr, K_NOT_READY, "recovery manager is not bound");
-    RETURN_IF_NOT_OK(topologyRecoveryManager_->CheckReadAllowed(req.key(), req.range_end()));
     CHECK_FAIL_RETURN_STATUS(req.known_mod_revision() >= 0, K_INVALID,
                              "known modification revision must not be negative");
     CHECK_FAIL_RETURN_STATUS(req.known_mod_revision() == 0 || req.range_end().empty(), K_INVALID,
@@ -1109,35 +1038,29 @@ Status CoordinatorServiceImpl::DeleteRange(const DeleteRangeReqPb &req, DeleteRa
 {
     METRIC_INC(metrics::KvMetricId::COORDINATOR_RPC_DELETE_RANGE_REQUEST_TOTAL);
     std::shared_lock<std::shared_mutex> leaderLock(leaderOperationMutex_);
+    RETURN_IF_NOT_OK(RequireTopologyRecoveryManager());
     ParsedTopologyCoordinationKey parsed;
-    const bool isMembershipRollback = servingState_.load(std::memory_order_acquire) == ServingState::LEADER_RECOVERING
-                                      && req.range_end().empty() && !req.expected_coordinator_id().empty()
-                                      && req.expected_mod_revision() != COORDINATOR_NO_MOD_REVISION_CHECK
-                                      && topologyRecoveryManager_ != nullptr
-                                      && topologyRecoveryManager_->ParseKey(req.key(), parsed).IsOk()
-                                      && parsed.kind == TopologyCoordinationKeyKind::MEMBERSHIP
-                                      && !parsed.relativeKey.empty();
-    bool businessAllowed = false;
-    RETURN_IF_NOT_OK(PrepareRpcResponse(isMembershipRollback, rsp.mutable_header(), businessAllowed));
-    RETURN_OK_IF_TRUE(!businessAllowed);
+    RETURN_IF_NOT_OK(topologyRecoveryManager_->ParseKey(req.key(), parsed));
+    RETURN_IF_NOT_OK(ValidateTopologyCoordinationRange(parsed, req.key(), req.range_end(), false));
+    RETURN_IF_NOT_OK(ValidateTopologyCoordinationMutationKey(parsed));
+    const bool isMembershipRollback =
+        req.range_end().empty() && !req.expected_coordinator_id().empty()
+        && req.expected_mod_revision() != COORDINATOR_NO_MOD_REVISION_CHECK
+        && parsed.kind == TopologyCoordinationKeyKind::MEMBERSHIP && !parsed.relativeKey.empty();
+    RETURN_IF_NOT_OK(PrepareResponseHeader(parsed.clusterName, rsp.mutable_header()));
+    const bool allowed = isMembershipRollback ? AllowRecoveryControl<DeleteRangeReqPb>(rsp.header())
+                                              : AllowContinue<DeleteRangeReqPb>(rsp.header());
+    RETURN_OK_IF_TRUE(!allowed);
     RETURN_IF_NOT_OK(CheckCoordinatorStore(store_));
     CHECK_FAIL_RETURN_STATUS(req.expected_coordinator_id().empty() || req.expected_coordinator_id() == coordinatorId_,
                              K_TRY_AGAIN, "DeleteRange CoordinatorId fence no longer matches this process");
     CHECK_FAIL_RETURN_STATUS(
         req.expected_mod_revision() == COORDINATOR_NO_MOD_REVISION_CHECK || req.range_end().empty(), K_INVALID,
         "DeleteRange modification revision fence only supports an exact key");
-    CHECK_FAIL_RETURN_STATUS(topologyRecoveryManager_ != nullptr, K_NOT_READY, "recovery manager is not bound");
-    RETURN_IF_NOT_OK(topologyRecoveryManager_->CheckMutationAllowed(req.key(), req.range_end()));
 
     int64_t deleted = 0;
     int64_t revision = 0;
     RETURN_IF_NOT_OK(store_->DeleteRange(req.key(), req.range_end(), deleted, revision, req.expected_mod_revision()));
-    if (isMembershipRollback) {
-        const uint64_t leaderTerm = leaderTerm_.load(std::memory_order_acquire);
-        leaderLock.unlock();
-        CompleteRecoveryWindow(leaderTerm);
-        FillResponseHeader(rsp.mutable_header());
-    }
     rsp.set_deleted(deleted);
     rsp.set_revision(revision);
     return Status::OK();
@@ -1147,15 +1070,16 @@ Status CoordinatorServiceImpl::WatchRange(const WatchRangeReqPb &req, WatchRange
 {
     METRIC_INC(metrics::KvMetricId::COORDINATOR_RPC_WATCH_RANGE_REQUEST_TOTAL);
     std::shared_lock<std::shared_mutex> leaderLock(leaderOperationMutex_);
-    bool businessAllowed = false;
-    RETURN_IF_NOT_OK(PrepareRpcResponse(false, rsp.mutable_header(), businessAllowed));
-    RETURN_OK_IF_TRUE(!businessAllowed);
-    RETURN_IF_NOT_OK(CheckCoordinatorStore(store_));
+    RETURN_IF_NOT_OK(RequireTopologyRecoveryManager());
+    ParsedTopologyCoordinationKey parsed;
+    RETURN_IF_NOT_OK(topologyRecoveryManager_->ParseKey(req.key(), parsed));
+    RETURN_IF_NOT_OK(ValidateTopologyCoordinationRange(parsed, req.key(), req.range_end(), true));
+    RETURN_IF_NOT_OK(PrepareResponseHeader(parsed.clusterName, rsp.mutable_header()));
+    RETURN_OK_IF_TRUE(!AllowContinue<WatchRangeReqPb>(rsp.header()));
     CHECK_FAIL_RETURN_STATUS(!req.registration_id().empty(), K_INVALID, "watch registration ID is empty");
-    CHECK_FAIL_RETURN_STATUS(topologyRecoveryManager_ != nullptr, K_NOT_READY, "recovery manager is not bound");
-    RETURN_IF_NOT_OK(topologyRecoveryManager_->ValidateWatchRange(req.key(), req.range_end()));
+    RETURN_IF_NOT_OK(CheckCoordinatorStore(store_));
     std::lock_guard<std::mutex> lock(membershipWatchMutex_);
-    RETURN_IF_NOT_OK(CheckWatcherMembership(req));
+    RETURN_IF_NOT_OK(CheckWatcherMembership(req, parsed));
 
     int64_t watchId = 0;
     std::vector<KeyValueEntry> initialKvs;
@@ -1168,13 +1092,9 @@ Status CoordinatorServiceImpl::WatchRange(const WatchRangeReqPb &req, WatchRange
     return Status::OK();
 }
 
-Status CoordinatorServiceImpl::CheckWatcherMembership(const WatchRangeReqPb &req)
+Status CoordinatorServiceImpl::CheckWatcherMembership(const WatchRangeReqPb &req,
+                                                      const ParsedTopologyCoordinationKey &parsed)
 {
-    ParsedTopologyCoordinationKey parsed;
-    RETURN_IF_NOT_OK(topologyRecoveryManager_->ParseKey(req.key(), parsed));
-    if (parsed.kind == TopologyCoordinationKeyKind::OTHER) {
-        return Status::OK();
-    }
     std::unique_ptr<cluster::TopologyKeyHelper> keys;
     RETURN_IF_NOT_OK(cluster::TopologyKeyHelper::Create(parsed.clusterName, keys));
     std::string memberKey;
@@ -1191,9 +1111,8 @@ Status CoordinatorServiceImpl::CancelWatch(const CancelWatchReqPb &req, CancelWa
 {
     METRIC_INC(metrics::KvMetricId::COORDINATOR_RPC_CANCEL_WATCH_REQUEST_TOTAL);
     std::shared_lock<std::shared_mutex> leaderLock(leaderOperationMutex_);
-    bool businessAllowed = false;
-    RETURN_IF_NOT_OK(PrepareRpcResponse(false, rsp.mutable_header(), businessAllowed));
-    RETURN_OK_IF_TRUE(!businessAllowed);
+    RETURN_IF_NOT_OK(PrepareResponseHeader(rsp.mutable_header()));
+    RETURN_OK_IF_TRUE(!AllowContinue<CancelWatchReqPb>(rsp.header()));
     RETURN_IF_NOT_OK(CheckCoordinatorStore(store_));
     CHECK_FAIL_RETURN_STATUS(req.expected_coordinator_id() == coordinatorId_, K_TRY_AGAIN,
                              "CancelWatch CoordinatorId no longer owns these watch IDs");
@@ -1207,9 +1126,13 @@ Status CoordinatorServiceImpl::KeepAlive(const KeepAliveReqPb &req, KeepAliveRsp
 {
     METRIC_INC(metrics::KvMetricId::COORDINATOR_RPC_KEEP_ALIVE_REQUEST_TOTAL);
     std::shared_lock<std::shared_mutex> leaderLock(leaderOperationMutex_);
-    bool businessAllowed = false;
-    RETURN_IF_NOT_OK(PrepareRpcResponse(true, rsp.mutable_header(), businessAllowed));
-    RETURN_OK_IF_TRUE(!businessAllowed);
+    RETURN_IF_NOT_OK(RequireTopologyRecoveryManager());
+    ParsedTopologyCoordinationKey parsed;
+    RETURN_IF_NOT_OK(topologyRecoveryManager_->ParseKey(req.key(), parsed));
+    CHECK_FAIL_RETURN_STATUS(parsed.kind == TopologyCoordinationKeyKind::MEMBERSHIP && !parsed.relativeKey.empty(),
+                             K_INVALID, "KeepAlive requires an exact membership key");
+    RETURN_IF_NOT_OK(PrepareResponseHeader(parsed.clusterName, rsp.mutable_header()));
+    RETURN_OK_IF_TRUE(!AllowContinue<KeepAliveReqPb>(rsp.header()));
     RETURN_IF_NOT_OK(CheckCoordinatorStore(store_));
     CHECK_FAIL_RETURN_STATUS(req.expected_coordinator_id().empty() || req.expected_coordinator_id() == coordinatorId_,
                              K_TRY_AGAIN, "KeepAlive CoordinatorId fence no longer matches this process");
@@ -1217,51 +1140,42 @@ Status CoordinatorServiceImpl::KeepAlive(const KeepAliveReqPb &req, KeepAliveRsp
     int64_t ttlMs = 0;
     int64_t remainingTtlMs = 0;
     RETURN_IF_NOT_OK(store_->KeepAlive(req.key(), ttlMs, remainingTtlMs, req.expected_mod_revision()));
-    if (topologyRecoveryManager_ != nullptr) {
-        topologyRecoveryManager_->NotifyMembershipActivity(req.key());
-    }
-    if (topologyRecoveryManager_ != nullptr && topologyControlHost_ != nullptr) {
-        ParsedTopologyCoordinationKey parsed;
-        RETURN_IF_NOT_OK(topologyRecoveryManager_->ParseKey(req.key(), parsed));
-        if (parsed.kind == TopologyCoordinationKeyKind::MEMBERSHIP) {
-            if (req.failed_targets_size() == 0) {
-                topologyControlHost_->RecordWorkerFailureSummaries(parsed.clusterName, parsed.relativeKey, {});
-                FillResponseHeader(rsp.mutable_header());
-                rsp.set_ttl(ttlMs);
-                rsp.set_remaining_ttl(remainingTtlMs);
-                return Status::OK();
-            }
-            cluster::MembershipRecord reporter;
-            auto reporterRc = ReadMembershipRecord(*store_, req.key(), parsed.relativeKey, reporter);
-            if (reporterRc.IsError()) {
-                LOG(WARNING) << "Skip worker failure summaries because reporter membership is unavailable, key="
-                             << req.key() << ", rc=" << reporterRc.ToString();
-                FillResponseHeader(rsp.mutable_header());
-                rsp.set_ttl(ttlMs);
-                rsp.set_remaining_ttl(remainingTtlMs);
-                return Status::OK();
-            }
-            std::unique_ptr<cluster::TopologyKeyHelper> keys;
-            RETURN_IF_NOT_OK(cluster::TopologyKeyHelper::Create(parsed.clusterName, keys));
-            std::vector<cluster::MembershipRecord> failedTargets;
-            failedTargets.reserve(req.failed_targets_size());
-            for (const auto &target : req.failed_targets()) {
-                std::string targetMembershipKey;
-                if (cluster::TopologyKeyHelper::MembershipKey(target, targetMembershipKey).IsError()) {
-                    continue;
-                }
-                cluster::MembershipRecord targetRecord;
-                if (ReadMembershipRecord(*store_, keys->MembershipTable() + "/" + targetMembershipKey, target,
-                                         targetRecord).IsOk()) {
-                    failedTargets.emplace_back(std::move(targetRecord));
-                } else {
-                    failedTargets.push_back({ target, cluster::MemberLifecycleState::READY, -1, "" });
-                }
-            }
-            topologyControlHost_->RecordWorkerFailureSummaries(parsed.clusterName, reporter, failedTargets);
+    topologyRecoveryManager_->NotifyMembershipActivity(parsed);
+    if (topologyControlHost_ != nullptr) {
+        if (req.failed_targets_size() == 0) {
+            topologyControlHost_->RecordWorkerFailureSummaries(parsed.clusterName, parsed.relativeKey, {});
+            rsp.set_ttl(ttlMs);
+            rsp.set_remaining_ttl(remainingTtlMs);
+            return Status::OK();
         }
+        cluster::MembershipRecord reporter;
+        auto reporterRc = ReadMembershipRecord(*store_, req.key(), parsed.relativeKey, reporter);
+        if (reporterRc.IsError()) {
+            LOG(WARNING) << "Skip worker failure summaries because reporter membership is unavailable, key="
+                         << req.key() << ", rc=" << reporterRc.ToString();
+            rsp.set_ttl(ttlMs);
+            rsp.set_remaining_ttl(remainingTtlMs);
+            return Status::OK();
+        }
+        std::unique_ptr<cluster::TopologyKeyHelper> keys;
+        RETURN_IF_NOT_OK(cluster::TopologyKeyHelper::Create(parsed.clusterName, keys));
+        std::vector<cluster::MembershipRecord> failedTargets;
+        failedTargets.reserve(req.failed_targets_size());
+        for (const auto &target : req.failed_targets()) {
+            std::string targetMembershipKey;
+            if (cluster::TopologyKeyHelper::MembershipKey(target, targetMembershipKey).IsError()) {
+                continue;
+            }
+            cluster::MembershipRecord targetRecord;
+            if (ReadMembershipRecord(*store_, keys->MembershipTable() + "/" + targetMembershipKey, target,
+                                     targetRecord).IsOk()) {
+                failedTargets.emplace_back(std::move(targetRecord));
+            } else {
+                failedTargets.push_back({ target, cluster::MemberLifecycleState::READY, -1, "" });
+            }
+        }
+        topologyControlHost_->RecordWorkerFailureSummaries(parsed.clusterName, reporter, failedTargets);
     }
-    FillResponseHeader(rsp.mutable_header());
     rsp.set_ttl(ttlMs);
     rsp.set_remaining_ttl(remainingTtlMs);
     return Status::OK();
@@ -1270,11 +1184,10 @@ Status CoordinatorServiceImpl::KeepAlive(const KeepAliveReqPb &req, KeepAliveRsp
 Status CoordinatorServiceImpl::GetCoordinatorId(const GetCoordinatorIdReqPb &req, GetCoordinatorIdRspPb &rsp)
 {
     METRIC_INC(metrics::KvMetricId::COORDINATOR_RPC_GET_COORDINATOR_ID_REQUEST_TOTAL);
-    (void)req;
     std::shared_lock<std::shared_mutex> leaderLock(leaderOperationMutex_);
-    bool businessAllowed = false;
-    RETURN_IF_NOT_OK(PrepareRpcResponse(false, rsp.mutable_header(), businessAllowed));
-    RETURN_OK_IF_TRUE(!businessAllowed);
+    (void)req;
+    RETURN_IF_NOT_OK(PrepareResponseHeader(rsp.mutable_header()));
+    RETURN_OK_IF_TRUE(!AllowContinue<GetCoordinatorIdReqPb>(rsp.header()));
     CHECK_FAIL_RETURN_STATUS(coordinatorId_.size() == UUID_SIZE, K_NOT_READY, "CoordinatorId is not initialized");
     return Status::OK();
 }
@@ -1291,8 +1204,7 @@ Status CoordinatorServiceImpl::ExchangeBootstrapObservation(const RaftBootstrapO
 
     {
         std::lock_guard<std::mutex> lock(lifecycleMutex_);
-        const auto lifecycleState = servingState_.load(std::memory_order_acquire);
-        if (lifecycleState == ServingState::STOPPING || lifecycleState == ServingState::STOPPED) {
+        if (lifecycleState_.load(std::memory_order_acquire) == LifecycleState::STOPPED) {
             return Status(K_SHUTTING_DOWN, "Coordinator bootstrap state is unavailable during shutdown");
         }
         CHECK_FAIL_RETURN_STATUS(IsElectionConfigured(), K_INVALID, "Coordinator election is disabled");
@@ -1316,7 +1228,10 @@ Status CoordinatorServiceImpl::ReportTopologyRecoveryCandidate(const ReportTopol
     CHECK_FAIL_RETURN_STATUS(req.canonical_topology().size() <= MAX_TOPOLOGY_RECOVERY_PAYLOAD_BYTES, K_INVALID,
                              "candidate topology payload exceeds limit");
     std::shared_lock<std::shared_mutex> leaderLock(leaderOperationMutex_);
-    FillResponseHeader(rsp.mutable_header());
+    std::unique_ptr<cluster::TopologyKeyHelper> keys;
+    RETURN_IF_NOT_OK(cluster::TopologyKeyHelper::Create(req.cluster_name(), keys));
+    RETURN_IF_NOT_OK(PrepareResponseHeader(req.cluster_name(), rsp.mutable_header()));
+    RETURN_OK_IF_TRUE(!AllowContinue<ReportTopologyRecoveryCandidateReqPb>(rsp.header()));
     if (req.coordinator_id() != coordinatorId_) {
         rsp.set_result(ReportTopologyRecoveryCandidateRspPb::COORDINATOR_ID_MISMATCH);
         return Status::OK();
@@ -1338,7 +1253,6 @@ Status CoordinatorServiceImpl::ReportTopologyRecoveryCandidate(const ReportTopol
     TopologyRecoveryReportDecision decision;
     RETURN_IF_NOT_OK(topologyRecoveryManager_->ReportCandidate(req.cluster_name(), req.leader_term(),
                                                                req.coordinator_id(), std::move(report), decision));
-    FillResponseHeader(rsp.mutable_header());
     rsp.set_result(ToPbReportResult(decision.result));
     rsp.set_recovery_state(ToPbRecoveryState(decision.state));
     rsp.set_payload_required(decision.payloadRequired);
@@ -1350,41 +1264,39 @@ Status CoordinatorServiceImpl::EnsureLeaderMembership(const EnsureLeaderMembersh
 {
     METRIC_INC(metrics::KvMetricId::COORDINATOR_RPC_ENSURE_LEADER_MEMBERSHIP_REQUEST_TOTAL);
     std::shared_lock<std::shared_mutex> leaderLock(leaderOperationMutex_);
-    FillResponseHeader(rsp.mutable_header());
-    if (RequireRecoveryLeader(req.leader_term(), req.coordinator_id()).IsError()) {
-        rsp.set_result(EnsureLeaderMembershipRspPb::STALE_EPOCH);
-        return Status::OK();
-    }
+    std::unique_ptr<cluster::TopologyKeyHelper> clusterKeys;
+    RETURN_IF_NOT_OK(cluster::TopologyKeyHelper::Create(req.cluster_name(), clusterKeys));
+    RETURN_IF_NOT_OK(PrepareResponseHeader(req.cluster_name(), rsp.mutable_header()));
+    RETURN_OK_IF_TRUE(!AllowContinue<EnsureLeaderMembershipReqPb>(rsp.header()));
+
     std::string physicalKey;
     if (!BuildEnsureMembershipPhysicalKey(req, physicalKey)) {
         rsp.set_result(EnsureLeaderMembershipRspPb::INVALID_MEMBERSHIP);
         return Status::OK();
     }
+    ParsedTopologyCoordinationKey parsed;
+    RETURN_IF_NOT_OK(topologyRecoveryManager_->ParseKey(physicalKey, parsed));
+    CHECK_FAIL_RETURN_STATUS(parsed.kind == TopologyCoordinationKeyKind::MEMBERSHIP && !parsed.relativeKey.empty(),
+                             K_INVALID, "EnsureLeaderMembership requires an exact membership key");
+    if (RequireRecoveryLeader(req.leader_term(), req.coordinator_id()).IsError()) {
+        rsp.set_result(EnsureLeaderMembershipRspPb::STALE_EPOCH);
+        return Status::OK();
+    }
     RETURN_IF_NOT_OK(CheckCoordinatorStore(store_));
-    std::string clusterName;
     bool reserved = false;
-    RETURN_IF_NOT_OK(PrepareTopologyMembershipPut(physicalKey, clusterName, reserved));
+    RETURN_IF_NOT_OK(PrepareTopologyMembershipPut(parsed, reserved));
     int64_t version = 0;
     int64_t revision = 0;
-    Raii reservationCompletion([this, &clusterName, &reserved, &version, &revision] {
+    Raii reservationCompletion([this, &parsed, &reserved, &version, &revision] {
         if (reserved && topologyControlHost_ != nullptr) {
-            topologyControlHost_->CompleteMembershipPut(clusterName, version > 0 && revision > 0);
+            topologyControlHost_->CompleteMembershipPut(parsed.clusterName, version > 0 && revision > 0);
         }
     });
     RETURN_IF_NOT_OK(store_->Put(physicalKey, req.membership_value(), req.ttl_ms(), COORDINATOR_NO_VERSION_CHECK,
                                  version, revision));
-    if (RequireRecoveryLeader(req.leader_term(), req.coordinator_id()).IsError()) {
-        rsp.set_result(EnsureLeaderMembershipRspPb::STALE_EPOCH);
-        return Status::OK();
-    }
     int64_t ttlMs = 0;
     int64_t remainingTtlMs = 0;
     RETURN_IF_NOT_OK(store_->KeepAlive(physicalKey, ttlMs, remainingTtlMs));
-    if (RequireRecoveryLeader(req.leader_term(), req.coordinator_id()).IsError()) {
-        rsp.set_result(EnsureLeaderMembershipRspPb::STALE_EPOCH);
-        return Status::OK();
-    }
-    FillResponseHeader(rsp.mutable_header());
     rsp.set_result(EnsureLeaderMembershipRspPb::ACCEPTED);
     rsp.set_remaining_ttl_ms(remainingTtlMs);
     rsp.set_membership_mod_revision(revision);
@@ -1396,14 +1308,11 @@ Status CoordinatorServiceImpl::ReportWorkerLiveness(const ReportWorkerLivenessRe
 {
     METRIC_INC(metrics::KvMetricId::COORDINATOR_RPC_REPORT_WORKER_LIVENESS_REQUEST_TOTAL);
     std::shared_lock<std::shared_mutex> leaderLock(leaderOperationMutex_);
-    bool businessAllowed = false;
-    RETURN_IF_NOT_OK(PrepareRpcResponse(false, rsp.mutable_header(), businessAllowed));
-    if (!businessAllowed) {
-        return Status::OK();
-    }
-    CHECK_FAIL_RETURN_STATUS(topologyControlHost_ != nullptr, K_NOT_READY, "topology Control Host is not bound");
     std::unique_ptr<cluster::TopologyKeyHelper> keys;
     RETURN_IF_NOT_OK(cluster::TopologyKeyHelper::Create(req.cluster_name(), keys));
+    RETURN_IF_NOT_OK(PrepareResponseHeader(req.cluster_name(), rsp.mutable_header()));
+    RETURN_OK_IF_TRUE(!AllowContinue<ReportWorkerLivenessReqPb>(rsp.header()));
+    CHECK_FAIL_RETURN_STATUS(topologyControlHost_ != nullptr, K_NOT_READY, "topology Control Host is not bound");
     std::string canonical;
     RETURN_IF_NOT_OK(cluster::TopologyKeyHelper::ProbeKey(req.witness_address(), canonical));
     RETURN_IF_NOT_OK(cluster::TopologyKeyHelper::MembershipKey(req.target_address(), canonical));
@@ -1441,19 +1350,17 @@ Status CoordinatorServiceImpl::GetClusterRawSnapshot(const GetClusterRawSnapshot
 {
     METRIC_INC(metrics::KvMetricId::COORDINATOR_RPC_GET_CLUSTER_RAW_SNAPSHOT_REQUEST_TOTAL);
     std::shared_lock<std::shared_mutex> leaderLock(leaderOperationMutex_);
-    bool businessAllowed = false;
-    RETURN_IF_NOT_OK(PrepareRpcResponse(false, rsp.mutable_header(), businessAllowed));
-    RETURN_OK_IF_TRUE(!businessAllowed);
-    RETURN_IF_NOT_OK(CheckCoordinatorStore(store_));
     std::string topologyKey;
     std::string membershipKey;
     std::string membershipEnd;
     RETURN_IF_NOT_OK(BuildClusterReadKeys(req.cluster_name(), topologyKey, membershipKey, membershipEnd));
+    RETURN_IF_NOT_OK(PrepareResponseHeader(req.cluster_name(), rsp.mutable_header()));
+    RETURN_OK_IF_TRUE(!AllowContinue<GetClusterRawSnapshotReqPb>(rsp.header()));
+    RETURN_IF_NOT_OK(CheckCoordinatorStore(store_));
     GetClusterRawSnapshotRspPb localRsp;
     std::vector<KeyValueEntry> topologyKvs;
     std::vector<KeyValueEntry> membershipKvs;
     int64_t ignoredRevision = 0;
-    // Diagnostics intentionally bypass recovery gating so operators can inspect the raw facts used during recovery.
     // This endpoint remains read-only and does not project health, hash ranges, or routes on the Coordinator.
     RETURN_IF_NOT_OK(store_->Range(topologyKey, "", topologyKvs, ignoredRevision));
     RETURN_IF_NOT_OK(store_->Range(membershipKey, membershipEnd, membershipKvs, ignoredRevision));
@@ -1468,42 +1375,5 @@ Status CoordinatorServiceImpl::GetClusterRawSnapshot(const GetClusterRawSnapshot
     return Status::OK();
 }
 
-void CoordinatorServiceImpl::FillResponseHeader(ResponseHeader *header) const
-{
-    if (header == nullptr) {
-        return;
-    }
-    header->set_coordinator_id(coordinatorId_);
-    if (!IsElectionConfigured()) {
-        header->set_is_leader(true);
-        header->set_leader_term(0);
-        header->set_serving_state(ResponseHeader::LEADER_SERVING);
-        header->clear_leader_address();
-        return;
-    }
-    const auto state = servingState_.load(std::memory_order_acquire);
-    header->set_leader_term(leaderTerm_.load(std::memory_order_acquire));
-    if (state == ServingState::LEADER_SERVING) {
-        header->set_is_leader(true);
-        header->set_serving_state(ResponseHeader::LEADER_SERVING);
-        header->clear_leader_address();
-        return;
-    }
-    if (state == ServingState::LEADER_RECOVERING) {
-        header->set_is_leader(false);
-        header->set_serving_state(ResponseHeader::LEADER_RECOVERING);
-        header->set_leader_address(coordinatorAddr_.ToString());
-        return;
-    }
-    header->set_is_leader(false);
-    std::string leaderAddress;
-    if (GetLeader(leaderAddress).IsOk()) {
-        header->set_leader_address(std::move(leaderAddress));
-        header->set_serving_state(ResponseHeader::FOLLOWER_SERVING);
-    } else {
-        header->clear_leader_address();
-        header->clear_serving_state();
-    }
-}
 }  // namespace coordinator
 }  // namespace datasystem

@@ -268,9 +268,8 @@ TEST(CoordinatorServiceProxyTest, RecoveringResponseRequiresExplicitAcceptance)
     CoordinatorServiceProxyBrpcImpl proxy(discovery);
     coordinator::ResponseHeader header;
     header.set_coordinator_id(COORDINATOR_ID);
-    header.set_is_leader(false);
     header.set_leader_term(7);
-    header.set_serving_state(coordinator::ResponseHeader::LEADER_RECOVERING);
+    header.set_state(coordinator::ResponseHeader::RECOVERING);
 
     EXPECT_EQ(proxy.AcceptResponse(header, DEFAULT_COORDINATOR_RPC_TIMEOUT_MS, nullptr, false).GetCode(), K_NOT_READY);
     DS_ASSERT_OK(proxy.AcceptResponse(header, DEFAULT_COORDINATOR_RPC_TIMEOUT_MS, nullptr, true));

@@ -12,7 +12,7 @@
  */
 
 /**
- * Description: Unit tests for Coordinator leader serving gates.
+ * Description: Unit tests for Coordinator service lifecycle state.
  */
 
 #include <algorithm>
@@ -26,127 +26,113 @@
 #include <vector>
 
 #include "ut/common.h"
+
+#include <array>
+#include <unordered_map>
+#include <utility>
+
 #include "datasystem/cluster/membership/membership_value_codec.h"
 #include "datasystem/cluster/repository/topology_key_helper.h"
+#include "datasystem/common/kvstore/coordination_keys.h"
 #include "datasystem/common/log/trace.h"
+#include "datasystem/common/metrics/kv_metrics.h"
 #include "datasystem/common/util/raii.h"
 #include "datasystem/common/rpc/bthread_utils.h"
-#include "datasystem/common/metrics/kv_metrics.h"
+#include "datasystem/coordinator/topology_recovery_manager.h"
 #define private public
 #include "datasystem/coordinator/coordinator_service_impl.h"
-#include "datasystem/coordinator/topology_control_host.h"
 #undef private
+#include "datasystem/coordinator/topology_control_host.h"
 
+DS_DECLARE_bool(use_brpc);
 DS_DECLARE_uint32(node_dead_timeout_s);
 
 namespace datasystem {
 namespace ut {
 namespace {
 constexpr uint16_t TEST_COORDINATOR_PORT = 18501;
-constexpr uint64_t FOLLOWER_TERM = 7;
-constexpr uint64_t RECOVERING_TERM = 8;
-constexpr char RECOVERING_LEADER_ADDRESS[] = "127.0.0.1:18501";
-constexpr char VALID_CLUSTER_NAME[] = "cluster-a";
+constexpr uint64_t LEADER_TERM = 8;
+constexpr size_t ELECTION_MEMBER_COUNT = 3;
+constexpr char COORDINATOR_ID[] = "coordinator-id";
+constexpr char MISMATCHED_COORDINATOR_ID[] = "mismatched-coordinator-id";
+constexpr char LEADER_ADDRESS[] = "127.0.0.1:18502";
+constexpr char CLUSTER_NAME[] = "cluster-a";
+constexpr char MEMBER_ADDRESS[] = "127.0.0.1:31501";
+constexpr int64_t MEMBERSHIP_TTL_MS = 60'000;
 
-class FakeCoordinatorDiscovery final : public ICoordinatorDiscovery {
+std::unique_ptr<coordinator::CoordinatorServiceImpl> MakeService()
+{
+    return std::make_unique<coordinator::CoordinatorServiceImpl>(HostPort("127.0.0.1", TEST_COORDINATOR_PORT), nullptr,
+                                                                  0);
+}
+
+void SetRunning(coordinator::CoordinatorServiceImpl &service)
+{
+    service.coordinatorId_ = COORDINATOR_ID;
+    service.lifecycleState_.store(coordinator::CoordinatorServiceImpl::LifecycleState::RUNNING,
+                                  std::memory_order_release);
+}
+
+Status InitializeRunning(coordinator::CoordinatorServiceImpl &service)
+{
+    RETURN_IF_NOT_OK(service.Init());
+    service.lifecycleState_.store(coordinator::CoordinatorServiceImpl::LifecycleState::RUNNING,
+                                  std::memory_order_release);
+    return Status::OK();
+}
+
+void ExpectHeaderState(const coordinator::ResponseHeader &header, coordinator::ResponseHeader::StatePb expected,
+                       const std::string &coordinatorId, uint64_t expectedTerm = 0)
+{
+    EXPECT_EQ(header.state(), expected);
+    EXPECT_EQ(header.coordinator_id(), coordinatorId);
+    EXPECT_EQ(header.leader_term(), expectedTerm);
+    EXPECT_TRUE(header.leader_address().empty());
+}
+
+std::string EncodeMembershipValue()
+{
+    cluster::MembershipValue membership;
+    membership.timestamp = 1;
+    membership.lifecycleState = cluster::MemberLifecycleState::READY;
+    membership.hostId = "host-a";
+    std::string encoded;
+    EXPECT_TRUE(cluster::MembershipValueCodec::Encode(membership, encoded).IsOk());
+    return encoded;
+}
+
+class TestCoordinatorDiscovery final : public ICoordinatorDiscovery {
 public:
-    Status GetCoordinators(std::vector<std::string> &addresses) override
+    Status GetCoordinators(std::vector<std::string> &serviceList) override
     {
-        addresses = { "127.0.0.1:18501", "127.0.0.1:18502" };
+        serviceList.clear();
         return Status::OK();
     }
 };
 
-class SlowProbeWatchDispatcher final : public coordinator::WatchDispatcherImpl {
-public:
-    explicit SlowProbeWatchDispatcher(WatchRegistry *registry, std::function<void()> onFirstProbe = {})
-        : WatchDispatcherImpl(registry, "test-coordinator", WatchDispatcher::DEFAULT_DISPATCH_THREAD_COUNT),
-          onFirstProbe_(std::move(onFirstProbe))
-    {
-    }
-
-    coordinator::WorkerReachabilityProbeResult ProbeWorkerReachable(
-        const std::string &, std::chrono::steady_clock::time_point deadline) override
-    {
-        if (!firstProbeCalled_.exchange(true) && onFirstProbe_) {
-            onFirstProbe_();
-        }
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= deadline) {
-            return { Status(K_RPC_DEADLINE_EXCEEDED, "probe deadline expired"), false };
-        }
-        SleepCurrentFor(std::min(deadline, now + std::chrono::milliseconds(150)) - now);
-        return { Status(K_RPC_DEADLINE_EXCEEDED, "probe timed out"), true };
-    }
-
-private:
-    std::function<void()> onFirstProbe_;
-    std::atomic<bool> firstProbeCalled_{ false };
-};
-
-class CoordinatorServiceImplTest : public CommonTest {
+class CoordinatorServiceMetricsTest : public CommonTest {
 public:
     void SetUp() override
     {
         CommonTest::SetUp();
-        coordinator::CoordinatorRaftFlags raftFlags;
-        raftFlags.localAddress = "127.0.0.1:18501";
-        service_ = std::make_unique<coordinator::CoordinatorServiceImpl>(
-            HostPort("127.0.0.1", TEST_COORDINATOR_PORT), std::make_shared<FakeCoordinatorDiscovery>(), 2,
-            std::move(raftFlags));
-        DS_ASSERT_OK(service_->Init(true));
+        service_ = MakeService();
+        DS_ASSERT_OK(service_->Init());
         metrics::ResetKvMetricsForTest();
         DS_ASSERT_OK(metrics::InitKvMetrics());
     }
 
     void TearDown() override
     {
-        if (service_ != nullptr) {
-            DS_EXPECT_OK(service_->Shutdown());
-        }
+        DS_EXPECT_OK(service_->Shutdown());
         metrics::ResetKvMetricsForTest();
         CommonTest::TearDown();
     }
 
 protected:
-    std::string ValidMembershipValue() const
-    {
-        cluster::MembershipValue value{ 1, cluster::MemberLifecycleState::READY, "host-a", "v1" };
-        std::string bytes;
-        EXPECT_TRUE(cluster::MembershipValueCodec::Encode(value, bytes).IsOk());
-        return bytes;
-    }
-
-    std::string MembershipKey(std::string_view workerAddress) const
-    {
-        std::unique_ptr<cluster::TopologyKeyHelper> keys;
-        EXPECT_TRUE(cluster::TopologyKeyHelper::Create(VALID_CLUSTER_NAME, keys).IsOk());
-        return keys->MembershipTable() + "/" + std::string(workerAddress);
-    }
-
-    void ExpectHeader(const coordinator::ResponseHeader &header, bool isLeader,
-                      coordinator::ResponseHeader::ServingStatePb servingState, uint64_t term,
-                      std::string_view leaderAddress) const
-    {
-        EXPECT_EQ(header.is_leader(), isLeader);
-        EXPECT_EQ(header.serving_state(), servingState);
-        EXPECT_EQ(header.leader_term(), term);
-        EXPECT_EQ(header.leader_address(), leaderAddress);
-        EXPECT_FALSE(header.coordinator_id().empty());
-    }
-
-    void EnterRecoveringLeader()
-    {
-        service_->OnLeaderStart(RECOVERING_TERM);
-        // These cases exercise recovery-control RPCs after recovery work has been discovered.
-        service_->servingState_.store(coordinator::CoordinatorServiceImpl::ServingState::LEADER_RECOVERING,
-                                      std::memory_order_release);
-    }
-
     std::unique_ptr<coordinator::CoordinatorServiceImpl> service_;
 };
 
-TEST_F(CoordinatorServiceImplTest, ExpiredWatchProbeDoesNotRecordNotificationRpcMetrics)
+TEST_F(CoordinatorServiceMetricsTest, ExpiredWatchProbeDoesNotRecordNotificationRpcMetrics)
 {
     auto result =
         service_->watchDispatcher_->ProbeWorkerReachable("127.0.0.1:1", std::chrono::steady_clock::now());
@@ -157,7 +143,7 @@ TEST_F(CoordinatorServiceImplTest, ExpiredWatchProbeDoesNotRecordNotificationRpc
     EXPECT_NE(summaries.front().find("\"metrics\":[]"), std::string::npos);
 }
 
-TEST_F(CoordinatorServiceImplTest, EveryRpcHandlerIncrementsOnlyItsRequestCounter)
+TEST_F(CoordinatorServiceMetricsTest, EveryRpcHandlerIncrementsOnlyItsRequestCounter)
 {
     const auto expectSingleIncrement = [](const char *name, const auto &call) {
         call();
@@ -224,262 +210,782 @@ TEST_F(CoordinatorServiceImplTest, EveryRpcHandlerIncrementsOnlyItsRequestCounte
                           [&] { (void)service_->ReportWorkerLiveness(livenessReq, livenessRsp); });
 }
 
-TEST_F(CoordinatorServiceImplTest, RecoveringLeaderAcceptsOnlyEnsureAndExistingRecoveryReport)
+void EnableElection(coordinator::CoordinatorServiceImpl &service)
 {
-    EnterRecoveringLeader();
+    service.coordinatorDiscovery_ = std::make_shared<TestCoordinatorDiscovery>();
+    service.expectedMemberCount_ = ELECTION_MEMBER_COUNT;
+    service.leadershipSnapshotProvider_ = [](coordinator::CoordinatorLeadershipSnapshot &snapshot) {
+        snapshot = { true, LEADER_ADDRESS, LEADER_TERM };
+        return Status::OK();
+    };
+    service.OnLeaderStart(LEADER_TERM);
+}
 
-    coordinator::RangeReqPb rangeRequest;
-    rangeRequest.set_key("/coordinator/recovering-fence");
+class CoordinatorServiceImplTest : public CommonTest {};
+
+TEST_F(CoordinatorServiceImplTest, CoordinatorServiceConstructAndInitRemainCreated)
+{
+    auto service = MakeService();
+    EXPECT_EQ(service->lifecycleState_.load(std::memory_order_acquire),
+              coordinator::CoordinatorServiceImpl::LifecycleState::CREATED);
+
+    DS_ASSERT_OK(service->Init());
+
+    EXPECT_TRUE(service->initialized_);
+    EXPECT_FALSE(service->rpcStarted_);
+    EXPECT_EQ(service->lifecycleState_.load(std::memory_order_acquire),
+              coordinator::CoordinatorServiceImpl::LifecycleState::CREATED);
+    DS_ASSERT_OK(service->Shutdown());
+}
+
+TEST_F(CoordinatorServiceImplTest, CoordinatorLeaderCallbacksDoNotChangeRunningLifecycle)
+{
+    auto service = MakeService();
+    DS_ASSERT_OK(service->Init());
+    service->lifecycleState_.store(coordinator::CoordinatorServiceImpl::LifecycleState::RUNNING,
+                                   std::memory_order_release);
+
+    service->OnLeaderStart(LEADER_TERM);
+
+    EXPECT_EQ(service->leaderTerm_.load(std::memory_order_acquire), LEADER_TERM);
+    EXPECT_EQ(service->lifecycleState_.load(std::memory_order_acquire),
+              coordinator::CoordinatorServiceImpl::LifecycleState::RUNNING);
+
+    service->OnLeaderStop(Status(K_RUNTIME_ERROR, "leadership lost"));
+
+    EXPECT_EQ(service->leaderTerm_.load(std::memory_order_acquire), 0U);
+    EXPECT_EQ(service->lifecycleState_.load(std::memory_order_acquire),
+              coordinator::CoordinatorServiceImpl::LifecycleState::RUNNING);
+    DS_ASSERT_OK(service->Shutdown());
+}
+
+TEST_F(CoordinatorServiceImplTest, PrepareResponseHeaderRejectsNullAndLifecycleErrors)
+{
+    auto service = MakeService();
+    coordinator::ResponseHeader header;
+
+    EXPECT_EQ(service->PrepareResponseHeader(nullptr).GetCode(), K_INVALID);
+    EXPECT_EQ(service->PrepareResponseHeader(&header).GetCode(), K_NOT_READY);
+
+    service->lifecycleState_.store(coordinator::CoordinatorServiceImpl::LifecycleState::STOPPED,
+                                   std::memory_order_release);
+    EXPECT_EQ(service->PrepareResponseHeader(&header).GetCode(), K_SHUTTING_DOWN);
+}
+
+TEST_F(CoordinatorServiceImplTest, PrepareResponseHeaderNoElectionIsServingAtTermZero)
+{
+    auto service = MakeService();
+    SetRunning(*service);
+    coordinator::ResponseHeader header;
+    header.set_state(coordinator::ResponseHeader::NOT_LEADER);
+    header.set_leader_address("stale-leader");
+    header.set_coordinator_id("stale-id");
+    header.set_leader_term(LEADER_TERM);
+
+    DS_ASSERT_OK(service->PrepareResponseHeader(&header));
+
+    EXPECT_EQ(header.state(), coordinator::ResponseHeader::SERVING);
+    EXPECT_TRUE(header.leader_address().empty());
+    EXPECT_EQ(header.coordinator_id(), COORDINATOR_ID);
+    EXPECT_EQ(header.leader_term(), 0U);
+}
+
+TEST_F(CoordinatorServiceImplTest, PrepareClusterResponseHeaderFollowersSkipRecoveryState)
+{
+    auto service = MakeService();
+    SetRunning(*service);
+    int leadershipCalls = 0;
+    int recoveryStateCalls = 0;
+    coordinator::CoordinatorLeadershipSnapshot observed;
+    service->leadershipSnapshotProvider_ = [&](coordinator::CoordinatorLeadershipSnapshot &snapshot) {
+        ++leadershipCalls;
+        snapshot = observed;
+        return Status::OK();
+    };
+    service->recoveryStateProvider_ = [&](const std::string &) {
+        ++recoveryStateCalls;
+        return coordinator::TopologyRecoveryState::READY;
+    };
+
+    for (const auto &leaderAddress : std::array<std::string, 2>{ LEADER_ADDRESS, "" }) {
+        observed = { false, leaderAddress, LEADER_TERM };
+        coordinator::ResponseHeader header;
+        DS_ASSERT_OK(service->PrepareResponseHeader(CLUSTER_NAME, &header));
+        EXPECT_EQ(header.state(), coordinator::ResponseHeader::NOT_LEADER);
+        EXPECT_EQ(header.leader_address(), leaderAddress);
+        EXPECT_EQ(header.coordinator_id(), COORDINATOR_ID);
+        EXPECT_EQ(header.leader_term(), LEADER_TERM);
+    }
+    EXPECT_EQ(leadershipCalls, 2);
+    EXPECT_EQ(recoveryStateCalls, 0);
+}
+
+TEST_F(CoordinatorServiceImplTest, PrepareClusterResponseHeaderMapsOneRecoveryStateRead)
+{
+    auto service = MakeService();
+    SetRunning(*service);
+    EnableElection(*service);
+    int leadershipCalls = 0;
+    int recoveryStateCalls = 0;
+    auto recoveryState = coordinator::TopologyRecoveryState::RECOVERING;
+    service->leadershipSnapshotProvider_ = [&](coordinator::CoordinatorLeadershipSnapshot &snapshot) {
+        ++leadershipCalls;
+        snapshot = { true, LEADER_ADDRESS, LEADER_TERM };
+        return Status::OK();
+    };
+    service->recoveryStateProvider_ = [&](const std::string &clusterName) {
+        ++recoveryStateCalls;
+        EXPECT_EQ(clusterName, CLUSTER_NAME);
+        return recoveryState;
+    };
+    const std::array<std::pair<coordinator::TopologyRecoveryState, coordinator::ResponseHeader::StatePb>, 4> cases{ {
+        { coordinator::TopologyRecoveryState::READY, coordinator::ResponseHeader::SERVING },
+        { coordinator::TopologyRecoveryState::RECOVERING, coordinator::ResponseHeader::RECOVERING },
+        { coordinator::TopologyRecoveryState::INSTALLING, coordinator::ResponseHeader::RECOVERING },
+        { coordinator::TopologyRecoveryState::BLOCKED, coordinator::ResponseHeader::RECOVERING },
+    } };
+
+    for (const auto &[state, expectedHeaderState] : cases) {
+        leadershipCalls = 0;
+        recoveryStateCalls = 0;
+        recoveryState = state;
+        coordinator::ResponseHeader header;
+        header.set_leader_address("stale-leader");
+        DS_ASSERT_OK(service->PrepareResponseHeader(CLUSTER_NAME, &header));
+        EXPECT_EQ(header.state(), expectedHeaderState);
+        EXPECT_TRUE(header.leader_address().empty());
+        EXPECT_EQ(header.coordinator_id(), COORDINATOR_ID);
+        EXPECT_EQ(header.leader_term(), LEADER_TERM);
+        EXPECT_EQ(leadershipCalls, 1);
+        EXPECT_EQ(recoveryStateCalls, 1);
+    }
+}
+
+TEST_F(CoordinatorServiceImplTest, RangeUsesPreparedRecoveryAdmission)
+{
+    auto service = MakeService();
+    DS_ASSERT_OK(InitializeRunning(*service));
+    EnableElection(*service);
+    int recoveryStateCalls = 0;
+    service->recoveryStateProvider_ = [&](const std::string &clusterName) {
+        ++recoveryStateCalls;
+        EXPECT_EQ(clusterName, "single-read");
+        return coordinator::TopologyRecoveryState::READY;
+    };
+    const std::string key = "/datasystem/single-read/topology/";
+    int64_t version = 0;
+    int64_t revision = 0;
+    DS_ASSERT_OK(service->store_->Put(key, "topology", 0, COORDINATOR_KEY_NOT_EXISTS_VERSION, version, revision));
+
+    coordinator::RangeReqPb request;
+    request.set_key(key);
+    coordinator::RangeRspPb response;
+    DS_ASSERT_OK(service->Range(request, response));
+
+    EXPECT_EQ(recoveryStateCalls, 1);
+    ASSERT_EQ(response.kvs_size(), 1);
+    EXPECT_EQ(response.kvs(0).value(), "topology");
+    DS_ASSERT_OK(service->Shutdown());
+}
+
+TEST_F(CoordinatorServiceImplTest, PrepareClusterResponseHeaderRejectsMissingRecoveryManager)
+{
+    auto service = MakeService();
+    SetRunning(*service);
+    EnableElection(*service);
+    coordinator::ResponseHeader header;
+
+    EXPECT_EQ(service->PrepareResponseHeader(CLUSTER_NAME, &header).GetCode(), K_NOT_READY);
+}
+
+TEST_F(CoordinatorServiceImplTest, LeaderHeadersWaitForMatchingCallbackTermBeforeAnySideEffect)
+{
+    auto service = MakeService();
+    DS_ASSERT_OK(InitializeRunning(*service));
+    service->coordinatorDiscovery_ = std::make_shared<TestCoordinatorDiscovery>();
+    service->expectedMemberCount_ = ELECTION_MEMBER_COUNT;
+    int leadershipCalls = 0;
+    service->leadershipSnapshotProvider_ = [&](coordinator::CoordinatorLeadershipSnapshot &snapshot) {
+        ++leadershipCalls;
+        snapshot = { true, LEADER_ADDRESS, LEADER_TERM };
+        return Status::OK();
+    };
+    service->recoveryStateProvider_ = [](const std::string &) { return coordinator::TopologyRecoveryState::READY; };
+    const auto revisionBefore = service->memStore_->CurrentRevision();
+
+    coordinator::PutReqPb put;
+    put.set_key("/datasystem/callback-gap/notify/" + std::string(MEMBER_ADDRESS));
+    put.set_value("notify");
+    coordinator::PutRspPb putBeforeCallback;
+    EXPECT_EQ(service->Put(put, putBeforeCallback).GetCode(), K_NOT_READY);
+    EXPECT_EQ(putBeforeCallback.header().state(), coordinator::ResponseHeader::STATE_UNSPECIFIED);
+
+    coordinator::EnsureLeaderMembershipReqPb ensure;
+    ensure.set_cluster_name("callback-gap");
+    ensure.set_reporter_address(MEMBER_ADDRESS);
+    ensure.set_coordinator_id(service->coordinatorId_);
+    ensure.set_leader_term(LEADER_TERM);
+    ensure.set_membership_value(EncodeMembershipValue());
+    ensure.set_ttl_ms(MEMBERSHIP_TTL_MS);
+    coordinator::EnsureLeaderMembershipRspPb ensureBeforeCallback;
+    EXPECT_EQ(service->EnsureLeaderMembership(ensure, ensureBeforeCallback).GetCode(), K_NOT_READY);
+    EXPECT_EQ(ensureBeforeCallback.header().state(), coordinator::ResponseHeader::STATE_UNSPECIFIED);
+    EXPECT_EQ(service->memStore_->CurrentRevision(), revisionBefore);
+
+    service->OnLeaderStart(LEADER_TERM);
+
+    coordinator::PutRspPb putAfterCallback;
+    DS_ASSERT_OK(service->Put(put, putAfterCallback));
+    EXPECT_EQ(putAfterCallback.header().state(), coordinator::ResponseHeader::SERVING);
+    EXPECT_EQ(putAfterCallback.header().leader_term(), LEADER_TERM);
+    coordinator::EnsureLeaderMembershipRspPb ensureAfterCallback;
+    DS_ASSERT_OK(service->EnsureLeaderMembership(ensure, ensureAfterCallback));
+    EXPECT_EQ(ensureAfterCallback.header().state(), coordinator::ResponseHeader::SERVING);
+    EXPECT_EQ(ensureAfterCallback.header().leader_term(), LEADER_TERM);
+    EXPECT_EQ(ensureAfterCallback.result(), coordinator::EnsureLeaderMembershipRspPb::ACCEPTED);
+    EXPECT_GT(service->memStore_->CurrentRevision(), revisionBefore);
+    EXPECT_EQ(leadershipCalls, 4);
+    DS_ASSERT_OK(service->Shutdown());
+}
+
+TEST_F(CoordinatorServiceImplTest, TypedAdmissionAllowsOnlyRecoveryControlDuringRecovery)
+{
+    auto service = MakeService();
+    coordinator::ResponseHeader header;
+    const auto verify = [&](coordinator::ResponseHeader::StatePb state, bool allowBusiness, bool allowControl) {
+        header.set_state(state);
+        EXPECT_EQ(service->AllowContinue<coordinator::PutReqPb>(header), allowBusiness);
+        EXPECT_EQ(service->AllowContinue<coordinator::KeepAliveReqPb>(header), allowControl);
+        EXPECT_EQ(service->AllowContinue<coordinator::EnsureLeaderMembershipReqPb>(header), allowControl);
+        EXPECT_EQ(service->AllowContinue<coordinator::ReportTopologyRecoveryCandidateReqPb>(header), allowControl);
+    };
+
+    verify(coordinator::ResponseHeader::STATE_UNSPECIFIED, false, false);
+    verify(coordinator::ResponseHeader::NOT_LEADER, false, false);
+    verify(coordinator::ResponseHeader::RECOVERING, false, true);
+    verify(coordinator::ResponseHeader::SERVING, true, true);
+}
+
+TEST_F(CoordinatorServiceImplTest, RecoveringOrdinaryClusterRpcsReturnHeaderWithoutSideEffects)
+{
+    auto service = MakeService();
+    DS_ASSERT_OK(InitializeRunning(*service));
+    EnableElection(*service);
+    const std::string coordinatorId = service->coordinatorId_;
+    auto recoveryState = coordinator::TopologyRecoveryState::READY;
+    int recoveryStateCalls = 0;
+    service->recoveryStateProvider_ = [&](const std::string &clusterName) {
+        EXPECT_EQ(clusterName, "ordinary");
+        ++recoveryStateCalls;
+        return recoveryState;
+    };
+
+    const std::string membershipKey = "/datasystem/ordinary/cluster/" + std::string(MEMBER_ADDRESS);
+    coordinator::PutReqPb setup;
+    setup.set_key(membershipKey);
+    setup.set_value(EncodeMembershipValue());
+    setup.set_ttl(MEMBERSHIP_TTL_MS);
+    coordinator::PutRspPb setupResponse;
+    DS_ASSERT_OK(service->Put(setup, setupResponse));
+
+    recoveryState = coordinator::TopologyRecoveryState::RECOVERING;
+    recoveryStateCalls = 0;
+    const auto revisionBefore = service->memStore_->CurrentRevision();
+    const auto nextWatchIdBefore = service->watchRegistry_->nextWatchId_.load(std::memory_order_acquire);
+    auto store = service->store_;
+    service->store_.reset();
+    auto controlHost = std::move(service->topologyControlHost_);
+
+    coordinator::PutReqPb put;
+    put.set_key(membershipKey);
+    put.set_value("blocked");
+    put.set_expected_coordinator_id(MISMATCHED_COORDINATOR_ID);
+    coordinator::PutRspPb putResponse;
+    DS_ASSERT_OK(service->Put(put, putResponse));
+    ExpectHeaderState(putResponse.header(), coordinator::ResponseHeader::RECOVERING, coordinatorId, LEADER_TERM);
+
+    coordinator::RangeReqPb range;
+    range.set_key(membershipKey);
     coordinator::RangeRspPb rangeResponse;
-    // A recovering Leader returns a normal routing envelope but does not touch the local Store.
-    DS_ASSERT_OK(service_->Range(rangeRequest, rangeResponse));
+    DS_ASSERT_OK(service->Range(range, rangeResponse));
+    ExpectHeaderState(rangeResponse.header(), coordinator::ResponseHeader::RECOVERING, coordinatorId, LEADER_TERM);
     EXPECT_TRUE(rangeResponse.kvs().empty());
-    ExpectHeader(rangeResponse.header(), false, coordinator::ResponseHeader::LEADER_RECOVERING, RECOVERING_TERM,
-                 RECOVERING_LEADER_ADDRESS);
 
-    coordinator::EnsureLeaderMembershipReqPb ensureRequest;
-    ensureRequest.set_leader_term(RECOVERING_TERM);
-    ensureRequest.set_coordinator_id(rangeResponse.header().coordinator_id());
-    ensureRequest.set_cluster_name(VALID_CLUSTER_NAME);
-    ensureRequest.set_reporter_address("127.0.0.1:31501");
-    ensureRequest.set_membership_value(ValidMembershipValue());
-    ensureRequest.set_ttl_ms(10'000);
+    coordinator::DeleteRangeReqPb deleteRange;
+    deleteRange.set_key(membershipKey);
+    deleteRange.set_expected_coordinator_id(MISMATCHED_COORDINATOR_ID);
+    coordinator::DeleteRangeRspPb deleteResponse;
+    DS_ASSERT_OK(service->DeleteRange(deleteRange, deleteResponse));
+    ExpectHeaderState(deleteResponse.header(), coordinator::ResponseHeader::RECOVERING, coordinatorId, LEADER_TERM);
+    EXPECT_EQ(deleteResponse.deleted(), 0);
+
+    coordinator::WatchRangeReqPb watch;
+    watch.set_key("/datasystem/ordinary/topology/");
+    watch.set_watcher_addr(MEMBER_ADDRESS);
+    watch.set_registration_id("recovering-watch");
+    coordinator::WatchRangeRspPb watchResponse;
+    DS_ASSERT_OK(service->WatchRange(watch, watchResponse));
+    ExpectHeaderState(watchResponse.header(), coordinator::ResponseHeader::RECOVERING, coordinatorId, LEADER_TERM);
+    EXPECT_EQ(watchResponse.watch_id(), 0);
+
+    coordinator::ReportWorkerLivenessReqPb liveness;
+    liveness.set_cluster_name("ordinary");
+    liveness.set_witness_address(MEMBER_ADDRESS);
+    liveness.set_target_address("127.0.0.1:31502");
+    liveness.set_target_member_id("target-member");
+    liveness.set_probe_round(1);
+    liveness.set_result(coordinator::WORKER_REACHABLE);
+    liveness.set_coordinator_id(coordinatorId);
+    coordinator::ReportWorkerLivenessRspPb livenessResponse;
+    DS_ASSERT_OK(service->ReportWorkerLiveness(liveness, livenessResponse));
+    ExpectHeaderState(livenessResponse.header(), coordinator::ResponseHeader::RECOVERING, coordinatorId, LEADER_TERM);
+
+    coordinator::GetClusterRawSnapshotReqPb snapshot;
+    snapshot.set_cluster_name("ordinary");
+    coordinator::GetClusterRawSnapshotRspPb snapshotResponse;
+    DS_ASSERT_OK(service->GetClusterRawSnapshot(snapshot, snapshotResponse));
+    ExpectHeaderState(snapshotResponse.header(), coordinator::ResponseHeader::RECOVERING, coordinatorId, LEADER_TERM);
+    EXPECT_TRUE(snapshotResponse.topology_kvs().empty());
+    EXPECT_TRUE(snapshotResponse.membership_kvs().empty());
+
+    EXPECT_EQ(recoveryStateCalls, 6);
+    EXPECT_EQ(service->memStore_->CurrentRevision(), revisionBefore);
+    EXPECT_EQ(service->watchRegistry_->nextWatchId_.load(std::memory_order_acquire), nextWatchIdBefore);
+
+    service->store_ = std::move(store);
+    service->topologyControlHost_ = std::move(controlHost);
+    std::vector<KeyValueEntry> members;
+    int64_t revision = 0;
+    DS_ASSERT_OK(service->store_->Range(membershipKey, "", members, revision));
+    ASSERT_EQ(members.size(), 1U);
+    EXPECT_EQ(members.front().value, setup.value());
+    DS_ASSERT_OK(service->Shutdown());
+}
+
+TEST_F(CoordinatorServiceImplTest, RecoveryControlRpcsExecuteWithRecoveringHeader)
+{
+    const std::string clusterName = "recovery-control";
+    auto service = MakeService();
+    DS_ASSERT_OK(InitializeRunning(*service));
+    EnableElection(*service);
+    const std::string coordinatorId = service->coordinatorId_;
+    int recoveryStateCalls = 0;
+    service->recoveryStateProvider_ = [&](const std::string &observedClusterName) {
+        EXPECT_EQ(observedClusterName, clusterName);
+        ++recoveryStateCalls;
+        return coordinator::TopologyRecoveryState::RECOVERING;
+    };
+
+    coordinator::EnsureLeaderMembershipReqPb ensure;
+    ensure.set_cluster_name(clusterName);
+    ensure.set_reporter_address(MEMBER_ADDRESS);
+    ensure.set_coordinator_id(coordinatorId);
+    ensure.set_leader_term(LEADER_TERM);
+    ensure.set_membership_value(EncodeMembershipValue());
+    ensure.set_ttl_ms(MEMBERSHIP_TTL_MS);
     coordinator::EnsureLeaderMembershipRspPb ensureResponse;
-    DS_ASSERT_OK(service_->EnsureLeaderMembership(ensureRequest, ensureResponse));
+    DS_ASSERT_OK(service->EnsureLeaderMembership(ensure, ensureResponse));
+    ExpectHeaderState(ensureResponse.header(), coordinator::ResponseHeader::RECOVERING, coordinatorId, LEADER_TERM);
     EXPECT_EQ(ensureResponse.result(), coordinator::EnsureLeaderMembershipRspPb::ACCEPTED);
     EXPECT_GT(ensureResponse.membership_mod_revision(), 0);
-    ExpectHeader(ensureResponse.header(), false, coordinator::ResponseHeader::LEADER_RECOVERING,
-                 RECOVERING_TERM, RECOVERING_LEADER_ADDRESS);
-    {
-        std::lock_guard<std::mutex> lock(service_->topologyControlHost_->mutex_);
-        const auto entry = service_->topologyControlHost_->entries_.find(VALID_CLUSTER_NAME);
-        ASSERT_NE(entry, service_->topologyControlHost_->entries_.end());
-        EXPECT_EQ(entry->second->state, coordinator::TopologyControlHost::EntryState::WAITING_RECOVERY);
-        EXPECT_TRUE(entry->second->hasCommittedMembership);
-        EXPECT_EQ(entry->second->pendingMembershipPuts, 0UL);
-    }
 
-    coordinator::KeepAliveReqPb keepAliveRequest;
-    keepAliveRequest.set_key(MembershipKey(ensureRequest.reporter_address()));
-    keepAliveRequest.set_expected_coordinator_id(ensureResponse.header().coordinator_id());
-    keepAliveRequest.set_expected_mod_revision(ensureResponse.membership_mod_revision());
-    service_->topologyControlHost_->RecordWorkerFailureSummaries(VALID_CLUSTER_NAME, ensureRequest.reporter_address(),
-                                                                 { "127.0.0.1:31502" });
+    coordinator::KeepAliveReqPb keepAlive;
+    keepAlive.set_key("/datasystem/" + clusterName + "/cluster/" + MEMBER_ADDRESS);
+    keepAlive.set_expected_coordinator_id(coordinatorId);
+    keepAlive.set_expected_mod_revision(ensureResponse.membership_mod_revision());
     coordinator::KeepAliveRspPb keepAliveResponse;
-    DS_ASSERT_OK(service_->KeepAlive(keepAliveRequest, keepAliveResponse));
-    EXPECT_GT(keepAliveResponse.ttl(), 0);
+    DS_ASSERT_OK(service->KeepAlive(keepAlive, keepAliveResponse));
+    ExpectHeaderState(keepAliveResponse.header(), coordinator::ResponseHeader::RECOVERING, coordinatorId, LEADER_TERM);
+    EXPECT_EQ(keepAliveResponse.ttl(), MEMBERSHIP_TTL_MS);
     EXPECT_GT(keepAliveResponse.remaining_ttl(), 0);
-    ExpectHeader(keepAliveResponse.header(), false, coordinator::ResponseHeader::LEADER_RECOVERING, RECOVERING_TERM,
-                 RECOVERING_LEADER_ADDRESS);
-    {
-        std::lock_guard<std::mutex> lock(service_->topologyControlHost_->failureReportMutex_);
-        const auto cluster = service_->topologyControlHost_->failureReportsByCluster_.find(VALID_CLUSTER_NAME);
-        EXPECT_TRUE(cluster == service_->topologyControlHost_->failureReportsByCluster_.end()
-                    || cluster->second.empty());
-    }
 
-    coordinator::ReportTopologyRecoveryCandidateReqPb reportRequest;
-    reportRequest.set_cluster_name(VALID_CLUSTER_NAME);
-    reportRequest.set_reporter_address("127.0.0.1:31501");
-    reportRequest.set_result(coordinator::TOPOLOGY_RECOVERY_NO_SNAPSHOT);
-    reportRequest.set_leader_term(RECOVERING_TERM);
-    reportRequest.set_coordinator_id(rangeResponse.header().coordinator_id());
+    coordinator::ReportTopologyRecoveryCandidateReqPb report;
+    report.set_cluster_name(clusterName);
+    report.set_coordinator_id(coordinatorId);
+    report.set_leader_term(LEADER_TERM);
+    report.set_reporter_address(MEMBER_ADDRESS);
+    report.set_result(coordinator::TOPOLOGY_RECOVERY_NO_SNAPSHOT);
     coordinator::ReportTopologyRecoveryCandidateRspPb reportResponse;
-    DS_ASSERT_OK(service_->ReportTopologyRecoveryCandidate(reportRequest, reportResponse));
+    DS_ASSERT_OK(service->ReportTopologyRecoveryCandidate(report, reportResponse));
+    ExpectHeaderState(reportResponse.header(), coordinator::ResponseHeader::RECOVERING, coordinatorId, LEADER_TERM);
     EXPECT_EQ(reportResponse.result(), coordinator::ReportTopologyRecoveryCandidateRspPb::ACCEPTED);
-    ExpectHeader(reportResponse.header(), false, coordinator::ResponseHeader::LEADER_RECOVERING,
-                 RECOVERING_TERM, RECOVERING_LEADER_ADDRESS);
+    EXPECT_EQ(reportResponse.recovery_state(), coordinator::COORDINATOR_RECOVERING);
+    EXPECT_EQ(recoveryStateCalls, 3);
+    DS_ASSERT_OK(service->Shutdown());
 }
 
-TEST_F(CoordinatorServiceImplTest, ProbesMultipleFailedMembersWithinSharedDeadline)
+TEST_F(CoordinatorServiceImplTest, InvalidEnsureMembershipRetainsAdmittedHeaderWithoutSideEffects)
 {
-    service_->coordinatorDiscovery_.reset();
-    service_->expectedMemberCount_ = 0;
-    service_->servingState_.store(coordinator::CoordinatorServiceImpl::ServingState::LEADER_SERVING,
-                                  std::memory_order_release);
-    service_->watchDispatcher_ = std::make_shared<SlowProbeWatchDispatcher>(service_->watchRegistry_.get());
-    std::vector<cluster::MemberIdentity> targets;
-    for (size_t index = 0; index < 10; ++index) {
-        targets.push_back({ "member-" + std::to_string(index), "127.0.0.1:" + std::to_string(31501 + index) });
+    auto service = MakeService();
+    DS_ASSERT_OK(InitializeRunning(*service));
+    EnableElection(*service);
+    auto recoveryState = coordinator::TopologyRecoveryState::RECOVERING;
+    service->recoveryStateProvider_ = [&](const std::string &clusterName) {
+        EXPECT_EQ(clusterName, CLUSTER_NAME);
+        return recoveryState;
+    };
+    const auto revisionBefore = service->memStore_->CurrentRevision();
+    auto store = service->store_;
+    service->store_.reset();
+    auto controlHost = std::move(service->topologyControlHost_);
+
+    coordinator::EnsureLeaderMembershipReqPb ensure;
+    ensure.set_cluster_name(CLUSTER_NAME);
+    ensure.set_reporter_address("invalid-address");
+    ensure.set_coordinator_id(service->coordinatorId_);
+    ensure.set_leader_term(LEADER_TERM);
+    ensure.set_membership_value(EncodeMembershipValue());
+    ensure.set_ttl_ms(MEMBERSHIP_TTL_MS);
+    for (const auto expectedState : { coordinator::ResponseHeader::RECOVERING,
+                                      coordinator::ResponseHeader::SERVING }) {
+        recoveryState = expectedState == coordinator::ResponseHeader::RECOVERING
+                            ? coordinator::TopologyRecoveryState::RECOVERING
+                            : coordinator::TopologyRecoveryState::READY;
+        coordinator::EnsureLeaderMembershipRspPb response;
+        DS_ASSERT_OK(service->EnsureLeaderMembership(ensure, response));
+        ExpectHeaderState(response.header(), expectedState, service->coordinatorId_, LEADER_TERM);
+        EXPECT_EQ(response.result(), coordinator::EnsureLeaderMembershipRspPb::INVALID_MEMBERSHIP);
+        EXPECT_EQ(service->memStore_->CurrentRevision(), revisionBefore);
     }
 
-    const auto start = std::chrono::steady_clock::now();
-    const auto results = service_->ProbeMembersLiveness(targets, start + std::chrono::milliseconds(250));
-    const auto elapsed =
-        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
-
-    ASSERT_EQ(results.size(), targets.size());
-    EXPECT_TRUE(std::all_of(results.begin(), results.end(), [](const auto &result) {
-        return result.outcome == cluster::ControlBackendProbeOutcome::DEADLINE_EXCEEDED;
-    }));
-    EXPECT_LT(elapsed, std::chrono::milliseconds(220));
+    service->store_ = std::move(store);
+    service->topologyControlHost_ = std::move(controlHost);
+    DS_ASSERT_OK(service->Shutdown());
 }
 
-TEST_F(CoordinatorServiceImplTest, DiscardsProbeResultsWhenControlEpochChanges)
+TEST_F(CoordinatorServiceImplTest, CollectionRootsCannotBePutOrExactlyDeleted)
 {
-    service_->coordinatorDiscovery_.reset();
-    service_->expectedMemberCount_ = 0;
-    service_->servingState_.store(coordinator::CoordinatorServiceImpl::ServingState::LEADER_SERVING,
-                                  std::memory_order_release);
-    service_->watchDispatcher_ = std::make_shared<SlowProbeWatchDispatcher>(service_->watchRegistry_.get(), [this] {
-        service_->servingState_.store(coordinator::CoordinatorServiceImpl::ServingState::STOPPING,
-                                      std::memory_order_release);
-    });
-    const std::vector<cluster::MemberIdentity> targets{ { "member-0", "127.0.0.1:31501" },
-                                                        { "member-1", "127.0.0.1:31502" } };
+    auto service = MakeService();
+    DS_ASSERT_OK(InitializeRunning(*service));
+    service->recoveryStateProvider_ = [](const std::string &) { return coordinator::TopologyRecoveryState::READY; };
+    std::unique_ptr<cluster::TopologyKeyHelper> keys;
+    DS_ASSERT_OK(cluster::TopologyKeyHelper::Create("mutation-root", keys));
+    const std::array<std::string, 6> collectionRoots{
+        keys->MigrateTaskTable() + "/", keys->DeleteTaskTable() + "/", keys->NotifyTable() + "/",
+        keys->ProbeTable() + "/",       keys->MembershipTable() + "/", keys->ScaleInMetadataDoneTable() + "/"
+    };
+    const auto revisionBefore = service->memStore_->CurrentRevision();
+    auto store = service->store_;
+    service->store_.reset();
+    auto controlHost = std::move(service->topologyControlHost_);
 
-    const auto results =
-        service_->ProbeMembersLiveness(targets, std::chrono::steady_clock::now() + std::chrono::milliseconds(250));
-    service_->servingState_.store(coordinator::CoordinatorServiceImpl::ServingState::LEADER_SERVING,
-                                  std::memory_order_release);
+    for (const auto &root : collectionRoots) {
+        SCOPED_TRACE(root);
+        coordinator::PutReqPb put;
+        put.set_key(root);
+        put.set_value("invalid-root-mutation");
+        coordinator::PutRspPb putResponse;
+        EXPECT_EQ(service->Put(put, putResponse).GetCode(), K_INVALID);
+        EXPECT_EQ(putResponse.header().state(), coordinator::ResponseHeader::STATE_UNSPECIFIED);
 
-    ASSERT_EQ(results.size(), targets.size());
-    EXPECT_TRUE(std::all_of(results.begin(), results.end(), [](const auto &result) {
-        return result.outcome == cluster::ControlBackendProbeOutcome::CANCELLED;
-    }));
+        coordinator::DeleteRangeReqPb deleteRange;
+        deleteRange.set_key(root);
+        coordinator::DeleteRangeRspPb deleteResponse;
+        EXPECT_EQ(service->DeleteRange(deleteRange, deleteResponse).GetCode(), K_INVALID);
+        EXPECT_EQ(deleteResponse.header().state(), coordinator::ResponseHeader::STATE_UNSPECIFIED);
+    }
+    EXPECT_EQ(service->memStore_->CurrentRevision(), revisionBefore);
+
+    service->store_ = std::move(store);
+    service->topologyControlHost_ = std::move(controlHost);
+    DS_ASSERT_OK(service->Shutdown());
 }
 
-TEST_F(CoordinatorServiceImplTest, ConfiguresActiveFailureDirectProbe)
+TEST_F(CoordinatorServiceImplTest, InvalidPhysicalKeysFailBeforeHeaderOrStoreAccess)
 {
-    coordinator::TopologyControlHost::Options options;
+    auto service = MakeService();
+    DS_ASSERT_OK(InitializeRunning(*service));
+    int recoveryStateCalls = 0;
+    service->recoveryStateProvider_ = [&](const std::string &) {
+        ++recoveryStateCalls;
+        return coordinator::TopologyRecoveryState::READY;
+    };
+    const auto revisionBefore = service->memStore_->CurrentRevision();
+    auto store = service->store_;
+    service->store_.reset();
 
-    service_->ConfigureTopologyHostOptions(options);
+    coordinator::PutReqPb put;
+    put.set_key("/outside/coordinator");
+    coordinator::PutRspPb putResponse;
+    EXPECT_EQ(service->Put(put, putResponse).GetCode(), K_INVALID);
+    EXPECT_EQ(putResponse.header().state(), coordinator::ResponseHeader::STATE_UNSPECIFIED);
 
-    EXPECT_TRUE(options.controller.memberLivenessProbe);
+    coordinator::RangeReqPb range;
+    range.set_key("/outside/coordinator");
+    coordinator::RangeRspPb rangeResponse;
+    EXPECT_EQ(service->Range(range, rangeResponse).GetCode(), K_INVALID);
+    EXPECT_EQ(rangeResponse.header().state(), coordinator::ResponseHeader::STATE_UNSPECIFIED);
+
+    coordinator::DeleteRangeReqPb deleteRange;
+    deleteRange.set_key("/outside/coordinator");
+    coordinator::DeleteRangeRspPb deleteResponse;
+    EXPECT_EQ(service->DeleteRange(deleteRange, deleteResponse).GetCode(), K_INVALID);
+    EXPECT_EQ(deleteResponse.header().state(), coordinator::ResponseHeader::STATE_UNSPECIFIED);
+
+    coordinator::WatchRangeReqPb watch;
+    watch.set_key("/outside/coordinator");
+    coordinator::WatchRangeRspPb watchResponse;
+    EXPECT_EQ(service->WatchRange(watch, watchResponse).GetCode(), K_INVALID);
+    EXPECT_EQ(watchResponse.header().state(), coordinator::ResponseHeader::STATE_UNSPECIFIED);
+
+    coordinator::KeepAliveReqPb keepAlive;
+    keepAlive.set_key("/outside/coordinator");
+    coordinator::KeepAliveRspPb keepAliveResponse;
+    EXPECT_EQ(service->KeepAlive(keepAlive, keepAliveResponse).GetCode(), K_INVALID);
+    EXPECT_EQ(keepAliveResponse.header().state(), coordinator::ResponseHeader::STATE_UNSPECIFIED);
+
+    EXPECT_EQ(recoveryStateCalls, 0);
+    EXPECT_EQ(service->memStore_->CurrentRevision(), revisionBefore);
+    service->store_ = std::move(store);
+    DS_ASSERT_OK(service->Shutdown());
 }
 
-TEST_F(CoordinatorServiceImplTest, StaleTermEnsureDoesNotCreateMembership)
+TEST_F(CoordinatorServiceImplTest, MasterAddressSingletonUsesLeadershipOnlyAdmission)
 {
-    EnterRecoveringLeader();
+    auto service = MakeService();
+    DS_ASSERT_OK(InitializeRunning(*service));
+    int recoveryStateCalls = 0;
+    service->recoveryStateProvider_ = [&](const std::string &) {
+        ++recoveryStateCalls;
+        return coordinator::TopologyRecoveryState::RECOVERING;
+    };
+    const std::string key = std::string(COORDINATION_MASTER_ADDRESS_TABLE) + "/" + COORDINATION_MASTER_ADDRESS_KEY;
+
+    coordinator::PutReqPb put;
+    put.set_key(key);
+    put.set_value("127.0.0.1:31501");
+    coordinator::PutRspPb putResponse;
+    DS_ASSERT_OK(service->Put(put, putResponse));
+
+    coordinator::RangeReqPb range;
+    range.set_key(key);
+    coordinator::RangeRspPb rangeResponse;
+    DS_ASSERT_OK(service->Range(range, rangeResponse));
+    ASSERT_EQ(rangeResponse.kvs_size(), 1);
+    EXPECT_EQ(rangeResponse.kvs(0).value(), put.value());
+    EXPECT_EQ(recoveryStateCalls, 0);
+
+    range.set_range_end(key + "0");
+    coordinator::RangeRspPb invalidRangeResponse;
+    EXPECT_EQ(service->Range(range, invalidRangeResponse).GetCode(), K_INVALID);
+    DS_ASSERT_OK(service->Shutdown());
+}
+
+TEST_F(CoordinatorServiceImplTest, ReadyAndRecoveringClustersAreAdmittedIndependently)
+{
+    auto service = MakeService();
+    DS_ASSERT_OK(InitializeRunning(*service));
+    EnableElection(*service);
+    std::unordered_map<std::string, int> calls;
+    service->recoveryStateProvider_ = [&](const std::string &clusterName) {
+        ++calls[clusterName];
+        return clusterName == "a" ? coordinator::TopologyRecoveryState::READY
+                                  : coordinator::TopologyRecoveryState::RECOVERING;
+    };
+
+    coordinator::PutReqPb readyPut;
+    readyPut.set_key("/datasystem/a/cluster/127.0.0.1:31511");
+    readyPut.set_value(EncodeMembershipValue());
+    coordinator::PutRspPb readyResponse;
+    DS_ASSERT_OK(service->Put(readyPut, readyResponse));
+    ExpectHeaderState(readyResponse.header(), coordinator::ResponseHeader::SERVING, service->coordinatorId_,
+                      LEADER_TERM);
+    EXPECT_GT(readyResponse.revision(), 0);
+
+    coordinator::PutReqPb recoveringPut;
+    recoveringPut.set_key("/datasystem/b/cluster/127.0.0.1:31512");
+    recoveringPut.set_value(EncodeMembershipValue());
+    coordinator::PutRspPb recoveringResponse;
+    DS_ASSERT_OK(service->Put(recoveringPut, recoveringResponse));
+    ExpectHeaderState(recoveringResponse.header(), coordinator::ResponseHeader::RECOVERING, service->coordinatorId_,
+                      LEADER_TERM);
+    EXPECT_EQ(recoveringResponse.revision(), 0);
+
+    std::vector<KeyValueEntry> entries;
+    int64_t revision = 0;
+    DS_ASSERT_OK(service->store_->Range(readyPut.key(), "", entries, revision));
+    EXPECT_EQ(entries.size(), 1U);
+    entries.clear();
+    DS_ASSERT_OK(service->store_->Range(recoveringPut.key(), "", entries, revision));
+    EXPECT_TRUE(entries.empty());
+    EXPECT_EQ(calls["a"], 1);
+    EXPECT_EQ(calls["b"], 1);
+    DS_ASSERT_OK(service->Shutdown());
+}
+
+TEST_F(CoordinatorServiceImplTest, InvalidRangesFailBeforeClusterHeader)
+{
+    auto service = MakeService();
+    DS_ASSERT_OK(InitializeRunning(*service));
+    EnableElection(*service);
+    int recoveryStateCalls = 0;
+    service->recoveryStateProvider_ = [&](const std::string &) {
+        ++recoveryStateCalls;
+        return coordinator::TopologyRecoveryState::READY;
+    };
+
+    coordinator::RangeReqPb validRange;
+    validRange.set_key("/datasystem/a/cluster/");
+    validRange.set_range_end("/datasystem/a/cluster0");
+    coordinator::RangeRspPb validResponse;
+    DS_ASSERT_OK(service->Range(validRange, validResponse));
+    ExpectHeaderState(validResponse.header(), coordinator::ResponseHeader::SERVING, service->coordinatorId_,
+                      LEADER_TERM);
+
+    coordinator::RangeReqPb crossCluster;
+    crossCluster.set_key("/datasystem/a/cluster/");
+    crossCluster.set_range_end("/datasystem/b/cluster0");
+    coordinator::RangeRspPb crossClusterResponse;
+    EXPECT_EQ(service->Range(crossCluster, crossClusterResponse).GetCode(), K_INVALID);
+    EXPECT_EQ(crossClusterResponse.header().state(), coordinator::ResponseHeader::STATE_UNSPECIFIED);
+
+    coordinator::DeleteRangeReqPb deleteRange;
+    deleteRange.set_key("/datasystem/a/cluster/");
+    deleteRange.set_range_end("/datasystem/a/cluster0");
+    coordinator::DeleteRangeRspPb deleteResponse;
+    EXPECT_EQ(service->DeleteRange(deleteRange, deleteResponse).GetCode(), K_INVALID);
+    EXPECT_EQ(deleteResponse.header().state(), coordinator::ResponseHeader::STATE_UNSPECIFIED);
+
+    coordinator::WatchRangeReqPb watch;
+    watch.set_key("/datasystem/a/topology/");
+    watch.set_range_end("/datasystem/b/topology0");
+    watch.set_registration_id("cross-cluster");
+    coordinator::WatchRangeRspPb watchResponse;
+    EXPECT_EQ(service->WatchRange(watch, watchResponse).GetCode(), K_INVALID);
+    EXPECT_EQ(watchResponse.header().state(), coordinator::ResponseHeader::STATE_UNSPECIFIED);
+    EXPECT_EQ(recoveryStateCalls, 1);
+    DS_ASSERT_OK(service->Shutdown());
+}
+
+TEST_F(CoordinatorServiceImplTest, FollowerAdmissionPrecedesRequestDetailValidation)
+{
+    auto service = MakeService();
+    DS_ASSERT_OK(InitializeRunning(*service));
+    int recoveryStateCalls = 0;
+    service->recoveryStateProvider_ = [&](const std::string &) {
+        ++recoveryStateCalls;
+        return coordinator::TopologyRecoveryState::READY;
+    };
+    service->leadershipSnapshotProvider_ = [](coordinator::CoordinatorLeadershipSnapshot &snapshot) {
+        snapshot = { false, LEADER_ADDRESS, LEADER_TERM };
+        return Status::OK();
+    };
+
+    coordinator::WatchRangeReqPb watch;
+    watch.set_key("/datasystem/follower/topology/");
+    coordinator::WatchRangeRspPb watchResponse;
+    DS_ASSERT_OK(service->WatchRange(watch, watchResponse));
+    EXPECT_EQ(watchResponse.header().state(), coordinator::ResponseHeader::NOT_LEADER);
+    EXPECT_EQ(watchResponse.header().leader_address(), LEADER_ADDRESS);
+
+    coordinator::ReportTopologyRecoveryCandidateReqPb report;
+    report.set_cluster_name("follower");
+    coordinator::ReportTopologyRecoveryCandidateRspPb reportResponse;
+    DS_ASSERT_OK(service->ReportTopologyRecoveryCandidate(report, reportResponse));
+    EXPECT_EQ(reportResponse.header().state(), coordinator::ResponseHeader::NOT_LEADER);
+    EXPECT_EQ(reportResponse.header().leader_address(), LEADER_ADDRESS);
+    EXPECT_EQ(recoveryStateCalls, 0);
+    DS_ASSERT_OK(service->Shutdown());
+}
+
+TEST_F(CoordinatorServiceImplTest, FollowerUnscopedRpcsReturnHeaderWithoutCancelSideEffect)
+{
+    auto service = MakeService();
+    DS_ASSERT_OK(InitializeRunning(*service));
+    int recoveryStateCalls = 0;
+    service->recoveryStateProvider_ = [&](const std::string &) {
+        ++recoveryStateCalls;
+        return coordinator::TopologyRecoveryState::READY;
+    };
+    const std::string coordinatorId = service->coordinatorId_;
+    const std::string membershipKey = "/datasystem/follower/cluster/" + std::string(MEMBER_ADDRESS);
+    coordinator::PutReqPb put;
+    put.set_key(membershipKey);
+    put.set_value(EncodeMembershipValue());
+    coordinator::PutRspPb putResponse;
+    DS_ASSERT_OK(service->Put(put, putResponse));
+
+    const std::string watchKey = "/datasystem/follower/topology/";
+    coordinator::WatchRangeReqPb watch;
+    watch.set_key(watchKey);
+    watch.set_watcher_addr(MEMBER_ADDRESS);
+    watch.set_registration_id("follower-cancel");
+    coordinator::WatchRangeRspPb watchResponse;
+    DS_ASSERT_OK(service->WatchRange(watch, watchResponse));
+    ASSERT_GT(watchResponse.watch_id(), 0);
+
+    service->leadershipSnapshotProvider_ = [](coordinator::CoordinatorLeadershipSnapshot &snapshot) {
+        snapshot = { false, LEADER_ADDRESS, LEADER_TERM };
+        return Status::OK();
+    };
+    recoveryStateCalls = 0;
+    coordinator::CancelWatchReqPb cancel;
+    cancel.set_watcher_addr(MEMBER_ADDRESS);
+    cancel.add_watch_ids(watchResponse.watch_id());
+    cancel.set_expected_coordinator_id(coordinatorId);
+    coordinator::CancelWatchRspPb cancelResponse;
+    DS_ASSERT_OK(service->CancelWatch(cancel, cancelResponse));
+    EXPECT_EQ(cancelResponse.header().state(), coordinator::ResponseHeader::NOT_LEADER);
+    EXPECT_EQ(cancelResponse.header().leader_address(), LEADER_ADDRESS);
+    EXPECT_EQ(cancelResponse.header().coordinator_id(), coordinatorId);
+    EXPECT_EQ(cancelResponse.header().leader_term(), LEADER_TERM);
+
+    std::vector<std::shared_ptr<WatcherEntry>> matched;
+    service->watchRegistry_->MatchWatchers(watchKey, matched);
+    ASSERT_EQ(matched.size(), 1U);
+    EXPECT_EQ(matched.front()->watchId, watchResponse.watch_id());
 
     coordinator::GetCoordinatorIdReqPb idRequest;
     coordinator::GetCoordinatorIdRspPb idResponse;
-    DS_ASSERT_OK(service_->GetCoordinatorId(idRequest, idResponse));
-
-    coordinator::EnsureLeaderMembershipReqPb request;
-    request.set_cluster_name(VALID_CLUSTER_NAME);
-    request.set_reporter_address("127.0.0.1:31501");
-    request.set_coordinator_id(idResponse.header().coordinator_id());
-    request.set_leader_term(FOLLOWER_TERM);
-    request.set_membership_value(ValidMembershipValue());
-    request.set_ttl_ms(10'000);
-    coordinator::EnsureLeaderMembershipRspPb response;
-
-    DS_ASSERT_OK(service_->EnsureLeaderMembership(request, response));
-    EXPECT_EQ(response.result(), coordinator::EnsureLeaderMembershipRspPb::STALE_EPOCH);
-    ExpectHeader(response.header(), false, coordinator::ResponseHeader::LEADER_RECOVERING, RECOVERING_TERM,
-                 RECOVERING_LEADER_ADDRESS);
-
-    // Recovery control remains available while business reads are gated. A current-round
-    // report proves the rejected Ensure did not admit this Worker's membership.
-    coordinator::ReportTopologyRecoveryCandidateReqPb reportRequest;
-    reportRequest.set_cluster_name(VALID_CLUSTER_NAME);
-    reportRequest.set_reporter_address("127.0.0.1:31501");
-    reportRequest.set_result(coordinator::TOPOLOGY_RECOVERY_NO_SNAPSHOT);
-    reportRequest.set_coordinator_id(idResponse.header().coordinator_id());
-    reportRequest.set_leader_term(RECOVERING_TERM);
-    coordinator::ReportTopologyRecoveryCandidateRspPb reportResponse;
-    DS_ASSERT_OK(service_->ReportTopologyRecoveryCandidate(reportRequest, reportResponse));
-    EXPECT_EQ(reportResponse.result(), coordinator::ReportTopologyRecoveryCandidateRspPb::MEMBERSHIP_NOT_READY);
+    DS_ASSERT_OK(service->GetCoordinatorId(idRequest, idResponse));
+    EXPECT_EQ(idResponse.header().state(), coordinator::ResponseHeader::NOT_LEADER);
+    EXPECT_EQ(idResponse.header().leader_address(), LEADER_ADDRESS);
+    EXPECT_EQ(idResponse.header().coordinator_id(), coordinatorId);
+    EXPECT_EQ(idResponse.header().leader_term(), LEADER_TERM);
+    EXPECT_EQ(recoveryStateCalls, 0);
+    DS_ASSERT_OK(service->Shutdown());
 }
 
-TEST_F(CoordinatorServiceImplTest, MembershipDeleteCompletesRecoveringLeaderGate)
+TEST_F(CoordinatorServiceImplTest, FencedMembershipDeleteExecutesDuringRecovery)
 {
-    EnterRecoveringLeader();
-    const std::string workerAddress = "127.0.0.1:31501";
+    auto service = MakeService();
+    DS_ASSERT_OK(InitializeRunning(*service));
+    EnableElection(*service);
+    service->recoveryStateProvider_ = [](const std::string &clusterName) {
+        EXPECT_EQ(clusterName, CLUSTER_NAME);
+        return coordinator::TopologyRecoveryState::RECOVERING;
+    };
+
+    const std::string membershipKey = "/datasystem/" + std::string(CLUSTER_NAME) + "/cluster/" + MEMBER_ADDRESS;
     int64_t version = 0;
     int64_t revision = 0;
-    DS_ASSERT_OK(service_->store_->Put(MembershipKey(workerAddress), ValidMembershipValue(), 10'000,
-                                      COORDINATOR_KEY_NOT_EXISTS_VERSION, version, revision));
-    ASSERT_EQ(service_->topologyRecoveryManager_->GetRoundSummary().recoveringCount, 1U);
+    DS_ASSERT_OK(service->store_->Put(membershipKey, EncodeMembershipValue(), MEMBERSHIP_TTL_MS,
+                                     COORDINATOR_KEY_NOT_EXISTS_VERSION, version, revision));
 
     coordinator::DeleteRangeReqPb request;
-    request.set_key(MembershipKey(workerAddress));
+    request.set_key(membershipKey);
     coordinator::DeleteRangeRspPb response;
-    DS_ASSERT_OK(service_->DeleteRange(request, response));
+    DS_ASSERT_OK(service->DeleteRange(request, response));
+    ExpectHeaderState(response.header(), coordinator::ResponseHeader::RECOVERING, service->coordinatorId_, LEADER_TERM);
     EXPECT_EQ(response.deleted(), 0);
-    EXPECT_EQ(service_->topologyRecoveryManager_->GetRoundSummary().recoveringCount, 1U);
 
-    request.set_expected_coordinator_id(service_->coordinatorId_);
+    request.set_expected_coordinator_id(service->coordinatorId_);
     request.set_expected_mod_revision(revision);
     response.Clear();
-    DS_ASSERT_OK(service_->DeleteRange(request, response));
-
+    DS_ASSERT_OK(service->DeleteRange(request, response));
+    ExpectHeaderState(response.header(), coordinator::ResponseHeader::RECOVERING, service->coordinatorId_, LEADER_TERM);
     EXPECT_EQ(response.deleted(), 1);
-    EXPECT_TRUE(response.header().is_leader());
-    EXPECT_EQ(service_->servingState_.load(std::memory_order_acquire),
-              coordinator::CoordinatorServiceImpl::ServingState::LEADER_SERVING);
 
-    service_->servingState_.store(coordinator::CoordinatorServiceImpl::ServingState::LEADER_RECOVERING,
-                                  std::memory_order_release);
+    std::vector<KeyValueEntry> entries;
+    int64_t rangeRevision = 0;
+    DS_ASSERT_OK(service->store_->Range(membershipKey, "", entries, rangeRevision));
+    EXPECT_TRUE(entries.empty());
+
     response.Clear();
-    DS_ASSERT_OK(service_->DeleteRange(request, response));
+    DS_ASSERT_OK(service->DeleteRange(request, response));
+    ExpectHeaderState(response.header(), coordinator::ResponseHeader::RECOVERING, service->coordinatorId_, LEADER_TERM);
     EXPECT_EQ(response.deleted(), 0);
-    EXPECT_TRUE(response.header().is_leader());
-}
-
-TEST_F(CoordinatorServiceImplTest, CoordinatorIdProbeRejectsUnknownLeaderButReturnsRecoveringLeader)
-{
-    coordinator::GetCoordinatorIdReqPb request;
-    coordinator::GetCoordinatorIdRspPb response;
-
-    EXPECT_EQ(service_->GetCoordinatorId(request, response).GetCode(), K_NOT_READY);
-
-    EnterRecoveringLeader();
-    response.Clear();
-    DS_ASSERT_OK(service_->GetCoordinatorId(request, response));
-    ExpectHeader(response.header(), false, coordinator::ResponseHeader::LEADER_RECOVERING, RECOVERING_TERM,
-                 RECOVERING_LEADER_ADDRESS);
-
-    service_->OnLeaderStop(Status(K_RUNTIME_ERROR, "leadership lost"));
-    response.Clear();
-    EXPECT_EQ(service_->GetCoordinatorId(request, response).GetCode(), K_NOT_READY);
-}
-
-TEST_F(CoordinatorServiceImplTest, LeaderStopImmediatelyRevokesBusinessServing)
-{
-    EnterRecoveringLeader();
-    service_->OnLeaderStop(Status(K_RUNTIME_ERROR, "leadership lost"));
-
-    coordinator::GetCoordinatorIdReqPb request;
-    coordinator::GetCoordinatorIdRspPb response;
-    EXPECT_EQ(service_->GetCoordinatorId(request, response).GetCode(), K_NOT_READY);
-
-    coordinator::RangeReqPb rangeRequest;
-    rangeRequest.set_key("/coordinator/revoked-leader");
-    coordinator::RangeRspPb rangeResponse;
-    EXPECT_EQ(service_->Range(rangeRequest, rangeResponse).GetCode(), K_NOT_READY);
-}
-
-TEST_F(CoordinatorServiceImplTest, RecoveryGateRestoresLeaderRoundTrace)
-{
-    constexpr char EXPECTED_TRACE_ID[] = "CoordinatorBootstrap;recovery-gate-test";
-    std::promise<std::string> observedTracePromise;
-    auto observedTrace = observedTracePromise.get_future();
-    service_->recoveryWindowTraceHook_ = [this, &observedTracePromise] {
-        if (std::this_thread::get_id() == service_->recoveryGateThread_.get_id()) {
-            observedTracePromise.set_value(Trace::Instance().GetTraceID());
-        }
-    };
-    const auto savedNodeDeadTimeout = FLAGS_node_dead_timeout_s;
-    Raii restoreTestState([this, savedNodeDeadTimeout] {
-        FLAGS_node_dead_timeout_s = savedNodeDeadTimeout;
-        std::unique_lock<std::shared_mutex> operationLock(service_->leaderOperationMutex_);
-        service_->recoveryWindowTraceHook_ = {};
-    });
-
-    {
-        TraceGuard traceGuard = Trace::Instance().SetTraceNewID(EXPECTED_TRACE_ID);
-        service_->OnLeaderStart(RECOVERING_TERM);
-    }
-    ASSERT_TRUE(Trace::Instance().GetTraceID().empty());
-    service_->servingState_.store(coordinator::CoordinatorServiceImpl::ServingState::LEADER_RECOVERING,
-                                  std::memory_order_release);
-    FLAGS_node_dead_timeout_s = 0;
-    service_->recoveryGateCv_.notify_all();
-
-    ASSERT_EQ(observedTrace.wait_for(std::chrono::seconds(5)), std::future_status::ready);
-    EXPECT_EQ(observedTrace.get(), EXPECTED_TRACE_ID);
+    DS_ASSERT_OK(service->Shutdown());
 }
 }  // namespace
 }  // namespace ut

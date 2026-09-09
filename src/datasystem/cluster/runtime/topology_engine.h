@@ -184,6 +184,13 @@ public:
         Builder &SetNodeDeadTimeout(std::chrono::seconds timeout);
 
         /**
+         * @brief Bind the maximum wait for a Coordinator to finish topology recovery during Worker startup.
+         * @param[in] timeout Non-negative recovery wait; production uses the full node-dead timeout.
+         * @return This Builder.
+         */
+        Builder &SetCoordinatorReadyTimeout(std::chrono::seconds timeout);
+
+        /**
          * @brief Bind the periodic exact-read and failure-scope probe interval.
          * @param[in] interval Positive interval; production uses the bounded default.
          * @return This Builder.
@@ -399,6 +406,7 @@ private:
         std::chrono::seconds scopeProbeDeadline{ 2 };
         std::chrono::milliseconds scopeProbeInterval{ 5'000 };
         std::chrono::seconds nodeDeadTimeout{ 0 };
+        std::chrono::seconds coordinatorReadyTimeout{ 0 };
         std::chrono::seconds localIsolationTimeout{ 0 };
         std::chrono::seconds stopGrace{ 10 };
         ControlBackendProbe controlBackendProbe;
@@ -472,6 +480,7 @@ private:
      * @return K_OK on success or member-role startup status otherwise.
      */
     Status StartMemberRole();
+    Status WaitForCoordinatorReady();
 
     /**
      * @brief Attempt every safe shutdown step and retain the first failure.
@@ -656,11 +665,16 @@ private:
     std::mutex availabilityTransitionMutex_;
     // Uses stateMutex_ and signals changes to threadExited_.
     std::condition_variable stoppedCv_;
+    std::mutex startupWaitMutex_;
+    std::condition_variable startupWaitCv_;
+    std::condition_variable lifecycleCv_;
     Thread stateThread_;
     bool startAttempted_{ false };
     bool ingressBound_{ false };
     bool lifecycleOperationInFlight_{ false };
     bool threadExited_{ true };
+    std::atomic<bool> startupCancellationRequested_{ false };
+    std::atomic<bool> coordinatorReadyWaitActive_{ false };
     std::atomic<TopologyEngineState> state_{ TopologyEngineState::STOPPED };
     // Latest internal candidate; traffic-allowing candidates remain unpublished until Start commits RUNNING.
     std::atomic<TopologyAvailabilityLevel> availability_{ TopologyAvailabilityLevel::NOT_READY };

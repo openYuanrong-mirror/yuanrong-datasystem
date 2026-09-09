@@ -83,7 +83,7 @@ public:
     /**
      * @brief Mark the local TopologyEngine ready for candidate export.
      */
-    void NotifyRuntimeReady();
+    void NotifyRecoveryParticipationReady();
 
     /**
      * @brief Stop scheduling and cooperatively drain report work.

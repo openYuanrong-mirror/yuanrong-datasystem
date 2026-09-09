@@ -324,7 +324,7 @@ TEST(WorkerLeaderReconcilerTest, EnsureAcceptancePrecedesReporterAndUsesObserved
     TopologyRecoveryReporter reporter(proxy, kClusterName, kWorkerAddress,
                                       [](uint64_t &, std::string &) { return Status(K_NOT_FOUND, "no snapshot"); },
                                       ReporterOptions());
-    reporter.NotifyRuntimeReady();
+    reporter.NotifyRecoveryParticipationReady();
     proxy.routes_.Set(Identity(9, 2));
     WorkerLeaderReconciler reconciler(proxy, backend, reporter, kClusterName);
     DS_ASSERT_OK(reconciler.Init());
@@ -351,7 +351,7 @@ TEST(WorkerLeaderReconcilerTest, RejectedEnsureNeverWakesReporter)
     TopologyRecoveryReporter reporter(proxy, kClusterName, kWorkerAddress,
                                       [](uint64_t &, std::string &) { return Status(K_NOT_FOUND, "no snapshot"); },
                                       ReporterOptions());
-    reporter.NotifyRuntimeReady();
+    reporter.NotifyRecoveryParticipationReady();
     proxy.routes_.Set(Identity(9, 2));
     WorkerLeaderReconciler reconciler(proxy, backend, reporter, kClusterName);
     DS_ASSERT_OK(reconciler.Init());
@@ -372,7 +372,7 @@ TEST(WorkerLeaderReconcilerTest, NewRouteEpochDiscardsOldEnsureCompletion)
     TopologyRecoveryReporter reporter(proxy, kClusterName, kWorkerAddress,
                                       [](uint64_t &, std::string &) { return Status(K_NOT_FOUND, "no snapshot"); },
                                       ReporterOptions());
-    reporter.NotifyRuntimeReady();
+    reporter.NotifyRecoveryParticipationReady();
     proxy.BlockEnsure();
     proxy.routes_.Set(Identity(9, 1));
     WorkerLeaderReconciler reconciler(proxy, backend, reporter, kClusterName);
@@ -453,7 +453,7 @@ TEST(WorkerLeaderReconcilerTest, SameLeaderIdentityDoesNotSubmitSecondEnsure)
     TopologyRecoveryReporter reporter(proxy, kClusterName, kWorkerAddress,
                                       [](uint64_t &, std::string &) { return Status(K_NOT_FOUND, "no snapshot"); },
                                       ReporterOptions());
-    reporter.NotifyRuntimeReady();
+    reporter.NotifyRecoveryParticipationReady();
     proxy.routes_.Set(Identity(9, 2));
     WorkerLeaderReconciler reconciler(proxy, backend, reporter, kClusterName);
     DS_ASSERT_OK(reconciler.Init());
@@ -474,7 +474,7 @@ TEST(WorkerLeaderReconcilerTest, ExplicitMembershipLossResubmitsEnsureForSameLea
     TopologyRecoveryReporter reporter(proxy, kClusterName, kWorkerAddress,
                                       [](uint64_t &, std::string &) { return Status(K_NOT_FOUND, "no snapshot"); },
                                       ReporterOptions());
-    reporter.NotifyRuntimeReady();
+    reporter.NotifyRecoveryParticipationReady();
     proxy.routes_.Set(Identity(9, 2));
     WorkerLeaderReconciler reconciler(proxy, backend, reporter, kClusterName);
     DS_ASSERT_OK(reconciler.Init());
@@ -524,7 +524,7 @@ TEST(WorkerLeaderReconcilerTest, AsyncRejoinCompletesMembershipReadyAfterEnsure)
     TopologyRecoveryReporter reporter(proxy, kClusterName, kWorkerAddress,
                                       [](uint64_t &, std::string &) { return Status(K_NOT_FOUND, "no snapshot"); },
                                       ReporterOptions());
-    reporter.NotifyRuntimeReady();
+    reporter.NotifyRecoveryParticipationReady();
     proxy.routes_.Set(Identity(9, 2));
     WorkerLeaderReconciler reconciler(proxy, backend, reporter, kClusterName);
     DS_ASSERT_OK(reconciler.Init());
@@ -549,7 +549,7 @@ TEST(WorkerLeaderReconcilerTest, InflightReconcileDefersQueuedRejoinCleanupToRes
     TopologyRecoveryReporter reporter(proxy, kClusterName, kWorkerAddress,
                                       [](uint64_t &, std::string &) { return Status(K_NOT_FOUND, "no snapshot"); },
                                       ReporterOptions());
-    reporter.NotifyRuntimeReady();
+    reporter.NotifyRecoveryParticipationReady();
     WorkerLeaderReconciler reconciler(proxy, backend, reporter, kClusterName);
     DS_ASSERT_OK(reconciler.Init());
     DS_ASSERT_OK(proxy.SetLeaderChangeHandler({}));
@@ -618,7 +618,7 @@ TEST(WorkerLeaderReconcilerTest, ExplicitMembershipLossDuringInflightEnsureResub
     TopologyRecoveryReporter reporter(proxy, kClusterName, kWorkerAddress,
                                       [](uint64_t &, std::string &) { return Status(K_NOT_FOUND, "no snapshot"); },
                                       ReporterOptions());
-    reporter.NotifyRuntimeReady();
+    reporter.NotifyRecoveryParticipationReady();
     proxy.BlockEnsure();
     proxy.routes_.Set(Identity(9, 2));
     WorkerLeaderReconciler reconciler(proxy, backend, reporter, kClusterName);
@@ -734,7 +734,7 @@ TEST(WorkerLeaderReconcilerTest, TermfulLeaderInitialMembershipWakesReporterWith
     TopologyRecoveryReporter reporter(proxy, kClusterName, kWorkerAddress,
                                       [](uint64_t &, std::string &) { return Status(K_NOT_FOUND, "no snapshot"); },
                                       ReporterOptions());
-    reporter.NotifyRuntimeReady();
+    reporter.NotifyRecoveryParticipationReady();
     proxy.routes_.Set(Identity(9, 1));
     WorkerLeaderReconciler reconciler(proxy, backend, reporter, kClusterName);
     DS_ASSERT_OK(reconciler.Init());
@@ -760,7 +760,7 @@ TEST(WorkerLeaderReconcilerTest, MembershipSuccessForOldLifetimeEnsuresCurrentLe
     TopologyRecoveryReporter reporter(proxy, kClusterName, kWorkerAddress,
                                       [](uint64_t &, std::string &) { return Status(K_NOT_FOUND, "no snapshot"); },
                                       ReporterOptions());
-    reporter.NotifyRuntimeReady();
+    reporter.NotifyRecoveryParticipationReady();
     proxy.routes_.Set(Identity(10, 2, kNextCoordinatorId));
     WorkerLeaderReconciler reconciler(proxy, backend, reporter, kClusterName);
     DS_ASSERT_OK(reconciler.Init());
@@ -788,7 +788,7 @@ TEST(WorkerLeaderReconcilerTest, SynchronousMembershipReconcileConvergesAfterSuc
     TopologyRecoveryReporter reporter(proxy, kClusterName, kWorkerAddress,
                                       [](uint64_t &, std::string &) { return Status(K_NOT_FOUND, "no snapshot"); },
                                       ReporterOptions());
-    reporter.NotifyRuntimeReady();
+    reporter.NotifyRecoveryParticipationReady();
     WorkerLeaderReconciler reconciler(proxy, backend, reporter, kClusterName);
     DS_ASSERT_OK(reconciler.Init());
     DS_ASSERT_OK(proxy.SetLeaderChangeHandler({}));
@@ -823,7 +823,7 @@ TEST(WorkerLeaderReconcilerTest, TermZeroMembershipForOldLifetimeEnsuresCurrentC
     TopologyRecoveryReporter reporter(proxy, kClusterName, kWorkerAddress,
                                       [](uint64_t &, std::string &) { return Status(K_NOT_FOUND, "no snapshot"); },
                                       ReporterOptions());
-    reporter.NotifyRuntimeReady();
+    reporter.NotifyRecoveryParticipationReady();
     proxy.routes_.Set(Identity(0, 1, kNextCoordinatorId));
     WorkerLeaderReconciler reconciler(proxy, backend, reporter, kClusterName);
     DS_ASSERT_OK(reconciler.Init());
@@ -850,7 +850,7 @@ TEST(WorkerLeaderReconcilerTest, TermZeroLeaderInitialMembershipWakesReporterWit
     TopologyRecoveryReporter reporter(proxy, kClusterName, kWorkerAddress,
                                       [](uint64_t &, std::string &) { return Status(K_NOT_FOUND, "no snapshot"); },
                                       ReporterOptions());
-    reporter.NotifyRuntimeReady();
+    reporter.NotifyRecoveryParticipationReady();
     proxy.routes_.Set(Identity(0, 1));
     WorkerLeaderReconciler reconciler(proxy, backend, reporter, kClusterName);
     DS_ASSERT_OK(reconciler.Init());

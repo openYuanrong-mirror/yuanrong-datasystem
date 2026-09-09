@@ -252,7 +252,11 @@ Status CoordinatorRuntime::Stop()
 bool CoordinatorRuntime::IsLeader() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    return service_ != nullptr && service_->IsLeader();
+    if (service_ == nullptr) {
+        return false;
+    }
+    coordinator::CoordinatorLeadershipSnapshot snapshot;
+    return service_->GetLeadershipSnapshot(snapshot).IsOk() && snapshot.isLeader;
 }
 
 Status CoordinatorRuntime::GetLeader(std::string &leaderAddress) const
@@ -262,7 +266,13 @@ Status CoordinatorRuntime::GetLeader(std::string &leaderAddress) const
     if (service_ == nullptr) {
         return Status(K_NOT_READY, "Coordinator Runtime service is not running");
     }
-    return service_->GetLeader(leaderAddress);
+    coordinator::CoordinatorLeadershipSnapshot snapshot;
+    RETURN_IF_NOT_OK(service_->GetLeadershipSnapshot(snapshot));
+    if (snapshot.leaderAddress.empty()) {
+        return Status(K_NOT_READY, "Coordinator raft leader is not known yet");
+    }
+    leaderAddress = std::move(snapshot.leaderAddress);
+    return Status::OK();
 }
 
 coordinator::CoordinatorRaftFlags CoordinatorRuntime::GetRaftFlags() const

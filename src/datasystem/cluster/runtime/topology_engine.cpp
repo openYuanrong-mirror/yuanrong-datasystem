@@ -29,6 +29,7 @@
 #include "datasystem/common/kvstore/etcd/etcd_store.h"
 #include "datasystem/common/log/log.h"
 #include "datasystem/common/log/spdlog/provider.h"
+#include "datasystem/common/rpc/bthread_utils.h"
 #include "datasystem/common/util/net_util.h"
 #include "datasystem/common/util/rpc_util.h"
 #include "datasystem/common/util/status_helper.h"
@@ -41,6 +42,9 @@ constexpr uint32_t LOCAL_ISOLATION_CONFIRMATIONS = 3;
 constexpr int TOPOLOGY_WATCH_EVENT_LOG_INTERVAL = 1'024;
 constexpr int CONTROL_DEGRADED_ERROR_LOG_INTERVAL = 60;
 constexpr int MARK_EXITING_FAILURE_LOG_INTERVAL = 30;
+constexpr auto COORDINATOR_READY_RETRY_INTERVAL = std::chrono::milliseconds(100);
+constexpr auto COORDINATOR_READY_MAX_RETRY_INTERVAL = std::chrono::milliseconds(1'000);
+constexpr auto DEFAULT_COORDINATOR_READY_TIMEOUT = std::chrono::seconds(10);
 // This background write is retried by the Controller; keep one attempt below the default Engine stop grace so
 // Controller shutdown is not pinned by ETCD's 50-second default RPC timeout.
 constexpr int32_t LOCAL_RECOVERY_READY_TIMEOUT_MS = 3'000;
@@ -177,6 +181,7 @@ struct TopologyEngine::Builder::Config {
     std::function<Status(const std::map<std::string, int64_t> &, RestartEffectMode)> membershipRestartHandler;
     std::function<void(std::shared_ptr<const TopologySnapshot>)> snapshotPublishedHandler;
     std::chrono::seconds nodeDeadTimeout{ TopologyControllerOptions{}.nodeDeadTimeout };
+    std::chrono::seconds coordinatorReadyTimeout{ DEFAULT_COORDINATOR_READY_TIMEOUT };
     std::chrono::seconds localIsolationTimeout{ TopologyControllerOptions{}.nodeDeadTimeout };
     std::chrono::milliseconds scopeProbeInterval{ 5'000 };
     std::chrono::milliseconds scaleInCollectWindow{ TopologyControllerOptions{}.scaleInCollectWindow };
@@ -314,6 +319,14 @@ TopologyEngine::Builder &TopologyEngine::Builder::SetNodeDeadTimeout(std::chrono
     return *this;
 }
 
+TopologyEngine::Builder &TopologyEngine::Builder::SetCoordinatorReadyTimeout(std::chrono::seconds timeout)
+{
+    if (config_ != nullptr) {
+        config_->coordinatorReadyTimeout = timeout;
+    }
+    return *this;
+}
+
 TopologyEngine::Builder &TopologyEngine::Builder::SetFailureScopeProbeInterval(std::chrono::milliseconds interval)
 {
     if (config_ != nullptr) {
@@ -342,6 +355,7 @@ Status TopologyEngine::Builder::Validate() const
 {
     CHECK_FAIL_RETURN_STATUS(config_ != nullptr && IsCanonicalAddress(config_->localAddress)
                                  && config_->callbacks != nullptr && config_->nodeDeadTimeout.count() >= 0
+                                 && config_->coordinatorReadyTimeout.count() >= 0
                                  && config_->localIsolationTimeout.count() >= 0
                                  && config_->scopeProbeInterval.count() > 0
                                  && config_->scaleInCollectWindow.count() >= 0
@@ -434,6 +448,7 @@ TopologyEngine::RuntimeOptions TopologyEngine::ConsumeRuntimeOptions(Builder::Co
     options.isRestart = config.isRestart;
     options.unifiedEtcdWatch = config.backendKind == Builder::Config::BackendKind::ETCD;
     options.nodeDeadTimeout = config.nodeDeadTimeout;
+    options.coordinatorReadyTimeout = config.coordinatorReadyTimeout;
     options.localIsolationTimeout = config.localIsolationTimeout;
     options.scopeProbeInterval = config.scopeProbeInterval;
     options.controlBackendProbe = std::move(config.controlBackendProbe);
@@ -647,6 +662,7 @@ Status TopologyEngine::Start()
                                  "cluster topology Engine Start is one-shot");
         startAttempted_ = true;
         lifecycleOperationInFlight_ = true;
+        startupCancellationRequested_.store(false, std::memory_order_release);
         state_.store(TopologyEngineState::STARTING);
     }
     if (coordinatorProxy_ != nullptr) {
@@ -666,6 +682,9 @@ Status TopologyEngine::Start()
         });
     }
     auto rc = BindCoordinatorIngress();
+    if (rc.IsOk() && recoveryReporter_ != nullptr) {
+        recoveryReporter_->NotifyRecoveryParticipationReady();
+    }
     if (rc.IsOk()) {
         rc = StartMemberRole();
     }
@@ -677,9 +696,6 @@ Status TopologyEngine::Start()
                          << cleanupStatus.ToString();
         }
         return rc;
-    }
-    if (recoveryReporter_ != nullptr) {
-        recoveryReporter_->NotifyRuntimeReady();
     }
     CommitSuccessfulStart();
     LOG(INFO) << "CLUSTER_LIFECYCLE cluster=" << options_.clusterName << " role=worker state=ready";
@@ -716,7 +732,7 @@ Status TopologyEngine::StartMemberRole()
     CHECK_FAIL_RETURN_STATUS(!options_.unifiedEtcdWatch || controllerRevision > 0, K_INVALID,
                              "unified ETCD Controller bootstrap revision is invalid");
     int64_t watchRevision = 0;
-    auto readStatus = ReloadTopology(true);
+    auto readStatus = coordinatorProxy_ == nullptr ? ReloadTopology(true) : WaitForCoordinatorReady();
     if (readStatus.IsError()) {
         RecordError(readStatus);
         if (readStatus.GetCode() != K_NOT_FOUND && readStatus.GetCode() != K_NOT_READY) {
@@ -767,6 +783,40 @@ Status TopologyEngine::StartMemberRole()
     return StartStateThread();
 }
 
+Status TopologyEngine::WaitForCoordinatorReady()
+{
+    constexpr int RETRY_BACKOFF_MULTIPLIER = 2;
+    bool waitingLogged = false;
+    auto retryInterval = COORDINATOR_READY_RETRY_INTERVAL;
+    const auto startupDeadline = std::chrono::steady_clock::now() + options_.coordinatorReadyTimeout
+                                 + std::chrono::milliseconds(ENGINE_READ_TIMEOUT_MS);
+    const auto jitter = std::chrono::milliseconds(std::hash<std::string>{}(options_.localAddress)
+                                                  % COORDINATOR_READY_RETRY_INTERVAL.count());
+    coordinatorReadyWaitActive_.store(true, std::memory_order_release);
+    Raii clearWaitState([this] { coordinatorReadyWaitActive_.store(false, std::memory_order_release); });
+    while (!startupCancellationRequested_.load(std::memory_order_acquire)) {
+        auto status = ReloadTopology(true);
+        if (status.GetCode() != K_NOT_READY) {
+            return status;
+        }
+        if (!waitingLogged) {
+            LOG(INFO) << "CLUSTER_LIFECYCLE cluster=" << options_.clusterName
+                      << " role=worker state=waiting_for_coordinator_ready";
+            waitingLogged = true;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        CHECK_FAIL_RETURN_STATUS(now < startupDeadline, K_RPC_DEADLINE_EXCEEDED,
+                                 "Coordinator did not become ready before the Worker startup deadline");
+        std::unique_lock<std::mutex> lock(startupWaitMutex_);
+        startupWaitCv_.wait_until(lock, std::min(startupDeadline, now + retryInterval + jitter), [this] {
+            return startupCancellationRequested_.load(std::memory_order_acquire);
+        });
+        retryInterval =
+            std::min(retryInterval * RETRY_BACKOFF_MULTIPLIER, COORDINATOR_READY_MAX_RETRY_INTERVAL);
+    }
+    RETURN_STATUS(K_SHUTTING_DOWN, "cluster topology Engine startup was cancelled");
+}
+
 Status TopologyEngine::CleanupAfterStartFailure()
 {
     state_.store(TopologyEngineState::STOPPING);
@@ -785,6 +835,7 @@ Status TopologyEngine::CleanupAfterStartFailure()
             state_.store(TopologyEngineState::STOPPED);
         }
         lifecycleOperationInFlight_ = false;
+        lifecycleCv_.notify_all();
     }
     return cleanupStatus;
 }
@@ -813,6 +864,7 @@ void TopologyEngine::CommitSuccessfulStart()
     {
         std::lock_guard<std::mutex> lock(lifecycleMutex_);
         lifecycleOperationInFlight_ = false;
+        lifecycleCv_.notify_all();
     }
 }
 
@@ -881,9 +933,20 @@ Status TopologyEngine::Shutdown(std::chrono::steady_clock::time_point deadline)
                                        ? deadline
                                        : std::min(deadline, std::chrono::steady_clock::now() + options_.stopGrace);
     {
-        std::lock_guard<std::mutex> lock(lifecycleMutex_);
+        std::unique_lock<std::mutex> lock(lifecycleMutex_);
         if (state_.load() == TopologyEngineState::STOPPED) {
             return Status::OK();
+        }
+        if (lifecycleOperationInFlight_ && coordinatorReadyWaitActive_.load(std::memory_order_acquire)) {
+            startupCancellationRequested_.store(true, std::memory_order_release);
+            startupWaitCv_.notify_all();
+            CHECK_FAIL_RETURN_STATUS(lifecycleCv_.wait_until(lock, effectiveDeadline,
+                                                             [this] { return !lifecycleOperationInFlight_; }),
+                                     K_RPC_DEADLINE_EXCEEDED,
+                                     "cluster topology Engine startup cancellation deadline exceeded");
+            if (state_.load() == TopologyEngineState::STOPPED) {
+                return Status::OK();
+            }
         }
         CHECK_FAIL_RETURN_STATUS(!lifecycleOperationInFlight_, K_TRY_AGAIN,
                                  "cluster topology Engine lifecycle operation is in progress");

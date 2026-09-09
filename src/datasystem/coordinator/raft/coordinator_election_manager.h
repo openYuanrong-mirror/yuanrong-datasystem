@@ -67,6 +67,8 @@ public:
     Status GetBootstrapState(RaftBootstrapState &state) const;
     Status ExchangeBootstrapObservation(const RaftBootstrapObservationPb &request,
                                         RaftBootstrapObservationPb &response);
+
+    Status GetLeadershipSnapshot(CoordinatorLeadershipSnapshot &snapshot) const;
     bool IsLeader() const;
     Status GetLeader(std::string &leaderAddress) const;
 
@@ -102,10 +104,9 @@ private:
         std::function<std::unique_ptr<MembershipHandle>(const CoordinatorMembershipOptions &, NodeHandle &,
                                                         const std::shared_ptr<ICoordinatorDiscovery> &)>
             createMembership;
+        std::function<Status(const NodeHandle &, CoordinatorLeadershipSnapshot &)> getLeadershipSnapshot;
         std::function<Status(MembershipHandle &)> startMembership;
         std::function<Status(MembershipHandle &)> shutdownMembership;
-        std::function<bool(const NodeHandle &)> isLeader;
-        std::function<Status(const NodeHandle &, std::string &)> getLeader;
     };
 
     CoordinatorElectionManager(CoordinatorElectionOptions options, CoordinatorRaftEventCallbacks callbacks,

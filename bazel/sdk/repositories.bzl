@@ -185,7 +185,10 @@ def setup_braft(name = "braft"):
         ],
         strip_prefix = "braft-1.1.2",
         build_file = Label("//third_party:braft.BUILD"),
-        patches = [Label("//third_party/patches/braft:align-election-timer-with-follower-lease.patch")],
+        patches = [
+            Label("//third_party/patches/braft:leadership-status.patch"),
+            Label("//third_party/patches/braft:align-election-timer-with-follower-lease.patch"),
+        ],
         patch_args = ["-p1"],
     )
 

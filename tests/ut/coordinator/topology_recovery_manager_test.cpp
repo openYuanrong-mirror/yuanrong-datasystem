@@ -40,6 +40,7 @@
 #include "datasystem/common/ak_sk/hasher.h"
 #include "datasystem/common/coordinator/coordinator_store.h"
 #include "datasystem/common/coordinator/memory_kv_store.h"
+#include "datasystem/common/kvstore/coordination_keys.h"
 #include "datasystem/common/coordinator/steady_clock.h"
 #include "datasystem/common/coordinator/ttl_manager.h"
 #include "datasystem/common/coordinator/watch_dispatcher.h"
@@ -54,15 +55,20 @@ namespace {
 constexpr char COORDINATOR_ID[] = "coordinator-id-1";
 constexpr char MEMBER_A[] = "127.0.0.1:12001";
 constexpr char MEMBER_B[] = "127.0.0.1:12002";
+constexpr char MEMBER_C[] = "127.0.0.1:12003";
 constexpr uint64_t TOPOLOGY_VERSION = 42;
 constexpr uint64_t DISCOVERY_WINDOW_MS = 100;
+constexpr uint64_t FAST_RECOVERY_WINDOW_MS = 3'000;
 constexpr auto VALIDATION_TIMEOUT = std::chrono::seconds(1);
+constexpr auto ROUND_TIMEOUT = std::chrono::seconds(10);
 constexpr auto TEST_DEADLINE = std::chrono::seconds(2);
 constexpr auto POLL_INTERVAL = std::chrono::milliseconds(1);
 constexpr auto SHUTDOWN_OBSERVATION = std::chrono::milliseconds(100);
 constexpr auto DELAYED_RECONCILE_WORKER_WINDOW = std::chrono::milliseconds(500);
 constexpr auto DELAYED_RECONCILE_VALIDATION_TIMEOUT = std::chrono::milliseconds(50);
 constexpr auto DELAYED_RECONCILE_WORKER_SETTLE = std::chrono::milliseconds(60);
+constexpr auto HARD_DEADLINE_TIMEOUT = std::chrono::milliseconds(200);
+constexpr auto REAL_CLOCK_HARD_DEADLINE_TIMEOUT = std::chrono::milliseconds(50);
 constexpr size_t DELAYED_RECONCILE_WORKER_COUNT = 2;
 constexpr uint64_t TEST_DOWNSTREAM_PHASE_US = 123;
 
@@ -94,7 +100,7 @@ protected:
         options_.discoveryWindow = std::chrono::milliseconds(DISCOVERY_WINDOW_MS);
         options_.validationWaitTimeout = VALIDATION_TIMEOUT;
         manager_ = std::make_unique<TopologyRecoveryManager>(COORDINATOR_ID, *store_, clock_, options_);
-        manager_->BeginLeaderRound({ 0, COORDINATOR_ID });
+        manager_->BeginLeaderRound({ 0, COORDINATOR_ID }, ROUND_TIMEOUT);
     }
 
     void TearDown() override
@@ -139,9 +145,10 @@ protected:
         return report;
     }
 
-    void ObserveMember(const std::string &clusterName, const std::string &address)
+    void ObserveMember(const std::string &clusterName, const std::string &address,
+                       cluster::MemberLifecycleState state = cluster::MemberLifecycleState::STARTING)
     {
-        manager_->ObserveMembershipChange(MembershipKey(clusterName, address), true);
+        manager_->ObserveMembershipChange(MembershipKey(clusterName, address), state);
     }
 
     void ReportEvidence(const std::string &clusterName, TopologyRecoveryCandidateReport report,
@@ -201,17 +208,266 @@ TEST_F(TopologyRecoveryManagerTest, NoSnapshotMakesClusterReadyAfterFixedWindow)
     EXPECT_TRUE(manager_->CheckReadAllowed(TopologyKey(clusterName), "").IsOk());
 }
 
+TEST_F(TopologyRecoveryManagerTest, ClusterWithoutRecoveryReportBecomesReadyAfterFastWindow)
+{
+    const std::string clusterName = "fresh-cluster";
+    ObserveMember(clusterName, MEMBER_A);
+
+    clock_->AdvanceMs(FAST_RECOVERY_WINDOW_MS - 1);
+    ObserveMember(clusterName, MEMBER_B);
+    EXPECT_EQ(manager_->GetState(clusterName), TopologyRecoveryState::RECOVERING);
+
+    clock_->AdvanceMs(1);
+    ASSERT_TRUE(DriveUntil(clusterName, MEMBER_A, TopologyRecoveryState::READY));
+    std::vector<KeyValueEntry> entries;
+    int64_t revision = 0;
+    DS_ASSERT_OK(store_->Range(TopologyKey(clusterName), "", entries, revision));
+    EXPECT_TRUE(entries.empty());
+}
+
+TEST_F(TopologyRecoveryManagerTest, ExistingMemberDoesNotEnableFastRecovery)
+{
+    const std::string clusterName = "existing-member";
+    ObserveMember(clusterName, MEMBER_A, cluster::MemberLifecycleState::READY);
+
+    clock_->AdvanceMs(FAST_RECOVERY_WINDOW_MS);
+    manager_->NotifyMembershipActivity(MembershipKey(clusterName, MEMBER_A));
+    std::this_thread::sleep_for(POLL_INTERVAL);
+    EXPECT_EQ(manager_->GetState(clusterName), TopologyRecoveryState::RECOVERING);
+
+    clock_->AdvanceMs(
+        std::chrono::duration_cast<std::chrono::milliseconds>(ROUND_TIMEOUT).count() - FAST_RECOVERY_WINDOW_MS);
+    ASSERT_TRUE(DriveUntil(clusterName, MEMBER_A, TopologyRecoveryState::READY));
+}
+
+TEST_F(TopologyRecoveryManagerTest, ExistingMemberCancelsFastRecovery)
+{
+    const std::string clusterName = "mixed-members";
+    ObserveMember(clusterName, MEMBER_A);
+    ObserveMember(clusterName, MEMBER_B, cluster::MemberLifecycleState::READY);
+
+    clock_->AdvanceMs(FAST_RECOVERY_WINDOW_MS);
+    manager_->NotifyMembershipActivity(MembershipKey(clusterName, MEMBER_A));
+    std::this_thread::sleep_for(POLL_INTERVAL);
+    EXPECT_EQ(manager_->GetState(clusterName), TopologyRecoveryState::RECOVERING);
+}
+
+TEST_F(TopologyRecoveryManagerTest, KeepAliveDoesNotEnableFastRecovery)
+{
+    const std::string clusterName = "keepalive-only";
+    manager_->NotifyMembershipActivity(MembershipKey(clusterName, MEMBER_A));
+
+    clock_->AdvanceMs(FAST_RECOVERY_WINDOW_MS);
+    manager_->NotifyMembershipActivity(MembershipKey(clusterName, MEMBER_A));
+    std::this_thread::sleep_for(POLL_INTERVAL);
+    EXPECT_EQ(manager_->GetState(clusterName), TopologyRecoveryState::RECOVERING);
+}
+
+TEST_F(TopologyRecoveryManagerTest, RecoveryReportCancelsFastWindow)
+{
+    const std::string clusterName = "reported-cluster";
+    ObserveMember(clusterName, MEMBER_A);
+    ObserveMember(clusterName, MEMBER_B);
+    TopologyRecoveryCandidateReport report;
+    report.reporterAddress = MEMBER_A;
+    TopologyRecoveryReportDecision decision;
+    DS_ASSERT_OK(manager_->ReportCandidate(clusterName, 0, COORDINATOR_ID, report, decision));
+
+    clock_->AdvanceMs(FAST_RECOVERY_WINDOW_MS);
+    manager_->NotifyMembershipActivity(MembershipKey(clusterName, MEMBER_A));
+    EXPECT_EQ(manager_->GetState(clusterName), TopologyRecoveryState::RECOVERING);
+
+    clock_->AdvanceMs(ROUND_TIMEOUT.count() * 1'000 - FAST_RECOVERY_WINDOW_MS);
+    ASSERT_TRUE(DriveUntil(clusterName, MEMBER_A, TopologyRecoveryState::READY));
+}
+
+TEST_F(TopologyRecoveryManagerTest, MissingReporterIsForcedReadyAtHardDeadlineWithoutStoreWrite)
+{
+    manager_->BeginLeaderRound({ 1, COORDINATOR_ID }, HARD_DEADLINE_TIMEOUT);
+    const std::string clusterName = "missing-reporter";
+    ObserveMember(clusterName, MEMBER_A);
+    ObserveMember(clusterName, MEMBER_B);
+    TopologyRecoveryCandidateReport report;
+    report.reporterAddress = MEMBER_A;
+    TopologyRecoveryReportDecision decision;
+    DS_ASSERT_OK(manager_->ReportCandidate(clusterName, 1, COORDINATOR_ID, report, decision));
+
+    clock_->AdvanceMs(HARD_DEADLINE_TIMEOUT.count() - 1);
+    manager_->NotifyMembershipActivity(MembershipKey(clusterName, MEMBER_A));
+    EXPECT_EQ(manager_->GetState(clusterName), TopologyRecoveryState::RECOVERING);
+
+    clock_->AdvanceMs(1);
+    ASSERT_TRUE(DriveUntil(clusterName, MEMBER_A, TopologyRecoveryState::READY));
+    std::vector<KeyValueEntry> entries;
+    int64_t revision = 0;
+    DS_ASSERT_OK(store_->Range(TopologyKey(clusterName), "", entries, revision));
+    EXPECT_TRUE(entries.empty());
+}
+
+TEST_F(TopologyRecoveryManagerTest, HardDeadlineDoesNotSlideAfterMembershipChange)
+{
+    manager_->BeginLeaderRound({ 1, COORDINATOR_ID }, HARD_DEADLINE_TIMEOUT);
+    const std::string clusterName = "fixed-hard-deadline";
+    ObserveMember(clusterName, MEMBER_A);
+    ObserveMember(clusterName, MEMBER_B);
+    TopologyRecoveryCandidateReport report;
+    report.reporterAddress = MEMBER_A;
+    TopologyRecoveryReportDecision decision;
+    DS_ASSERT_OK(manager_->ReportCandidate(clusterName, 1, COORDINATOR_ID, report, decision));
+
+    clock_->AdvanceMs(DISCOVERY_WINDOW_MS + 50);
+    ObserveMember(clusterName, MEMBER_C);
+    clock_->AdvanceMs(HARD_DEADLINE_TIMEOUT.count() - DISCOVERY_WINDOW_MS - 51);
+    manager_->NotifyMembershipActivity(MembershipKey(clusterName, MEMBER_A));
+    EXPECT_EQ(manager_->GetState(clusterName), TopologyRecoveryState::RECOVERING);
+
+    clock_->AdvanceMs(1);
+    ASSERT_TRUE(DriveUntil(clusterName, MEMBER_A, TopologyRecoveryState::READY));
+}
+
+TEST_F(TopologyRecoveryManagerTest, BlockedClusterIsForcedReadyAtHardDeadlineWithoutStoreWrite)
+{
+    manager_->BeginLeaderRound({ 1, COORDINATOR_ID }, HARD_DEADLINE_TIMEOUT);
+    const std::string clusterName = "blocked-hard-deadline";
+    ObserveMember(clusterName, MEMBER_A);
+    ObserveMember(clusterName, MEMBER_B);
+    auto first = SnapshotEvidence(MEMBER_A, TOPOLOGY_VERSION, 'a');
+    auto second = SnapshotEvidence(MEMBER_B, TOPOLOGY_VERSION, 'b');
+    TopologyRecoveryReportDecision decision;
+    first.canonicalTopology.clear();
+    second.canonicalTopology.clear();
+    DS_ASSERT_OK(manager_->ReportCandidate(clusterName, 1, COORDINATOR_ID, first, decision));
+    DS_ASSERT_OK(manager_->ReportCandidate(clusterName, 1, COORDINATOR_ID, second, decision));
+
+    clock_->AdvanceMs(DISCOVERY_WINDOW_MS);
+    ASSERT_TRUE(DriveUntil(clusterName, MEMBER_A, TopologyRecoveryState::BLOCKED));
+    clock_->AdvanceMs(HARD_DEADLINE_TIMEOUT.count() - DISCOVERY_WINDOW_MS);
+    ASSERT_TRUE(DriveUntil(clusterName, MEMBER_A, TopologyRecoveryState::READY));
+
+    std::vector<KeyValueEntry> entries;
+    int64_t revision = 0;
+    DS_ASSERT_OK(store_->Range(TopologyKey(clusterName), "", entries, revision));
+    EXPECT_TRUE(entries.empty());
+}
+
+TEST_F(TopologyRecoveryManagerTest, HardDeadlineSchedulerConvergesWithoutFurtherActivity)
+{
+    manager_.reset();
+    options_.discoveryWindow = std::chrono::milliseconds(500);
+    auto realClock = std::make_shared<SteadyClockReal>();
+    manager_ = std::make_unique<TopologyRecoveryManager>(COORDINATOR_ID, *store_, realClock, options_);
+    manager_->BeginLeaderRound({ 1, COORDINATOR_ID }, REAL_CLOCK_HARD_DEADLINE_TIMEOUT);
+    const std::string clusterName = "automatic-hard-deadline";
+
+    ObserveMember(clusterName, MEMBER_A);
+
+    EXPECT_TRUE(WaitUntil([&] { return manager_->GetState(clusterName) == TopologyRecoveryState::READY; }));
+}
+
+TEST_F(TopologyRecoveryManagerTest, ParsesAllTopologyKeyKindsInDefaultAndNamedClusters)
+{
+    constexpr char migrateTaskId[] = "m-e7-0123456789abcdef0123456789abcdef";
+    constexpr char deleteTaskId[] = "d-e7-0123456789abcdef0123456789abcdef";
+    constexpr char sourceId[] = "source-member-id";
+    struct KeyCase {
+        std::string physicalKey;
+        TopologyCoordinationKeyKind kind;
+        std::string relativeKey;
+    };
+
+    for (const std::string &clusterName : { std::string(), std::string("blue") }) {
+        std::unique_ptr<cluster::TopologyKeyHelper> keys;
+        DS_ASSERT_OK(cluster::TopologyKeyHelper::Create(clusterName, keys));
+        std::string metadataDoneKey;
+        DS_ASSERT_OK(cluster::TopologyKeyHelper::ScaleInMetadataDoneKey(7, sourceId, migrateTaskId,
+                                                                        metadataDoneKey));
+        const std::vector<KeyCase> cases = {
+            { keys->TopologyTable() + "/", TopologyCoordinationKeyKind::TOPOLOGY, "" },
+            { keys->MigrateTaskTable() + "/", TopologyCoordinationKeyKind::MIGRATE_TASK, "" },
+            { keys->DeleteTaskTable() + "/", TopologyCoordinationKeyKind::DELETE_TASK, "" },
+            { keys->NotifyTable() + "/", TopologyCoordinationKeyKind::NOTIFY, "" },
+            { keys->ProbeTable() + "/", TopologyCoordinationKeyKind::PROBE, "" },
+            { keys->MembershipTable() + "/", TopologyCoordinationKeyKind::MEMBERSHIP, "" },
+            { keys->ScaleInMetadataDoneTable() + "/", TopologyCoordinationKeyKind::SCALE_IN_METADATA_DONE, "" },
+            { keys->MigrateTaskTable() + "/" + migrateTaskId, TopologyCoordinationKeyKind::MIGRATE_TASK,
+              migrateTaskId },
+            { keys->DeleteTaskTable() + "/" + deleteTaskId, TopologyCoordinationKeyKind::DELETE_TASK,
+              deleteTaskId },
+            { keys->NotifyTable() + "/" + MEMBER_A, TopologyCoordinationKeyKind::NOTIFY, MEMBER_A },
+            { keys->ProbeTable() + "/" + MEMBER_A, TopologyCoordinationKeyKind::PROBE, MEMBER_A },
+            { keys->MembershipTable() + "/" + MEMBER_A, TopologyCoordinationKeyKind::MEMBERSHIP, MEMBER_A },
+            { keys->ScaleInMetadataDoneTable() + "/" + metadataDoneKey,
+              TopologyCoordinationKeyKind::SCALE_IN_METADATA_DONE, metadataDoneKey },
+            { keys->RolloutTable() + "/" + EVICTION_POLICY_ROLLOUT_KEY,
+              TopologyCoordinationKeyKind::EVICTION_POLICY_ROLLOUT, EVICTION_POLICY_ROLLOUT_KEY },
+        };
+        for (const auto &keyCase : cases) {
+            ParsedTopologyCoordinationKey parsed;
+            DS_ASSERT_OK(manager_->ParseKey(keyCase.physicalKey, parsed));
+            EXPECT_EQ(parsed.clusterName, clusterName);
+            EXPECT_EQ(parsed.kind, keyCase.kind);
+            EXPECT_EQ(parsed.relativeKey, keyCase.relativeKey);
+        }
+    }
+}
+
+TEST_F(TopologyRecoveryManagerTest, ParsesOnlyExactMasterAddressSingleton)
+{
+    const std::string key = std::string(COORDINATION_MASTER_ADDRESS_TABLE) + "/" + COORDINATION_MASTER_ADDRESS_KEY;
+    ParsedTopologyCoordinationKey parsed;
+    DS_ASSERT_OK(manager_->ParseKey(key, parsed));
+    EXPECT_TRUE(parsed.clusterName.empty());
+    EXPECT_EQ(parsed.kind, TopologyCoordinationKeyKind::MASTER_ADDRESS);
+    EXPECT_EQ(parsed.relativeKey, COORDINATION_MASTER_ADDRESS_KEY);
+
+    EXPECT_EQ(manager_->ParseKey(key + "/child", parsed).GetCode(), K_INVALID);
+    EXPECT_EQ(manager_->ParseKey("/datasystem/blue/master_address", parsed).GetCode(), K_INVALID);
+    EXPECT_EQ(manager_->CheckReadAllowed(key, key + "0").GetCode(), K_INVALID);
+}
+
 TEST_F(TopologyRecoveryManagerTest, RejectsReservedClusterNames)
 {
-    ParsedTopologyCoordinationKey parsed;
-    DS_ASSERT_OK(manager_->ParseKey(TopologyKey(""), parsed));
-    EXPECT_TRUE(parsed.clusterName.empty());
-    EXPECT_EQ(parsed.kind, TopologyCoordinationKeyKind::TOPOLOGY);
-
     std::unique_ptr<cluster::TopologyKeyHelper> keys;
-    for (const std::string name : { "topology", "tasks", "notify", "probe", "cluster", "scale-in-metadata-done" }) {
+    for (const std::string name :
+         { "topology", "tasks", "notify", "probe", "cluster", "scale-in-metadata-done", "control" }) {
         EXPECT_EQ(cluster::TopologyKeyHelper::Create(name, keys).GetCode(), K_INVALID);
     }
+}
+
+TEST_F(TopologyRecoveryManagerTest, RejectsInvalidPhysicalKeysAndResetsParsedOutput)
+{
+    const std::vector<std::string> invalidKeys = {
+        "/svc/key",
+        "/datasystem/unknown/path",
+        "/datasystem",
+        "/datasystem/",
+        "/datasystem/blue",
+        "/datasystem/topology",
+        "/datasystem/bad!/topology/",
+        "/datasystem/cluster/not-an-address",
+        "/datasystem/control/unknown",
+        "/datasystem/blue/control/unknown",
+    };
+    for (const auto &physicalKey : invalidKeys) {
+        ParsedTopologyCoordinationKey parsed{ "stale", TopologyCoordinationKeyKind::MEMBERSHIP, "stale" };
+        EXPECT_EQ(manager_->ParseKey(physicalKey, parsed).GetCode(), K_INVALID);
+        EXPECT_TRUE(parsed.clusterName.empty());
+        EXPECT_EQ(parsed.kind, TopologyCoordinationKeyKind::TOPOLOGY);
+        EXPECT_TRUE(parsed.relativeKey.empty());
+    }
+}
+
+TEST_F(TopologyRecoveryManagerTest, ParseKeyAndGetStateHaveNoRecoveryOrStoreSideEffects)
+{
+    const auto summaryBefore = manager_->GetRoundSummary();
+    const auto revisionBefore = memoryStore_->CurrentRevision();
+    ParsedTopologyCoordinationKey parsed;
+
+    DS_ASSERT_OK(manager_->ParseKey(TopologyKey("side-effect-free"), parsed));
+    EXPECT_EQ(manager_->GetState("side-effect-free"), TopologyRecoveryState::RECOVERING);
+
+    EXPECT_EQ(manager_->GetRoundSummary().contextCount, summaryBefore.contextCount);
+    EXPECT_EQ(memoryStore_->CurrentRevision(), revisionBefore);
 }
 
 TEST_F(TopologyRecoveryManagerTest, ParsesExactWorkerProbeKeys)
@@ -279,7 +535,7 @@ TEST_F(TopologyRecoveryManagerTest, RejectsNonCanonicalScaleInMetadataDoneMarker
 TEST_F(TopologyRecoveryManagerTest, RejectsEvidenceFromAnotherLeaderTermWithoutChangingContext)
 {
     const std::string clusterName = "term-fence";
-    manager_->BeginLeaderRound({ 9, COORDINATOR_ID });
+    manager_->BeginLeaderRound({ 9, COORDINATOR_ID }, ROUND_TIMEOUT);
     ObserveMember(clusterName, MEMBER_A);
     const auto summaryBefore = manager_->GetRoundSummary();
     const auto revisionBefore = memoryStore_->CurrentRevision();
@@ -327,7 +583,10 @@ TEST_F(TopologyRecoveryManagerTest, CommittedStoreMembershipMutationsDriveAdmiss
     const std::string clusterName = "observer";
     const auto membershipKey = MembershipKey(clusterName, MEMBER_A);
     store_->SetCommittedMutationObserver([this](WatchEvent::Type type, const std::string &key) {
-        manager_->ObserveMembershipChange(key, type == WatchEvent::Type::PUT);
+        manager_->ObserveMembershipChange(
+            key, type == WatchEvent::Type::PUT
+                     ? std::make_optional(cluster::MemberLifecycleState::STARTING)
+                     : std::nullopt);
     });
     int64_t storedVersion = 0;
     int64_t revision = 0;
@@ -459,15 +718,74 @@ TEST_F(TopologyRecoveryManagerTest, MembershipDeleteDoesNotBreakAnInstallingCand
     store_->SetCommittedMutationObserver([&](WatchEvent::Type type, const std::string &key) {
         if (type == WatchEvent::Type::PUT && key == TopologyKey(clusterName)) {
             readStatus.store(manager_->CheckReadAllowed(key, "").GetCode());
-            manager_->ObserveMembershipChange(MembershipKey(clusterName, MEMBER_A), false);
+            manager_->ObserveMembershipChange(MembershipKey(clusterName, MEMBER_A), std::nullopt);
         }
     });
+    DS_ASSERT_OK(manager_->ReportCandidate(clusterName, 0, COORDINATOR_ID, payload, decision));
 
     DS_ASSERT_OK(manager_->ReportCandidate(clusterName, 0, COORDINATOR_ID, payload, decision));
     clock_->AdvanceMs(DISCOVERY_WINDOW_MS);
     ASSERT_TRUE(DriveUntil(clusterName, MEMBER_A, TopologyRecoveryState::READY));
     EXPECT_EQ(readStatus.load(), K_NOT_READY);
     store_->SetCommittedMutationObserver({});
+}
+
+TEST_F(TopologyRecoveryManagerTest, InstallingCandidateAcceptsIdenticalRetryAndRejectsConflict)
+{
+    std::promise<void> installationEntered;
+    auto installationEnteredFuture = installationEntered.get_future();
+    std::promise<void> releaseInstallation;
+    auto releaseInstallationFuture = releaseInstallation.get_future().share();
+    std::atomic<uint32_t> installAttempts{ 0 };
+    std::atomic<bool> installationReleased{ false };
+    auto release = [&] {
+        if (!installationReleased.exchange(true)) {
+            releaseInstallation.set_value();
+        }
+    };
+    manager_.reset();
+    options_.beforeInstall = [&] {
+        if (installAttempts.fetch_add(1) == 0) {
+            installationEntered.set_value();
+        }
+        releaseInstallationFuture.wait();
+    };
+    manager_ = std::make_unique<TopologyRecoveryManager>(COORDINATOR_ID, *store_, clock_, options_);
+    manager_->BeginLeaderRound({ 0, COORDINATOR_ID }, ROUND_TIMEOUT);
+    auto stopManager = Raii([&] {
+        release();
+        manager_.reset();
+    });
+
+    const std::string clusterName = "installing-idempotency";
+    ObserveMember(clusterName, MEMBER_A);
+    auto payload = SnapshotEvidence(MEMBER_A, TOPOLOGY_VERSION, 'a');
+    TopologyRecoveryReportDecision decision;
+    ReportEvidence(clusterName, payload, decision);
+    ASSERT_TRUE(decision.payloadRequired);
+    DS_ASSERT_OK(manager_->ReportCandidate(clusterName, 0, COORDINATOR_ID, payload, decision));
+
+    const auto revisionBeforeInstall = memoryStore_->CurrentRevision();
+    clock_->AdvanceMs(DISCOVERY_WINDOW_MS);
+    manager_->NotifyMembershipActivity(MembershipKey(clusterName, MEMBER_A));
+    ASSERT_EQ(installationEnteredFuture.wait_for(TEST_DEADLINE), std::future_status::ready);
+    ASSERT_EQ(manager_->GetState(clusterName), TopologyRecoveryState::INSTALLING);
+
+    TopologyRecoveryReportDecision retryDecision;
+    DS_ASSERT_OK(manager_->ReportCandidate(clusterName, 0, COORDINATOR_ID, payload, retryDecision));
+    EXPECT_EQ(retryDecision.state, TopologyRecoveryState::INSTALLING);
+
+    auto conflictingPayload = SnapshotEvidence(MEMBER_A, TOPOLOGY_VERSION, 'b');
+    TopologyRecoveryReportDecision conflictDecision;
+    EXPECT_EQ(manager_
+                  ->ReportCandidate(clusterName, 0, COORDINATOR_ID, std::move(conflictingPayload), conflictDecision)
+                  .GetCode(),
+              K_TRY_AGAIN);
+
+    release();
+    ASSERT_TRUE(DriveUntil(clusterName, MEMBER_A, TopologyRecoveryState::READY));
+    EXPECT_EQ(installAttempts.load(), 1U);
+    EXPECT_EQ(memoryStore_->CurrentRevision(), revisionBeforeInstall + 1);
 }
 
 TEST_F(TopologyRecoveryManagerTest, CommittedObserverExceptionDoesNotStrandInstallation)
@@ -481,6 +799,7 @@ TEST_F(TopologyRecoveryManagerTest, CommittedObserverExceptionDoesNotStrandInsta
     store_->SetCommittedMutationObserver([](WatchEvent::Type, const std::string &) {
         throw std::runtime_error("injected committed observer failure");
     });
+    DS_ASSERT_OK(manager_->ReportCandidate(clusterName, 0, COORDINATOR_ID, payload, decision));
 
     DS_ASSERT_OK(manager_->ReportCandidate(clusterName, 0, COORDINATOR_ID, payload, decision));
     clock_->AdvanceMs(DISCOVERY_WINDOW_MS);
@@ -573,7 +892,7 @@ TEST_F(TopologyRecoveryManagerTest, MembershipDeleteReopensBlockedArbitration)
     clock_->AdvanceMs(DISCOVERY_WINDOW_MS);
     ASSERT_TRUE(DriveUntil(clusterName, MEMBER_A, TopologyRecoveryState::BLOCKED));
 
-    manager_->ObserveMembershipChange(MembershipKey(clusterName, MEMBER_B), false);
+    manager_->ObserveMembershipChange(MembershipKey(clusterName, MEMBER_B), std::nullopt);
     DS_ASSERT_OK(manager_->ReportCandidate(clusterName, 0, COORDINATOR_ID, retained, decision));
     clock_->AdvanceMs(DISCOVERY_WINDOW_MS);
     ASSERT_TRUE(DriveUntil(clusterName, MEMBER_A, TopologyRecoveryState::READY));
@@ -595,19 +914,31 @@ TEST_F(TopologyRecoveryManagerTest, RecoveryGatesAndMemberLimitAreClusterScoped)
     manager_.reset();
     options_.maxMembersPerCluster = 1;
     manager_ = std::make_unique<TopologyRecoveryManager>(COORDINATOR_ID, *store_, clock_, options_);
-    manager_->BeginLeaderRound({ 0, COORDINATOR_ID });
+    manager_->BeginLeaderRound({ 0, COORDINATOR_ID }, ROUND_TIMEOUT);
     ObserveMember("bounded", MEMBER_A);
     ObserveMember("bounded", MEMBER_B);
     emptyReport.reporterAddress = MEMBER_B;
     EXPECT_EQ(manager_->ReportCandidate("bounded", 0, COORDINATOR_ID, emptyReport, decision).GetCode(), K_TRY_AGAIN);
 }
 
-TEST_F(TopologyRecoveryManagerTest, BroadRangeCannotCrossIntoTopologyKeyspaceDuringRecovery)
+TEST_F(TopologyRecoveryManagerTest, RejectsNonTopologyAndCrossKeyspaceRanges)
 {
-    const std::string broadRangeEnd(1, static_cast<char>(0x7f));
-    EXPECT_EQ(manager_->CheckReadAllowed("/", broadRangeEnd).GetCode(), K_INVALID);
-    EXPECT_EQ(manager_->CheckMutationAllowed("/", broadRangeEnd).GetCode(), K_INVALID);
-    EXPECT_TRUE(manager_->CheckReadAllowed("/alpha", "/beta").IsOk());
+    std::unique_ptr<cluster::TopologyKeyHelper> defaultKeys;
+    std::unique_ptr<cluster::TopologyKeyHelper> namedKeys;
+    DS_ASSERT_OK(cluster::TopologyKeyHelper::Create("", defaultKeys));
+    DS_ASSERT_OK(cluster::TopologyKeyHelper::Create("blue", namedKeys));
+    const std::string deletePrefix = defaultKeys->DeleteTaskTable() + "/";
+    const std::string migrateRangeEnd = defaultKeys->MigrateTaskTable() + "0";
+    const std::string namedTopologyKey = namedKeys->TopologyTable() + "/";
+    const std::string crossClusterRangeEnd = "/datasystem/green/topology0";
+
+    EXPECT_EQ(manager_->CheckReadAllowed("/svc/key", "").GetCode(), K_INVALID);
+    EXPECT_EQ(manager_->CheckMutationAllowed("/svc/key", "").GetCode(), K_INVALID);
+    EXPECT_EQ(manager_->ValidateWatchRange("/svc/key", "").GetCode(), K_INVALID);
+    EXPECT_EQ(manager_->CheckReadAllowed(deletePrefix, migrateRangeEnd).GetCode(), K_INVALID);
+    EXPECT_EQ(manager_->ValidateWatchRange(deletePrefix, migrateRangeEnd).GetCode(), K_INVALID);
+    EXPECT_EQ(manager_->CheckReadAllowed(namedTopologyKey, crossClusterRangeEnd).GetCode(), K_INVALID);
+    EXPECT_EQ(manager_->ValidateWatchRange(namedTopologyKey, crossClusterRangeEnd).GetCode(), K_INVALID);
 }
 
 TEST_F(TopologyRecoveryManagerTest, RejectsOversizedAndNonCanonicalCandidatePayloads)
@@ -675,6 +1006,8 @@ TEST_F(TopologyRecoveryManagerTest, ShutdownWaitsForStartedTopologyInstallation)
     const std::string topologyKey = TopologyKey(clusterName);
     ObserveMember(clusterName, MEMBER_A);
     auto payload = SnapshotEvidence(MEMBER_A, TOPOLOGY_VERSION, 'a');
+    TopologyRecoveryReportDecision decision;
+    ReportEvidence(clusterName, payload, decision);
     std::promise<void> installationStarted;
     auto installationFuture = installationStarted.get_future();
     std::promise<void> releaseInstallation;
@@ -689,8 +1022,6 @@ TEST_F(TopologyRecoveryManagerTest, ShutdownWaitsForStartedTopologyInstallation)
             releaseFuture.wait();
         }
     });
-    TopologyRecoveryReportDecision decision;
-    ReportEvidence(clusterName, payload, decision);
     DS_ASSERT_OK(manager_->ReportCandidate(clusterName, 0, COORDINATOR_ID, payload, decision));
     clock_->AdvanceMs(DISCOVERY_WINDOW_MS);
     manager_->NotifyMembershipActivity(MembershipKey(clusterName, MEMBER_A));
@@ -729,7 +1060,7 @@ TEST_F(TopologyRecoveryManagerTest, InvalidHighestCandidateBlocksUntilItsMemberD
     EXPECT_EQ(manager_->ReportCandidate(clusterName, 0, COORDINATOR_ID, invalidHigher, decision).GetCode(), K_INVALID);
     EXPECT_EQ(manager_->GetState(clusterName), TopologyRecoveryState::BLOCKED);
 
-    manager_->ObserveMembershipChange(MembershipKey(clusterName, MEMBER_B), false);
+    manager_->ObserveMembershipChange(MembershipKey(clusterName, MEMBER_B), std::nullopt);
     ReportEvidence(clusterName, validLower, decision);
     ASSERT_TRUE(decision.payloadRequired);
     DS_ASSERT_OK(manager_->ReportCandidate(clusterName, 0, COORDINATOR_ID, validLower, decision));
@@ -744,7 +1075,7 @@ TEST_F(TopologyRecoveryManagerTest, CandidateMemoryBudgetRejectsPayloadBeforeQue
     manager_.reset();
     options_.maxCandidateMemoryBytes = payload.canonicalTopology.size() - 1;
     manager_ = std::make_unique<TopologyRecoveryManager>(COORDINATOR_ID, *store_, clock_, options_);
-    manager_->BeginLeaderRound({ 0, COORDINATOR_ID });
+    manager_->BeginLeaderRound({ 0, COORDINATOR_ID }, ROUND_TIMEOUT);
     ObserveMember(clusterName, MEMBER_A);
     TopologyRecoveryReportDecision decision;
     ReportEvidence(clusterName, payload, decision);
@@ -759,7 +1090,7 @@ TEST_F(TopologyRecoveryManagerTest, ClusterAdmissionLimitRejectsAnAdditionalClus
     manager_.reset();
     options_.maxClusters = 1;
     manager_ = std::make_unique<TopologyRecoveryManager>(COORDINATOR_ID, *store_, clock_, options_);
-    manager_->BeginLeaderRound({ 0, COORDINATOR_ID });
+    manager_->BeginLeaderRound({ 0, COORDINATOR_ID }, ROUND_TIMEOUT);
     ObserveMember("first", MEMBER_A);
     ObserveMember("second", MEMBER_B);
     TopologyRecoveryCandidateReport report;
@@ -776,7 +1107,7 @@ TEST_F(TopologyRecoveryManagerTest, UnboundRequestsDoNotConsumeClusterAdmission)
     manager_.reset();
     options_.maxClusters = 1;
     manager_ = std::make_unique<TopologyRecoveryManager>(COORDINATOR_ID, *store_, clock_, options_);
-    manager_->BeginLeaderRound({ 0, COORDINATOR_ID });
+    manager_->BeginLeaderRound({ 0, COORDINATOR_ID }, ROUND_TIMEOUT);
     TopologyRecoveryCandidateReport report;
     report.reporterAddress = MEMBER_A;
     TopologyRecoveryReportDecision decision;
@@ -813,7 +1144,7 @@ TEST_F(TopologyRecoveryManagerTest, DelayedReconcileTimerDoesNotBlockPayloadVali
     options_.maxRecoveryThreads = DELAYED_RECONCILE_WORKER_COUNT;
     auto realClock = std::make_shared<SteadyClockReal>();
     manager_ = std::make_unique<TopologyRecoveryManager>(COORDINATOR_ID, *store_, realClock, options_);
-    manager_->BeginLeaderRound({ 0, COORDINATOR_ID });
+    manager_->BeginLeaderRound({ 0, COORDINATOR_ID }, ROUND_TIMEOUT);
 
     TopologyRecoveryReportDecision decision;
     for (size_t i = 0; i < DELAYED_RECONCILE_WORKER_COUNT; ++i) {
@@ -839,7 +1170,7 @@ TEST_F(TopologyRecoveryManagerTest, ShutdownCancelsDelayedReconcile)
     manager_.reset();
     options_.discoveryWindow = std::chrono::seconds(1);
     manager_ = std::make_unique<TopologyRecoveryManager>(COORDINATOR_ID, *store_, clock_, options_);
-    manager_->BeginLeaderRound({ 0, COORDINATOR_ID });
+    manager_->BeginLeaderRound({ 0, COORDINATOR_ID }, ROUND_TIMEOUT);
     const std::string clusterName = "shutdown-delayed";
     ObserveMember(clusterName, MEMBER_A);
     TopologyRecoveryCandidateReport report;
@@ -892,7 +1223,7 @@ TEST_F(TopologyRecoveryManagerTest, ReturningMemberReusesCurrentProcessTopologyA
     int64_t revision = 0;
     DS_ASSERT_OK(store_->Put(TopologyKey(clusterName), authority, 0, COORDINATOR_KEY_NOT_EXISTS_VERSION,
                              storedVersion, revision));
-    manager_->ObserveMembershipChange(MembershipKey(clusterName, MEMBER_A), false);
+    manager_->ObserveMembershipChange(MembershipKey(clusterName, MEMBER_A), std::nullopt);
     EXPECT_EQ(manager_->GetState(clusterName), TopologyRecoveryState::RECOVERING);
 
     ObserveMember(clusterName, MEMBER_A);
@@ -918,7 +1249,7 @@ TEST_F(TopologyRecoveryManagerTest, StaleStoredAuthorityReadCannotPublishIntoRec
     ObserveMember(clusterName, MEMBER_A);
     ASSERT_TRUE(WaitUntil([&] { return inject::GetExecuteCount(injectPoint) > 0; }));
 
-    manager_->ObserveMembershipChange(MembershipKey(clusterName, MEMBER_A), false);
+    manager_->ObserveMembershipChange(MembershipKey(clusterName, MEMBER_A), std::nullopt);
     int64_t deleted = 0;
     DS_ASSERT_OK(store_->DeleteRange(TopologyKey(clusterName), "", deleted, revision));
     ASSERT_EQ(deleted, 1);
@@ -951,7 +1282,7 @@ TEST_F(TopologyRecoveryManagerTest, StalePayloadValidationCannotPublishIntoRecre
         return manager_->ReportCandidate(clusterName, 0, COORDINATOR_ID, stalePayload, staleDecision);
     });
     ASSERT_TRUE(WaitUntil([&] { return inject::GetExecuteCount(injectPoint) > 0; }));
-    manager_->ObserveMembershipChange(MembershipKey(clusterName, MEMBER_A), false);
+    manager_->ObserveMembershipChange(MembershipKey(clusterName, MEMBER_A), std::nullopt);
     ObserveMember(clusterName, MEMBER_B);
     TopologyRecoveryCandidateReport noSnapshot;
     noSnapshot.reporterAddress = MEMBER_B;

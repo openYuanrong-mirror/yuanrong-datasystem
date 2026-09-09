@@ -43,6 +43,7 @@
 #include "datasystem/common/util/net_util.h"
 #include "datasystem/common/util/thread.h"
 #include "datasystem/coordinator/topology_control_host.h"
+#include "datasystem/coordinator/topology_recovery_manager.h"
 #include "datasystem/coordinator/raft/coordinator_election_manager.h"
 #include "datasystem/coordinator/raft/coordinator_raft_types.h"
 #include "datasystem/coordinator/watch_dispatcher_impl.h"
@@ -55,9 +56,6 @@ namespace st {
 class CoordinatorServiceElectionTestBase;
 }
 namespace coordinator {
-class TopologyControlHost;
-class TopologyRecoveryManager;
-
 class CoordinatorServiceImpl : public CoordinatorService, public ICoordinatorService {
 public:
     /**
@@ -82,37 +80,34 @@ public:
     ~CoordinatorServiceImpl() noexcept override;
 
     /**
-     * @brief Initialize a newly created service and publish INITIALIZED only after all initialization succeeds.
+     * @brief Initialize a newly created service. Successful initialization keeps request entry in CREATED.
      * @return Operation status. Initialization failures preserve the original status and leave the service STOPPED.
      */
     Status Init() override;
 
     /**
-     * @brief Initialize a newly created service and optionally publish STARTING for in-process direct-call tests.
-     * @param[in] publishStarting Whether to publish STARTING instead of INITIALIZED after successful initialization.
-     * @return Operation status. Initialization failures preserve the original status and leave the service STOPPED.
-     */
-    Status Init(bool publishStarting);
-
-    /**
-     * @brief Start RPC services. No-election mode publishes RUNNING; election mode remains STARTING.
+     * @brief Start RPC services. No-election mode publishes RUNNING; election mode remains CREATED.
      * @return Operation status. Startup failures preserve the original status and leave the service STOPPED.
      */
     Status Start();
 
     /**
      * @brief Publish the election owner and start its background bootstrap worker after external registration succeeds.
-     * @return Operation status. A synchronous failure detaches and cleans up the Manager, leaves the service STARTING,
-     *         and cannot be retried.
+     * @return Operation status. A synchronous failure detaches the Manager, stops the service, and cannot be retried.
      */
     Status StartElectionManager();
 
-    // Raft state-machine callbacks enter the recovery gate through these two methods.
+    // Raft state-machine callbacks begin and end recovery rounds without changing request-entry lifecycle.
     void OnLeaderStart(int64_t term);
     void OnLeaderStop(const Status &status);
 
     /**
-     * @brief Report whether the running election-enabled service owns Raft leadership.
+     * @brief Report one coherent Raft leadership observation for the running service.
+     */
+    Status GetLeadershipSnapshot(CoordinatorLeadershipSnapshot &snapshot) const;
+
+    /**
+     * @brief Report whether the running service owns leadership.
      */
     bool IsLeader() const;
 
@@ -207,7 +202,7 @@ public:
     Status ReportWorkerLiveness(const ReportWorkerLivenessReqPb &req, ReportWorkerLivenessRspPb &rsp) override;
 
     /**
-     * @brief Read raw topology and membership facts without recovery gating or domain projection.
+     * @brief Read raw topology and membership facts after cluster recovery admission, without domain projection.
      * @param[in] req Validated logical cluster name.
      * @param[out] rsp Raw key/value groups including each entry's modification revision.
      * @return Store, validation, or response-size status.
@@ -217,15 +212,10 @@ public:
 private:
     friend class ::datasystem::st::CoordinatorServiceElectionTestBase;
 
-    enum class ServingState : uint8_t {
-        CREATED,            // Constructed but not initialized.
-        INITIALIZED,        // Components are initialized but the RPC service is not started.
-        STARTING,           // RPC and Raft startup are in progress.
-        FOLLOWER_SERVING,   // Running with Raft enabled, but this Coordinator is not the Leader.
-        LEADER_RECOVERING,  // Elected Leader rebuilding topology state; only recovery control RPCs are admitted.
-        LEADER_SERVING,     // Business RPCs are admitted; non-Raft mode is always in this state after startup.
-        STOPPING,           // Shutdown has started and no new work may be admitted.
-        STOPPED,            // Shutdown has completed.
+    enum class LifecycleState : uint8_t {
+        CREATED,  // Request entry is not published yet.
+        RUNNING,  // RPC request entry is published.
+        STOPPED,  // Request entry is permanently closed.
     };
 
     /**
@@ -242,8 +232,9 @@ private:
     /**
      * @brief Reconcile a membership callback against the latest committed key before watch cleanup.
      * @param[in] key Physical membership key reported by the Store.
+     * @param[in] parsed Parsed membership key from the committed-mutation observer.
      */
-    void HandleCommittedMembershipMutation(const std::string &key);
+    void HandleCommittedMembershipMutation(const std::string &key, const ParsedTopologyCoordinationKey &parsed);
 
     /**
      * @brief Route one committed Store mutation to Recovery, Host and watch cleanup.
@@ -254,38 +245,43 @@ private:
 
     /**
      * @brief Reserve Controller capacity before one membership Put can commit.
-     * @param[in] key Physical Put key.
-     * @param[out] clusterName Parsed cluster when this is a membership Put.
+     * @param[in] parsed Parsed Put key.
      * @param[out] reserved True when reservation completion is required.
-     * @return Admission, parse, or lifecycle status.
+     * @return Admission or lifecycle status.
      */
-    Status PrepareTopologyMembershipPut(const std::string &key, std::string &clusterName, bool &reserved);
+    Status PrepareTopologyMembershipPut(const ParsedTopologyCoordinationKey &parsed, bool &reserved);
 
     /**
      * @brief Reject a topology watch whose owning membership no longer exists.
      * @param[in] req Watch request to validate while membershipWatchMutex_ is held.
-     * @return K_OK for a live member or non-topology watch; K_NOT_FOUND for a stale member.
+     * @param[in] parsed Parsed watch key.
+     * @return K_OK for a live member; K_NOT_FOUND for a stale member.
      */
-    Status CheckWatcherMembership(const WatchRangeReqPb &req);
+    Status CheckWatcherMembership(const WatchRangeReqPb &req, const ParsedTopologyCoordinationKey &parsed);
 
     /**
-     * @brief Fill leader and CoordinatorId response metadata.
-     * @param[out] header Response header to fill.
+     * @brief Build one routeable response header from a single leadership snapshot.
+     * @param[out] header Response header to replace after a successful snapshot.
+     * @return Lifecycle or leadership snapshot status. K_OK guarantees a complete routeable header.
      */
-    void FillResponseHeader(ResponseHeader *header) const;
+    Status PrepareResponseHeader(ResponseHeader *header) const;
+
     /**
-     * @brief Fill response metadata and apply the serving gate for one RPC class.
-     * @param[in] allowLeaderRecovering Whether allow business logic to execute during Leader recovery.
-     * @param[out] header Response header to fill.
-     * @param[out] businessAllowed True only when this request may execute against local business state.
-     * @return K_OK with a routeable envelope for Followers, recovering Leaders, or the current serving Leader;
-     *         lifecycle and stale-local-leadership gate status otherwise.
+     * @brief Build one per-cluster response header from leadership and recovery state.
+     * @param[in] clusterName Cluster whose recovery state controls Leader admission.
+     * @param[out] header Response header to replace after a successful snapshot.
+     * @return Lifecycle, leadership, or recovery-manager status. K_OK guarantees a complete routeable header.
      */
-    Status PrepareRpcResponse(bool allowLeaderRecovering, ResponseHeader *header, bool &businessAllowed) const;
+    Status PrepareResponseHeader(const std::string &clusterName, ResponseHeader *header) const;
+
+    template <typename Request>
+    bool AllowContinue(const ResponseHeader &header) const;
+
+    template <typename Request>
+    bool AllowRecoveryControl(const ResponseHeader &header) const;
+
+    Status RequireTopologyRecoveryManager() const;
     Status RequireRecoveryLeader(uint64_t term, std::string_view coordinatorId) const;
-    void RunRecoveryGate();
-    void StopRecoveryGate();
-    void CompleteRecoveryWindow(uint64_t term);
     bool IsCurrentLeaderRound(uint64_t term, std::string_view coordinatorId) const;
 
     bool IsElectionConfigured() const noexcept;
@@ -297,7 +293,6 @@ private:
     Status RunUnderCollectiveReplacementFence(uint64_t expectedEpoch, const std::function<Status()> &mutation) const;
     std::vector<cluster::ControlBackendProbeResult> ProbeMembersLiveness(
         const std::vector<cluster::MemberIdentity> &targets, std::chrono::steady_clock::time_point deadline) const;
-    Status CheckServing() const;
     Status InitInternal();
     Status FinishSuccessfulStart();
     Status StartInternal();
@@ -326,47 +321,76 @@ private:
     std::string brpcAddr_;
     int brpcPort_ = 0;
     std::string coordinatorId_;
-    // Serializes one-way lifecycle state transitions and leader/bootstrap queries. Election startup reserves one
-    // attempt, publishes Manager ownership before starting its background worker, then publishes completion under this
-    // mutex. Shutdown publishes STOPPING and transfers Manager ownership under this mutex, then performs every blocking
-    // cleanup stage without the lock before reacquiring it only to publish the shared result.
+    // Serializes initialization, RPC/election startup, Manager ownership and the shutdown transaction. Shutdown waits
+    // for election startup publication, then publishes STOPPED and transfers Manager ownership under this mutex. It
+    // releases the mutex before taking leaderOperationMutex_ or performing any blocking cleanup and reacquires it only
+    // to publish the cleanup result.
     mutable std::mutex lifecycleMutex_;
     std::condition_variable lifecycleCv_;
+    bool initialized_{ false };
+    bool rpcStartInProgress_{ false };
+    bool rpcStarted_{ false };
     bool electionStartInProgress_{ false };
     bool electionStartAttempted_{ false };
     bool shutdownInProgress_{ false };
     bool shutdownComplete_{ false };
     Status shutdownStatus_;
-    std::atomic<ServingState> servingState_{ ServingState::CREATED };
-    // This fence linearizes RPC admission with Raft Leader transitions; CoordinatorElectionManager remains the
+    std::atomic<LifecycleState> lifecycleState_{ LifecycleState::CREATED };
+    // This fence linearizes operations with Raft Leader round transitions; CoordinatorElectionManager remains the
     // Raft source of truth.
     mutable std::shared_mutex leaderOperationMutex_;
-    // Leader-round trace restored by the delayed recovery gate; protected by leaderOperationMutex_.
-    std::string recoveryTraceId_;
-    // Wakes the recovery timer on state changes. ServingState is the single service/admission state machine.
-    mutable std::mutex recoveryGateMutex_;
-    std::condition_variable recoveryGateCv_;
     std::atomic<uint64_t> leaderTerm_{ 0 };
-    bool recoveryGateStopping_{ false };
-    Thread recoveryGateThread_;
 
 #ifdef WITH_TESTS
-    // Narrow deterministic seams for lifecycle publication, real brpc handler/server ordering, snapshot-copy, and
-    // Manager cleanup ordering.
+    // Narrow deterministic seams for lifecycle publication, handler/server ordering, snapshot/recovery observation,
+    // and Manager cleanup ordering.
     std::function<void()> electionManagerPublishedHook_;
     std::function<void()> raftBootstrapHandlerEnteredHook_;
     std::function<void()> raftBootstrapSnapshotCopiedHook_;
     std::function<Status()> electionManagerShutdownHook_;
     std::function<void()> rpcServerShutdownHook_;
-    std::function<void()> recoveryWindowTraceHook_;
+    std::function<Status(CoordinatorLeadershipSnapshot &)> leadershipSnapshotProvider_;
+    std::function<TopologyRecoveryState(const std::string &)> recoveryStateProvider_;
 #endif
 
     // Declaration order is the reverse-destruction fallback. Explicit Shutdown remains authoritative:
-    // gate closed -> ElectionManager (Membership then Node) -> RpcServer -> business brpc adapter.
+    // lifecycle STOPPED -> ElectionManager (Membership then Node) -> RpcServer -> business brpc adapter.
     std::unique_ptr<CoordinatorServiceBrpcAdapter> brpcAdapter_;
     std::unique_ptr<RpcServer> rpcServer_;
     std::unique_ptr<CoordinatorElectionManager> electionManager_;
 };
+
+template <typename Request>
+bool CoordinatorServiceImpl::AllowContinue(const ResponseHeader &header) const
+{
+    return header.state() == ResponseHeader::SERVING;
+}
+
+template <typename Request>
+bool CoordinatorServiceImpl::AllowRecoveryControl(const ResponseHeader &header) const
+{
+    return header.state() == ResponseHeader::RECOVERING || header.state() == ResponseHeader::SERVING;
+}
+
+template <>
+inline bool CoordinatorServiceImpl::AllowContinue<KeepAliveReqPb>(const ResponseHeader &header) const
+{
+    return AllowRecoveryControl<KeepAliveReqPb>(header);
+}
+
+template <>
+inline bool CoordinatorServiceImpl::AllowContinue<EnsureLeaderMembershipReqPb>(const ResponseHeader &header) const
+{
+    return AllowRecoveryControl<EnsureLeaderMembershipReqPb>(header);
+}
+
+template <>
+inline bool CoordinatorServiceImpl::AllowContinue<ReportTopologyRecoveryCandidateReqPb>(
+    const ResponseHeader &header) const
+{
+    return AllowRecoveryControl<ReportTopologyRecoveryCandidateReqPb>(header);
+}
+
 }  // namespace coordinator
 }  // namespace datasystem
 #endif  // DATASYSTEM_COORDINATOR_COORDINATOR_SERVICE_IMPL_H

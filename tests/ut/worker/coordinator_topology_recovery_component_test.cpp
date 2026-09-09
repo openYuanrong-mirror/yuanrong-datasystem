@@ -82,7 +82,7 @@ struct RecoveryGeneration {
           manager(std::make_unique<coordinator::TopologyRecoveryManager>(coordinatorId, *store, clock, Options()))
     {
         EXPECT_TRUE(store->Start().IsOk());
-        manager->BeginLeaderRound({ 0, coordinatorId });
+        manager->BeginLeaderRound({ 0, coordinatorId }, std::chrono::seconds(10));
     }
 
     static coordinator::TopologyRecoveryOptions Options()
@@ -344,10 +344,10 @@ TEST(CoordinatorTopologyRecoveryComponentTest, WorkerRebuildsTwoFreshCoordinator
             return Status::OK();
         },
         reporterOptions);
-    reporter.NotifyRuntimeReady();
+    reporter.NotifyRecoveryParticipationReady();
 
     RecoveryGeneration first(COORDINATOR_A);
-    first.manager->ObserveMembershipChange(MembershipKey(), true);
+    first.manager->ObserveMembershipChange(MembershipKey(), cluster::MemberLifecycleState::STARTING);
     proxy.SetTarget(COORDINATOR_A, *first.manager);
     reporter.NotifyMembershipReady(CoordinatorLeaderIdentity{ HostPort(), COORDINATOR_A, 0, 1 });
     ASSERT_TRUE(proxy.WaitForAttempts(2));
@@ -355,7 +355,7 @@ TEST(CoordinatorTopologyRecoveryComponentTest, WorkerRebuildsTwoFreshCoordinator
     ExpectInstalled(first, canonical);
 
     RecoveryGeneration second(COORDINATOR_B);
-    second.manager->ObserveMembershipChange(MembershipKey(), true);
+    second.manager->ObserveMembershipChange(MembershipKey(), cluster::MemberLifecycleState::STARTING);
     proxy.SetTarget(COORDINATOR_B, *second.manager);
     reporter.NotifyMembershipReady(CoordinatorLeaderIdentity{ HostPort(), COORDINATOR_B, 0, 1 });
     ASSERT_TRUE(proxy.WaitForAttempts(4));
@@ -381,10 +381,10 @@ TEST(CoordinatorTopologyRecoveryComponentTest, CoordinatorSwitchBetweenEvidenceA
             return Status::OK();
         },
         reporterOptions);
-    reporter.NotifyRuntimeReady();
+    reporter.NotifyRecoveryParticipationReady();
 
     RecoveryGeneration first(COORDINATOR_A);
-    first.manager->ObserveMembershipChange(MembershipKey(), true);
+    first.manager->ObserveMembershipChange(MembershipKey(), cluster::MemberLifecycleState::STARTING);
     proxy.SetTarget(COORDINATOR_A, *first.manager);
     proxy.BlockNextResponse();
     reporter.NotifyMembershipReady(CoordinatorLeaderIdentity{ HostPort(), COORDINATOR_A, 0, 1 });
@@ -396,7 +396,7 @@ TEST(CoordinatorTopologyRecoveryComponentTest, CoordinatorSwitchBetweenEvidenceA
     }
 
     RecoveryGeneration second(COORDINATOR_B);
-    second.manager->ObserveMembershipChange(MembershipKey(), true);
+    second.manager->ObserveMembershipChange(MembershipKey(), cluster::MemberLifecycleState::STARTING);
     proxy.SetTarget(COORDINATOR_B, *second.manager);
     reporter.NotifyMembershipReady(CoordinatorLeaderIdentity{ HostPort(), COORDINATOR_B, 0, 1 });
     proxy.ReleaseBlockedResponse();

@@ -38,6 +38,7 @@
 #include "datasystem/common/flags/common_flags.h"
 #include "datasystem/common/rpc/brpc_factory.h"
 #include "datasystem/coordinator/coordinator_service_impl.h"
+#include "datasystem/coordinator/topology_recovery_manager.h"
 #include "datasystem/protos/coordinator.brpc.stub.pb.h"
 #include "datasystem/utils/coordinator_discovery.h"
 
@@ -277,15 +278,32 @@ protected:
         const auto discoveryCallsBeforeRpcStart = discovery->CallCount();
         service_ = std::make_unique<coordinator::CoordinatorServiceImpl>(
             HostPort(kLoopbackIp, portLease_.Port()), discovery, expectedMemberCount, MakeRaftFlags());
+        service_->recoveryStateProvider_ = [](const std::string &) {
+            return coordinator::TopologyRecoveryState::READY;
+        };
+        coordinator::CoordinatorLeadershipSnapshot snapshot;
+        const auto snapshotBeforeInit = service_->GetLeadershipSnapshot(snapshot);
+        EXPECT_EQ(snapshotBeforeInit.GetCode(), K_NOT_READY) << snapshotBeforeInit.ToString();
         const auto initStatus = service_->Init();
         ASSERT_TRUE(initStatus.IsOk()) << initStatus.ToString();
+        const auto snapshotBeforeStart = service_->GetLeadershipSnapshot(snapshot);
+        EXPECT_EQ(snapshotBeforeStart.GetCode(), K_NOT_READY) << snapshotBeforeStart.ToString();
         const auto startStatus = service_->Start();
         ASSERT_LT(std::chrono::steady_clock::now(), deadline);
         ASSERT_TRUE(startStatus.IsOk()) << startStatus.ToString();
+        const auto snapshotAfterStart = service_->GetLeadershipSnapshot(snapshot);
+        if (expectedMemberCount > 1) {
+            EXPECT_EQ(snapshotAfterStart.GetCode(), K_NOT_READY) << snapshotAfterStart.ToString();
+        } else {
+            EXPECT_TRUE(snapshotAfterStart.IsOk()) << snapshotAfterStart.ToString();
+        }
         ASSERT_EQ(discovery->CallCount(), discoveryCallsBeforeRpcStart);
         const auto electionStatus = service_->StartElectionManager();
         ASSERT_LT(std::chrono::steady_clock::now(), deadline);
         ASSERT_TRUE(electionStatus.IsOk()) << electionStatus.ToString();
+        const auto snapshotAfterElectionStart = service_->GetLeadershipSnapshot(snapshot);
+        EXPECT_TRUE(snapshotAfterElectionStart.IsOk() || snapshotAfterElectionStart.GetCode() == K_NOT_READY)
+            << snapshotAfterElectionStart.ToString();
     }
 
     bool IsLocalRaftLeader() const
@@ -293,19 +311,10 @@ protected:
         return service_ != nullptr && service_->IsLeader();
     }
 
-    bool IsRaftServingGateOpen() const
+    bool IsRequestEntryRunning() const
     {
-        return service_ != nullptr
-               && service_->servingState_.load(std::memory_order_acquire)
-                      == coordinator::CoordinatorServiceImpl::ServingState::LEADER_SERVING;
-    }
-
-    void SetRaftServingGate(bool serving)
-    {
-        ASSERT_NE(service_, nullptr);
-        service_->servingState_.store(serving ? coordinator::CoordinatorServiceImpl::ServingState::LEADER_SERVING
-                                              : coordinator::CoordinatorServiceImpl::ServingState::FOLLOWER_SERVING,
-                                      std::memory_order_release);
+        coordinator::CoordinatorLeadershipSnapshot snapshot;
+        return service_ != nullptr && service_->GetLeadershipSnapshot(snapshot).IsOk();
     }
 
     Status GetRaftLeader(std::string &leader) const
@@ -314,12 +323,6 @@ protected:
             return Status(K_NOT_READY, "Coordinator service is not available in the election ST");
         }
         return service_->GetLeader(leader);
-    }
-
-    void FillResponseHeader(coordinator::ResponseHeader *header) const
-    {
-        ASSERT_NE(service_, nullptr);
-        service_->FillResponseHeader(header);
     }
 
     bool LifecycleOwnersReleased() const
@@ -412,8 +415,8 @@ TEST_P(CoordinatorServiceElectionTest, SingleExpectedMemberServesBusinessRpcWith
     EXPECT_EQ(duplicateStartStatus.GetCode(), K_INVALID) << duplicateStartStatus.ToString();
     EXPECT_NE(duplicateStartStatus.GetMsg().find("already starting or running"), std::string::npos)
         << duplicateStartStatus.ToString();
-    EXPECT_FALSE(IsLocalRaftLeader());
-    EXPECT_TRUE(IsRaftServingGateOpen());
+    EXPECT_TRUE(IsLocalRaftLeader());
+    EXPECT_TRUE(IsRequestEntryRunning());
 
     std::string leader = "stale";
     const auto leaderStatus = GetRaftLeader(leader);
@@ -432,7 +435,7 @@ TEST_P(CoordinatorServiceElectionTest, SingleExpectedMemberServesBusinessRpcWith
         EXPECT_FALSE(response.header().coordinator_id().empty());
     } else {
         coordinator::PutReqPb request;
-        request.set_key("/coordinator-service-election/business-rpc");
+        request.set_key("/datasystem/election/probe/" + endpoint_);
         request.set_value("real-brpc-value");
         coordinator::PutRspPb response;
         const auto rpcStatus = stub.Put(request, response);
@@ -479,7 +482,7 @@ TEST_F(CoordinatorServiceElectionTestBase, RestartSingleCoordinatorDoesNotRedisc
     const auto callsAfterFirstStart = discovery->CallCount();
 
     ASSERT_NO_FATAL_FAILURE(CreateAndStartService(discovery, caseDeadline));
-    EXPECT_FALSE(IsLocalRaftLeader());
+    EXPECT_TRUE(IsLocalRaftLeader());
     std::string recoveredLeader = "stale";
     const auto recoveredLeaderStatus = GetRaftLeader(recoveredLeader);
     EXPECT_EQ(recoveredLeaderStatus.GetCode(), K_INVALID) << recoveredLeaderStatus.ToString();
@@ -507,6 +510,9 @@ TEST_F(CoordinatorServiceElectionTestBase, BindConflictReturnsOriginalErrorAndLe
     EXPECT_NE(startStatus.GetMsg().find("Failed to start brpc server on " + endpoint_), std::string::npos)
         << startStatus.ToString();
     EXPECT_EQ(discovery->CallCount(), 0U);
+    coordinator::CoordinatorLeadershipSnapshot snapshot;
+    const auto snapshotStatus = service_->GetLeadershipSnapshot(snapshot);
+    EXPECT_EQ(snapshotStatus.GetCode(), K_SHUTTING_DOWN) << snapshotStatus.ToString();
     EXPECT_TRUE(LifecycleOwnersReleased());
     EXPECT_TRUE(service_->Shutdown().IsOk());
     EXPECT_TRUE(service_->Shutdown().IsOk());
@@ -517,7 +523,7 @@ TEST_F(CoordinatorServiceElectionTestBase, BindConflictReturnsOriginalErrorAndLe
     ASSERT_TRUE(WaitUntil([this] { return CanBindLoopbackPort(portLease_.Port()); }, caseDeadline));
 
     ASSERT_NO_FATAL_FAILURE(CreateAndStartService(discovery, caseDeadline));
-    EXPECT_FALSE(IsLocalRaftLeader());
+    EXPECT_TRUE(IsLocalRaftLeader());
     EXPECT_EQ(discovery->CallCount(), 0U);
     ASSERT_NO_FATAL_FAILURE(ShutdownAndReleaseService(caseDeadline));
 }

@@ -707,8 +707,7 @@ protected:
 
     bool IsBusinessServing(const BusinessRpcObservation &observation) const
     {
-        return observation.status.IsOk() && observation.header.is_leader()
-               && observation.header.serving_state() == coordinator::ResponseHeader::LEADER_SERVING;
+        return observation.status.IsOk() && observation.header.state() == coordinator::ResponseHeader::SERVING;
     }
 
     bool BusinessGatesMatchLeader(const std::vector<size_t> &indexes, size_t leaderIndex, Deadline deadline) const
@@ -721,15 +720,9 @@ protected:
                 }
                 continue;
             }
-            if (observation.status.IsOk()) {
-                if (observation.coordinatorId.empty() || observation.header.is_leader()
-                    || observation.header.serving_state() != coordinator::ResponseHeader::FOLLOWER_SERVING
-                    || observation.header.leader_address().empty()) {
-                    return false;
-                }
-                continue;
-            }
-            if (observation.status.GetCode() != K_NOT_READY) {
+            if (!observation.status.IsOk() || observation.coordinatorId.empty()
+                || observation.header.state() != coordinator::ResponseHeader::NOT_LEADER
+                || observation.header.leader_address().empty()) {
                 return false;
             }
         }
@@ -1320,8 +1313,7 @@ TEST_F(CoordinatorRuntimeElectionTest, LeaderFailoverRestartsOldLeaderAsPersiste
     const auto restartedGate = CallBusinessRpc(initial.leaderIndex, caseDeadline);
     EXPECT_TRUE(restartedGate.status.IsOk()) << restartedGate.status.ToString();
     EXPECT_FALSE(IsBusinessServing(restartedGate));
-    EXPECT_FALSE(restartedGate.header.is_leader());
-    EXPECT_EQ(restartedGate.header.serving_state(), coordinator::ResponseHeader::FOLLOWER_SERVING);
+    EXPECT_EQ(restartedGate.header.state(), coordinator::ResponseHeader::NOT_LEADER);
     EXPECT_EQ(restartedGate.header.leader_address(), failover.endpoint);
     EXPECT_TRUE(HasCommittedConfiguration(initial.leaderIndex, BaselineEndpointSet(), caseDeadline));
     EXPECT_LT(std::chrono::steady_clock::now(), caseDeadline);
@@ -1416,7 +1408,10 @@ TEST_F(CoordinatorRuntimeElectionTest, QuorumLossClosesServingGateUntilOriginalM
             if (leaderStatus.GetCode() != K_NOT_READY || !reportedLeader.empty()) {
                 return false;
             }
-            return CallBusinessRpc(initial.leaderIndex, quorumLossDeadline).status.GetCode() == K_NOT_READY;
+            const auto business = CallBusinessRpc(initial.leaderIndex, quorumLossDeadline);
+            return business.status.IsOk() && !business.coordinatorId.empty()
+                   && business.header.state() == coordinator::ResponseHeader::NOT_LEADER
+                   && business.header.leader_address().empty();
         },
         quorumLossDeadline);
     ASSERT_TRUE(quorumLossObservation.completionTime <= quorumLossDeadline)

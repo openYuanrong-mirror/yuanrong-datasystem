@@ -157,7 +157,7 @@ void TopologyRecoveryReporter::NotifyMembershipReady(const std::string &coordina
     NotifyMembershipReady(CoordinatorLeaderIdentity{ HostPort(), coordinatorId, 0, 0 });
 }
 
-void TopologyRecoveryReporter::NotifyRuntimeReady()
+void TopologyRecoveryReporter::NotifyRecoveryParticipationReady()
 {
     {
         std::lock_guard<std::mutex> lock(mutex_);

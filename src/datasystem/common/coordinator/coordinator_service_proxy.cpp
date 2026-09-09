@@ -47,9 +47,8 @@ Status CheckCoordinatorAddress(const HostPort &coordinatorAddr)
 
 Status CheckResponseHeader(const coordinator::ResponseHeader &header, bool allowLeaderRecovering = false)
 {
-    const bool accepted =
-        header.is_leader()
-        || (allowLeaderRecovering && header.serving_state() == coordinator::ResponseHeader::LEADER_RECOVERING);
+    const bool accepted = header.state() == coordinator::ResponseHeader::SERVING
+                          || (allowLeaderRecovering && header.state() == coordinator::ResponseHeader::RECOVERING);
     CHECK_FAIL_RETURN_STATUS(accepted, StatusCode::K_NOT_READY,
                              "coordinator is not leader, leader address: " + header.leader_address());
     CHECK_FAIL_RETURN_STATUS(header.coordinator_id().size() == UUID_SIZE, StatusCode::K_INVALID,
@@ -107,11 +106,11 @@ CoordinatorLeaderRouter::RpcResult RouteResult(Status status, const coordinator:
     route.leaderAddress = header.leader_address();
     route.coordinatorId = header.coordinator_id();
     route.leaderTerm = header.leader_term();
-    if (header.serving_state() == coordinator::ResponseHeader::LEADER_RECOVERING) {
+    if (header.state() == coordinator::ResponseHeader::RECOVERING) {
         route.state = CoordinatorLeaderRouter::RpcResponseHeader::State::RECOVERING;
-    } else if (header.is_leader()) {
+    } else if (header.state() == coordinator::ResponseHeader::SERVING) {
         route.state = CoordinatorLeaderRouter::RpcResponseHeader::State::SERVING;
-    } else {
+    } else if (header.state() == coordinator::ResponseHeader::NOT_LEADER) {
         route.state = CoordinatorLeaderRouter::RpcResponseHeader::State::NOT_LEADER;
     }
     return { std::move(status), std::move(route) };

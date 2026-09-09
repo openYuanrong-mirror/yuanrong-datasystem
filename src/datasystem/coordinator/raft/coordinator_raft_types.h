@@ -83,6 +83,12 @@ struct RaftBootstrapState {
     RaftBootstrapPhase phase{ RaftBootstrapPhase::OBSERVING };
 };
 
+struct CoordinatorLeadershipSnapshot {
+    bool isLeader{ false };
+    std::string leaderAddress;
+    uint64_t term{ 0 };
+};
+
 struct CoordinatorRaftFlags {
     std::string localAddress;
     std::string dataDir;

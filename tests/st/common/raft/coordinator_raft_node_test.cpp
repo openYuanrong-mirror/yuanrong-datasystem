@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -70,6 +71,7 @@ constexpr std::chrono::seconds kCtestTimeout{ 8 };
 constexpr size_t kBootstrapNodeCount = 3;
 constexpr size_t kMembershipNodeCount = 4;
 constexpr size_t kWaitingNodeIndex = kMembershipNodeCount - 1;
+constexpr uint64_t kStaleLeadershipTerm = std::numeric_limits<uint64_t>::max();
 
 static_assert(kWaitingToJoinObservationWindow
               >= kMinimumObservedElectionTimeouts * std::chrono::milliseconds{ kElectionTimeoutMs });
@@ -1163,6 +1165,13 @@ TEST_F(CoordinatorRaftNodeTest, BootstrapOneNodePublishesLeaderAndCommittedConfi
     ASSERT_TRUE(WaitUntil([this] { return node_->IsLeader(); }, caseDeadline))
         << "one-node raft did not elect local leader " << localAddress_;
 
+    coordinator::CoordinatorLeadershipSnapshot leadershipSnapshot;
+    const auto snapshotStatus = node_->GetLeadershipSnapshot(leadershipSnapshot);
+    ASSERT_TRUE(snapshotStatus.IsOk()) << snapshotStatus.ToString();
+    EXPECT_TRUE(leadershipSnapshot.isLeader);
+    EXPECT_EQ(leadershipSnapshot.leaderAddress, localAddress_);
+    EXPECT_GT(leadershipSnapshot.term, 0U);
+
     std::string leaderAddress;
     const auto leaderStatus = node_->GetLeader(leaderAddress);
     ASSERT_TRUE(leaderStatus.IsOk()) << leaderStatus.ToString();
@@ -1297,6 +1306,13 @@ TEST_F(CoordinatorRaftNodeTest, WaitingToJoinDoesNotSelfElect)
 
     const auto noLeaderObservationDeadline = std::chrono::steady_clock::now() + kWaitingToJoinObservationWindow;
     EXPECT_FALSE(WaitUntil([this] { return node_->IsLeader(); }, noLeaderObservationDeadline));
+
+    coordinator::CoordinatorLeadershipSnapshot leadershipSnapshot{ true, localAddress_, kStaleLeadershipTerm };
+    const auto snapshotStatus = node_->GetLeadershipSnapshot(leadershipSnapshot);
+    ASSERT_TRUE(snapshotStatus.IsOk()) << snapshotStatus.ToString();
+    EXPECT_FALSE(leadershipSnapshot.isLeader);
+    EXPECT_TRUE(leadershipSnapshot.leaderAddress.empty());
+    EXPECT_NE(leadershipSnapshot.term, kStaleLeadershipTerm);
 
     std::string leaderAddress;
     EXPECT_EQ(node_->GetLeader(leaderAddress).GetCode(), K_NOT_READY);

@@ -303,10 +303,42 @@ void CoordinatorRaftNode::ShutdownInternal() noexcept
     }
 }
 
+Status CoordinatorRaftNode::GetLeadershipSnapshot(CoordinatorLeadershipSnapshot &snapshot) const
+{
+    snapshot = {};
+    std::unique_lock<std::mutex> lock(lifecycleMutex_);
+    if (state_ != LifecycleState::STARTED || node_ == nullptr) {
+        return NotReadyStatus("report a leadership snapshot");
+    }
+
+    braft::LeadershipStatus raftStatus;
+    node_->get_leadership_status(&raftStatus);
+    if (raftStatus.term < 0) {
+        return Status(K_DATA_INCONSISTENCY, "Coordinator raft leadership snapshot has a negative term");
+    }
+
+    CoordinatorLeadershipSnapshot observedSnapshot;
+    observedSnapshot.term = static_cast<uint64_t>(raftStatus.term);
+    if (raftStatus.leader_id.is_empty()) {
+        snapshot = std::move(observedSnapshot);
+        return Status::OK();
+    }
+
+    auto normalizedAddress = CoordinatorRaftPeerAddress(raftStatus.leader_id);
+    if (normalizedAddress.empty()) {
+        return Status(K_DATA_INCONSISTENCY, "Coordinator raft leader has an invalid internal identity");
+    }
+    observedSnapshot.isLeader = raftStatus.state == braft::STATE_LEADER;
+    observedSnapshot.leaderAddress = std::move(normalizedAddress);
+
+    snapshot = std::move(observedSnapshot);
+    return Status::OK();
+}
+
 bool CoordinatorRaftNode::IsLeader() const
 {
-    std::lock_guard<std::mutex> lock(lifecycleMutex_);
-    return state_ == LifecycleState::STARTED && node_ != nullptr && node_->is_leader();
+    CoordinatorLeadershipSnapshot snapshot;
+    return GetLeadershipSnapshot(snapshot).IsOk() && snapshot.isLeader;
 }
 
 bool CoordinatorRaftNode::UpdateObservedLeaderLocked(const std::string &leaderAddress,
@@ -323,28 +355,12 @@ bool CoordinatorRaftNode::UpdateObservedLeaderLocked(const std::string &leaderAd
 Status CoordinatorRaftNode::GetLeader(std::string &leaderAddress) const
 {
     leaderAddress.clear();
-    std::unique_lock<std::mutex> lock(lifecycleMutex_);
-    if (state_ != LifecycleState::STARTED || node_ == nullptr) {
-        return NotReadyStatus("report a leader");
-    }
-
-    const auto leader = node_->leader_id();
-    if (leader.is_empty()) {
+    CoordinatorLeadershipSnapshot snapshot;
+    RETURN_IF_NOT_OK(GetLeadershipSnapshot(snapshot));
+    if (snapshot.leaderAddress.empty()) {
         return Status(K_NOT_READY, "Coordinator raft leader is not known yet");
     }
-    auto normalizedAddress = CoordinatorRaftPeerAddress(leader);
-    if (normalizedAddress.empty()) {
-        return Status(K_DATA_INCONSISTENCY, "Coordinator raft leader has an invalid internal identity");
-    }
-    std::string previousLeader;
-    const bool leaderChanged = UpdateObservedLeaderLocked(normalizedAddress, previousLeader);
-    leaderAddress = std::move(normalizedAddress);
-    const auto currentLeader = leaderAddress;
-    lock.unlock();
-    if (leaderChanged) {
-        LOG(INFO) << "COORDINATOR_RAFT_LEADER_CHANGED current_addr=" << options_.localPeer
-                  << " old_leader=" << previousLeader << " new_leader=" << currentLeader << " reason=get_leader";
-    }
+    leaderAddress = std::move(snapshot.leaderAddress);
     return Status::OK();
 }
 

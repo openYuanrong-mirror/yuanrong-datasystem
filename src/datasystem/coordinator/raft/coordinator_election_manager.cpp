@@ -459,12 +459,11 @@ CoordinatorElectionManager::Dependencies CoordinatorElectionManager::MakeProduct
         handle->membership = std::make_unique<CoordinatorMembershipManager>(options, *node.node, discovery);
         return handle;
     };
+    dependencies.getLeadershipSnapshot = [](const NodeHandle &handle, CoordinatorLeadershipSnapshot &snapshot) {
+        return handle.node->GetLeadershipSnapshot(snapshot);
+    };
     dependencies.startMembership = [](MembershipHandle &handle) { return handle.membership->Start(); };
     dependencies.shutdownMembership = [](MembershipHandle &handle) { return handle.membership->Shutdown(); };
-    dependencies.isLeader = [](const NodeHandle &handle) { return handle.node->IsLeader(); };
-    dependencies.getLeader = [](const NodeHandle &handle, std::string &leaderAddress) {
-        return handle.node->GetLeader(leaderAddress);
-    };
     return dependencies;
 }
 
@@ -524,8 +523,8 @@ Status CoordinatorElectionManager::ValidateStartupInput() const
         dependencies_.probeLocalMetadata && dependencies_.discoverCandidates && dependencies_.exchangeObservation
             && dependencies_.now
             && dependencies_.createNode && dependencies_.startNode && dependencies_.createMembership
-            && dependencies_.startMembership && dependencies_.shutdownMembership && dependencies_.isLeader
-            && dependencies_.getLeader,
+            && dependencies_.getLeadershipSnapshot && dependencies_.startMembership
+            && dependencies_.shutdownMembership,
         K_INVALID, "Coordinator election manager dependencies are incomplete");
     return Status::OK();
 }
@@ -1433,20 +1432,39 @@ Status CoordinatorElectionManager::Shutdown()
     return result;
 }
 
+Status CoordinatorElectionManager::GetLeadershipSnapshot(CoordinatorLeadershipSnapshot &snapshot) const
+{
+    snapshot = {};
+    std::lock_guard<std::mutex> lock(lifecycleMutex_);
+    if (state_ != LifecycleState::RUNNING || node_ == nullptr) {
+        return Status(K_NOT_READY, "Coordinator election manager cannot report leadership before raft startup");
+    }
+
+    CoordinatorLeadershipSnapshot observedSnapshot;
+    const auto status = dependencies_.getLeadershipSnapshot(*node_, observedSnapshot);
+    if (status.IsError()) {
+        return status;
+    }
+    snapshot = std::move(observedSnapshot);
+    return Status::OK();
+}
+
 bool CoordinatorElectionManager::IsLeader() const
 {
-    std::lock_guard<std::mutex> lock(lifecycleMutex_);
-    return state_ == LifecycleState::RUNNING && node_ != nullptr && dependencies_.isLeader(*node_);
+    CoordinatorLeadershipSnapshot snapshot;
+    return GetLeadershipSnapshot(snapshot).IsOk() && snapshot.isLeader;
 }
 
 Status CoordinatorElectionManager::GetLeader(std::string &leaderAddress) const
 {
     leaderAddress.clear();
-    std::lock_guard<std::mutex> lock(lifecycleMutex_);
-    if (state_ != LifecycleState::RUNNING || node_ == nullptr) {
-        return Status(K_NOT_READY, "Coordinator election manager cannot report a leader before raft startup");
+    CoordinatorLeadershipSnapshot snapshot;
+    RETURN_IF_NOT_OK(GetLeadershipSnapshot(snapshot));
+    if (snapshot.leaderAddress.empty()) {
+        return Status(K_NOT_READY, "Coordinator raft leader is not known yet");
     }
-    return dependencies_.getLeader(*node_, leaderAddress);
+    leaderAddress = std::move(snapshot.leaderAddress);
+    return Status::OK();
 }
 
 }  // namespace datasystem::coordinator

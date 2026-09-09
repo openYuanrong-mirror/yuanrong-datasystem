@@ -23,20 +23,20 @@ package datasystem.coordinator;
 option cc_enable_arenas = true;
 
 message ResponseHeader {
-  // true = this node is leader, request processed
-  // false = this node is not leader, check leader_address
-  bool is_leader = 1;
-  string leader_address = 2; // Empty if is_leader=true or if leader unknown
-  bytes coordinator_id = 3; // Unique identifier of this Coordinator process lifetime.
-  uint64 leader_term = 4; // Current Raft term; 0 when no term is known.
-  enum ServingStatePb {
-    SERVING_STATE_UNSPECIFIED = 0;
-    FOLLOWER_SERVING = 1;
-    LEADER_RECOVERING = 2;
-    LEADER_SERVING = 3;
-    NO_LEADER = 4;
+  // Serving decision reported by the responding Coordinator.
+  enum StatePb {
+    STATE_UNSPECIFIED = 0;
+    NOT_LEADER = 1;
+    RECOVERING = 2;
+    SERVING = 3;
   }
-  ServingStatePb serving_state = 5;
+  StatePb state = 1;
+  // Non-empty only for NOT_LEADER when the Leader address is known.
+  string leader_address = 2;
+  // Unique identifier for the responding Coordinator process lifetime.
+  bytes coordinator_id = 3;
+  // Raft term captured from the same response snapshot as state.
+  uint64 leader_term = 4;
 }
 
 enum CoordinatorRecoveryStatePb {
