@@ -31,6 +31,7 @@ set -euo pipefail
 #   -c, --clean       Clean build directory first (cmake) / bazel clean first (bazel)
 #   -b, --build SYS   Build system: cmake or bazel (default: bazel)
 #   -M on|off         Build the Bazel kvtest with URMA support (default: off)
+#   -x on|off         Build all three Bazel tools with jemalloc profiling support (default: off)
 #   --use-httplib     cmake mode only: build httplib+std::thread backend instead of
 #                     the default brpc+bthread backend. The brpc backend reuses the
 #                     main repo's cmake/external_libs scripts to download/build
@@ -45,11 +46,12 @@ JOBS="${JOBS:-$(nproc 2>/dev/null || echo 8)}"
 BUILD_SYSTEM="bazel"
 BUILD_TYPE="Release"
 BUILD_WITH_URMA="off"
+BUILD_WITH_JEMALLOC_PROF="off"
 CLEAN=0
 USE_HTTPLIB=0
 
 usage() {
-    sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '3,/^SCRIPT_DIR=/{ /^SCRIPT_DIR=/d; s/^# \{0,1\}//; p; }' "$0"
     exit 0
 }
 
@@ -75,6 +77,16 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             BUILD_WITH_URMA="$2"; shift 2 ;;
+        -x)
+            if [[ $# -lt 2 ]]; then
+                echo "ERROR: -x requires on or off"
+                exit 1
+            fi
+            if [[ "$2" != "on" && "$2" != "off" ]]; then
+                echo "ERROR: invalid value '$2' for -x, choose from on or off"
+                exit 1
+            fi
+            BUILD_WITH_JEMALLOC_PROF="$2"; shift 2 ;;
         -c|--clean) CLEAN=1; shift ;;
         --use-httplib) USE_HTTPLIB=1; shift ;;
         -h|--help)  usage ;;
@@ -93,6 +105,10 @@ fi
 echo "Build system: $BUILD_SYSTEM"
 echo "Build type:   $BUILD_TYPE"
 echo "Jobs:         $JOBS"
+if [[ "$BUILD_WITH_JEMALLOC_PROF" == "on" && "$BUILD_SYSTEM" != "bazel" ]]; then
+    echo "ERROR: -x on is supported only with -b bazel"
+    exit 1
+fi
 if [[ "$BUILD_SYSTEM" == "cmake" ]]; then
     if [[ $USE_HTTPLIB -eq 1 ]]; then
         echo "Backend:      httplib + std::thread (--use-httplib)"
@@ -185,6 +201,11 @@ else  # bazel
     if [[ "$BUILD_WITH_URMA" == "on" ]]; then
         ba_args+=(--config=urma)
     fi
+    if [[ "$BUILD_WITH_JEMALLOC_PROF" == "on" ]]; then
+        ba_args+=(--config=jeprof)
+    else
+        ba_args+=(--define=enable_jemalloc_prof=false)
+    fi
     if detect_numa; then
         echo "NUMA: libnuma detected, enabling -Dkvtest_numa=true"
         ba_args+=(--define=kvtest_numa=true)
@@ -207,31 +228,29 @@ else  # bazel
 
     # Stage the bazel-built binaries where the Makefile package target expects them.
     bazel_bin_dir="$REPO_ROOT/bazel-bin"
-    kvtest_bin=""
-    for cand in \
-        "$bazel_bin_dir/tests/kvtest/kvtest" \
-        "$bazel_bin_dir/tests/kvtest/kvtest.exe"; do
-        if [[ -f "$cand" ]]; then kvtest_bin="$cand"; break; fi
-    done
-    if [[ -z "$kvtest_bin" ]]; then
-        echo "ERROR: kvtest binary not found under $bazel_bin_dir/tests/kvtest/"
-        exit 1
-    fi
     mkdir -p "$BUILD_DIR"
-    cp -f "$kvtest_bin" "$BUILD_DIR/kvtest"
-
-    # Stage coordinator_test and worker_test
-    for bin_name in coordinator_test worker_test; do
+    for bin_name in kvtest coordinator_test worker_test; do
+        binary=""
         for cand in \
             "$bazel_bin_dir/tests/kvtest/$bin_name" \
             "$bazel_bin_dir/tests/kvtest/$bin_name.exe"; do
-            if [[ -f "$cand" ]]; then cp -f "$cand" "$BUILD_DIR/$bin_name"; break; fi
+            if [[ -f "$cand" ]]; then binary="$cand"; break; fi
         done
-        if [[ ! -f "$BUILD_DIR/$bin_name" ]]; then
-            echo "WARNING: $bin_name not found in bazel output"
+        if [[ -z "$binary" ]]; then
+            echo "ERROR: $bin_name binary not found under $bazel_bin_dir/tests/kvtest/"
+            exit 1
         fi
+        if ! readelf -d "$binary" | grep 'libjemalloc.so.2' >/dev/null; then
+            echo "ERROR: $bin_name is not linked to the jemalloc runtime"
+            exit 1
+        fi
+        cp -f "$binary" "$BUILD_DIR/$bin_name"
     done
 
+    rm -f "$BUILD_DIR/lib/libjemalloc.so.2" "$SCRIPT_DIR/output/lib/libjemalloc.so.2"
+    (cd "$REPO_ROOT" && bazel build "${ba_args[@]}" //:libjemalloc_shared_file)
+    mkdir -p "$BUILD_DIR/lib"
+    cp -fL "$bazel_bin_dir/yr/datasystem/lib/libjemalloc.so.2" "$BUILD_DIR/lib/"
     # Copy URMA .so (Bazel in-tree: binaries are self-contained except URMA)
     if [[ "$BUILD_WITH_URMA" == "on" ]]; then
         (cd "$REPO_ROOT" && bazel build @local_urma//:urma_libs "${ba_args[@]}")
@@ -267,7 +286,7 @@ else  # bazel
     echo ""
     echo "Packaging..."
     cd "$SCRIPT_DIR"
-    # bazel binary is self-contained — no SDK libs needed at runtime.
+    # No SDK libs are needed; jemalloc and optional URMA runtimes are staged in build/lib.
     make package BAZEL_SDK_DIR="$SDK_DIR"
     echo ""
     echo "Done: $SCRIPT_DIR/output/"

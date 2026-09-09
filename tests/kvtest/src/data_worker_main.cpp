@@ -1,4 +1,5 @@
 #include "common/jf_service_discovery.h"
+#include "common/jemalloc_prof.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -37,6 +38,7 @@ struct Args {
     std::string configPath;
     std::string jfAddr;
     std::string serviceName = "kvcache_coordinator";
+    bool showVersion = false;
 };
 
 static bool ParseArgs(int argc, char **argv, Args &args)
@@ -45,7 +47,8 @@ static bool ParseArgs(int argc, char **argv, Args &args)
         std::string arg = argv[i];
         if (arg == "--version" || arg == "-v") {
             printf("worker_test %s (commit: %s)\n", BUILD_VERSION, BUILD_COMMIT);
-            return false;
+            args.showVersion = true;
+            return true;
         }
         auto next = [&]() -> std::string {
             if (i + 1 >= argc) {
@@ -81,6 +84,10 @@ int main(int argc, char **argv)
     Args args;
     if (!ParseArgs(argc, argv, args))
         return 1;
+
+    printf("jemalloc_prof_supported=%s\n", JemallocProfSupported() ? "true" : "false");
+    if (args.showVersion)
+        return 0;
 
     SetVersionString(DATASYSTEM_VERSION);
     char *fake_argv[] = { argv[0], nullptr };

@@ -17,12 +17,60 @@ import glob
 import json
 import logging
 import os
+import posixpath
 import shlex
 import subprocess
 import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+def normalize_jemalloc_prof_conf(conf, log_dir, instance_id, profile_name='kvtest'):
+    if not isinstance(conf, str) or not conf.strip():
+        raise ValueError('jemalloc_prof_conf cannot be empty')
+    values = {}
+    for position, item in enumerate(conf.split(','), start=1):
+        if ':' not in item:
+            raise ValueError(f'Invalid jemalloc_prof_conf option {position}: expected key:value')
+        key, value = (part.strip() for part in item.split(':', 1))
+        if not key or not value or '\0' in item or '\n' in item or '\r' in item:
+            raise ValueError(f'Invalid jemalloc_prof_conf option {position}')
+        if key in values:
+            raise ValueError(f'Duplicate jemalloc_prof_conf option: {key}')
+        values[key] = value
+    for key in ('prof', 'prof_active', 'prof_thread_active_init'):
+        if values.get(key, 'true').lower() != 'true':
+            raise ValueError(f'jemalloc_prof_conf requires {key}:true')
+    for key in ('prof', 'prof_active', 'prof_thread_active_init', 'prof_final', 'prof_gdump',
+                'prof_accum', 'prof_leak', 'prof_log', 'prof_leak_error', 'prof_sys_thread_name'):
+        if key in values:
+            if values[key].lower() not in ('true', 'false'):
+                raise ValueError(f'{key} must be true or false')
+            values[key] = values[key].lower()
+    for key, minimum in (('lg_prof_sample', 0), ('lg_prof_interval', -1)):
+        if key in values:
+            value = values[key]
+            if not value.lstrip('-').isascii() or not value.lstrip('-').isdigit():
+                raise ValueError(f'{key} must be an integer')
+            if not minimum <= int(value) <= 63:
+                raise ValueError(f'{key} must be between {minimum} and 63')
+    values['prof'] = 'true'
+    if 'prof_prefix' not in values:
+        if not log_dir:
+            raise ValueError('log directory is required when prof_prefix is absent')
+        values['prof_prefix'] = posixpath.join(log_dir, 'jemalloc', f'{profile_name}_{instance_id}')
+    if any(char in values['prof_prefix'] for char in ',\0\n\r'):
+        raise ValueError('prof_prefix cannot contain commas or control characters')
+    parent = posixpath.dirname(values['prof_prefix'])
+    if not parent:
+        raise ValueError('prof_prefix must include a directory, for example /path/to/heap/kvtest')
+    return ','.join(f'{key}:{value}' for key, value in values.items()), parent
+
+
+def validate_jemalloc_prof_conf(conf):
+    normalize_jemalloc_prof_conf(conf, 'logs', 0)
+    return conf
 
 
 # ---------------------------------------------------------------------------
@@ -1079,7 +1127,7 @@ def start_service_standalone(pod, namespace, binary_name, remote_dir, config_pat
                              config=None,
                              enable_procmon=True, procmon_remote_dir='/tmp',
                              port=None, process_name=None,
-                             timeout=DEFAULT_TIMEOUT):
+                             timeout=DEFAULT_TIMEOUT, jemalloc_prof_conf=None):
     """Start a standalone test binary in a pod.
 
     Uses ``standalone_launcher.py`` (uploaded alongside procmon) to fork +
@@ -1111,6 +1159,25 @@ def start_service_standalone(pod, namespace, binary_name, remote_dir, config_pat
     """
     name = pod['name']
     pod_ip = pod['ip']
+    env = {}
+    if jemalloc_prof_conf is not None:
+        try:
+            log_dir = (config or {}).get('log_dir')
+            if isinstance(log_dir, dict):
+                log_dir = log_dir.get('value')
+            conf, parent = normalize_jemalloc_prof_conf(
+                jemalloc_prof_conf, log_dir, port or name, profile_name=binary_name)
+            _, status, _ = check_process(pod, namespace, binary_name, timeout=timeout)
+            if status == 'alive':
+                raise RuntimeError('profiling configuration requires stopping and restarting the existing process')
+            if status != 'dead':
+                raise RuntimeError('cannot determine whether the service is already running')
+            prepare_standalone_jemalloc_prof(
+                pod, namespace, binary_name, remote_dir, parent, timeout)
+            env['MALLOC_CONF'] = conf
+        except (ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            log_error(f'{name} ({pod_ip}) -> profiling preflight failed: {error}')
+            return False
     if config is not None:
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json',
                                          prefix=f'standalone_{name}_',
@@ -1152,14 +1219,14 @@ def start_service_standalone(pod, namespace, binary_name, remote_dir, config_pat
                 port=port, host=pod_ip,
                 ready_file=ready_file,
                 ready_timeout=min(timeout, 60),
-                subprocess_timeout=timeout)
+                subprocess_timeout=timeout, env=env)
         else:
             log_error(f'  {name} ({pod_ip}) -> launcher upload failed, '
                       f'falling back to nohup path')
             pid = _launch_via_nohup(
                 name, namespace, binary_name, remote_dir, log_path,
                 lib_path, config_path, jf_addr, service_name, extra_args,
-                pod, port, process_name, timeout)
+                pod, port, process_name, timeout, env=env)
     finally:
         # Use the launcher-reported elapsed (Popen → ready, excludes
         # kubectl exec / python3 startup overhead) when available. Fall
@@ -1208,11 +1275,28 @@ def start_service_standalone(pod, namespace, binary_name, remote_dir, config_pat
     return True
 
 
+def prepare_standalone_jemalloc_prof(pod, namespace, binary_name, remote_dir, parent, timeout):
+    cwd = f'cd {shlex.quote(remote_dir)} && '
+    runtime_env = 'MALLOC_CONF= LD_LIBRARY_PATH=./lib:"${LD_LIBRARY_PATH:-}" '
+    result = kubectl_exec(
+        pod['name'], namespace,
+        cwd + runtime_env + shlex.quote(f'./{binary_name}') + ' --version',
+        check=False, timeout=timeout)
+    if result.returncode != 0 or 'jemalloc_prof_supported=true' not in result.stdout.splitlines():
+        raise RuntimeError(
+            f'{binary_name} cannot load a profiling allocator; rebuild with -b bazel -x on '
+            'and install the matching lib/ directory')
+    directory = shlex.quote(parent)
+    kubectl_exec(pod['name'], namespace,
+                 cwd + f'mkdir -p -- {directory} && test -d {directory} && '
+                 f'test -w {directory} && test -x {directory}', timeout=timeout)
+
+
 def _launch_via_launcher(name, namespace, launcher_remote, binary_path,
                          cwd, log_path, lib_path, binary_argv,
                          port=None, host='127.0.0.1',
                          ready_file=None,
-                         ready_timeout=30, subprocess_timeout=DEFAULT_TIMEOUT):
+                         ready_timeout=30, subprocess_timeout=DEFAULT_TIMEOUT, env=None):
     """Invoke standalone_launcher.py via kubectl exec; return (pid, elapsed).
 
     Returns a ``(pid_str, elapsed_float)`` tuple if the launcher printed a
@@ -1230,13 +1314,15 @@ def _launch_via_launcher(name, namespace, launcher_remote, binary_path,
     e.g. worker ``ready_check_path``) > ``port`` (TCP connect, e.g.
     coordinator) > none (grace-poll for early exits).
     """
-    cmd = ['kubectl', 'exec', '-n', namespace, name, '--',
-           'python3', launcher_remote,
+    cmd = ['kubectl', 'exec', '-n', namespace, name, '--']
+    if env:
+        cmd.extend(['env'] + [f'{key}={value}' for key, value in env.items()])
+    cmd.extend(['python3', launcher_remote,
            '--binary', binary_path,
            '--cwd', cwd,
            '--log', log_path,
            '--lib-path', lib_path,
-           '--ready-timeout', str(ready_timeout)]
+           '--ready-timeout', str(ready_timeout)])
     if ready_file:
         cmd.extend(['--ready-file', ready_file])
     if port:
@@ -1305,7 +1391,7 @@ def _extract_ready_check_path(config):
 
 def _launch_via_nohup(name, namespace, binary_name, remote_dir, log_path,
                       lib_path, config_path, jf_addr, service_name,
-                      extra_args, pod, port, process_name, timeout):
+                      extra_args, pod, port, process_name, timeout, env=None):
     """Legacy nohup-and-timeout launch path (fallback when launcher upload fails).
 
     Mirrors the pre-launcher implementation: kubectl exec with the
@@ -1313,10 +1399,13 @@ def _launch_via_nohup(name, namespace, binary_name, remote_dir, log_path,
     (kubectl hangs because the binary holds the SPDY pipe). Slow but works
     without the launcher script.
     """
-    cmd = (f'cd {remote_dir} && '
-           f'LD_LIBRARY_PATH={lib_path}:$LD_LIBRARY_PATH nohup ./{binary_name} '
-           f'--config {config_path} --jf {jf_addr} --service {service_name} {extra_args} '
-           f'> {log_path} 2>&1 </dev/null & '
+    env_prefix = ''.join(f'{key}={shlex.quote(value)} ' for key, value in (env or {}).items())
+    cmd = (f'cd {shlex.quote(remote_dir)} && {env_prefix}'
+           f'LD_LIBRARY_PATH={shlex.quote(lib_path)}:"${{LD_LIBRARY_PATH:-}}" '
+           f'nohup {shlex.quote("./" + binary_name)} '
+           f'--config {shlex.quote(config_path)} --jf {shlex.quote(jf_addr)} '
+           f'--service {shlex.quote(service_name)} {extra_args} '
+           f'> {shlex.quote(log_path)} 2>&1 </dev/null & '
            f'echo $!')
     try:
         subprocess.run(

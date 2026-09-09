@@ -273,6 +273,42 @@ Backed by `tests/kvtest/BUILD.bazel` and `tests/kvtest/build.sh`:
 - the CMake mode links against a pre-installed SDK (`-s/--sdk`, default `../../output/cpp`), while the Bazel mode
   builds `//tests/kvtest:kvtest` against the in-tree `//src/datasystem/client:datasystem`, producing a self-contained
   binary that does not need `libdatasystem.so` at runtime;
+- kvtest `build.sh -b bazel -x on` selects `--config=jeprof`, links `jemalloc_prof_shared`, and packages
+  `libjemalloc.so.2` beside the binary in `lib/` with an origin-relative runtime path. Default `-x off` links and
+  packages ordinary `jemalloc_shared`; CMake rejects `-x on`. Startup and `--version` report `jemalloc_prof_supported`,
+  queried from the loaded allocator in both Bazel builds. The prefixed static shared-memory allocator remains unchanged;
+- `deploy_client.py start/deploy --jemalloc_prof_conf` normalizes `MALLOC_CONF`, checks remote binary capability, and prepares
+  the profile directory before either launcher or nohup startup. Default prefix is
+  `<output_dir>/jemalloc/kvtest_<instance_id>`; when logging output is unspecified, profiling deployments fix a generated
+  `metrics_<instance_id>_<timestamp>` directory in the uploaded config. Explicit prefixes override that default.
+  Paths are interpreted on the target, and the binary's bundled jemalloc takes precedence over remote SDK libraries.
+  Client installs rebuild a dedicated managed `allocator_lib/` under the host lock and prepend only that directory,
+  not a persistent SDK-containing `lib/`, when a remote SDK is selected.
+  Install owns runtime uploads; start only uploads instance configuration and launches. Deploy stops on install failure
+  and propagates start failures to the CLI exit status;
+- `//tests/kvtest:jemalloc_prof_test` checks relocated binary loading and actual heap output with `--config=jeprof`,
+  and checks ordinary shared jemalloc without profiling with `--define=enable_jemalloc_prof=false`. Python regressions
+  are in `tests/kvtest/tests/python/test_jemalloc_prof.py` and `test_build_sh.py`;
+  the shared shell test checks actual malloc/free bindings to the relocated jemalloc via glibc LD_DEBUG.
+  `test_jemalloc_runtime.py` covers a non-interposing DSO negative case and real SDK-library selection after redeploy;
+- `coordinator_test` and `worker_test` use the same `jemalloc_prof_capability` dependency as `kvtest`, including
+  allocator selection and origin-relative runtime lookup. All three binaries report actual capability at startup;
+  standalone `--version` exits successfully. `coordinator_jemalloc_prof_test` and `worker_jemalloc_prof_test` reuse the
+  relocated-binary/profile-dump test. The build entrypoint rejects missing or unlinked outputs for any of the three tools.
+  Standalone service profiling is enabled via `MALLOC_CONF` before launch;
+- `deploy_worker.py` and `deploy_coordinator.py` accept `start/deploy --jemalloc_prof_conf` for standalone services.
+  They share `deploy_common.normalize_jemalloc_prof_conf` with `deploy_client.py`; the default service prefix is
+  `<log_dir>/jemalloc/<binary_name>_<port>`, using the config after overrides. Missing log_dir requires explicit prof_prefix.
+  Capability and directory checks run on the target before either launcher or nohup receives MALLOC_CONF.
+  Explicit profiling on an already-running tool fails with a restart instruction. Expected standalone preflight
+  failures return a per-Pod failure for batch aggregation. Shared normalization rejects disabled process/thread sampling
+  and validates known profiling booleans and sampling/interval exponents.
+  Coordinator dscli mode rejects the option because dscli only supports Worker profiling.
+  Tests are in `tests/kvtest/tests/python/test_standalone_jemalloc_prof.py`;
+- The kvtest README versions the allocator comparison baseline as `kvtest-bazel-allocator-v0` before this PR,
+  `kvtest-bazel-jemalloc-v1` for ordinary shared jemalloc, and `kvtest-bazel-jemalloc-prof-v1` for profiling.
+  Reports must retain tool/build/allocator/config identity; no cross-baseline performance equivalence is claimed.
+  Rollback restores the complete archived v0 tool package, not merely `-x off` or a replacement DSO;
 - optional NUMA support uses `HAS_LIBNUMA` as the single compile-time gate. `tests/kvtest/build.sh` enables the Bazel
   `kvtest_numa` setting only after a compiler probe can include `numa.h` and link `-lnuma`; CMake likewise requires
   both the header and library. A direct Bazel build without that setting keeps NUMA calls compiled out, even when a
@@ -358,10 +394,11 @@ Backed by `tests/kvtest/deploy_coordinator.py`, `deploy_worker.py`, `deploy_comm
   `anon_jemalloc_stats_available=0`, procmon records the status counters but leaves memory cells empty because the
   exported byte counters retain their last successful values.
 - `deploy_worker.py start` / `deploy` enable Worker heap profiling solely through an explicit
-  `--jemalloc-prof-options <MALLOC_CONF>` value; there is no separate runtime toggle. The option is forwarded to
+  `--jemalloc_prof_conf <MALLOC_CONF>` value (`--jemalloc-prof-options` remains an alias); there is no separate runtime toggle.
+  In dscli mode the option is forwarded to
   `dscli start --jemalloc_prof_conf`, which verifies that the package was built with root `build.sh -x on`, adds
-  `prof:true`, and derives `<log_dir>/jemalloc/datasystem_worker` when `prof_prefix` is absent. The option is rejected
-  in standalone mode because that launch path does not use dscli's profiling environment setup.
+  `prof:true`, and derives `<log_dir>/jemalloc/datasystem_worker` when `prof_prefix` is absent. Standalone mode uses
+  the shared tool capability/directory checks and MALLOC_CONF startup environment described above.
   `deploy_common.discover_nodes` now sorts by node name so the same helper serves
   `deploy_pods` percentage distribution and `deploy_coordinator` round-robin spread deterministically.
 - `deploy_common.clean_pod` / `cmd_clean_impl` / `cmd_clean_shared` form the clean pipeline shared by

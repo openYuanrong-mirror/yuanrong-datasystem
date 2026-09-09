@@ -46,12 +46,22 @@ from deploy_common import (
     setup_logging,
     start_service,
     start_service_standalone,
+    validate_jemalloc_prof_conf,
 )
 
 
 PROCESS_NAME = 'datasystem_coordinator'
 PROCESS_NAME_STANDALONE = 'coordinator_test'
 ADDRESS_KEY = 'coordinator_address'
+
+
+def _reject_dscli_jemalloc_profile(args):
+    if (getattr(args, 'jemalloc_prof_conf', None) is not None
+            and not getattr(args, 'standalone', False)):
+        log_error('ERROR: coordinator --jemalloc_prof_conf requires --standalone; '
+                  'dscli supports profiling only for workers')
+        return True
+    return False
 
 
 def start_coordinator(pod, namespace, config, coordinator_port, remote_config,
@@ -93,6 +103,8 @@ def cmd_start(args, pods):
     of dscli. The binary and .so deps must be pre-installed via
     ``install --standalone`` or the deploy command.
     """
+    if _reject_dscli_jemalloc_profile(args):
+        return 1
     if getattr(args, 'standalone', False):
         return cmd_start_standalone(args, pods)
 
@@ -147,6 +159,9 @@ def cmd_start_standalone(args, pods):
         _, status, _ = check_process(pod, args.namespace, binary_name,
                                      timeout=args.timeout)
         if status == 'alive':
+            if getattr(args, 'jemalloc_prof_conf', None) is not None:
+                log_error(f'{pod["name"]} -> profiling configuration requires stopping and restarting the existing process')
+                return False
             log_info(f'  {pod["name"]} ({pod["ip"]}) -> already running, skip')
             return True
         cfg = json.loads(json.dumps(config_template))
@@ -160,7 +175,8 @@ def cmd_start_standalone(args, pods):
             procmon_remote_dir=args.procmon_dir or '/tmp',
             port=args.port,
             process_name=binary_name,
-            timeout=args.timeout)
+            timeout=args.timeout,
+            jemalloc_prof_conf=getattr(args, 'jemalloc_prof_conf', None))
 
     return do_for_all_pods(pods, do_op, 'Starting coordinators (standalone)')
 
@@ -243,6 +259,9 @@ def cmd_deploy(args, pods=None):
     if args.image and not args.instances:
         log_error('ERROR: --instances is required when --image is set')
         return 1
+    if _reject_dscli_jemalloc_profile(args):
+        return 1
+
     # Validate: standalone requires --jf
     if getattr(args, 'standalone', False) and not getattr(args, 'jf', None):
         log_error('ERROR: --jf is required in standalone mode')
@@ -479,6 +498,9 @@ def main():
                               help='Disable procmon.py monitoring (default)')
     parser_start.add_argument('--procmon-dir', default=None,
                               help='Remote directory for procmon files (default: same as --remote-config dir)')
+    parser_start.add_argument('--jemalloc_prof_conf', default=None,
+                              type=validate_jemalloc_prof_conf,
+                              help='Jemalloc MALLOC_CONF for standalone coordinator_test')
     # Standalone mode (coordinator_test binary instead of dscli)
     parser_start.add_argument('-S', '--standalone', action='store_true', default=False,
                               help='Use coordinator_test binary instead of dscli')
@@ -618,6 +640,9 @@ def main():
                                help='Delete existing pods with same prefix before deploying')
     parser_deploy.add_argument('--dry-run', action='store_true', default=False,
                                help='Preview pod manifest only; skip install and start')
+    parser_deploy.add_argument('--jemalloc_prof_conf', default=None,
+                               type=validate_jemalloc_prof_conf,
+                               help='Jemalloc MALLOC_CONF for standalone coordinator_test')
     # Standalone mode params
     parser_deploy.add_argument('--jf', default=None,
                                help='JF mock address (standalone mode)')

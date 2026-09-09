@@ -14,7 +14,7 @@ import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from deploy_common import log_error, log_info, setup_logging
+from deploy_common import log_error, log_info, normalize_jemalloc_prof_conf, setup_logging
 
 
 _GRACEFUL_STOP_TIMEOUT = 120
@@ -61,6 +61,7 @@ class Deployer:
         self.nodes = self.deploy.get('nodes', [])
         self.remote_work_dir = self.deploy.get('remote_work_dir', '')
         self.binary_path = None  # resolved in main() via --kvtest-binary-path or deploy.json
+        self.jemalloc_prof_conf = None
         version_file = os.path.join(self.base_dir, 'VERSION')
         self.version = open(version_file).read().strip() if os.path.isfile(version_file) else '?'
         self.default_transport = self.deploy.get('transport', 'ssh')
@@ -396,6 +397,8 @@ class Deployer:
         config['nodes'] = self.build_config_nodes()
         config['peers'] = self.build_peers(node)
         config.update(self.build_node_overrides(node))
+        if self.jemalloc_prof_conf is not None and not config.get('output_dir'):
+            config['output_dir'] = f'metrics_{node["instance_id"]}_{time.strftime("%Y%m%d_%H%M%S")}'
         return config
 
     # --- Actions ---
@@ -406,6 +409,32 @@ class Deployer:
     def _get_host_lock(self, node):
         key = self._host_key(node)
         return self._host_locks.setdefault(key, threading.Lock())
+
+    def prepare_jemalloc_prof_env(self, node, config, ld_path, custom_env):
+        conf, parent = normalize_jemalloc_prof_conf(
+            self.jemalloc_prof_conf, config['output_dir'], node['instance_id'])
+        probe_env = dict(custom_env, MALLOC_CONF='')
+        existing_lib_path = probe_env.pop('LD_LIBRARY_PATH', None)
+        env_prefix = ' '.join(f'{key}={shlex.quote(str(value))}' for key, value in probe_env.items())
+        if existing_lib_path is not None:
+            combined = f'{ld_path}:{existing_lib_path}' if ld_path else str(existing_lib_path)
+            env_prefix += f' LD_LIBRARY_PATH={shlex.quote(combined)}'
+        elif ld_path:
+            env_prefix += f' LD_LIBRARY_PATH={shlex.quote(ld_path)}:"${{LD_LIBRARY_PATH:-}}"'
+        result = self.run_on(
+            node, f'cd {shlex.quote(self.remote_work_dir)} && '
+            f'{env_prefix} ./kvtest --version', check=False)
+        if (result.returncode != 0
+                or 'jemalloc_prof_supported=true' not in result.stdout.splitlines()):
+            raise RuntimeError(
+                'kvtest does not support jemalloc profiling or its runtime cannot be loaded; '
+                'rebuild with build.sh -b bazel -x on and deploy the matching lib/ directory')
+        directory = shlex.quote(parent)
+        self.run_on(
+            node, f'cd {shlex.quote(self.remote_work_dir)} && '
+            f'mkdir -p -- {directory} && test -d {directory} && '
+            f'test -w {directory} && test -x {directory}')
+        custom_env['MALLOC_CONF'] = conf
 
     def install_node(self, node):
         """Install binary + .so + procmon + launcher to a node (no start).
@@ -428,31 +457,42 @@ class Deployer:
         try:
             # Step 1: Create remote directory
             log_info(f'{tag} mkdir {self.remote_work_dir}')
-            self.run_on(node, f'mkdir -p {self.remote_work_dir}')
+            self.run_on(node, f'mkdir -p -- {shlex.quote(self.remote_work_dir)}')
 
             # Step 2: Upload binary + .so (under host lock to avoid concurrent
             # scp races on the same target file when multiple instances share
             # a host).
             remote_binary = f'{self.remote_work_dir}/kvtest'
             remote_sdk = node.get('remote_sdk_dir', self.deploy.get('remote_sdk_dir', ''))
+            local_lib_dir = os.path.join(os.path.dirname(os.path.abspath(self.binary_path)), 'lib')
+            bundled_jemalloc = os.path.join(local_lib_dir, 'libjemalloc.so.2')
+            has_bundled_jemalloc = os.path.isfile(bundled_jemalloc)
             with self._get_host_lock(node):
                 log_info(f'{tag} uploading binary ({os.path.getsize(self.binary_path) // 1024}KB)')
                 self.scp_to(node, self.binary_path, remote_binary)
                 if remote_sdk:
                     log_info(f'{tag} using container SDK: {remote_sdk}')
                 else:
-                    local_lib_dir = os.path.join(self.base_dir, 'output', 'lib')
                     if os.path.isdir(local_lib_dir):
                         import glob as _glob
                         so_files = _glob.glob(os.path.join(local_lib_dir, '*.so*'))
                         if so_files:
                             remote_lib = f'{self.remote_work_dir}/lib'
                             log_info(f'{tag} uploading lib ({len(so_files)} .so files)')
-                            self.scp_to(node, local_lib_dir, remote_lib)
+                            self.run_on(node, f'mkdir -p -- {shlex.quote(remote_lib)}')
+                            for so_file in so_files:
+                                if so_file != bundled_jemalloc:
+                                    self.scp_to(node, so_file, f'{remote_lib}/{os.path.basename(so_file)}')
                             remote_sdk = remote_lib
 
+                if has_bundled_jemalloc:
+                    allocator_dir = f'{self.remote_work_dir}/allocator_lib'
+                    directory = shlex.quote(allocator_dir)
+                    self.run_on(node, f'rm -rf -- {directory} && mkdir -p -- {directory}')
+                    self.scp_to(node, bundled_jemalloc, f'{allocator_dir}/libjemalloc.so.2')
+
             # Step 3: chmod
-            self.run_on(node, f'chmod +x {self.remote_work_dir}/kvtest')
+            self.run_on(node, f'chmod +x {shlex.quote(remote_binary)}')
 
             # Step 4: Upload procmon (one-time; start phase does not re-upload)
             if self.enable_procmon:
@@ -520,20 +560,25 @@ class Deployer:
 
             # Resolve SDK lib path (set by install phase on the node).
             remote_sdk = node.get('remote_sdk_dir', self.deploy.get('remote_sdk_dir', ''))
+            local_lib_dir = os.path.join(os.path.dirname(os.path.abspath(self.binary_path)), 'lib')
             if not remote_sdk:
                 # Match install_node's fallback: if .so was uploaded to lib/
-                local_lib_dir = os.path.join(self.base_dir, 'output', 'lib')
                 if os.path.isdir(local_lib_dir):
                     import glob as _glob
                     if _glob.glob(os.path.join(local_lib_dir, '*.so*')):
                         remote_sdk = f'{self.remote_work_dir}/lib'
             ld_path = remote_sdk if remote_sdk else ''
+            has_bundled_jemalloc = os.path.isfile(os.path.join(local_lib_dir, 'libjemalloc.so.2'))
+            if has_bundled_jemalloc:
+                ld_path = f'{self.remote_work_dir}/allocator_lib' + (f':{ld_path}' if ld_path else '')
 
             # Custom env vars: HOST_IP injection + SDK tuning.
             # Uses status.hostIP (k8s node InternalIP), NOT nodeName (hostname)
             # — hostname would break coordinator/etcd registration which
             # expects an IP address.
             custom_env = {k: v for k, v in config.get('env', {}).items() if k}
+            if ld_path and 'LD_LIBRARY_PATH' in custom_env:
+                ld_path += ':' + str(custom_env.pop('LD_LIBRARY_PATH'))
             host_id_env = config.get('host_id_env_name') or 'HOST_IP'
             if host_id_env and host_id_env not in custom_env:
                 host_ip = node.get('host_ip', '')
@@ -561,8 +606,13 @@ class Deployer:
             # cmd_start skip-alive semantics).
             already = self.run_on(node, 'pgrep -x kvtest', check=False, timeout=10)
             if already.returncode == 0 and already.stdout.strip():
+                if self.jemalloc_prof_conf is not None:
+                    raise RuntimeError('profiling configuration requires stopping and restarting the existing kvtest')
                 log_info(f'{tag} already running (pid={already.stdout.strip().split(chr(10))[0]}), skip')
                 return True, 0.0
+
+            if self.jemalloc_prof_conf is not None:
+                self.prepare_jemalloc_prof_env(node, config, ld_path, custom_env)
 
             # Launch via standalone_launcher.py (fork+setsid via Python syscall).
             # The launcher parent prints "{pid} {elapsed}" to stdout and exits
@@ -592,7 +642,7 @@ class Deployer:
                             f'{k}={shlex.quote(str(v))}'
                             for k, v in custom_env.items()) + ' '
                     launcher_parts = [
-                        f'cd {self.remote_work_dir} &&',
+                        f'cd {shlex.quote(self.remote_work_dir)} &&',
                         env_prefix,
                         'python3', shlex.quote(f'{self.remote_work_dir}/standalone_launcher.py'),
                         '--binary', shlex.quote(f'{self.remote_work_dir}/kvtest'),
@@ -627,14 +677,14 @@ class Deployer:
                     # launcher upload failed). Kubectl exec / ssh may hang
                     # for the full subprocess timeout because the binary
                     # holds the SPDY pipe; allow_timeout swallows it.
-                    env_prefix = (f'LD_LIBRARY_PATH={ld_path}:$LD_LIBRARY_PATH '
+                    env_prefix = (f'LD_LIBRARY_PATH={shlex.quote(ld_path)}:"${{LD_LIBRARY_PATH:-}}" '
                                   if ld_path else '')
                     if custom_env:
                         env_prefix += ' '.join(
                             f'{k}={shlex.quote(str(v))}'
                             for k, v in custom_env.items()) + ' '
                     start_cmd = (
-                        f"cd {self.remote_work_dir} && "
+                        f"cd {shlex.quote(self.remote_work_dir)} && "
                         f"{env_prefix}"
                         f"nohup ./kvtest config_{instance_id}.json "
                         f"> run.log 2>&1 </dev/null & "
@@ -748,6 +798,7 @@ class Deployer:
         total = len(results)
         log_info(f'\nInstall result: {ok}/{total} succeeded')
         _print_timings('install', timings)
+        return ok == total
 
     def do_start(self):
         """Start kvtest on all nodes (assumes install completed).
@@ -781,6 +832,7 @@ class Deployer:
         total = len(results)
         log_info(f'\nStart result: {ok}/{total} succeeded')
         _print_timings('start', timings)
+        return ok == total
 
     def do_deploy(self):
         """Full lifecycle: install + start on all nodes.
@@ -788,9 +840,10 @@ class Deployer:
         Equivalent to ``do_install`` followed by ``do_start``. Kept for
         backward compatibility with the ``deploy`` CLI subcommand.
         """
-        self.do_install()
+        if not self.do_install():
+            return False
         log_info('\n--- install done, starting ---')
-        self.do_start()
+        return self.do_start()
 
     def do_stop(self):
         if not self.nodes:
@@ -1613,7 +1666,8 @@ def main():
 
     shared = argparse.ArgumentParser(add_help=False)
     shared.add_argument('--kvtest-binary-path',
-                        help='Path to kvtest binary (default: output/kvtest, or deploy.json kvtest_binary_path)')
+                        help='Path to kvtest binary (default: adjacent kvtest or output/kvtest; '
+                             'overridden by deploy.json kvtest_binary_path)')
 
     # install
     p = sub.add_parser('install', help='Upload binary + .so + procmon + launcher (no start)',
@@ -1623,6 +1677,8 @@ def main():
     # start
     p = sub.add_parser('start', help='Start kvtest on all nodes (assumes install ran)',
                        parents=[shared])
+    p.add_argument('--jemalloc_prof_conf',
+                   help='Jemalloc MALLOC_CONF; default prof_prefix is <output_dir>/jemalloc/kvtest_<instance_id>')
     p.add_argument('deploy_json', help='Path to deploy.json')
     p.add_argument('config_template', nargs='?', default='config/config.json.example',
                    help='Config template (default: config/config.json.example)')
@@ -1633,6 +1689,9 @@ def main():
     p.add_argument('deploy_json', help='Path to deploy.json')
     p.add_argument('config_template', nargs='?', default='config/config.json.example',
                    help='Config template (default: config/config.json.example)')
+    p.add_argument('--jemalloc_prof_conf',
+                   help='Jemalloc MALLOC_CONF for a kvtest built with -b bazel -x on; '
+                        'default prof_prefix is <output_dir>/jemalloc/kvtest_<instance_id>')
 
     # stop
     p = sub.add_parser('stop', help='Stop all instances (HTTP POST /stop -> KvtestControl::Stop)', parents=[shared])
@@ -1675,17 +1734,28 @@ def main():
     config_template = getattr(args, 'config_template', None)
     deployer = Deployer(args.deploy_json, config_template)
 
-    # Resolve binary path: CLI --kvtest-binary-path > deploy.json "kvtest_binary_path" > output/kvtest
-    default_binary = os.path.join(deployer.base_dir, 'output', 'kvtest')
+    default_binary = os.path.join(deployer.base_dir, 'kvtest')
+    if not os.path.isfile(default_binary):
+        default_binary = os.path.join(deployer.base_dir, 'output', 'kvtest')
     deployer.binary_path = getattr(args, 'kvtest_binary_path', None) or deployer.deploy.get(
         'kvtest_binary_path') or default_binary
 
+    if args.command in ('start', 'deploy'):
+        deployer.jemalloc_prof_conf = args.jemalloc_prof_conf
+        if args.jemalloc_prof_conf is not None:
+            try:
+                normalize_jemalloc_prof_conf(args.jemalloc_prof_conf, 'logs', 0)
+            except ValueError as error:
+                parser.error(str(error))
     if args.command == 'install':
-        deployer.do_install()
+        if not deployer.do_install():
+            sys.exit(1)
     elif args.command == 'start':
-        deployer.do_start()
+        if not deployer.do_start():
+            sys.exit(1)
     elif args.command == 'deploy':
-        deployer.do_deploy()
+        if not deployer.do_deploy():
+            sys.exit(1)
         duration = parse_duration(deployer.deploy.get('duration', '0'))
         if duration > 0:
             deployer.do_run(duration)
