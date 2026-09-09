@@ -121,7 +121,9 @@ Status InitializeFastTransportManager(const HostPort &hostport)
     });
 #ifdef USE_URMA
     if (IsUrmaRuntimeConfigured()) {
-        RETURN_IF_NOT_OK(UrmaManager::Instance().Init(hostport));
+        auto &manager = UrmaManager::Instance();
+        RETURN_IF_NOT_OK(manager.Init(hostport));
+        RETURN_IF_NOT_OK(manager.InitClientPortHealthMonitor());
         PublishClientUrmaRuntimeReady();
     }
 #endif
@@ -132,6 +134,25 @@ Status InitializeFastTransportManager(const HostPort &hostport)
     }
 #endif
     return Status::OK();
+}
+
+Status CheckClientLocalUbPortHealth()
+{
+#ifdef USE_URMA
+    if (IsUrmaRuntimeConfigured()) {
+        return UrmaManager::Instance().CheckClientPortHealthAdmission();
+    }
+#endif
+    return Status::OK();
+}
+
+void TriggerClientLocalUbPortHealthQuery()
+{
+#ifdef USE_URMA
+    if (IsUrmaRuntimeConfigured()) {
+        UrmaManager::Instance().TriggerClientPortHealthQuery();
+    }
+#endif
 }
 
 Status ProbeUbDataPlane(const UrmaHandshakeRspPb &response, UrmaWriteFailure *failure)

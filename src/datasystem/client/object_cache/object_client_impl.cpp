@@ -2037,6 +2037,7 @@ Status ObjectClientImpl::Create(const std::string &objectKey, uint64_t dataSize,
     CHECK_FAIL_RETURN_STATUS(!objectKey.empty(), K_INVALID, "The objectKey is empty");
     RETURN_IF_NOT_OK(CheckValidObjectKey(objectKey));
     CHECK_FAIL_RETURN_STATUS(dataSize > 0, K_INVALID, "The dataSize value should be bigger than zero.");
+    RETURN_IF_NOT_OK(CheckLocalUbNodeAdmission());
     auto config = GetClientLatencyTraceConfig();
     const bool traceEnabled = ShouldCollectLatencyTrace(config);
     if (traceEnabled) {
@@ -2519,6 +2520,7 @@ Status ObjectClientImpl::Put(const std::string &objectKey, const uint8_t *data, 
     CHECK_FAIL_RETURN_STATUS(size > 0, K_INVALID, "The dataSize value should be bigger than zero.");
     CHECK_FAIL_RETURN_STATUS(nestedObjectKeys.find(objectKey) == nestedObjectKeys.end(), K_UNKNOWN_ERROR,
                              "Nested object references cannot be nested in a loop.");
+    RETURN_IF_NOT_OK(CheckLocalUbNodeAdmission());
     auto config = GetClientLatencyTraceConfig();
     const bool traceEnabled = ShouldCollectLatencyTrace(config);
     if (traceEnabled) {
@@ -3431,6 +3433,7 @@ Status ObjectClientImpl::Get(const std::vector<std::string> &objectKeys, int64_t
     RETURN_IF_NOT_OK(CheckValidObjectKeyVector(objectKeys));
     CHECK_FAIL_RETURN_STATUS_PRINT_ERROR(Validator::IsBatchSizeUnderLimit(objectKeys.size()), K_INVALID,
                                          FormatString("The objectKeys size exceed %d.", OBJECT_KEYS_MAX_SIZE_LIMIT));
+    RETURN_IF_NOT_OK(CheckLocalUbNodeAdmission());
     const int32_t effectiveTimeoutMs = requestTimeoutMs > 0 ? requestTimeoutMs : requestTimeoutMs_;
     ApiDeadlineGuard deadlineGuard(effectiveTimeoutMs);
     auto config = GetClientLatencyTraceConfig();
@@ -3560,6 +3563,7 @@ Status ObjectClientImpl::Set(const std::shared_ptr<Buffer> &buffer)
     GetRequestContext()->reqTimeoutDuration.InitUs(ApiDeadline::Instance().ApiRemainingUs());
     CHECK_FAIL_RETURN_STATUS(buffer != nullptr, K_INVALID, "The buffer should not be empty.");
     RETURN_IF_NOT_OK(buffer->CheckDeprecated());
+    RETURN_IF_NOT_OK(CheckLocalUbNodeAdmission());
     std::shared_lock<std::shared_timed_mutex> shutdownLck(shutdownMux_);
     PerfPoint perfPoint(PerfKey::CLIENT_PUT_OBJECT);
     VLOG(1) << "Start putting buffer";
@@ -3683,6 +3687,7 @@ Status ObjectClientImpl::MSet(const std::vector<std::shared_ptr<Buffer>> &buffer
     CHECK_FAIL_RETURN_STATUS_PRINT_ERROR(Validator::IsBatchSizeUnderLimit(buffers.size()), K_INVALID,
                                          FormatString("The buffer size cannot exceed %d.", OBJECT_KEYS_MAX_SIZE_LIMIT));
     RETURN_IF_NOT_OK(IsClientReady());
+    RETURN_IF_NOT_OK(CheckLocalUbNodeAdmission());
     ApiDeadlineGuard deadlineGuard(requestTimeoutMs_);
     GetRequestContext()->reqTimeoutDuration.InitUs(ApiDeadline::Instance().ApiRemainingUs());
     const size_t bufferCnt = buffers.size();
@@ -3776,6 +3781,7 @@ Status ObjectClientImpl::MCreate(const std::vector<std::string> &keys, const std
         CHECK_FAIL_RETURN_STATUS(!keys[i].empty(), K_INVALID, "The key should not be empty.");
         RETURN_IF_NOT_OK(CheckValidObjectKey(keys[i]));
     }
+    RETURN_IF_NOT_OK(CheckLocalUbNodeAdmission());
     LOG(INFO) << "Begin to create multiput object." << VectorToString(keys);
     std::vector<bool> exist;
     bool skipCheckExistence = param.existence != ExistenceOpt::NX;
@@ -3794,6 +3800,7 @@ Status ObjectClientImpl::MSet(const std::vector<std::string> &keys, const std::v
     RETURN_IF_NOT_OK(routedMode_->CheckMultiSetInputParamValidationNtx(keys, vals, outFailedKeys, deduplicateKeys,
                                                                        deduplicateVals));
     RETURN_IF_NOT_OK(IsClientReady());
+    RETURN_IF_NOT_OK(CheckLocalUbNodeAdmission());
     ApiDeadlineGuard deadlineGuard(requestTimeoutMs_);
     GetRequestContext()->reqTimeoutDuration.InitUs(ApiDeadline::Instance().ApiRemainingUs());
     if (!enableLocalCache_) {
@@ -4890,7 +4897,13 @@ Status ObjectClientImpl::Publish(const std::shared_ptr<ObjectBufferInfo> &buffer
                                  const std::unordered_set<std::string> &nestedObjectKeys, bool isShm)
 {
     std::shared_lock<std::shared_timed_mutex> shutdownLck(shutdownMux_);
+    RETURN_IF_NOT_OK(CheckLocalUbNodeAdmission());
     return boundMode_->Publish(bufferInfo, nestedObjectKeys, isShm);
+}
+
+Status ObjectClientImpl::CheckLocalUbNodeAdmission() const
+{
+    return transportLayer_ == nullptr ? Status::OK() : transportLayer_->CheckLocalNodeAdmission();
 }
 
 Status ObjectClientImpl::GIncreaseRef(const std::vector<std::string> &firstIncIds,

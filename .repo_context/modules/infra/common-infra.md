@@ -209,10 +209,11 @@ MADV_HUGEPAGE)` to the shared-memory memfd mapping after `mmap` succeeds when th
     closure until process exit, and `UrmaManager` skips `urma_uninit` plus dynamic-library unloading. This avoids an
     invalid partial teardown and the resulting expected provider error logs; fully converged shutdown keeps the normal
     explicit cleanup path.
-  - URMA write failures preserve raw provider-post and completion status in `UrmaWriteFailure`. The object-cache
-    classifier treats raw status `4` as a hard local-sender failure and CQE status `9` as a hard remote-peer ACK
-    timeout; wait/RPC timeout evidence without a CQE remains `SUSPECT`, and resource-pressure failures remain
-    non-isolating. Health-summary wire encoding maps the new CQE-9 reason to the existing hard-unavailable reason so
+  - URMA write failures preserve raw provider-post and completion status in `UrmaWriteFailure`. For client-side UB
+    writes, the object-cache classifier treats raw status `4` as local-port-health query evidence rather than direct
+    node-isolation evidence. CQE status `9` remains remote-peer ACK-timeout evidence; wait/RPC timeout evidence without
+    a CQE remains `SUSPECT`, and resource-pressure failures remain non-isolating. Health-summary wire encoding maps
+    the new CQE-9 reason to the existing hard-unavailable reason so
     rolling upgrades preserve the established enum range. A generic `K_URMA_ERROR` without raw provider/CQE evidence
     is not sufficient for hard isolation.
   - A timed-out URMA WRITE carrying a late-completion observer retains its complete `UrmaEvent` in the existing request
@@ -221,8 +222,9 @@ MADV_HUGEPAGE)` to the shared-memory memfd mapping after `mmap` succeeds when th
     the Event already holds only a weak send-lane reference and never owns the payload. A late status-4 CQE consumes the
     original Event and notifies the still-live owner outside Event/retention locks. Retention is bounded to 1,024 Events
     and 3 seconds, with oldest-first capacity eviction, incremental poll-loop expiry, and explicit shutdown cleanup.
-    Late status-4 completions are fenced by the local sender recovery generation. Worker-to-worker late status-9
-    completions are attributed to the Event's remote endpoint and fenced by a per-peer recovery generation; that
+    Late status-4 query triggers are accepted only while the originating local sender remains live and open.
+    Worker-to-worker late status-9 completions are attributed to the Event's remote endpoint and fenced by a per-peer
+    recovery generation; that
     generation advances on successful peer recovery and trusted Worker-incarnation replacement. Reads, writes without
     a live observer, and WRs rejected before provider submission retain the original immediate deletion behavior.
   - Worker recovery probes preserve the raw `UrmaWriteFailure` through posting and CQE wait. A status-4 probe failure
@@ -231,12 +233,21 @@ MADV_HUGEPAGE)` to the shared-memory memfd mapping after `mmap` succeeds when th
     one fault cannot be reassigned to the unrelated subject. Soft `SUSPECT` verification keeps admission open while
     the probe is in flight; a probe failure without authoritative status `4` or `9` remains `SUSPECT` and retries with
     bounded backoff. Recovery probes for an already hard-unavailable subject remain fail-closed.
-  - The client transport layer owns process-local UB sender admission. A raw status-4 write failure closes admission
-    for later UB Create/Set/MCreate/MSet operations. Admission captures the sender generation and registers a stack
-    operation token under the sender-state lock, then releases that lock before transport I/O. Shutdown closes the
-    single-word in-flight gate and drains already-admitted tokens outside the sender-state lock.
-    Recovery uses an explicit one-byte URMA WRITE to a manager-owned probe segment advertised by an ACTIVE Worker
-    handshake, with bounded exponential retry. Business requests do not reopen the sender state.
+  - `UrmaManager` owns one client-process `UbPortHealthMonitor` bound to the lifetime of its URMA context. Client-side
+    CQE status `4` only wakes an asynchronous `urma_user_ctl(BONDP_USER_CTL_QUERY_PORT_STATUS)` query. A failed or
+    invalid query leaves admission unchanged; a valid all-BAD result rejects all Host object data APIs with
+    `K_URMA_WORKER_UNAVAILABLE`. Once isolated, any GOOD port immediately reopens admission, but one-second polling
+    continues until all ports are GOOD so a partial recovery can be observed and can regress to all-BAD safely.
+    The request hot path reads one process-wide scalar atomic admission state and never copies the monitor `shared_ptr`,
+    calls the provider, or takes the monitor lock. Repeated CQE-4 triggers are coalesced while a query is pending.
+    Monitor initialization failure follows the existing UB-runtime policy: required UB initialization returns the
+    error, while an optional SHM endpoint logs the failure and continues with SHM/TCP. An unexpected missing monitor is
+    rate-limited in logs while preserving the defined fail-open behavior. Shutdown prevents monitor recreation,
+    removes and joins the monitor, clears its published admission state, and then tears down the URMA context.
+    `tests/ut/common/rdma/ub_port_health_test.cpp` covers monitor state and lifecycle branches;
+    `tests/ut/common/rdma/urma_port_status_provider_test.cpp` covers the mock ABI-to-provider path; and the mock-only
+    Client CQE-4 case in `tests/st/client/object_cache/urma_object_client_test.cpp` covers asynchronous query, Host Get
+    and Set rejection at 4/4 BAD, and reopening at 3/4 BAD.
   - when hetero is enabled, RDMA dependencies also pull in device and shared-memory related components.
   - CUDA host-memory registration lives under `common/device/nvidia` but remains independent of hetero GPU and Pipeline
     H2D build switches. It uses CUDA Runtime API declarations when toolkit headers are available and builds as a no-op

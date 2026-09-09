@@ -19,6 +19,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -55,6 +56,7 @@ constexpr uint32_t K_MOCK_PRIORITY_SERVICE_LEVEL = 0;
 constexpr int K_NO_WAIT_MS = 0;
 constexpr int K_POLL_SLEEP_MS = 1;
 constexpr uint32_t K_DEFAULT_ACK_COUNT = 1;
+constexpr int64_t K_DEFAULT_PORT_COUNT = 4;
 constexpr uint64_t K_DEFAULT_IMPORT_SEG_SIZE = 4096;
 constexpr uint64_t K_INVALID_TOKEN = 0;
 
@@ -286,8 +288,44 @@ urma_status_t ds_urma_mock_set_context_opt(urma_context_t *context, urma_opt_nam
 urma_status_t ds_urma_mock_user_ctl(urma_context_t *ctx, urma_user_ctl_in_t *in, urma_user_ctl_out_t *out)
 {
     (void)ctx;
-    (void)in;
-    (void)out;
+    if (in == nullptr || out == nullptr) {
+        return URMA_E_INVALID;
+    }
+    if (in->opcode != BONDP_USER_CTL_QUERY_PORT_STATUS) {
+        return URMA_SUCCESS;
+    }
+    if (out->addr == 0 || out->len < sizeof(bondp_query_port_status_out_t)) {
+        return URMA_E_INVALID;
+    }
+    if (ShouldReturnFromStatusInject("UrmaMock.QueryPortStatus.error")) {
+        return URMA_E_FAIL;
+    }
+
+    int64_t totalPortCount = K_DEFAULT_PORT_COUNT;
+    int64_t badPortCount = 0;
+#ifdef WITH_TESTS
+    INJECT_POINT_NO_RETURN("UrmaMock.QueryPortStatus", [&totalPortCount, &badPortCount](int64_t total, int64_t bad) {
+        totalPortCount = total;
+        badPortCount = bad;
+    });
+#endif
+    if (totalPortCount <= 0 || badPortCount < 0 || badPortCount > totalPortCount
+        || totalPortCount > BONDP_QUERY_PORT_STATUS_MAX_PORTS) {
+        return URMA_E_INVALID;
+    }
+
+    auto *statusOut = reinterpret_cast<bondp_query_port_status_out_t *>(out->addr);
+    statusOut->port_count = static_cast<uint32_t>(totalPortCount);
+    for (uint32_t i = 0; i < statusOut->port_count; ++i) {
+        statusOut->port_status[i].chip_id = i + 1;
+        statusOut->port_status[i].die_id = 1;
+        statusOut->port_status[i].port_idx = 0;
+        statusOut->port_status[i].status = i < static_cast<uint32_t>(badPortCount)
+                                               ? BONDP_PORT_STATUS_BAD
+                                               : BONDP_PORT_STATUS_GOOD;
+    }
+    out->len = static_cast<decltype(out->len)>(offsetof(bondp_query_port_status_out_t, port_status)
+                                               + statusOut->port_count * sizeof(statusOut->port_status[0]));
     return URMA_SUCCESS;
 }
 

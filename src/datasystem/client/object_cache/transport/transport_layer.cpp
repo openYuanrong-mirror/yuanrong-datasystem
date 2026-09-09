@@ -43,9 +43,7 @@
 #include "datasystem/common/log/log.h"
 #include "datasystem/common/metrics/kv_metrics.h"
 #include "datasystem/common/object_cache/ub_failure_classifier.h"
-#ifdef USE_URMA
-#include "datasystem/common/rdma/urma_manager.h"
-#endif
+#include "datasystem/common/rdma/fast_transport_manager_wrapper.h"
 #include "datasystem/common/rpc/api_deadline.h"
 #include "datasystem/common/rpc/brpc_status_util.h"
 #include "datasystem/common/util/rpc_util.h"
@@ -59,7 +57,6 @@
 namespace datasystem {
 namespace client {
 namespace {
-constexpr uint32_t MAX_LOCAL_UB_PROBE_BACKOFF_LEVEL = 6;
 constexpr int32_t PROVIDER_UB_RECOVERY_PROBE_TIMEOUT_MS = 3'000;
 // SHM-off fallback is a steady-state path (every write on a SHM-disabled same-host worker); throttle the
 // diagnostic so it does not flood the log. Matches the read-path/DataPlaneExecutor convention.
@@ -255,7 +252,7 @@ struct TransportLayer::LocalUbSenderState final : public UrmaLateCompletionObser
         });
     }
 
-    void OnLateUrmaCompletion(const UrmaLateCompletion &completion, uint64_t ownerToken,
+    void OnLateUrmaCompletion(const UrmaLateCompletion &completion, uint64_t,
                               uint64_t peerToken) noexcept override
     {
         try {
@@ -268,33 +265,10 @@ struct TransportLayer::LocalUbSenderState final : public UrmaLateCompletionObser
                 || workerAddr.ParseString(completion.remoteAddress).IsError()) {
                 return;
             }
-            bool wasUnavailable = false;
-            {
-                std::lock_guard<std::shared_mutex> lock(mutex);
-                if (IsShuttingDown() || ownerToken != generation.load(std::memory_order_acquire)) {
-                    return;
-                }
-                wasUnavailable = unavailable.exchange(true, std::memory_order_acq_rel);
-                failure = Status(K_URMA_ERROR,
-                                 FormatString("Late URMA completion reports local sender unavailable, requestId=%llu, "
-                                              "cqeStatus=%d, remoteInstanceId=%s",
-                                              completion.requestId, completion.cqeStatus,
-                                              completion.remoteInstanceId.c_str()));
-                probeWorker = workerAddr;
-                ++generation;
-                probeBackoffLevel = 1;
-                probeDeadline = std::chrono::steady_clock::now() + probeBaseDelay;
+            if (IsShuttingDown()) {
+                return;
             }
-            if (!wasUnavailable) {
-                LOG(ERROR) << "[LOCAL_UB_CIRCUIT_BREAK] Client-local UB sender quarantined by late CQE, worker="
-                           << workerAddr.ToString() << ", requestId=" << completion.requestId
-                           << ", cqeStatus=" << completion.cqeStatus
-                           << "; UB Create/Set/MSet will fast-fail K_URMA_WORKER_UNAVAILABLE until a recovery probe "
-                              "succeeds";
-            }
-            if (auto cv = reconcileCv.lock()) {
-                cv->notify_all();
-            }
+            TriggerClientLocalUbPortHealthQuery();
         } catch (const std::exception &error) {
             LOG(ERROR) << "Failed to process late Client URMA completion: " << error.what();
         } catch (...) {
@@ -303,13 +277,6 @@ struct TransportLayer::LocalUbSenderState final : public UrmaLateCompletionObser
     }
 
     mutable std::shared_mutex mutex;
-    std::atomic<bool> unavailable{ false };
-    Status failure = Status::OK();
-    std::optional<HostPort> probeWorker;
-    std::atomic<uint64_t> generation{ 0 };
-    uint32_t probeBackoffLevel = 0;
-    std::chrono::steady_clock::time_point probeDeadline;
-    std::chrono::milliseconds probeBaseDelay{ std::chrono::seconds(1) };
     std::weak_ptr<bthread::Mutex> reconcileMutex;
     std::weak_ptr<bthread::ConditionVariable> reconcileCv;
     std::shared_ptr<ThreadPool> lateCompletionPool;
@@ -370,13 +337,12 @@ TransportLayer::TransportLayer(std::shared_ptr<Signature> signature, std::shared
 
 TransportLayer::TransportLayer(std::shared_ptr<DataPlaneManager> dataPlaneManager,
                                std::shared_ptr<TransportAdvisor> advisor)
-    : TransportLayer(std::move(dataPlaneManager), std::move(advisor), std::chrono::seconds(1))
+    : TransportLayer(std::move(dataPlaneManager), std::move(advisor), nullptr)
 {
 }
 
 TransportLayer::TransportLayer(std::shared_ptr<DataPlaneManager> dataPlaneManager,
                                std::shared_ptr<TransportAdvisor> advisor,
-                               std::chrono::milliseconds localUbProbeBaseDelay,
                                std::shared_ptr<UbHealthFilter> readSourceFilter,
                                std::shared_ptr<ThreadPool> releasePool)
     : manager_(std::move(dataPlaneManager)),
@@ -387,7 +353,6 @@ TransportLayer::TransportLayer(std::shared_ptr<DataPlaneManager> dataPlaneManage
       healthFilter_(readSourceFilter == nullptr ? std::make_shared<UbHealthFilter>() : std::move(readSourceFilter))
 {
     localUbSenderState_ = std::make_shared<LocalUbSenderState>();
-    localUbSenderState_->probeBaseDelay = std::max(localUbProbeBaseDelay, std::chrono::milliseconds(1));
     localUbSenderState_->reconcileMutex = reconcileMutex_;
     localUbSenderState_->reconcileCv = reconcileCv_;
     localUbSenderState_->lateCompletionPool = lateCompletionPool_;
@@ -418,16 +383,17 @@ Status TransportLayer::CheckLocalUbSenderAdmission(TransportHint hint) const
 {
     CHECK_FAIL_RETURN_STATUS(!localUbSenderState_->IsShuttingDown(), K_SHUTTING_DOWN,
                              "TransportLayer is shutting down");
-    if (hint != TransportHint::UB_CANDIDATE
-        || !localUbSenderState_->unavailable.load(std::memory_order_acquire)) {
-        return Status::OK();
-    }
-    return Status(K_URMA_WORKER_UNAVAILABLE, "Client-local UB sender is unavailable");
+    return hint == TransportHint::UB_CANDIDATE ? CheckClientLocalUbPortHealth() : Status::OK();
 }
 
 Status TransportLayer::CheckLocalUbSenderAdmission() const
 {
     return CheckLocalUbSenderAdmission(TransportHint::UB_CANDIDATE);
+}
+
+Status TransportLayer::CheckLocalNodeAdmission() const
+{
+    return CheckClientLocalUbPortHealth();
 }
 
 Status TransportLayer::RunClientLocalUbWrite(const HostPort &workerAddr, ObjectBufferInfo &bufferInfo,
@@ -438,17 +404,17 @@ Status TransportLayer::RunClientLocalUbWrite(const HostPort &workerAddr, ObjectB
     bufferInfo.ubFailureReportRc = Status::OK();
     bufferInfo.ubProviderStatus.reset();
     bufferInfo.ubCqeStatus.reset();
-    PrepareLocalUbLateCompletion(bufferInfo, AccessTransportKind::UB, operation.ownerToken);
+    PrepareLocalUbLateCompletion(bufferInfo, AccessTransportKind::UB);
     Status rc = write();
     const Status &failureRc = bufferInfo.ubFailureReportRc.IsError() ? bufferInfo.ubFailureReportRc : rc;
     (void)ReportLocalUbSenderFailure({ workerAddr, AccessTransportKind::UB, failureRc,
-                                      bufferInfo.ubProviderStatus, bufferInfo.ubCqeStatus },
-                                     operation.ownerToken);
+                                      bufferInfo.ubProviderStatus, bufferInfo.ubCqeStatus });
     return rc;
 }
 
 Status TransportLayer::AcquireLocalUbSenderAdmission(TransportHint hint, LocalUbSenderOperation &operation) const
 {
+    // Callers may check before connection setup; repeat here to close the race before admitting the UB operation.
     RETURN_IF_NOT_OK(CheckLocalUbSenderAdmission(hint));
     if (hint != TransportHint::UB_CANDIDATE) {
         return Status::OK();
@@ -456,17 +422,12 @@ Status TransportLayer::AcquireLocalUbSenderAdmission(TransportHint hint, LocalUb
     std::shared_lock<std::shared_mutex> admission(localUbSenderState_->mutex);
     CHECK_FAIL_RETURN_STATUS(!localUbSenderState_->IsShuttingDown(), K_SHUTTING_DOWN,
                              "TransportLayer is shutting down");
-    if (!localUbSenderState_->unavailable.load(std::memory_order_acquire)) {
-        localUbSenderState_->AdmitOperation();
-        operation.state = localUbSenderState_.get();
-        operation.ownerToken = localUbSenderState_->generation.load(std::memory_order_acquire);
-        return Status::OK();
-    }
-    return Status(K_URMA_WORKER_UNAVAILABLE, "Client-local UB sender is unavailable");
+    localUbSenderState_->AdmitOperation();
+    operation.state = localUbSenderState_.get();
+    return Status::OK();
 }
 
-void TransportLayer::PrepareLocalUbLateCompletion(ObjectBufferInfo &bufferInfo, AccessTransportKind kind,
-                                                  uint64_t ownerToken) const
+void TransportLayer::PrepareLocalUbLateCompletion(ObjectBufferInfo &bufferInfo, AccessTransportKind kind) const
 {
     if (kind != AccessTransportKind::UB) {
         bufferInfo.ubLateCompletionContext.reset();
@@ -475,7 +436,7 @@ void TransportLayer::PrepareLocalUbLateCompletion(ObjectBufferInfo &bufferInfo, 
     const uint64_t peerToken = healthFilter_ == nullptr
                                    ? 0
                                    : healthFilter_->CaptureWriteTargetCompletionGeneration(bufferInfo.workerAddr);
-    bufferInfo.ubLateCompletionContext = UrmaLateCompletionContext{ localUbSenderState_, ownerToken, peerToken };
+    bufferInfo.ubLateCompletionContext = UrmaLateCompletionContext{ localUbSenderState_, 0, peerToken };
 }
 
 bool TransportLayer::ReportWriteTargetUbFailure(const LocalUbSenderFailureView &failure)
@@ -495,7 +456,7 @@ bool TransportLayer::ReportWriteTargetUbFailure(const LocalUbSenderFailureView &
     return quarantined;
 }
 
-bool TransportLayer::ReportLocalUbSenderFailure(const LocalUbSenderFailureView &failure, uint64_t ownerToken)
+bool TransportLayer::ReportLocalUbSenderFailure(const LocalUbSenderFailureView &failure)
 {
     if (failure.kind != AccessTransportKind::UB || failure.status.IsOk()) {
         return false;
@@ -507,96 +468,14 @@ bool TransportLayer::ReportLocalUbSenderFailure(const LocalUbSenderFailureView &
     if (UbFailureClassifier().Classify(outcome) != UbFailureClass::PORT_UNAVAILABLE_ERROR4) {
         return false;
     }
-    // Quarantine the client-local UB sender: every subsequent UB Create/Set/MSet is fast-failed by
-    // CheckLocalUbSenderAdmission until a recovery probe succeeds (TryRecoverLocalUbSender). Emit a
-    // one-shot ERROR so operators see the circuit break without counting the per-request
-    // "Create still failed" WARNING storm below (which is intentionally unthrottled to preserve
-    // the failure rate signal during the outage).
-    bool wasUnavailable = false;
-    {
-        std::lock_guard<std::shared_mutex> lock(localUbSenderState_->mutex);
-        if (localUbSenderState_->IsShuttingDown()
-            || ownerToken != localUbSenderState_->generation.load(std::memory_order_acquire)) {
-            return false;
-        }
-        wasUnavailable = localUbSenderState_->unavailable.exchange(true, std::memory_order_acq_rel);
-        localUbSenderState_->unavailable.store(true, std::memory_order_release);
-        localUbSenderState_->failure = failure.status;
-        localUbSenderState_->probeWorker = failure.workerAddr;
-        ++localUbSenderState_->generation;
-        localUbSenderState_->probeBackoffLevel = 1;
-        localUbSenderState_->probeDeadline =
-            std::chrono::steady_clock::now() + localUbSenderState_->probeBaseDelay;
-    }
-    if (!wasUnavailable) {
-        // Only the first false->true transition trips the outage summary; concurrent failures that
-        // also reach here while unavailable already fast-fail via the admission check above.
-        LOG(ERROR) << "[LOCAL_UB_CIRCUIT_BREAK] Client-local UB sender quarantined, worker="
-                   << failure.workerAddr.ToString() << ", status=" << failure.status.ToString()
-                   << ", providerStatus=" << failure.providerStatus.value_or(0)
-                   << ", cqeStatus=" << failure.cqeStatus.value_or(0)
-                   << "; UB Create/Set/MSet will fast-fail K_URMA_WORKER_UNAVAILABLE until a recovery probe succeeds";
-    }
-    NotifyReconcile();
-    return true;
-}
-
-std::optional<std::chrono::steady_clock::time_point> TransportLayer::GetLocalUbProbeDeadline() const
-{
-    std::shared_lock<std::shared_mutex> lock(localUbSenderState_->mutex);
-    return localUbSenderState_->failure.IsError() && localUbSenderState_->probeWorker.has_value()
-               ? std::optional<std::chrono::steady_clock::time_point>{ localUbSenderState_->probeDeadline }
-               : std::nullopt;
-}
-
-void TransportLayer::TryRecoverLocalUbSender()
-{
-    std::optional<HostPort> workerAddr;
-    uint64_t generation = 0;
     {
         std::shared_lock<std::shared_mutex> lock(localUbSenderState_->mutex);
-        if (localUbSenderState_->failure.IsOk() || !localUbSenderState_->probeWorker.has_value()
-            || std::chrono::steady_clock::now() < localUbSenderState_->probeDeadline) {
-            return;
+        if (localUbSenderState_->IsShuttingDown()) {
+            return false;
         }
-        workerAddr = localUbSenderState_->probeWorker;
-        generation = localUbSenderState_->generation.load(std::memory_order_acquire);
     }
-
-    bool committed = false;
-    Status probeRc = manager_->ProbeUbConnection(*workerAddr, [this, &workerAddr, generation, &committed] {
-        std::lock_guard<std::shared_mutex> lock(localUbSenderState_->mutex);
-        if (!localUbSenderState_->IsShuttingDown() && localUbSenderState_->failure.IsError()
-            && localUbSenderState_->probeWorker == workerAddr
-            && localUbSenderState_->generation.load(std::memory_order_acquire) == generation) {
-            localUbSenderState_->failure = Status::OK();
-            localUbSenderState_->probeWorker.reset();
-            localUbSenderState_->probeBackoffLevel = 0;
-            localUbSenderState_->unavailable.store(false, std::memory_order_release);
-            ++localUbSenderState_->generation;
-            committed = true;
-        }
-    });
-    if (committed) {
-        LOG(INFO) << "Client-local UB sender recovered via probe to " << workerAddr->ToString();
-        return;
-    }
-    if (localUbSenderState_->IsShuttingDown()) {
-        return;
-    }
-    std::lock_guard<std::shared_mutex> lock(localUbSenderState_->mutex);
-    if (localUbSenderState_->failure.IsOk() || localUbSenderState_->probeWorker != workerAddr
-        || localUbSenderState_->generation.load(std::memory_order_acquire) != generation) {
-        return;
-    }
-    if (probeRc.IsOk()) {
-        return;
-    }
-    localUbSenderState_->probeBackoffLevel =
-        std::min<uint32_t>(localUbSenderState_->probeBackoffLevel + 1, MAX_LOCAL_UB_PROBE_BACKOFF_LEVEL);
-    auto delay = localUbSenderState_->probeBaseDelay * (1u << (localUbSenderState_->probeBackoffLevel - 1));
-    localUbSenderState_->probeDeadline = std::chrono::steady_clock::now() + delay;
-    LOG(WARNING) << "Client-local UB sender recovery probe failed for " << workerAddr->ToString() << ": " << probeRc;
+    TriggerClientLocalUbPortHealthQuery();
+    return true;
 }
 
 std::optional<std::chrono::steady_clock::time_point> TransportLayer::GetProviderUbProbeDeadline() const
@@ -846,7 +725,7 @@ Status TransportLayer::Create(const HostPort &workerAddr, const std::string &obj
     }
     if (rc.IsError()) {
         // Throttle this terminal diagnostic like the SHM-unavailable fallback log above so a sustained UB
-        // outage (e.g. local UB sender circuit-break) does not emit one WARN per request.
+        // outage (e.g. client-local all-port isolation) does not emit one WARN per request.
         LOG_EVERY_N(WARNING, TRANSPORT_DIAG_LOG_RATE)
             << "Create still failed for worker " << workerAddr.ToString() << ": " << rc;
         ScheduleAmbiguousCreateCleanup(workerAddr, ambiguousShmIds, param.requestContext);
@@ -939,15 +818,15 @@ Status TransportLayer::Set(ObjectBuffer &buffer, const TransportSetParam &param,
     mutableBufferInfo.ubFailureReportRc = Status::OK();
     mutableBufferInfo.ubProviderStatus.reset();
     mutableBufferInfo.ubCqeStatus.reset();
-    PrepareLocalUbLateCompletion(mutableBufferInfo, transporter->Kind(), operation.ownerToken);
+    PrepareLocalUbLateCompletion(mutableBufferInfo, transporter->Kind());
     Status rc = transporter->Set(buffer, param, &result);
-    return FinalizeSetPublish(workerAddr, buffer, param, hint, transporter, rc, operation.ownerToken, result, setStart);
+    return FinalizeSetPublish(workerAddr, buffer, param, hint, transporter, rc, result, setStart);
 }
 
 Status TransportLayer::FinalizeSetPublish(const HostPort &workerAddr, ObjectBuffer &buffer,
                                           const TransportSetParam &param, TransportHint hint,
                                           std::shared_ptr<IDataTransporter> &transporter, const Status &publishRc,
-                                          uint64_t ownerToken, TransportSetResult &result,
+                                          TransportSetResult &result,
                                           std::chrono::steady_clock::time_point setStart)
 {
     const auto &ubFailureReport = ObjectBufferInternal::GetInfo(buffer).ubFailureReportRc;
@@ -956,9 +835,8 @@ Status TransportLayer::FinalizeSetPublish(const HostPort &workerAddr, ObjectBuff
     // worker reference on buffer destruction, so skip ScheduleRelease for them to avoid a double decrement.
     const bool ownerManagesRef = bufferInfo.receiveBufferOwner != nullptr
                                  && bufferInfo.receiveBufferOwner->ManagesWorkerReference();
-    bool senderQuarantined = ReportLocalUbSenderFailure(
-        { workerAddr, transporter->Kind(), ubFailureReport, bufferInfo.ubProviderStatus, bufferInfo.ubCqeStatus },
-        ownerToken);
+    const bool localPortFailure = ReportLocalUbSenderFailure(
+        { workerAddr, transporter->Kind(), ubFailureReport, bufferInfo.ubProviderStatus, bufferInfo.ubCqeStatus });
     result.writeTargetQuarantined = ReportWriteTargetUbFailure(
         { workerAddr, transporter->Kind(), ubFailureReport, bufferInfo.ubProviderStatus, bufferInfo.ubCqeStatus });
     std::optional<Status> firstPublishRc;
@@ -974,7 +852,7 @@ Status TransportLayer::FinalizeSetPublish(const HostPort &workerAddr, ObjectBuff
         }
     };
     Status rc = publishRc;
-    if (senderQuarantined) {
+    if (localPortFailure) {
         releaseRef(TransportHint::TCP_ONLY);
         return rc.GetCode() == K_URMA_NEED_CONNECT ? ubFailureReport : rc;
     }
@@ -1009,14 +887,13 @@ Status TransportLayer::RetrySet(const HostPort &workerAddr, ObjectBuffer &buffer
     mutableBufferInfo.ubFailureReportRc = Status::OK();
     mutableBufferInfo.ubProviderStatus.reset();
     mutableBufferInfo.ubCqeStatus.reset();
-    PrepareLocalUbLateCompletion(mutableBufferInfo, transporter->Kind(), operation.ownerToken);
+    PrepareLocalUbLateCompletion(mutableBufferInfo, transporter->Kind());
     result = TransportSetResult{};
     Status rc = transporter->Set(buffer, retryParam, &result);
     const auto &bufferInfo = ObjectBufferInternal::GetInfo(buffer);
     (void)ReportLocalUbSenderFailure(
         { workerAddr, transporter->Kind(), bufferInfo.ubFailureReportRc, bufferInfo.ubProviderStatus,
-          bufferInfo.ubCqeStatus },
-        operation.ownerToken);
+          bufferInfo.ubCqeStatus });
     result.writeTargetQuarantined = ReportWriteTargetUbFailure(
         { workerAddr, transporter->Kind(), bufferInfo.ubFailureReportRc, bufferInfo.ubProviderStatus,
           bufferInfo.ubCqeStatus });
@@ -1134,17 +1011,15 @@ Status TransportLayer::MSet(const std::vector<std::shared_ptr<ObjectBuffer>> &bu
     RETURN_IF_NOT_OK(manager_->GetOrCreate(workerAddr, hint, transporter));
     RETURN_IF_NOT_OK(AcquireLocalUbSenderAdmission(hint, operation));
     for (const auto &buffer : buffers) {
-        PrepareLocalUbLateCompletion(ObjectBufferInternal::GetMutableInfo(*buffer), transporter->Kind(),
-                                     operation.ownerToken);
+        PrepareLocalUbLateCompletion(ObjectBufferInternal::GetMutableInfo(*buffer), transporter->Kind());
     }
     Status rc = transporter->MSet(buffers, param, result);
     const auto &ubFailureReport = result.ubFailureReportRc;
-    bool senderQuarantined = ReportLocalUbSenderFailure(
-        { workerAddr, transporter->Kind(), ubFailureReport, result.ubProviderStatus, result.ubCqeStatus },
-        operation.ownerToken);
+    const bool localPortFailure = ReportLocalUbSenderFailure(
+        { workerAddr, transporter->Kind(), ubFailureReport, result.ubProviderStatus, result.ubCqeStatus });
     result.writeTargetQuarantined = ReportWriteTargetUbFailure(
         { workerAddr, transporter->Kind(), ubFailureReport, result.ubProviderStatus, result.ubCqeStatus });
-    if (senderQuarantined) {
+    if (localPortFailure) {
         ScheduleMSetReleases(buffers, param.requestContext, result, TransportHint::TCP_ONLY);
         return rc.GetCode() == K_URMA_NEED_CONNECT ? ubFailureReport : rc;
     }
@@ -1181,11 +1056,7 @@ Status TransportLayer::RetryOrReplayMSet(const HostPort &workerAddr,
         manager_->Teardown(workerAddr);
     }
     Status retryRc = RetryMSet(workerAddr, buffers, param, hint, result);
-    std::optional<TransportHint> releaseHint;
-    if (localUbSenderState_->unavailable.load(std::memory_order_acquire)) {
-        releaseHint = TransportHint::TCP_ONLY;
-    }
-    ScheduleMSetReleases(buffers, param.requestContext, result, releaseHint);
+    ScheduleMSetReleases(buffers, param.requestContext, result);
     return retryRc;
 }
 
@@ -1198,13 +1069,11 @@ Status TransportLayer::RetryMSet(const HostPort &workerAddr, const std::vector<s
     RETURN_IF_NOT_OK(AcquireLocalUbSenderAdmission(hint, operation));
     result.Clear();
     for (const auto &buffer : buffers) {
-        PrepareLocalUbLateCompletion(ObjectBufferInternal::GetMutableInfo(*buffer), transporter->Kind(),
-                                     operation.ownerToken);
+        PrepareLocalUbLateCompletion(ObjectBufferInternal::GetMutableInfo(*buffer), transporter->Kind());
     }
     Status rc = transporter->MSet(buffers, param, result);
     (void)ReportLocalUbSenderFailure(
-        { workerAddr, transporter->Kind(), result.ubFailureReportRc, result.ubProviderStatus, result.ubCqeStatus },
-        operation.ownerToken);
+        { workerAddr, transporter->Kind(), result.ubFailureReportRc, result.ubProviderStatus, result.ubCqeStatus });
     result.writeTargetQuarantined = ReportWriteTargetUbFailure(
         { workerAddr, transporter->Kind(), result.ubFailureReportRc, result.ubProviderStatus, result.ubCqeStatus });
     if (rc.IsError()) {
@@ -1412,15 +1281,10 @@ bool TransportLayer::WaitForSnapshotOrStop(std::unique_lock<bthread::Mutex> &loc
 {
     // bthread::ConditionVariable has no predicate overloads and its wait_until takes a CLOCK_REALTIME
     // timespec, not a chrono steady_clock time_point, so emulate master's wait_until(deadline, pred)
-    // and wait(pred) by hand. A probe deadline expiring must EXIT this wait so ReconcileLoop can run
-    // TryRecoverLocalUbSender and fire the recovery probe; therefore break after any wait returns
-    // (deadline elapsed or notified), matching master's post-wait_until break.
+    // and wait(pred) by hand. A probe deadline expiring must exit this wait so ReconcileLoop can run
+    // the recovery probe; therefore break after any wait returns (deadline elapsed or notified).
     while (!reconcileStopping_ && !pendingSnapshot_.has_value()) {
-        auto probeDeadline = GetLocalUbProbeDeadline();
-        auto providerDeadline = GetProviderUbProbeDeadline();
-        if (!probeDeadline.has_value() || (providerDeadline.has_value() && *providerDeadline < *probeDeadline)) {
-            probeDeadline = providerDeadline;
-        }
+        auto probeDeadline = GetProviderUbProbeDeadline();
         auto writeTargetDeadline = GetWriteTargetUbProbeDeadline();
         if (!probeDeadline.has_value()
             || (writeTargetDeadline.has_value() && *writeTargetDeadline < *probeDeadline)) {
@@ -1461,7 +1325,6 @@ void TransportLayer::ReconcileLoop()
         if (snapshot.has_value()) {
             manager_->ReconcileWithSnapshot(*snapshot);
         }
-        TryRecoverLocalUbSender();
         TryRecoverProviderUbSource();
         TryRecoverWriteTargetUbSource();
     }
@@ -1473,7 +1336,6 @@ void TransportLayer::Shutdown()
     {
         std::lock_guard<std::shared_mutex> admission(localUbSenderState_->mutex);
         localUbSenderState_->CloseAdmission();
-        localUbSenderState_->unavailable.store(true, std::memory_order_release);
     }
     {
         std::unique_lock<std::mutex> lock(localUbSenderState_->inFlightDrainMutex);

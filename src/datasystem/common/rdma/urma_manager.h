@@ -34,6 +34,7 @@
 #include "datasystem/common/flags/flags.h"
 #include "datasystem/common/rdma/fast_transport_base.h"
 #include "datasystem/common/rdma/urma_info.h"
+#include "datasystem/common/rdma/ub_port_health.h"
 #include "datasystem/common/rdma/urma_resource.h"
 #include "datasystem/common/rpc/rpc_channel.h"
 #include "datasystem/common/shared_memory/allocator.h"
@@ -128,6 +129,12 @@ public:
      * @return Status of the call.
      */
     Status Init(const HostPort &hostport);
+
+    Status InitClientPortHealthMonitor();
+
+    void TriggerClientPortHealthQuery();
+
+    Status CheckClientPortHealthAdmission() const;
 
     /**
      * @brief Initialize memory buffer for client side.
@@ -948,6 +955,10 @@ private:
     // Polling thread
     std::unique_ptr<Thread> serverEventThread_{ nullptr };
     std::unique_ptr<std::thread> perfThread_{ nullptr };
+    mutable std::mutex clientPortHealthMutex_;
+    std::shared_ptr<UbPortHealthMonitor> clientPortHealthMonitor_;
+    std::atomic<uint64_t> clientPortHealthAdmissionState_{ 0 };
+    bool clientPortHealthStopping_{ false };
     UrmaAsyncEventHandler aeHandler_;
     std::unique_ptr<UrmaResource> urmaResource_;
     std::atomic<uint64_t> requestId_{ 0 };

@@ -47,6 +47,7 @@
 #include "datasystem/common/perf/perf_manager.h"
 #include "datasystem/common/rdma/fast_transport_base.h"
 #include "datasystem/common/rdma/urma_dlopen_util.h"
+#include "datasystem/common/rdma/urma_port_status_provider.h"
 #include "datasystem/common/rpc/bthread_utils.h"
 #include "datasystem/common/rpc/rpc_constants.h"
 #include "datasystem/common/rpc/api_deadline.h"
@@ -87,6 +88,8 @@ constexpr uint8_t URMA_AFFINITY_SRC_CHIP_MAX = URMA_AFFINITY_SRC_CHIP_MIN + URMA
 constexpr uint64_t URMA_RECOVERY_PROBE_SEGMENT_SIZE = 4096;
 constexpr uint64_t URMA_FIRST_WRITE_CHUNK_INDEX = 1;
 constexpr uint64_t URMA_SECOND_WRITE_CHUNK_INDEX = 2;
+constexpr uint64_t CLIENT_PORT_HEALTH_READY_MASK = 1uLL << 63;
+constexpr uint64_t CLIENT_PORT_COUNT_MASK = 0x7fffffffuLL;
 constexpr const char *URMA_ELAPSED_TOTAL_SUGGEST =
     "check whether URMA_ELAPSED_THREAD_SHED/URMA_ELAPSED_POLL_JFC/URMA_ELAPSED_NOTIFY logs appear in the "
     "same time window; if none appear, check URMA and UDMA";
@@ -229,6 +232,17 @@ UrmaManager::~UrmaManager()
 
 Status UrmaManager::Stop()
 {
+    std::shared_ptr<UbPortHealthMonitor> portHealthMonitor;
+    {
+        std::lock_guard<std::mutex> lock(clientPortHealthMutex_);
+        clientPortHealthStopping_ = true;
+        portHealthMonitor = std::atomic_exchange_explicit(
+            &clientPortHealthMonitor_, std::shared_ptr<UbPortHealthMonitor>{}, std::memory_order_acq_rel);
+    }
+    if (portHealthMonitor != nullptr) {
+        portHealthMonitor->Stop();
+    }
+    clientPortHealthAdmissionState_.store(0, std::memory_order_release);
     // Close every admission gate while poll is still alive. We deliberately fail closed during
     // teardown if a provider flush cannot be observed; deleting a possibly live Jetty is unsafe.
     if (urmaResource_ != nullptr) {
@@ -343,6 +357,64 @@ Status UrmaManager::Init(const HostPort &hostport)
     perfThread_ = std::make_unique<std::thread>(&UrmaManager::PerfThreadMain, this);
     needRollback = false;
     return Status::OK();
+}
+
+Status UrmaManager::InitClientPortHealthMonitor()
+{
+    if (!clientMode_.load(std::memory_order_acquire)) {
+        return Status::OK();
+    }
+    std::lock_guard<std::mutex> lock(clientPortHealthMutex_);
+    CHECK_FAIL_RETURN_STATUS(!clientPortHealthStopping_, K_SHUTTING_DOWN,
+                             "URMA port health monitor is shutting down");
+    if (std::atomic_load_explicit(&clientPortHealthMonitor_, std::memory_order_acquire) != nullptr) {
+        return Status::OK();
+    }
+    CHECK_FAIL_RETURN_STATUS(urmaResource_ != nullptr && urmaResource_->GetContext() != nullptr, K_NOT_READY,
+                             "URMA context is not initialized for port status query");
+    clientPortHealthAdmissionState_.store(0, std::memory_order_release);
+    auto provider = std::make_shared<UrmaPortStatusProvider>(urmaResource_->GetContext());
+    auto publishAdmission = [this](const UbPortHealthSnapshot &snapshot) {
+        const uint64_t state = snapshot.totalPortCount == 0
+                                   ? 0
+                                   : CLIENT_PORT_HEALTH_READY_MASK
+                                         | (static_cast<uint64_t>(snapshot.totalPortCount) << 32)
+                                         | snapshot.badPortCount;
+        clientPortHealthAdmissionState_.store(state, std::memory_order_release);
+    };
+    auto monitor = std::make_shared<UbPortHealthMonitor>(std::move(provider), UB_PORT_HEALTH_QUERY_INTERVAL,
+                                                         std::move(publishAdmission));
+    RETURN_IF_NOT_OK(monitor->Start());
+    std::atomic_store_explicit(&clientPortHealthMonitor_, std::move(monitor), std::memory_order_release);
+    clientPortHealthAdmissionState_.store(CLIENT_PORT_HEALTH_READY_MASK, std::memory_order_release);
+    return Status::OK();
+}
+
+void UrmaManager::TriggerClientPortHealthQuery()
+{
+    auto monitor = std::atomic_load_explicit(&clientPortHealthMonitor_, std::memory_order_acquire);
+    if (monitor != nullptr) {
+        monitor->TriggerQuery();
+    } else {
+        LOG_FIRST_AND_EVERY_N(ERROR, K_URMA_ERROR_LOG_EVERY_N)
+            << "Ignored client-local CQE 4 because the UB port health monitor is unavailable";
+    }
+}
+
+Status UrmaManager::CheckClientPortHealthAdmission() const
+{
+    const uint64_t state = clientPortHealthAdmissionState_.load(std::memory_order_acquire);
+    if ((state & CLIENT_PORT_HEALTH_READY_MASK) == 0) {
+        LOG_FIRST_AND_EVERY_N(ERROR, K_URMA_ERROR_LOG_EVERY_N)
+            << "Client-local UB port health admission is unavailable";
+        return Status::OK();
+    }
+    const auto totalPortCount = static_cast<uint32_t>((state >> 32) & CLIENT_PORT_COUNT_MASK);
+    const auto badPortCount = static_cast<uint32_t>(state);
+    if (totalPortCount == 0 || badPortCount != totalPortCount) {
+        return Status::OK();
+    }
+    return Status(K_URMA_WORKER_UNAVAILABLE, "Client-local UB endpoint unavailable: all ports are BAD");
 }
 
 static Status ParseEnvUint64(const std::string &envName, uint64_t &outVal)

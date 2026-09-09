@@ -138,6 +138,11 @@ list(FILTER DS_TEST_UT_SRCS EXCLUDE REGEX ".*/client/urma_connection_inflight_te
 
 if (NOT BUILD_WITH_RDMA)
     list(FILTER DS_TEST_UT_SRCS EXCLUDE REGEX ".*/rdma/.*\\.cpp$")
+    # The port-health monitor uses a fake provider and does not require RDMA hardware.
+    list(APPEND DS_TEST_UT_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/common/rdma/ub_port_health_test.cpp")
+    if (BUILD_WITH_URMA_MOCK)
+        list(APPEND DS_TEST_UT_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/common/rdma/urma_port_status_provider_test.cpp")
+    endif()
 endif()
 if (NOT BUILD_WITH_URMA)
     list(FILTER DS_TEST_UT_SRCS EXCLUDE REGEX ".*/client/urma_send_lane_test\\.cpp$")

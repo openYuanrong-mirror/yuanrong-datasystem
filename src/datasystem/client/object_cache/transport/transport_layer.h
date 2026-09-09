@@ -82,15 +82,18 @@ public:
     /** @brief Initialize transport runtime resources before data-plane connections are created. */
     Status Init();
 
-    /** @brief Reject a new client-local UB write while the process-local sender is quarantined. */
+    /** @brief Reject a new client-local UB write when every process-local UB port is confirmed BAD. */
     Status CheckLocalUbSenderAdmission() const;
+
+    /** @brief Reject all Host object data APIs when every client-local UB port is confirmed BAD. */
+    Status CheckLocalNodeAdmission() const;
 
     /**
      * @brief Run a client-local UB write under the shared sender admission and classify its raw failure evidence.
      * @param[in] workerAddr Worker endpoint used by the write.
      * @param[in,out] bufferInfo Buffer state populated with the raw provider/CQE failure detail.
      * @param[in] write Actual UB write operation.
-     * @return The write result, or K_URMA_WORKER_UNAVAILABLE when the sender is quarantined.
+     * @return The write result, or K_URMA_WORKER_UNAVAILABLE when every local UB port is confirmed BAD.
      */
     Status RunClientLocalUbWrite(const HostPort &workerAddr, ObjectBufferInfo &bufferInfo,
                                  const std::function<Status()> &write);
@@ -175,8 +178,7 @@ protected:
     /** @brief Construct the facade with injected collaborators for focused orchestration tests. */
     TransportLayer(std::shared_ptr<DataPlaneManager> dataPlaneManager, std::shared_ptr<TransportAdvisor> advisor);
     TransportLayer(std::shared_ptr<DataPlaneManager> dataPlaneManager, std::shared_ptr<TransportAdvisor> advisor,
-                   std::chrono::milliseconds localUbProbeBaseDelay,
-                   std::shared_ptr<UbHealthFilter> readSourceFilter = nullptr,
+                   std::shared_ptr<UbHealthFilter> readSourceFilter,
                    std::shared_ptr<ThreadPool> releasePool = nullptr);
     bool ReportProviderUbFailure(const HostPort &provider, const ProviderUbFailureDetailPb &detail);
     Status CheckUbReadSource(const HostPort &workerAddr, AccessTransportKind &deniedKind) const;
@@ -190,7 +192,6 @@ private:
         LocalUbSenderOperation &operator=(const LocalUbSenderOperation &) = delete;
 
         LocalUbSenderState *state{ nullptr };
-        uint64_t ownerToken{ 0 };
     };
 
     struct LocalUbSenderFailureView {
@@ -204,11 +205,8 @@ private:
     Status CheckLocalUbSenderAdmission(TransportHint hint) const;
     Status AcquireLocalUbSenderAdmission(TransportHint hint, LocalUbSenderOperation &operation) const;
     bool ReportWriteTargetUbFailure(const LocalUbSenderFailureView &failure);
-    bool ReportLocalUbSenderFailure(const LocalUbSenderFailureView &failure, uint64_t ownerToken);
-    void PrepareLocalUbLateCompletion(ObjectBufferInfo &bufferInfo, AccessTransportKind kind,
-                                      uint64_t ownerToken) const;
-    std::optional<std::chrono::steady_clock::time_point> GetLocalUbProbeDeadline() const;
-    void TryRecoverLocalUbSender();
+    bool ReportLocalUbSenderFailure(const LocalUbSenderFailureView &failure);
+    void PrepareLocalUbLateCompletion(ObjectBufferInfo &bufferInfo, AccessTransportKind kind) const;
     std::optional<std::chrono::steady_clock::time_point> GetProviderUbProbeDeadline() const;
     void TryRecoverProviderUbSource();
     std::optional<std::chrono::steady_clock::time_point> GetWriteTargetUbProbeDeadline() const;
@@ -219,12 +217,12 @@ private:
     // Returns true if the caller should process/apply a snapshot, false if it should stop or re-loop.
     // Extracted from ReconcileLoop to keep that function within the codecheck nesting-depth limit.
     bool WaitForSnapshotOrStop(std::unique_lock<bthread::Mutex> &lock);
-    // Post-publish Set processing: UB failure reporting + sender quarantine, routed SHM owner-managed
+    // Post-publish Set processing: UB failure reporting, routed SHM owner-managed
     // release decision, rebuild/retry, and async reference release. Extracted from Set to keep Set within
     // the codecheck function-size limit.
     Status FinalizeSetPublish(const HostPort &workerAddr, ObjectBuffer &buffer, const TransportSetParam &param,
                               TransportHint hint, std::shared_ptr<IDataTransporter> &transporter,
-                              const Status &publishRc, uint64_t ownerToken, TransportSetResult &result,
+                              const Status &publishRc, TransportSetResult &result,
                               std::chrono::steady_clock::time_point setStart);
     Status RetrySet(const HostPort &workerAddr, ObjectBuffer &buffer, const TransportSetParam &param,
                     TransportHint hint, TransportSetResult &result);
@@ -240,8 +238,8 @@ private:
                       std::chrono::steady_clock::time_point start);
     Status RetryMSet(const HostPort &workerAddr, const std::vector<std::shared_ptr<ObjectBuffer>> &buffers,
                      const TransportSetParam &param, TransportHint hint, TransportMSetResult &result);
-    // Rebuild/retry decision after an MSet failure that neither quarantined the local sender nor the
-    // write target. Extracted from MSet to keep MSet within the codecheck function-size limit.
+    // Rebuild/retry decision after an MSet failure that did not isolate the write target. Extracted
+    // from MSet to keep MSet within the codecheck function-size limit.
     Status RetryOrReplayMSet(const HostPort &workerAddr, const std::vector<std::shared_ptr<ObjectBuffer>> &buffers,
                              const TransportSetParam &param, TransportHint hint, TransportMSetResult &result,
                              const Status &rc);
