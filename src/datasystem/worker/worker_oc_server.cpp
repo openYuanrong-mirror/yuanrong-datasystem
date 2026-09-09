@@ -2593,6 +2593,17 @@ void WorkerOCServer::RegisteringAllResourceCollectionCallbackFunc()
 
 void WorkerOCServer::RegisteringWorkerCallbackFunc()
 {
+    RegisteringWorkerCommonCallbackFunc();
+    if (EnableOCService()) {
+        RegisteringObjectCacheCallbackFunc();
+    }
+    if (EnableSCService()) {
+        RegisteringStreamCacheCallbackFunc();
+    }
+}
+
+void WorkerOCServer::RegisteringWorkerCommonCallbackFunc()
+{
     auto &instance = ResMetricCollector::Instance();
     // The usage of spill
     instance.RegisterCollectHandler(ResMetricName::SPILL_HARD_DISK,
@@ -2625,44 +2636,55 @@ void WorkerOCServer::RegisteringWorkerCallbackFunc()
     // Deferred cleanup queue depth
     instance.RegisterCollectHandler(ResMetricName::DEFERRED_CLEANUP_QUEUE_SIZE,
                                     [] { return std::to_string(GetDeferredCleanupQueueSize()); });
+}
 
-    if (EnableOCService()) {
-        // The total number of objects
-        instance.RegisterCollectHandler(ResMetricName::OBJECT_COUNT, [this] {
-            return std::to_string(objCacheClientWorkerSvc_->GetTotalObjectCount());
-        });
-        // The total size of objects
-        instance.RegisterCollectHandler(ResMetricName::OBJECT_SIZE, [this] {
-            return std::to_string(objCacheClientWorkerSvc_->GetTotalObjectSize());
-        });
-        instance.RegisterCollectHandler(ResMetricName::OC_HIT_NUM,
-                                        [this] { return objCacheClientWorkerSvc_->GetHitInfo(); });
-        instance.RegisterCollectHandler(ResMetricName::OBJECT_COPY_WATERMARK, [] {
-            return object_cache::NodeSelector::Instance().GetObjectCopyWatermark().ToMetricsString();
-        });
-    }
+void WorkerOCServer::RegisteringObjectCacheCallbackFunc()
+{
+    auto &instance = ResMetricCollector::Instance();
+    // The total number of objects; the kv_metrics gauges mirror the same live values so both export
+    // channels report one collection snapshot instead of event-driven stale counters.
+    instance.RegisterCollectHandler(ResMetricName::OBJECT_COUNT, [this] {
+        const auto objectCount = objCacheClientWorkerSvc_->GetTotalObjectCount();
+        metrics::GetGauge(static_cast<uint16_t>(metrics::KvMetricId::WORKER_OBJECT_COUNT))
+            .Set(static_cast<int64_t>(objectCount));
+        return std::to_string(objectCount);
+    });
+    // The total size of objects
+    instance.RegisterCollectHandler(ResMetricName::OBJECT_SIZE, [this] {
+        const auto objectSize = objCacheClientWorkerSvc_->GetTotalObjectSize();
+        metrics::GetGauge(static_cast<uint16_t>(metrics::KvMetricId::WORKER_ALLOCATED_MEMORY_SIZE))
+            .Set(static_cast<int64_t>(objectSize));
+        return std::to_string(objectSize);
+    });
+    instance.RegisterCollectHandler(ResMetricName::OC_HIT_NUM,
+                                    [this] { return objCacheClientWorkerSvc_->GetHitInfo(); });
+    instance.RegisterCollectHandler(ResMetricName::OBJECT_COPY_WATERMARK, [] {
+        return object_cache::NodeSelector::Instance().GetObjectCopyWatermark().ToMetricsString();
+    });
+}
 
-    if (EnableSCService()) {
-        instance.RegisterCollectHandler(ResMetricName::STREAM_COUNT,
-                                        [this]() { return streamCacheClientWorkerSvc_->GetTotalStreamCount(); });
+void WorkerOCServer::RegisteringStreamCacheCallbackFunc()
+{
+    auto &instance = ResMetricCollector::Instance();
+    instance.RegisterCollectHandler(ResMetricName::STREAM_COUNT,
+                                    [this]() { return streamCacheClientWorkerSvc_->GetTotalStreamCount(); });
 
-        // The usage of WorkerSCService
-        instance.RegisterCollectHandler(ResMetricName::WORKER_SC_SERVICE_THREAD_POOL, [this]() {
-            return GetRpcServicesUsage("ClientWorkerSCService").ToString(FLAGS_log_monitor_interval_ms);
-        });
+    // The usage of WorkerSCService
+    instance.RegisterCollectHandler(ResMetricName::WORKER_SC_SERVICE_THREAD_POOL, [this]() {
+        return GetRpcServicesUsage("ClientWorkerSCService").ToString(FLAGS_log_monitor_interval_ms);
+    });
 
-        // The usage of WorkerSCService
-        instance.RegisterCollectHandler(ResMetricName::WORKER_WORKER_SC_SERVICE_THREAD_POOL, [this]() {
-            return GetRpcServicesUsage("WorkerWorkerSCService").ToString(FLAGS_log_monitor_interval_ms);
-        });
+    // The usage of WorkerWorkerSCService
+    instance.RegisterCollectHandler(ResMetricName::WORKER_WORKER_SC_SERVICE_THREAD_POOL, [this]() {
+        return GetRpcServicesUsage("WorkerWorkerSCService").ToString(FLAGS_log_monitor_interval_ms);
+    });
 
-        instance.RegisterCollectHandler(ResMetricName::STREAM_REMOTE_SEND_SUCCESS_RATE,
-                                        [this]() { return streamCacheClientWorkerSvc_->GetSCRemoteSendSuccessRate(); });
+    instance.RegisterCollectHandler(ResMetricName::STREAM_REMOTE_SEND_SUCCESS_RATE,
+                                    [this]() { return streamCacheClientWorkerSvc_->GetSCRemoteSendSuccessRate(); });
 
-        instance.RegisterCollectHandler(ResMetricName::SC_LOCAL_CACHE, [this]() {
-            return streamCacheWorkerWorkerSvc_->GetUsageMonitor().GetLocalMemoryUsed();
-        });
-    }
+    instance.RegisterCollectHandler(ResMetricName::SC_LOCAL_CACHE, [this]() {
+        return streamCacheWorkerWorkerSvc_->GetUsageMonitor().GetLocalMemoryUsed();
+    });
 }
 
 void WorkerOCServer::RegisteringMasterCallbackFunc()

@@ -223,6 +223,9 @@ std::string ResMetricCollector::BuildResourceJson(const std::vector<std::string>
 void ResMetricCollector::RegisterCollectHandler(ResMetricName metricName, std::function<std::string()> collectHandler)
 {
     if (exporter_ == nullptr && jsonExporter_ == nullptr) {
+        LOG(WARNING) << "ResMetricCollector is not initialized because both log_monitor and json_log_monitor are "
+                        "off at startup; the collect handler for metric "
+                     << int(metricName) << " stays dormant until the worker restarts with monitoring enabled";
         return;
     }
     collectHandler_.emplace(int(metricName), collectHandler);

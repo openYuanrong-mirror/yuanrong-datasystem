@@ -398,6 +398,19 @@ ds_cc_test(
 )
 
 ds_cc_test(
+    name = "kv_client_rebalance_stale_entry_test",
+    srcs = ["kv_client_rebalance_stale_entry_test.cpp"],
+    tags = ["manual"],
+    deps = KV_COMMON_DEPS + [
+        "//src/datasystem/common/flags:ds_flags",
+        "//src/datasystem/common/metrics:common_metrics",
+        "//src/datasystem/common/util:format",
+        "//src/datasystem/protos:cluster_topology_cc_proto",
+        "//tests/st/cluster:st_cluster",
+    ],
+)
+
+ds_cc_test(
     name = "kv_client_heat_rebalance_test",
     srcs = ["kv_client_heat_rebalance_test.cpp"],
     tags = ["manual"],

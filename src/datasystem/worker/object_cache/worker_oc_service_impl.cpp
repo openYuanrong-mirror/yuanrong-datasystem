@@ -242,16 +242,6 @@ uint64_t PayloadBytes(const std::vector<RpcMessage> &payloads)
     return bytes;
 }
 
-void UpdateWorkerObjectGauge(const std::shared_ptr<ObjectTable> &objectTable)
-{
-    if (objectTable != nullptr) {
-        metrics::GetGauge(static_cast<uint16_t>(metrics::KvMetricId::WORKER_OBJECT_COUNT)).Set(objectTable->GetSize());
-    }
-    memory::ShmMemStat stat;
-    memory::Allocator::Instance()->GetMemStat(stat);
-    metrics::GetGauge(static_cast<uint16_t>(metrics::KvMetricId::WORKER_ALLOCATED_MEMORY_SIZE))
-        .Set(stat.objectMemoryUsage);
-}
 
 void RecordMultiPublishTransportMetrics(const MultiPublishReqPb &req, uint64_t payloadBytes, bool clientShmEnabled)
 {
@@ -660,7 +650,6 @@ Status WorkerOCServiceImpl::Publish(const PublishReqPb &req, PublishRspPb &resp,
                 METRIC_ADD(metrics::KvMetricId::WORKER_FROM_CLIENT_PUBLISH_TCP_TOTAL_BYTES, payloadBytes);
             }
         }
-        UpdateWorkerObjectGauge(objectTable_);
     }
     return rc;
 }
@@ -680,7 +669,6 @@ Status WorkerOCServiceImpl::MultiPublish(const MultiPublishReqPb &req, MultiPubl
     RETURN_IF_NOT_OK(multiPublishProc_->MultiPublish(req, resp, payloads, clientId));
     const bool clientShmEnabled = WorkerOcServiceCrudCommonApi::ClientShmEnabled(clientId);
     RecordMultiPublishTransportMetrics(req, payloadBytes, clientShmEnabled);
-    UpdateWorkerObjectGauge(objectTable_);
     if (req.auto_release_memory_ref()) {
         std::set<std::string> failedSet{ resp.failed_object_keys().begin(), resp.failed_object_keys().end() };
         std::vector<ShmKey> shmIds;
@@ -1454,7 +1442,6 @@ Status WorkerOCServiceImpl::Create(const CreateReqPb &req, CreateRspPb &resp)
         "validate worker state failed");
     Status rc = createProc_->Create(req, resp);
     if (rc.IsOk()) {
-        UpdateWorkerObjectGauge(objectTable_);
         METRIC_ADD(metrics::KvMetricId::WORKER_CREATE_ALLOCATED_BYTES,
                    static_cast<uint64_t>(req.data_size()) + resp.metadata_size());
     }
@@ -1481,7 +1468,6 @@ Status WorkerOCServiceImpl::MultiCreate(const MultiCreateReqPb &req, MultiCreate
     }
     returnStatus = createProc_->MultiCreate(req, resp);
     if (returnStatus.IsOk()) {
-        UpdateWorkerObjectGauge(objectTable_);
         uint64_t totalBytes = 0;
         const int resultCount = resp.results_size();
         for (int i = 0; i < resultCount; ++i) {

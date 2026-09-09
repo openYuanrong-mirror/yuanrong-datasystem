@@ -1559,19 +1559,31 @@ void WorkerOcServiceMigrateImpl::RollbackObjects(const Container &objectKeys, co
         }
         bool needDel = it->second.second;
         auto &entry = it->second.first;
-        if ((*entry)->IsSpilled() && (*entry)->GetShmUnit() == nullptr) {
-            LOG_IF_ERROR(WorkerOcSpill::Instance()->Delete(objectKey),
-                         FormatString("[Migrate Data] Rollback %s from disk failed", objectKey));
+        // A protocol-violating master may report the same key as both expired and failed; the second rollback
+        // must skip the already deleted entry instead of dereferencing it.
+        if (entry->Get() == nullptr) {
+            continue;
+        }
+        const bool diskCopy = (*entry)->IsSpilled() && (*entry)->GetShmUnit() == nullptr;
+        if (diskCopy) {
+            const Status diskDeleteRc = WorkerOcSpill::Instance()->Delete(objectKey);
+            LOG_IF_ERROR(diskDeleteRc,
+                         FormatString("[Migrate Data] Rollback %s from disk failed, status: %s; the table entry is "
+                                      "still erased and the spill file remains until ForceCompact or restart "
+                                      "reclaims it",
+                                      objectKey, diskDeleteRc.ToString()));
         } else {
             evictionManager_->Erase(objectKey);
         }
-        if (needDel) {
-            (void)objectTable_->Erase(objectKey, *entry);
-        } else {
+        if ((*entry)->IsWriteBackMode()) {
+            asyncSendManager_->Remove(objectKey);
+        }
+        if (!needDel) {
             (*entry)->stateInfo.SetSpillState(false);
             (*entry)->stateInfo.SetCacheInvalid(true);
             (*entry)->SetShmUnit(nullptr);
         }
+        (void)objectTable_->Erase(objectKey, *entry);
     }
 }
 
