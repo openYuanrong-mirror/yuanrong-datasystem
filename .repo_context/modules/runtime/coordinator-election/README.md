@@ -174,6 +174,20 @@ frozen plan in `PROPOSED`. A fresh-bootstrap `STARTED` node continues to publish
 `committed_peers`; this permits the membership manager's transient `N + 1` replacement configuration. Receiver-local
 timestamps, stability state, terminal Status details, and local metadata state never cross the wire.
 
+Missing-data startup diagnostics are emitted before braft Node creation:
+
+- `COORDINATOR_RAFT_METADATA_ABSENT` (INFO) records the endpoint and configured data directory once per empty-data
+  startup, including static bootstrap and bootstrap waiting for quorum. Absence alone cannot distinguish a fresh
+  instance from a lost or incorrectly mounted volume.
+- `COORDINATOR_RAFT_EXISTING_MEMBER_WITHOUT_LOCAL_DATA` (WARNING) is emitted when observation bootstrap selects a
+  quorum-confirmed committed configuration that already contains the empty-data local endpoint. It records that
+  configuration, the endpoint and data directory, warns that in-place recovery is unsupported and catch-up may stall,
+  and directs operators to check the original volume or isolate and replace the instance using a new endpoint while
+  quorum remains available. The successful plan selection leaves the retry loop, so the warning is not periodic.
+- Static bootstrap does not exchange committed configurations and therefore emits only the absence diagnostic.
+  Neither diagnostic proves that files were deleted or that replication is already stalled; neither changes startup,
+  election, membership, or serving behavior.
+
 The Coordinator protobuf service order is a wire contract for the custom ZMQ transport. Legacy
 `ReportTopologyRecoveryCandidate` and `GetClusterRawSnapshot` remain method indexes 7 and 8;
 `ExchangeBootstrapObservation` replaces the former bootstrap-state method at index 9, so later method indexes do not
@@ -194,7 +208,7 @@ The current braft state machine rejects management-log apply and the Node expose
 | UT | `tests/ut/common/coordinator/coordinator_election_manager_test.cpp` | Incomplete-view waiting, stable full-view proposal confirmation, candidate-expansion reproduction, static full-peer startup without Exchange, committed-configuration priority, local recovery, and malformed observation rejection. |
 | UT | `tests/ut/coordinator/coordinator_server_options_test.cpp` | Public empty-path rejection, direct Runtime empty-path process-flags startup, non-empty config parsing, per-instance Raft snapshots, lifecycle retry, readiness, shutdown ordering, ZMQ method-index compatibility, and allocator-backed real brpc lifecycle. |
 | ST | `tests/st/common/raft/coordinator_service_election_test.cpp` | Real single-Service shared endpoint, election, recovery, and cleanup. |
-| ST | `tests/st/common/raft/coordinator_runtime_election_test.cpp` | Real in-process Runtimes launched with empty config paths, stable fixture-owned common flags, and per-generation endpoint/data/timing snapshots; covers complete-view bootstrap, Discovery failure, serving-gate isolation, failover, persisted restart, deleted-root rebuild, and bounded quorum loss. |
+| ST | `tests/st/common/raft/coordinator_runtime_election_test.cpp` | Real in-process Runtimes launched with empty config paths, stable fixture-owned common flags, and per-generation endpoint/data/timing snapshots; covers complete-view bootstrap, Discovery failure, serving-gate isolation, failover, persisted restart, and bounded quorum loss. |
 | ST | `tests/st/common/raft/coordinator_raft_node_test.cpp` | Real Node and Membership scenarios. |
 | ST | `tests/st/common/raft/braft_cluster_test.cpp` | Raw braft cluster behavior, including bounded failover after accepted Leader heartbeats align follower election timers. |
 
@@ -210,7 +224,7 @@ ctest --output-on-failure --timeout 8 \
 
 Dedicated targets are `coordinator_service_election_test` and `coordinator_runtime_election_test` in both CMake and Bazel. The focused `coordinator_server_options_test` retains process-safe port leases through real brpc Stop/Join and links `test_port_allocator` in CMake and Bazel. Both `coordinator_server_options_test` and `coordinator_election_manager_test` have CTest `TIMEOUT 8` and Bazel `timeout = "short"` declarations.
 
-Each Runtime election case body has a 6-second deadline; mandatory teardown Stop/join cleanup is not claimed to be inside that body budget. The quorum-loss case additionally starts an independent `steady_clock` deadline immediately after the second member's Stop/join completes and requires old-Leader stepdown plus `GetLeader`/business-gate `K_NOT_READY` within at most twice that Runtime generation's `GetRaftFlags().electionTimeoutMs`. The old-Leader and persisted-follower restart cases relaunch the same endpoint/data root with a generation-specific provider sharing the global registration state and assert zero Discovery queries on that provider through local metadata recovery. During persisted-follower downtime the original Leader remains serving; after restart the test permits any unique Leader and checks the observed Leader can serve, non-Leaders return only readiness-compatible business statuses, and all members expose the committed configuration. The deleted-follower-root case fully stops one follower, removes only that follower's Raft data root, relaunches the same endpoint/root before membership failure grace, and requires the new generation to query Discovery, rebuild the original three-peer committed configuration from authoritative peers, remain a non-serving follower, and publish `STARTED`. Each complete concrete case is bounded by the CTest 8-second timeout.
+Each Runtime election case body has a 6-second deadline; mandatory teardown Stop/join cleanup is not claimed to be inside that body budget. The quorum-loss case additionally starts an independent `steady_clock` deadline immediately after the second member's Stop/join completes and requires old-Leader stepdown plus `GetLeader`/business-gate `K_NOT_READY` within at most twice that Runtime generation's `GetRaftFlags().electionTimeoutMs`. The old-Leader and persisted-follower restart cases relaunch the same endpoint/data root with a generation-specific provider sharing the global registration state and assert zero Discovery queries on that provider through local metadata recovery. During persisted-follower downtime the original Leader remains serving; after restart the test permits any unique Leader and checks the observed Leader can serve, non-Leaders return only readiness-compatible business statuses, and all members expose the committed configuration. Each complete concrete case is bounded by the CTest 8-second timeout.
 
 ## Change Boundaries
 
