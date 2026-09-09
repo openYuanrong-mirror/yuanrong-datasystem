@@ -22,8 +22,8 @@
  *   [8-byte magic "TRCID:V1"][4-byte uint32_t len][traceID bytes][1-byte LogSampleState]
  * The trailing 1-byte LogSampleState carries the request sampling decision
  * (NONE/ADMIT/REJECT/UNDECIDED) so the receiving side restores
- * requestLogTrace + sampleDecision via ApplyLogSampleState(), mirroring the
- * MetaPb.log_sample_state field. The server adapter strips this
+ * requestLogTrace + sampleDecision via ApplyLogSampleState(). The server
+ * adapter strips this
  * prefix in CallMethod before dispatching. The magic version is intentionally
  * left at V1; the state byte is read defensively on the server (absent or
  * out-of-range byte falls back to LOG_SAMPLE_UNDECIDED), so this change

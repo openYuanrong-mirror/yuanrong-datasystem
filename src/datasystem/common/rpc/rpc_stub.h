@@ -27,7 +27,6 @@
 #include "datasystem/common/rpc/client_writer_reader_base.h"
 #include "datasystem/common/rpc/rpc_message.h"
 #include "datasystem/common/rpc/rpc_options.h"
-#include "datasystem/protos/meta_zmq.pb.h"
 #include "datasystem/utils/status.h"
 
 namespace datasystem {

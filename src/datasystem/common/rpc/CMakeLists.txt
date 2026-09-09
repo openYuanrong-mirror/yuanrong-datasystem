@@ -3,7 +3,6 @@ set(ZMQ_PLUGIN_DEPEND_LIBS
         protobuf::libprotobuf
         protobuf::libprotoc
         common_util
-        $<TARGET_FILE:zmq_meta_protos>
         $<TARGET_FILE:utils_protos>
         rpc_option_protos
         )
@@ -20,7 +19,7 @@ set(ZMQ_RPC_GENERATOR_SRC
 
 add_library(rpc_generator ${ZMQ_RPC_GENERATOR_SRC})
 target_link_libraries(rpc_generator PRIVATE ${ZMQ_PLUGIN_DEPEND_LIBS})
-add_dependencies(rpc_generator zmq_meta_protos rpc_option_protos)
+add_dependencies(rpc_generator utils_protos rpc_option_protos)
 
 add_executable(zmq_plugin plugin_generator/zmq_plugin.cpp)
 target_link_libraries(zmq_plugin PRIVATE rpc_generator)
@@ -75,7 +74,6 @@ set(COMMON_RPC_ZMQ_DEPENDS_LIBS
         utils_protos
         common_util
         common_event_loop
-        zmq_meta_protos
         rpc_option_protos)
 
 set(COMMON_RPC_ZMQ_CLIENT_DEPENDS_LIBS
@@ -87,7 +85,6 @@ set(COMMON_RPC_ZMQ_CLIENT_DEPENDS_LIBS
         common_perf
         common_util
         utils_protos_client
-        zmq_meta_protos_client
         rpc_option_protos
         common_event_loop
         common_encrypt)
@@ -99,11 +96,11 @@ endif()
 
 add_library(common_rpc_zmq STATIC ${COMMON_RPC_ZMQ_SRCS})
 target_link_libraries(common_rpc_zmq PUBLIC ${COMMON_RPC_ZMQ_DEPENDS_LIBS})
-add_dependencies(common_rpc_zmq zmq_meta_protos rpc_option_protos)
+add_dependencies(common_rpc_zmq rpc_option_protos)
 
 add_library(common_rpc_zmq_client STATIC ${COMMON_RPC_ZMQ_SRCS})
 target_link_libraries(common_rpc_zmq_client PUBLIC ${COMMON_RPC_ZMQ_CLIENT_DEPENDS_LIBS})
-add_dependencies(common_rpc_zmq_client zmq_meta_protos_client rpc_option_protos)
+add_dependencies(common_rpc_zmq_client rpc_option_protos)
 
 set(RPC_STUB_CACHE_MGR_SRCS
         rpc_stub_cache_mgr.cpp

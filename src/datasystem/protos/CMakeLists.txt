@@ -80,9 +80,6 @@ GEN_GLOBAL_PROTO_LIB_DEPEND(CLIENT
         DEPEND proto_lib_depend
         LINK ${PROTOBUF_LIBRARIES})
 
-GENERATE_PROTO_CPP(META_PROTO_SRCS META_PROTO_HDRS ${PROTO_BUILD_DIR}
-        PROTO_FILES ${PROTO_SRC_DIR}/meta_zmq.proto
-        PROTO_DEPEND proto_lib_depend)
 GENERATE_PROTO_CPP(RPC_OPTION_PROTO_SRCS RPC_OPTION_PROTO_HDRS ${PROTO_BUILD_DIR}
         PROTO_FILES ${PROTO_SRC_DIR}/rpc_option.proto
         PROTO_DEPEND proto_lib_depend)
@@ -92,16 +89,6 @@ GEN_GLOBAL_PROTO_LIB_DEPEND_SHARED(
         SOURCE ${RPC_OPTION_PROTO_SRCS}
         DEPEND proto_lib_depend
         LINK protobuf::libprotobuf)
-GEN_GLOBAL_PROTO_LIB_DEPEND(
-        NAME zmq_meta_protos
-        SOURCE ${META_PROTO_SRCS}
-        DEPEND proto_lib_depend
-        LINK ${PROTOBUF_LIBRARIES} log_sample_protos)
-GEN_GLOBAL_PROTO_LIB_DEPEND(CLIENT
-        NAME zmq_meta_protos_client
-        SOURCE ${META_PROTO_SRCS}
-        DEPEND proto_lib_depend
-        LINK ${PROTOBUF_LIBRARIES} log_sample_protos_client)
 
 # Build share memory proto lib
 GENERATE_ZMQ_CPP(zmq_proto_lib_depend SHARE_MEMORY_SRCS SHARE_MEMORY_ZMQ_HDRS ${PROTO_BUILD_DIR} ${PROTO_SRC_DIR} ${PROTO_SRC_DIR}/share_memory.proto)
@@ -110,7 +97,6 @@ GEN_GLOBAL_PROTO_LIB_DEPEND(
         SOURCE ${SHARE_MEMORY_SRCS}
         DEPEND zmq_proto_lib_depend
         LINK ${PROTOBUF_LIBRARIES}
-             zmq_meta_protos
              rpc_option_protos
              meta_transport_protos
              utils_protos)
@@ -119,7 +105,6 @@ GEN_GLOBAL_PROTO_LIB_DEPEND(CLIENT
         SOURCE ${SHARE_MEMORY_SRCS}
         DEPEND zmq_proto_lib_depend
         LINK ${PROTOBUF_LIBRARIES}
-             zmq_meta_protos_client
              rpc_option_protos
              meta_transport_protos_client
              utils_protos_client)
@@ -196,13 +181,13 @@ GEN_GLOBAL_PROTO_LIB_DEPEND(
         NAME posix_protos
         SOURCE ${OBJECT_POSIX_SRCS} ${STREAM_POSIX_SRCS}
         DEPEND zmq_proto_lib_depend
-        LINK ${PROTOBUF_LIBRARIES} zmq_meta_protos utils_protos p2p_subscribe_protos rpc_option_protos
+        LINK ${PROTOBUF_LIBRARIES} utils_protos p2p_subscribe_protos rpc_option_protos
              cluster_topology_protos)
 GEN_GLOBAL_PROTO_LIB_DEPEND(CLIENT
         NAME posix_protos_client
         SOURCE ${OBJECT_POSIX_SRCS} ${STREAM_POSIX_SRCS}
         DEPEND zmq_proto_lib_depend
-        LINK ${PROTOBUF_LIBRARIES} zmq_meta_protos_client utils_protos_client p2p_subscribe_protos_client
+        LINK ${PROTOBUF_LIBRARIES} utils_protos_client p2p_subscribe_protos_client
              rpc_option_protos cluster_topology_protos_client)
 
 # Compile the proto file at the second layer, for example, posix proto.
@@ -213,24 +198,24 @@ GEN_GLOBAL_PROTO_LIB_DEPEND(
         NAME worker_object_protos
         SOURCE ${WORKER_OBJECT_SRCS}
         DEPEND zmq_proto_lib_depend
-        LINK ${PROTOBUF_LIBRARIES} zmq_meta_protos rpc_option_protos meta_transport_protos share_memory_protos)
+        LINK ${PROTOBUF_LIBRARIES} rpc_option_protos meta_transport_protos share_memory_protos)
 GEN_GLOBAL_PROTO_LIB_DEPEND(CLIENT
         NAME worker_object_protos_client
         SOURCE ${WORKER_OBJECT_SRCS}
         DEPEND zmq_proto_lib_depend
-        LINK ${PROTOBUF_LIBRARIES} zmq_meta_protos_client rpc_option_protos meta_transport_protos_client
+        LINK ${PROTOBUF_LIBRARIES} rpc_option_protos meta_transport_protos_client
              share_memory_protos_client)
 
 GEN_GLOBAL_PROTO_LIB_DEPEND(
         NAME worker_stream_protos
         SOURCE ${WORKER_STREAM_SRCS}
         DEPEND zmq_proto_lib_depend
-        LINK ${PROTOBUF_LIBRARIES} zmq_meta_protos utils_protos posix_protos rpc_option_protos)
+        LINK ${PROTOBUF_LIBRARIES} utils_protos posix_protos rpc_option_protos)
 GEN_GLOBAL_PROTO_LIB_DEPEND(CLIENT
         NAME worker_stream_protos_client
         SOURCE ${WORKER_STREAM_SRCS}
         DEPEND zmq_proto_lib_depend
-        LINK ${PROTOBUF_LIBRARIES} zmq_meta_protos_client utils_protos_client posix_protos_client rpc_option_protos)
+        LINK ${PROTOBUF_LIBRARIES} utils_protos_client posix_protos_client rpc_option_protos)
 
 # Compile the proto file at the third layer, for example, master_object.proto, master_stream.proto
 GENERATE_ZMQ_CPP(zmq_proto_lib_depend MASTER_OBJECT_SRCS MASTER_OBJECT_HDRS ${PROTO_BUILD_DIR} ${PROTO_SRC_DIR} ${PROTO_SRC_DIR}/master_object.proto)
@@ -263,12 +248,12 @@ GEN_GLOBAL_PROTO_LIB_DEPEND(
         NAME master_heartbeat_protos
         SOURCE ${MASTER_HEARTBEAT_SRCS}
         DEPEND zmq_proto_lib_depend
-        LINK ${PROTOBUF_LIBRARIES} zmq_meta_protos rpc_option_protos)
+        LINK ${PROTOBUF_LIBRARIES} rpc_option_protos)
 GEN_GLOBAL_PROTO_LIB_DEPEND(CLIENT
         NAME master_heartbeat_protos_client
         SOURCE ${MASTER_HEARTBEAT_SRCS}
         DEPEND zmq_proto_lib_depend
-        LINK ${PROTOBUF_LIBRARIES} zmq_meta_protos_client rpc_option_protos)
+        LINK ${PROTOBUF_LIBRARIES} rpc_option_protos)
 
 if (WITH_TESTS)
     # Build generic service proto
@@ -294,10 +279,10 @@ if (ENABLE_PERF)
             NAME perf_posix_protos
             SOURCE ${PERF_SERVICE_SRCS}
             DEPEND zmq_proto_lib_depend
-            LINK ${PROTOBUF_LIBRARIES} zmq_meta_protos rpc_option_protos)
+            LINK ${PROTOBUF_LIBRARIES} rpc_option_protos)
     GEN_GLOBAL_PROTO_LIB_DEPEND(CLIENT
             NAME perf_posix_protos_client
             SOURCE ${PERF_SERVICE_SRCS}
             DEPEND zmq_proto_lib_depend
-            LINK ${PROTOBUF_LIBRARIES} zmq_meta_protos_client rpc_option_protos)
+            LINK ${PROTOBUF_LIBRARIES} rpc_option_protos)
 endif()

@@ -40,7 +40,6 @@ ds_cc_library(
     ],
     deps = [
         "//src/datasystem/common/util:strings_util",
-        "//src/datasystem/protos:meta_zmq_cc_proto",
         "//src/datasystem/protos:rpc_option_cc_proto",
         "//src/datasystem/protos:utils_cc_proto",
         "@com_google_protobuf//:protoc_lib",

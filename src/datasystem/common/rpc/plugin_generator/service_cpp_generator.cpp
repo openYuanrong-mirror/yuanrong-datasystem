@@ -30,13 +30,6 @@ void RpcGenerator::CreateServiceCpp(const google::protobuf::FileDescriptor &file
     GenerateServiceCppPrologue(printer, file);
     printer.PrintRaw(namespaceBegin);
 
-    for (auto i = 0; i < file.service_count(); ++i) {
-        auto *svc = file.service(i);
-        const std::string &svcName = svc->name();
-        ImplementZmqCallMethodDef(printer, *svc, PREFIX, svcName);
-        ImplementZmqDirectCallMethodDef(printer, *svc, PREFIX, svcName);
-    }
-
     printer.PrintRaw(namespaceEnd);
 }
 
@@ -52,45 +45,5 @@ void RpcGenerator::GenerateServiceCppPrologue(io::Printer &printer,
         "// source: $full_file_name$\n"
         "#include \"$file_name$.service.rpc.pb.h\"\n";
     printer.Print(vars, impl.c_str());
-}
-
-
-void RpcGenerator::ImplementZmqCallMethodDef(io::Printer &printer, const google::protobuf::ServiceDescriptor &svc,
-                                             const std::string &indent, const std::string &svcName)
-{
-    (void)svc;
-    (void)indent;
-    std::map<std::string, std::string> vars;
-    vars["svcName"] = svcName;
-    // brpc dispatches via the generated BrpcAdapter; the legacy CallMethod entry is dead
-    // under brpc-only transport. Keep the override defined (RpcServiceBase requires it)
-    // but with an empty body so generated code does not reference dead dispatch types.
-    printer.Print(vars,
-        "::datasystem::Status $svcName$::CallMethod(::datasystem::MetaPb meta,\n"
-        "                                           std::deque<::datasystem::RpcMessage> &&inMsg, int64_t seqNo) {\n"
-        "    (void)meta;\n"
-        "    (void)inMsg;\n"
-        "    (void)seqNo;\n"
-        "    return datasystem::Status::OK();\n"
-        "}\n");
-}
-
-void RpcGenerator::ImplementZmqDirectCallMethodDef(io::Printer &printer, const google::protobuf::ServiceDescriptor &svc,
-                                                   const std::string &indent, const std::string &svcName)
-{
-    (void)svc;
-    (void)indent;
-    std::map<std::string, std::string> vars;
-    vars["svcName"] = svcName;
-    printer.Print(vars,
-        "::datasystem::Status $svcName$::DirectCallMethod(::datasystem::MetaPb meta,\n"
-        "                                           std::deque<::datasystem::RpcMessage> &&inMsg, int64_t seqNo,\n"
-        "                                           std::deque<::datasystem::RpcMessage> &outMsg) {\n"
-        "    (void)meta;\n"
-        "    (void)inMsg;\n"
-        "    (void)seqNo;\n"
-        "    (void)outMsg;\n"
-        "    return datasystem::Status::OK();\n"
-        "}\n");
 }
 }  // namespace datasystem

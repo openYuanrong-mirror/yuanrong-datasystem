@@ -34,7 +34,6 @@
 namespace datasystem {
 namespace worker {
 namespace stream_cache {
-using MasterSCService_Stub = master::MasterSCService_Stub;
 /**
  * @brief The WorkerMasterSCApi is an abstract class that defines the interface for interactions with the stream cache
  * master service.

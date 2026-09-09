@@ -148,11 +148,6 @@ private:
      * @param[in] svc Pb Service Descriptor.
      * @param[in] indent Indent chars.
      */
-    static void ImplementZmqCallMethodDecl(io::Printer &printer);
-    static void ImplementZmqCallMethodDef(io::Printer &printer, const google::protobuf::ServiceDescriptor &svc,
-                                          const std::string &indent, const std::string &svcName);
-    static void ImplementZmqDirectCallMethodDef(io::Printer &printer, const google::protobuf::ServiceDescriptor &svc,
-                                                const std::string &indent, const std::string &svcName);
     static void ImplementCallMethodNoStream(io::Printer &printer, const google::protobuf::MethodDescriptor &method,
                                             int methodIndex, const std::string &indent, bool enableMsgQ = true);
     static void ImplementCallMethodClientStream(io::Printer &printer, const google::protobuf::MethodDescriptor &method,
