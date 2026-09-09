@@ -63,6 +63,7 @@
 #include "datasystem/worker/object_cache/service/worker_oc_service_crud_common_api.h"
 
 DS_DECLARE_uint32(eviction_reserve_mem_threshold_mb);
+DS_DECLARE_uint32(eviction_pretrigger_margin_mb);
 DS_DECLARE_uint32(spill_thread_num);
 DS_DECLARE_string(spill_io_mode);
 
@@ -83,6 +84,16 @@ constexpr uint32_t PRIMARY_END_LIFE_THREAD_NUM = 4;
 namespace datasystem {
 namespace object_cache {
 namespace {
+struct EvictionTriggerOptions {
+    ServiceType type;
+    CacheType cacheType;
+    bool usePretriggerWatermark;
+};
+
+bool CheckAndTriggerEviction(const std::string &keyInfo, uint64_t needSize,
+                             const std::shared_ptr<WorkerOcEvictionManager> &evictionManager,
+                             const EvictionTriggerOptions &options);
+
 EvictionCandidate MakeEvictionCandidate(EvictionPolicy policy, const EvictionList::Node &snapshot)
 {
     EvictionCandidate candidate;
@@ -387,7 +398,7 @@ Status WorkerOcEvictionManager::Init(const std::shared_ptr<ObjectGlobalRefTable<
         while (scheduleEvictionRunning_.load(std::memory_order_acquire) && !IsTermSignalReceived()) {
             auto evictInterval = 10;
             if (timer.ElapsedSecond() > evictInterval) {
-                EvictWhenMemoryExceedThrehold("", 0, shared_from_this(), ServiceType::OBJECT);
+                EvictWhenMemoryExceedPretriggerWatermark(shared_from_this());
                 EvictWhenMemoryExceedThrehold("", 0, shared_from_this(), ServiceType::STREAM);
                 timer.Reset();
             }
@@ -3186,18 +3197,19 @@ std::string WorkerOcEvictionManager::GetActionName(Action action)
     }
 }
 
-bool EvictWhenMemoryExceedThrehold(const std::string &keyInfo, uint64_t needSize,
-                                   const std::shared_ptr<WorkerOcEvictionManager> &evictionManager, ServiceType type,
-                                   CacheType cacheType)
+namespace {
+bool CheckAndTriggerEviction(const std::string &keyInfo, uint64_t needSize,
+                             const std::shared_ptr<WorkerOcEvictionManager> &evictionManager,
+                             const EvictionTriggerOptions &options)
 {
     uint64_t realMemoryUsed = 0;
     uint64_t memOccupied = 0;
     uint64_t maxAvailableMemorySize = 0;
-    memory::CacheType memCacheType = static_cast<memory::CacheType>(cacheType);
+    memory::CacheType memCacheType = static_cast<memory::CacheType>(options.cacheType);
     uint64_t memThreshold = 0;
     auto realObjMemoryUsed =
         datasystem::memory::Allocator::Instance()->GetTotalRealMemoryUsage(ServiceType::OBJECT, memCacheType);
-    auto getMemThresInitVal = [](uint64_t maxAvailableMemorySize, uint64_t evictionThresholdMB) {
+    auto getHardHighWatermark = [](uint64_t maxAvailableMemorySize, uint64_t evictionThresholdMB) {
         return std::max(static_cast<uint64_t>(maxAvailableMemorySize * GetEvictionHighWaterFactor()),
                         maxAvailableMemorySize > evictionThresholdMB * MB_TO_BYTES
                             ? maxAvailableMemorySize - evictionThresholdMB * MB_TO_BYTES
@@ -3208,31 +3220,46 @@ bool EvictWhenMemoryExceedThrehold(const std::string &keyInfo, uint64_t needSize
         // it could never be success, so skip evict.
         return false;
     }
-    if (type == ServiceType::OBJECT) {
+    if (options.type == ServiceType::OBJECT) {
         realMemoryUsed = realObjMemoryUsed;
         memOccupied = realMemoryUsed + needSize;
         maxAvailableMemorySize = std::min(
-            datasystem::memory::Allocator::Instance()->GetMaxMemorySize(type, memCacheType),
+            datasystem::memory::Allocator::Instance()->GetMaxMemorySize(options.type, memCacheType),
             (datasystem::memory::Allocator::Instance()->GetTotalRealMemoryFree(memCacheType) + realMemoryUsed));
-        memThreshold =
-            getMemThresInitVal(maxAvailableMemorySize, FLAGS_eviction_reserve_mem_threshold_mb);
-    } else if (type == ServiceType::STREAM) {
+        memThreshold = getHardHighWatermark(maxAvailableMemorySize, FLAGS_eviction_reserve_mem_threshold_mb);
+        if (options.usePretriggerWatermark && FLAGS_eviction_pretrigger_margin_mb > 0) {
+            memThreshold = GetEvictionTriggerWatermark(maxAvailableMemorySize, FLAGS_eviction_reserve_mem_threshold_mb,
+                                                       FLAGS_eviction_pretrigger_margin_mb);
+        }
+    } else if (options.type == ServiceType::STREAM) {
         realMemoryUsed =
             datasystem::memory::Allocator::Instance()->GetTotalRealMemoryUsage(ServiceType::STREAM) + realObjMemoryUsed;
         memOccupied = realMemoryUsed + needSize;
         maxAvailableMemorySize = datasystem::memory::Allocator::Instance()->GetMaxMemoryLimit();
-        memThreshold =
-            getMemThresInitVal(maxAvailableMemorySize, FLAGS_eviction_reserve_mem_threshold_mb);
+        memThreshold = getHardHighWatermark(maxAvailableMemorySize, FLAGS_eviction_reserve_mem_threshold_mb);
     }
     VLOG(1) << FormatString("Allocate memory for %s, size = %lu, memOccupied = %lu, memThreshold = %lu", keyInfo,
                             needSize, memOccupied, memThreshold);
     if (memOccupied >= memThreshold && realObjMemoryUsed > 0) {
         PerfPoint evictPoint(PerfKey::WORKER_EVICT_TASK);
-        evictionManager->Evict(needSize, cacheType);
+        evictionManager->Evict(needSize, options.cacheType);
         evictPoint.Record();
         return true;
     }
     return false;
+}
+}  // namespace
+
+bool EvictWhenMemoryExceedThrehold(const std::string &keyInfo, uint64_t needSize,
+                                   const std::shared_ptr<WorkerOcEvictionManager> &evictionManager, ServiceType type,
+                                   CacheType cacheType)
+{
+    return CheckAndTriggerEviction(keyInfo, needSize, evictionManager, { type, cacheType, false });
+}
+
+bool EvictWhenMemoryExceedPretriggerWatermark(const std::shared_ptr<WorkerOcEvictionManager> &evictionManager)
+{
+    return CheckAndTriggerEviction("", 0, evictionManager, { ServiceType::OBJECT, CacheType::MEMORY, true });
 }
 
 }  // namespace object_cache
