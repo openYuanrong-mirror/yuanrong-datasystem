@@ -36,6 +36,9 @@ Status MakePersistableTopology(const TopologyState &state, TopologyState &persis
             continue;
         }
         member.tokens.clear();
+        // Overrides must be recomputed together with the tokens: EncodeTopology rejects a state whose
+        // re-derived seed-0 tokens no longer match the carried-in overrides.
+        member.tokenSeedOverrides.clear();
         member.tokens.reserve(FLAGS_hash_ring_tokens_per_member);
         for (uint32_t index = 0; index < FLAGS_hash_ring_tokens_per_member; ++index) {
             bool allocated = false;
@@ -43,6 +46,9 @@ Status MakePersistableTopology(const TopologyState &state, TopologyState &persis
                 const auto token = HashAlgorithm::MakeToken(member.identity.address, index, seed);
                 if (occupied.emplace(token).second) {
                     member.tokens.emplace_back(token);
+                    if (seed > 0) {
+                        member.tokenSeedOverrides.emplace_back(TokenSeedOverride{ index, seed });
+                    }
                     allocated = true;
                     break;
                 }

@@ -7,6 +7,7 @@
  * Description: Built-in cluster hash routing and planning algorithm tests.
  */
 #include "datasystem/cluster/algorithm/hash_algorithm.h"
+#include "datasystem/cluster/algorithm/token_placement.h"
 
 #include <array>
 #include <chrono>
@@ -15,6 +16,7 @@
 #include <map>
 #include <set>
 #include <tuple>
+#include <unordered_set>
 
 #include "gtest/gtest.h"
 #include "ut/common.h"
@@ -25,8 +27,10 @@ namespace {
 constexpr uint32_t LARGE_ORDINARY_BATCH_SIZE = 2'500;
 constexpr uint32_t LARGE_BATCH_PORT_BASE = 30'000;
 constexpr uint64_t HASH_RING_SIZE = uint64_t{ 1 } << 32;
-constexpr std::array<uint32_t, 6> DISTRIBUTION_TOKEN_COUNTS{ 4, 8, 16, 32, 64, 128 };
-constexpr std::array<uint32_t, 5> DISTRIBUTION_MEMBER_COUNTS{ 8, 32, 128, 512, 2'048 };
+// Balanced placement evaluates BALANCED_PLACEMENT_SEED_CANDIDATES seeds per token, so the matrix stays
+// small enough for a default test; balance quality at 128 tokens is covered by token_placement_test.
+constexpr std::array<uint32_t, 4> DISTRIBUTION_TOKEN_COUNTS{ 4, 8, 16, 32 };
+constexpr std::array<uint32_t, 3> DISTRIBUTION_MEMBER_COUNTS{ 8, 32, 128 };
 
 MemberIdentity MakeIndexedIdentity(uint32_t index, uint32_t portBase)
 {
@@ -91,12 +95,20 @@ TEST(HashAlgorithmTest, BootstrapAllocatesFourUniqueDeterministicTokensPerMember
     for (const auto &member : first.next.members) {
         EXPECT_EQ(member.tokens.size(), 4);
         tokens.insert(member.tokens.begin(), member.tokens.end());
-        for (uint32_t index = 0; index < member.tokens.size(); ++index) {
-            EXPECT_EQ(member.tokens[index], HashAlgorithm::MakeToken(member.identity.address, index, 0));
-        }
     }
     EXPECT_EQ(tokens.size(), 8);
-    EXPECT_EQ(first.next.members[0].tokens, second.next.members[0].tokens);
+    // Only the first (address-ordered) bootstrap member keeps pure hash derivation; later members are
+    // balanced against the accumulated ring, so their tokens need not be seed-zero derivations.
+    const auto &firstMember = first.next.members.front();
+    EXPECT_EQ(firstMember.identity.address, "127.0.0.1:1");
+    for (uint32_t index = 0; index < firstMember.tokens.size(); ++index) {
+        EXPECT_EQ(firstMember.tokens[index], HashAlgorithm::MakeToken(firstMember.identity.address, index, 0));
+    }
+    for (size_t memberIndex = 0; memberIndex < first.next.members.size(); ++memberIndex) {
+        EXPECT_EQ(first.next.members[memberIndex].tokens, second.next.members[memberIndex].tokens);
+        EXPECT_EQ(first.next.members[memberIndex].tokenSeedOverrides,
+                  second.next.members[memberIndex].tokenSeedOverrides);
+    }
 }
 
 TEST(HashAlgorithmTest, TokenDerivationMatchesSchemaTwoGoldenValues)
@@ -207,13 +219,112 @@ TEST(HashAlgorithmTest, PlansMultiMemberScaleOutAsOneDeterministicOwnerChangeSet
     ASSERT_EQ(first.next.members.size(), 3);
     EXPECT_FALSE(first.ownerChanges.empty());
     EXPECT_EQ(first.ownerChanges.size(), second.ownerChanges.size());
-    EXPECT_EQ(first.next.members[1].tokens, second.next.members[1].tokens);
+    std::set<uint32_t> existingTokens(input.current.members.front().tokens.begin(),
+                                      input.current.members.front().tokens.end());
     for (size_t memberIndex = 1; memberIndex < first.next.members.size(); ++memberIndex) {
         const auto &member = first.next.members[memberIndex];
-        for (uint32_t tokenIndex = 0; tokenIndex < member.tokens.size(); ++tokenIndex) {
-            EXPECT_EQ(member.tokens[tokenIndex], HashAlgorithm::MakeToken(member.identity.address, tokenIndex, 0));
+        EXPECT_EQ(member.tokens, second.next.members[memberIndex].tokens);
+        EXPECT_EQ(member.tokenSeedOverrides, second.next.members[memberIndex].tokenSeedOverrides);
+        for (uint32_t token : member.tokens) {
+            // Balanced placement must not touch existing ring tokens and must stay collision-free.
+            EXPECT_EQ(existingTokens.count(token), 0);
+            EXPECT_TRUE(existingTokens.insert(token).second);
         }
     }
+}
+
+TEST(HashAlgorithmTest, RetainedJoiningMemberIsNotDoubleCountedInRangeDecision)
+{
+    // owners already contain the retained joiner's tokens; only the single new member adds tokens,
+    // so the plan stays at the 8000-token boundary and must not degrade to pure hash derivation.
+    constexpr uint32_t boundaryTokens = BALANCED_PLACEMENT_MAX_RING_TOKENS / 4 - 1;
+    HashAlgorithm algorithm;
+    ScaleOutPlanInput input;
+    input.tokensPerMember = 4;
+    input.current.clusterHasInit = true;
+    input.current.version = 1;
+    input.current.members.reserve(boundaryTokens);
+    const std::string retainedAddress = "10.0.0.1:9";
+    std::unordered_set<uint32_t> retainedTokens;
+    for (uint32_t index = 0; index < boundaryTokens; ++index) {
+        const auto address = index == 0 ? retainedAddress : "10.0.0.2:" + std::to_string(index);
+        std::string id = std::to_string(index);
+        id.resize(16, 'x');
+        auto &member = input.current.members.emplace_back();
+        member.identity = { std::move(id), address };
+        member.state = index == 0 ? MemberState::JOINING : MemberState::ACTIVE;
+        for (uint32_t token = 0; token < 4; ++token) {
+            const uint32_t ringPoint = index * 4 + token;
+            member.tokens.push_back(ringPoint);
+            retainedTokens.insert(ringPoint);
+        }
+    }
+    ASSERT_EQ(input.current.members.size(), boundaryTokens);
+    const std::string newAddress = "10.0.0.3:1";
+    input.joining = { input.current.members.front().identity, { std::string(16, 'z'), newAddress } };
+    TopologyPlan plan;
+    DS_ASSERT_OK(algorithm.PlanScaleOut(input, plan));
+    const auto newMember = std::find_if(plan.next.members.begin(), plan.next.members.end(),
+                                        [&](const auto &member) { return member.identity.address == newAddress; });
+    ASSERT_NE(newMember, plan.next.members.end());
+    bool pureHashDerived = !newMember->tokenSeedOverrides.empty();
+    for (uint32_t index = 0; index < newMember->tokens.size(); ++index) {
+        pureHashDerived = pureHashDerived
+                          && newMember->tokens[index] == HashAlgorithm::MakeToken(newAddress, index, 0);
+    }
+    EXPECT_FALSE(pureHashDerived);
+    for (uint32_t token : newMember->tokens) {
+        EXPECT_EQ(retainedTokens.count(token), 0);
+    }
+}
+
+TEST(HashAlgorithmTest, PlanScaleOutBalancesOverMultiMemberCurrentTopology)
+{
+    // Regression guard: placement owners must use dense member ordinals. Deriving them from cumulative
+    // token count inflates the ring's member count and collapses scale-out balance (bench 16x).
+    HashAlgorithm algorithm;
+    constexpr uint32_t tokensPerMember = 128;
+    constexpr size_t currentMembers = 10;
+    constexpr size_t joiningMembers = 3;
+    ScaleOutPlanInput input;
+    input.tokensPerMember = tokensPerMember;
+    input.current.clusterHasInit = true;
+    input.current.version = 1;
+    for (size_t index = 0; index < currentMembers; ++index) {
+        const auto address = "127.0.0.1:" + std::to_string(1000 + index);
+        std::string id = std::to_string(index);
+        id.resize(16, 'x');
+        auto &member = input.current.members.emplace_back();
+        member.identity = { std::move(id), address };
+        member.state = MemberState::ACTIVE;
+        for (uint32_t token = 0; token < tokensPerMember; ++token) {
+            member.tokens.push_back(HashAlgorithm::MakeToken(address, token, 0));
+        }
+    }
+    for (size_t index = 0; index < joiningMembers; ++index) {
+        std::string id = "join" + std::to_string(index);
+        id.resize(16, 'x');
+        input.joining.push_back({ std::move(id), "127.0.0.1:" + std::to_string(2000 + index) });
+    }
+    TopologyPlan plan;
+    DS_ASSERT_OK(algorithm.PlanScaleOut(input, plan));
+    ASSERT_EQ(plan.next.members.size(), currentMembers + joiningMembers);
+    std::map<uint32_t, size_t> ring;
+    for (size_t index = 0; index < plan.next.members.size(); ++index) {
+        for (uint32_t token : plan.next.members[index].tokens) {
+            ring.emplace(token, index);
+        }
+    }
+    std::vector<uint64_t> shares(plan.next.members.size(), 0);
+    for (auto iter = ring.begin(); iter != ring.end(); ++iter) {
+        auto prev = iter == ring.begin() ? std::prev(ring.end()) : std::prev(iter);
+        const uint64_t iterLin =
+            static_cast<uint64_t>(iter->first) + (iter->first <= prev->first ? (uint64_t{ 1 } << 32) : 0);
+        shares[iter->second] += iterLin - prev->first;
+    }
+    const auto [minShare, maxShare] = std::minmax_element(shares.begin(), shares.end());
+    EXPECT_GT(*minShare, 0);
+    EXPECT_LE(static_cast<double>(*maxShare) / static_cast<double>(*minShare), 1.1);
 }
 
 TEST(HashAlgorithmTest, PlansScaleInAndFailureWithoutChangingCurrentCommittedTokens)

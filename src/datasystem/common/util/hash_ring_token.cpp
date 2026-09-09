@@ -71,4 +71,27 @@ void MakeHashRingTokens(const std::string &address, const std::vector<uint32_t> 
     tokens = std::move(rebuilt);
 }
 
+void MakeHashRingTokenCandidates(const std::string &address, uint32_t index, uint32_t candidateSeeds,
+                                 std::vector<uint32_t> &tokens)
+{
+    std::string input;
+    InitializeTokenBuffer(address, input);
+    auto *const begin = input.data();
+    auto *const end = begin + input.size();
+    auto *const indexEnd = std::to_chars(begin + address.size() + 1, end, index).ptr;
+    const size_t indexSize = static_cast<size_t>(indexEnd - begin);
+    std::vector<uint32_t> derived;
+    derived.reserve(candidateSeeds);
+    derived.emplace_back(
+        MurmurHash3_32(reinterpret_cast<const uint8_t *>(begin), indexSize));
+    for (uint32_t seed = 1; seed < candidateSeeds; ++seed) {
+        auto *next = indexEnd;
+        *next++ = TOKEN_SEPARATOR;
+        next = std::to_chars(next, end, seed).ptr;
+        derived.emplace_back(
+            MurmurHash3_32(reinterpret_cast<const uint8_t *>(begin), static_cast<size_t>(next - begin)));
+    }
+    tokens = std::move(derived);
+}
+
 }  // namespace datasystem

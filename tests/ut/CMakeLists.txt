@@ -110,6 +110,7 @@ list(FILTER DS_TEST_UT_SRCS EXCLUDE REGEX .*/cluster/topology_reader_test\\.cpp$
 list(FILTER DS_TEST_UT_SRCS EXCLUDE REGEX .*/cluster/topology_observer_test\\.cpp$)
 list(FILTER DS_TEST_UT_SRCS EXCLUDE REGEX .*/cluster/coordination_event_dispatcher_test\\.cpp$)
 list(FILTER DS_TEST_UT_SRCS EXCLUDE REGEX .*/cluster/hash_algorithm_test\\.cpp$)
+list(FILTER DS_TEST_UT_SRCS EXCLUDE REGEX .*/cluster/algorithm/token_placement_test\\.cpp$)
 list(FILTER DS_TEST_UT_SRCS EXCLUDE REGEX .*/cluster/placement_facade_test\\.cpp$)
 list(FILTER DS_TEST_UT_SRCS EXCLUDE REGEX .*/cluster/topology_plan_builder_test\\.cpp$)
 list(FILTER DS_TEST_UT_SRCS EXCLUDE REGEX .*/cluster/topology_failure_classifier_test\\.cpp$)
@@ -298,6 +299,7 @@ add_executable(cluster_topology_contract_ut
         cluster/topology_observer_test.cpp
         cluster/coordination_event_dispatcher_test.cpp
         cluster/hash_algorithm_test.cpp
+        cluster/algorithm/token_placement_test.cpp
         cluster/placement_facade_test.cpp
         cluster/topology_plan_builder_test.cpp
         cluster/topology_failure_classifier_test.cpp
