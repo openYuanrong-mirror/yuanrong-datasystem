@@ -56,14 +56,6 @@ Status StaticCoordinatorDiscovery::GetCoordinators(std::vector<std::string> &ser
     return Status::OK();
 }
 
-Status StaticCoordinatorDiscovery::GetCoordinators(std::chrono::steady_clock::time_point deadline,
-                                                   std::vector<std::string> &serviceList)
-{
-    CHECK_FAIL_RETURN_STATUS(std::chrono::steady_clock::now() < deadline, K_RPC_DEADLINE_EXCEEDED,
-                             "Coordinator discovery deadline exceeded");
-    return GetCoordinators(serviceList);
-}
-
 size_t StaticCoordinatorDiscovery::GetCount() const
 {
     return addresses_.size();

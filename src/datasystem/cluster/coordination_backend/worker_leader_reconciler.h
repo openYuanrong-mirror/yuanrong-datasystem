@@ -21,7 +21,6 @@
 
 #include "datasystem/cluster/coordination_backend/ds_coordination_backend.h"
 #include "datasystem/cluster/coordination_backend/topology_recovery_reporter.h"
-#include "datasystem/common/coordinator/coordinator_leader_router.h"
 #include "datasystem/common/coordinator/coordinator_service_proxy.h"
 #include "datasystem/common/util/thread_pool.h"
 
@@ -35,6 +34,8 @@ public:
     WorkerLeaderReconciler(ICoordinatorServiceProxy &proxy, DsCoordinationBackend &backend,
                            TopologyRecoveryReporter &reporter, std::string clusterName);
     ~WorkerLeaderReconciler();
+
+    Status Init();
 
     // Router callbacks use this non-blocking entry point; Ensure is always done by ensurePool_.
     void OnLeaderChanged(const CoordinatorLeaderIdentity &identity);
@@ -78,6 +79,7 @@ private:
     static bool SameIdentity(const CoordinatorLeaderIdentity &left, const CoordinatorLeaderIdentity &right);
 
     ICoordinatorServiceProxy &proxy_;
+    CoordinatorLeaderRouter *router_{ nullptr };
     DsCoordinationBackend &backend_;
     TopologyRecoveryReporter &reporter_;
     const std::string clusterName_;
@@ -89,7 +91,6 @@ private:
     bool forceEnsurePending_{ false };  // Protected by mutex_; coalesces explicit membership-loss signals.
     bool completeRejoinPending_{ false };
     bool ensureScheduled_{ false };
-    std::unique_ptr<ICoordinatorLeaderRouteProvider::Subscription> subscription_;
     std::unique_ptr<ThreadPool> ensurePool_;  // Access and ownership transfer are protected by mutex_.
     std::atomic<bool> stopping_{ false };
 };

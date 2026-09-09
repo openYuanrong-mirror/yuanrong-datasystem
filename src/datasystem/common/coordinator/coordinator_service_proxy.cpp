@@ -21,6 +21,8 @@
 #include <thread>
 #include <utility>
 
+#include "datasystem/common/log/logging.h"
+#include "datasystem/common/rpc/bthread_utils.h"
 #include "datasystem/common/rpc/rpc_options.h"
 #include "datasystem/common/rpc/rpc_stub_cache_mgr.h"
 #include "datasystem/common/util/random_data.h"
@@ -34,6 +36,8 @@ namespace {
 constexpr int MAX_CAS_RETRY_TIMES = 16;
 constexpr uint32_t CAS_MAX_SLEEP_TIME_US = 200000;
 constexpr uint64_t COORDINATOR_PROXY_RPC_STUB_CACHE_SIZE = 100;
+constexpr uint32_t LEADER_CALLBACK_FAILURE_LOG_EVERY_N = 100;
+constexpr auto COORDINATOR_ROUTE_RETRY_INTERVAL = std::chrono::milliseconds(50);
 
 Status CheckCoordinatorAddress(const HostPort &coordinatorAddr)
 {
@@ -88,7 +92,33 @@ Status IdentityChangedStatus()
 {
     return Status(StatusCode::K_TRY_AGAIN, "CoordinatorId changed; retry request on the current Coordinator");
 }
+
+CoordinatorLeaderRouter::RpcResult RouteResult(Status status, const coordinator::ResponseHeader &header)
+{
+    if (header.coordinator_id().size() != UUID_SIZE) {
+        if (status.IsOk()) {
+            CoordinatorLeaderRouter::RpcResponseHeader invalid;
+            return { Status(K_INVALID, "Coordinator response contains an invalid CoordinatorId"), std::move(invalid) };
+        }
+        return { std::move(status), std::nullopt };
+    }
+
+    CoordinatorLeaderRouter::RpcResponseHeader route;
+    route.leaderAddress = header.leader_address();
+    route.coordinatorId = header.coordinator_id();
+    route.leaderTerm = header.leader_term();
+    if (header.serving_state() == coordinator::ResponseHeader::LEADER_RECOVERING) {
+        route.state = CoordinatorLeaderRouter::RpcResponseHeader::State::RECOVERING;
+    } else if (header.is_leader()) {
+        route.state = CoordinatorLeaderRouter::RpcResponseHeader::State::SERVING;
+    } else {
+        route.state = CoordinatorLeaderRouter::RpcResponseHeader::State::NOT_LEADER;
+    }
+    return { std::move(status), std::move(route) };
+}
 }  // namespace
+
+CoordinatorServiceProxyBase::~CoordinatorServiceProxyBase() = default;
 
 Status CoordinatorServiceProxyBase::Init()
 {
@@ -108,16 +138,25 @@ Status CoordinatorServiceProxyBase::Init()
     RETURN_IF_NOT_OK(discoveryStatus);
     CHECK_FAIL_RETURN_STATUS(!candidates.empty(), StatusCode::K_INVALID, "Coordinator Discovery returned no addresses");
 
-    std::vector<HostPort> initialCandidates;
+    std::vector<std::string> initialCandidates;
     for (const auto &value : candidates) {
         HostPort parsed;
         if (parsed.ParseString(value).IsOk() && !parsed.Empty()) {
-            initialCandidates.emplace_back(std::move(parsed));
+            initialCandidates.emplace_back(parsed.ToString());
         }
     }
     CHECK_FAIL_RETURN_STATUS(!initialCandidates.empty(), StatusCode::K_INVALID,
                              "Coordinator Discovery returned no valid addresses");
-    router_ = std::make_unique<CoordinatorLeaderRouter>(coordinatorDiscovery_, std::move(initialCandidates));
+    discoveryCache_ =
+        std::make_unique<CoordinatorDiscoveryCache>(coordinatorDiscovery_, std::move(initialCandidates));
+    auto *discoveryCache = discoveryCache_.get();
+    router_ = std::make_unique<CoordinatorLeaderRouter>(CoordinatorLeaderRouter::Dependencies{
+        .getCandidateSnapshot = [discoveryCache] { return discoveryCache->GetCandidateSnapshot(); },
+        .refreshCandidates = [discoveryCache] { discoveryCache->RefreshAsync(); },
+        .publishLeaderIdentity = [this](const CoordinatorLeaderIdentity &identity) { PublishLeaderIdentity(identity); },
+        .now = [] { return std::chrono::steady_clock::now(); },
+        .wait = [](std::chrono::milliseconds duration) { SleepCurrentFor(duration); },
+    });
     return Status::OK();
 }
 
@@ -181,21 +220,20 @@ Status CoordinatorServiceProxyBase::CallRawAt(const HostPort &address, RpcOption
 }
 
 template <typename ReqT, typename RspT, typename CallT>
-Status CoordinatorServiceProxyBase::CallRaw(RpcOptions &, const ReqT &req, RspT &rsp, CallT call, bool recoveryControl)
+Status CoordinatorServiceProxyBase::CallRaw(RpcOptions &options, const ReqT &req, RspT &rsp, CallT call,
+                                            bool recoveryControl)
 {
     CHECK_FAIL_RETURN_STATUS(router_ != nullptr, K_NOT_READY, "Coordinator leader router is not initialized");
+    const auto timeout = std::chrono::milliseconds(options.GetTimeout());
     return router_->Execute(
-        [this, &req, &rsp, &call](const HostPort &address, int32_t timeoutMs, coordinator::ResponseHeader &header,
-                                  bool &hasHeader) {
+        [this, &req, &rsp, &call](const HostPort &address, std::chrono::milliseconds attemptTimeout) {
             rsp.Clear();
             RpcOptions attemptOptions;
-            attemptOptions.SetTimeout(timeoutMs);
+            attemptOptions.SetTimeout(static_cast<int>(attemptTimeout.count()));
             auto status = CallRawAt(address, attemptOptions, req, rsp, call);
-            header = rsp.header();
-            hasHeader = header.coordinator_id().size() == UUID_SIZE;
-            return status;
+            return RouteResult(std::move(status), rsp.header());
         },
-        recoveryControl);
+        std::chrono::steady_clock::now() + timeout, timeout, COORDINATOR_ROUTE_RETRY_INTERVAL, recoveryControl);
 }
 
 CoordinatorServiceProxyBase::InFlightScope CoordinatorServiceProxyBase::BeginRpc(int32_t timeoutMs)
@@ -273,24 +311,23 @@ Status CoordinatorServiceProxyBase::ConfirmResponseIdentity(const std::string &r
 Status CoordinatorServiceProxyBase::ProbeCoordinatorId(int32_t timeoutMs, std::string &coordinatorId,
                                                        bool allowLeaderRecovering)
 {
-    // Router owns the fixed logical RPC deadline, including identity probes.
-    static_cast<void>(timeoutMs);
     coordinator::GetCoordinatorIdReqPb req;
     coordinator::GetCoordinatorIdRspPb rsp;
     CHECK_FAIL_RETURN_STATUS(router_ != nullptr, K_NOT_READY, "Coordinator leader router is not initialized");
-    RETURN_IF_NOT_OK(router_->Execute([this, &req, &rsp](const HostPort &address, int32_t remainingMs,
-                                                         coordinator::ResponseHeader &header, bool &hasHeader) {
-        rsp.Clear();
-        RpcOptions options;
-        options.SetTimeout(remainingMs);
-        const auto status =
-            CallRawAt(address, options, req, rsp, [](auto &stub, auto &opts, const auto &request, auto &response) {
-                return stub.GetCoordinatorId(opts, request, response);
-            });
-        header = rsp.header();
-        hasHeader = header.coordinator_id().size() == UUID_SIZE;
-        return status;
-    }, allowLeaderRecovering));
+    const auto timeout = std::chrono::milliseconds(timeoutMs);
+    RETURN_IF_NOT_OK(router_->Execute(
+        [this, &req, &rsp](const HostPort &address, std::chrono::milliseconds attemptTimeout) {
+            rsp.Clear();
+            RpcOptions options;
+            options.SetTimeout(static_cast<int>(attemptTimeout.count()));
+            auto status =
+                CallRawAt(address, options, req, rsp, [](auto &stub, auto &opts, const auto &request, auto &response) {
+                    return stub.GetCoordinatorId(opts, request, response);
+                });
+            return RouteResult(std::move(status), rsp.header());
+        },
+        std::chrono::steady_clock::now() + timeout, timeout, COORDINATOR_ROUTE_RETRY_INTERVAL,
+        allowLeaderRecovering));
     RETURN_IF_NOT_OK(CheckResponseHeader(rsp.header(), allowLeaderRecovering));
     coordinatorId = rsp.header().coordinator_id();
     return Status::OK();
@@ -569,9 +606,36 @@ Status CoordinatorServiceProxyBase::EnsureLeaderMembership(const coordinator::En
     return status;
 }
 
-ICoordinatorLeaderRouteProvider *CoordinatorServiceProxyBase::GetLeaderRouteProvider()
+Status CoordinatorServiceProxyBase::GetRouter(CoordinatorLeaderRouter *&router)
 {
-    return router_.get();
+    router = router_.get();
+    CHECK_FAIL_RETURN_STATUS(router != nullptr, K_NOT_READY, "Coordinator Leader router is not initialized");
+    return Status::OK();
+}
+
+Status CoordinatorServiceProxyBase::SetLeaderChangeHandler(
+    std::function<void(const CoordinatorLeaderIdentity &)> handler)
+{
+    std::lock_guard<std::mutex> lock(leaderCallbackMutex_);
+    leaderChangeHandler_ = std::move(handler);
+    return Status::OK();
+}
+
+void CoordinatorServiceProxyBase::PublishLeaderIdentity(const CoordinatorLeaderIdentity &identity)
+{
+    std::lock_guard<std::mutex> lock(leaderCallbackMutex_);
+    if (leaderChangeHandler_ == nullptr) {
+        return;
+    }
+    try {
+        leaderChangeHandler_(identity);
+    } catch (const std::exception &exception) {
+        LOG_EVERY_N(WARNING, LEADER_CALLBACK_FAILURE_LOG_EVERY_N)
+            << "Coordinator Leader change callback failed: " << exception.what();
+    } catch (...) {
+        LOG_EVERY_N(WARNING, LEADER_CALLBACK_FAILURE_LOG_EVERY_N)
+            << "Coordinator Leader change callback failed with an unknown exception";
+    }
 }
 
 Status CoordinatorServiceProxyBase::GetClusterRawSnapshot(const coordinator::GetClusterRawSnapshotReqPb &req,

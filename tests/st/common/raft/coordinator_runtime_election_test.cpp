@@ -37,6 +37,7 @@
 #include <unistd.h>
 
 #include <butil/at_exit.h>
+#include <gflags/gflags.h>
 #include <gtest/gtest.h>
 
 #include "cluster/test_port_allocator.h"
@@ -452,6 +453,10 @@ protected:
         savedExitFlag_ = g_exitFlag;
         g_exitFlag = 0;
 
+        ASSERT_TRUE(gflags::GetCommandLineOption("health_check_interval", &savedHealthCheckInterval_));
+        // BRPC's default 3-second socket probes do not fit the accelerated Raft restart budget.
+        ASSERT_FALSE(gflags::SetCommandLineOption("health_check_interval", "1").empty());
+
         rootDir_ = testCasePath_ + "/coordinator-runtime-election";
         std::error_code error;
         std::filesystem::remove_all(rootDir_, error);
@@ -475,6 +480,10 @@ protected:
             endpoints_[index] = std::string(kLoopbackIp) + ":" + std::to_string(portLeases_[index].Port());
             dataRoots_[index] = rootDir_ + "/raft-data-" + std::to_string(index);
         }
+        ASSERT_NE(CreateBusinessChannel(0, std::chrono::steady_clock::now() + kCaseBudget), nullptr);
+        ASSERT_TRUE(gflags::GetCommandLineOption("circuit_breaker_max_isolation_duration_ms", &savedSocketIsolationMs_));
+        // Socket failure isolation also applies with channel circuit breaking disabled.
+        ASSERT_FALSE(gflags::SetCommandLineOption("circuit_breaker_max_isolation_duration_ms", "200").empty());
     }
 
     void TearDown() override
@@ -527,6 +536,14 @@ protected:
         discovery_.reset();
         TestPortAllocator::Instance().ReleaseAll();
         g_exitFlag = savedExitFlag_;
+        if (!savedHealthCheckInterval_.empty()) {
+            EXPECT_FALSE(
+                gflags::SetCommandLineOption("health_check_interval", savedHealthCheckInterval_.c_str()).empty());
+        }
+        if (!savedSocketIsolationMs_.empty()) {
+            EXPECT_FALSE(gflags::SetCommandLineOption("circuit_breaker_max_isolation_duration_ms",
+                                                      savedSocketIsolationMs_.c_str()).empty());
+        }
         if (!testCasePath_.empty()) {
             std::error_code error;
             std::filesystem::remove_all(testCasePath_, error);
@@ -1020,6 +1037,8 @@ protected:
 private:
     bool savedUseBrpc_{ false };
     sig_atomic_t savedExitFlag_{ 0 };
+    std::string savedHealthCheckInterval_;
+    std::string savedSocketIsolationMs_;
 };
 
 TEST_F(CoordinatorRuntimeElectionTest, OneOfThreeCandidateWaitsWithoutSynchronousStartupFailure)

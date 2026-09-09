@@ -11,10 +11,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <chrono>
+#include <condition_variable>
+#include <future>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -48,7 +53,7 @@ struct DiscoveryReply {
     std::string exceptionMessage;
 };
 
-class ScriptedCoordinatorDiscovery final : public IDeadlineAwareCoordinatorDiscovery {
+class ScriptedCoordinatorDiscovery final : public ICoordinatorDiscovery {
 public:
     explicit ScriptedCoordinatorDiscovery(std::vector<DiscoveryReply> replies) : replies_(std::move(replies))
     {
@@ -67,11 +72,6 @@ public:
         }
         serviceList = reply.coordinators;
         return reply.status;
-    }
-
-    Status GetCoordinators(std::chrono::steady_clock::time_point, std::vector<std::string> &serviceList) override
-    {
-        return GetCoordinators(serviceList);
     }
 
     size_t GetCallCount() const
@@ -192,6 +192,56 @@ TEST(CoordinatorServiceProxyTest, SuccessfulInitIsIdempotent)
     DS_ASSERT_OK(proxy.Init());
 
     EXPECT_EQ(discovery->GetCallCount(), 1UL);
+}
+
+TEST(CoordinatorServiceProxyTest, GetRouterRequiresSuccessfulInit)
+{
+    auto discovery = MakeDiscovery(Status::OK(), { ADDRESS_A });
+    CoordinatorServiceProxyBrpcImpl proxy(discovery);
+    CoordinatorLeaderRouter *router = nullptr;
+
+    EXPECT_EQ(proxy.GetRouter(router).GetCode(), K_NOT_READY);
+    EXPECT_EQ(router, nullptr);
+
+    DS_ASSERT_OK(proxy.Init());
+    DS_ASSERT_OK(proxy.GetRouter(router));
+    EXPECT_NE(router, nullptr);
+}
+
+TEST(CoordinatorServiceProxyTest, ClearingLeaderChangeHandlerWaitsForInflightCallback)
+{
+    auto discovery = MakeDiscovery(Status::OK(), { ADDRESS_A });
+    CoordinatorServiceProxyBrpcImpl proxy(discovery);
+    DS_ASSERT_OK(proxy.Init());
+    std::mutex gateMutex;
+    std::condition_variable gateCv;
+    bool entered = false;
+    bool resume = false;
+    DS_ASSERT_OK(proxy.SetLeaderChangeHandler([&](const CoordinatorLeaderIdentity &) {
+        std::unique_lock<std::mutex> lock(gateMutex);
+        entered = true;
+        gateCv.notify_all();
+        gateCv.wait(lock, [&resume] { return resume; });
+    }));
+    auto publisher = std::async(std::launch::async, [&proxy] {
+        proxy.PublishLeaderIdentity(CoordinatorLeaderIdentity{ HostPort(), "", 0, 0 });
+    });
+    {
+        std::unique_lock<std::mutex> lock(gateMutex);
+        ASSERT_TRUE(gateCv.wait_for(lock, std::chrono::seconds(2), [&entered] { return entered; }));
+    }
+
+    auto clear = std::async(std::launch::async, [&proxy] { return proxy.SetLeaderChangeHandler({}); });
+    EXPECT_EQ(clear.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
+    {
+        std::lock_guard<std::mutex> lock(gateMutex);
+        resume = true;
+    }
+    gateCv.notify_all();
+
+    publisher.get();
+    ASSERT_EQ(clear.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    EXPECT_TRUE(clear.get().IsOk());
 }
 
 TEST(CoordinatorServiceProxyTest, FailedInitCanRetryDiscovery)

@@ -48,7 +48,7 @@ ds_cc_library(
     deps = [
         ":coordination_backend",
         ":topology_recovery_reporter",
-        "//src/datasystem/common/coordinator:coordinator_leader_router",
+        "//src/datasystem/common/coordinator:coordinator_store",
         "//src/datasystem/common/log:common_log",
         "//src/datasystem/common/util:common_util",
         "//src/datasystem/common/util:status_helper",

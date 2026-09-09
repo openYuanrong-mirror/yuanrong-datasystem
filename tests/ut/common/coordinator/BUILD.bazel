@@ -16,7 +16,14 @@ ds_cc_test(
     srcs = ["coordinator_leader_router_test.cpp"],
     deps = [
         "//src/datasystem/common/coordinator:coordinator_leader_router",
-        "//tests/ut:ut_common",
+    ],
+)
+
+ds_cc_test(
+    name = "coordinator_discovery_cache_test",
+    srcs = ["coordinator_discovery_cache_test.cpp"],
+    deps = [
+        "//src/datasystem/common/coordinator:coordinator_discovery_cache",
     ],
 )
 

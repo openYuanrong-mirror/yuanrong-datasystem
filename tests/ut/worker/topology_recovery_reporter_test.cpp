@@ -256,7 +256,7 @@ TopologyRecoveryReporter::SnapshotProvider NoSnapshot()
 void OpenReportGates(TopologyRecoveryReporter &reporter, const std::string &coordinatorId)
 {
     reporter.NotifyRuntimeReady();
-    reporter.NotifyMembershipReady(CoordinatorLeaderIdentity{ HostPort(), coordinatorId, 0, 1, true });
+    reporter.NotifyMembershipReady(CoordinatorLeaderIdentity{ HostPort(), coordinatorId, 0, 1 });
 }
 
 bool TriggerNextMembershipRound(TopologyRecoveryReporter &reporter, FakeCoordinatorServiceProxy &proxy,
@@ -264,7 +264,7 @@ bool TriggerNextMembershipRound(TopologyRecoveryReporter &reporter, FakeCoordina
 {
     const auto deadline = std::chrono::steady_clock::now() + ASYNC_TIMEOUT;
     while (std::chrono::steady_clock::now() < deadline) {
-        reporter.NotifyMembershipReady(CoordinatorLeaderIdentity{ HostPort(), coordinatorId, 0, 1, true });
+        reporter.NotifyMembershipReady(CoordinatorLeaderIdentity{ HostPort(), coordinatorId, 0, 1 });
         if (proxy.WaitForStarted(expectedCalls, SIGNAL_RETRY_INTERVAL)) {
             return true;
         }
@@ -389,14 +389,14 @@ TEST(TopologyRecoveryReporterTest, RequiresMembershipAndRuntimeReadiness)
 
     reporter.NotifyRuntimeReady();
     EXPECT_EQ(proxy.StartedCount(), 0UL);
-    reporter.NotifyMembershipReady(CoordinatorLeaderIdentity{ HostPort(), COORDINATOR_A, 0, 1, true });
+    reporter.NotifyMembershipReady(CoordinatorLeaderIdentity{ HostPort(), COORDINATOR_A, 0, 1 });
     ASSERT_TRUE(proxy.WaitForReturned(1));
 
     FakeCoordinatorServiceProxy secondProxy;
     secondProxy.PushAction(Accepted(coordinator::COORDINATOR_READY));
     TopologyRecoveryReporter secondReporter(secondProxy, CLUSTER_NAME, REPORTER_ADDRESS, NoSnapshot(),
                                             DefaultOptions());
-    secondReporter.NotifyMembershipReady(CoordinatorLeaderIdentity{ HostPort(), COORDINATOR_A, 0, 1, true });
+    secondReporter.NotifyMembershipReady(CoordinatorLeaderIdentity{ HostPort(), COORDINATOR_A, 0, 1 });
     EXPECT_EQ(secondProxy.StartedCount(), 0UL);
     secondReporter.NotifyRuntimeReady();
     EXPECT_TRUE(secondProxy.WaitForReturned(1));
@@ -413,7 +413,7 @@ TEST(TopologyRecoveryReporterTest, CoordinatorIdSwitchDiscardsOldRoundCompletion
 
     OpenReportGates(reporter, COORDINATOR_A);
     ASSERT_TRUE(proxy.WaitUntilBlocked());
-    reporter.NotifyMembershipReady(CoordinatorLeaderIdentity{ HostPort(), COORDINATOR_B, 0, 1, true });
+    reporter.NotifyMembershipReady(CoordinatorLeaderIdentity{ HostPort(), COORDINATOR_B, 0, 1 });
     proxy.ReleaseBlockedCall();
 
     ASSERT_TRUE(proxy.WaitForReturned(2));
@@ -429,9 +429,9 @@ TEST(TopologyRecoveryReporterTest, TermOrRouteEpochChangeStartsANewRoundForTheSa
     TopologyRecoveryReporter reporter(proxy, CLUSTER_NAME, REPORTER_ADDRESS, NoSnapshot(), DefaultOptions());
 
     reporter.NotifyRuntimeReady();
-    reporter.NotifyMembershipReady(CoordinatorLeaderIdentity{ HostPort(), COORDINATOR_A, 5, 1, true });
+    reporter.NotifyMembershipReady(CoordinatorLeaderIdentity{ HostPort(), COORDINATOR_A, 5, 1 });
     ASSERT_TRUE(proxy.WaitForReturned(1));
-    reporter.NotifyMembershipReady(CoordinatorLeaderIdentity{ HostPort(), COORDINATOR_A, 6, 2, true });
+    reporter.NotifyMembershipReady(CoordinatorLeaderIdentity{ HostPort(), COORDINATOR_A, 6, 2 });
     ASSERT_TRUE(proxy.WaitForReturned(2));
 
     EXPECT_EQ(proxy.RequestAt(0).leader_term(), 5UL);
@@ -446,7 +446,7 @@ TEST(TopologyRecoveryReporterTest, ReadyCompletesCoordinatorRound)
 
     OpenReportGates(reporter, COORDINATOR_A);
     ASSERT_TRUE(proxy.WaitForReturned(1));
-    reporter.NotifyMembershipReady(CoordinatorLeaderIdentity{ HostPort(), COORDINATOR_A, 0, 1, true });
+    reporter.NotifyMembershipReady(CoordinatorLeaderIdentity{ HostPort(), COORDINATOR_A, 0, 1 });
     reporter.NotifyRuntimeReady();
 
     EXPECT_EQ(proxy.StartedCount(), 1UL);
@@ -478,7 +478,7 @@ void VerifyRetryCanBeCancelled(StatusCode retryCode)
 
     OpenReportGates(reporter, COORDINATOR_A);
     ASSERT_TRUE(proxy.WaitForReturned(1));
-    reporter.NotifyMembershipReady(CoordinatorLeaderIdentity{ HostPort(), COORDINATOR_B, 0, 1, true });
+    reporter.NotifyMembershipReady(CoordinatorLeaderIdentity{ HostPort(), COORDINATOR_B, 0, 1 });
 
     ASSERT_TRUE(proxy.WaitForReturned(2));
     EXPECT_EQ(proxy.RequestAt(1).coordinator_id(), COORDINATOR_B);

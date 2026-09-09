@@ -60,11 +60,6 @@ WorkerLeaderReconciler::WorkerLeaderReconciler(ICoordinatorServiceProxy &proxy, 
       clusterName_(std::move(clusterName)),
       ensurePool_(std::make_unique<ThreadPool>(ENSURE_POOL_SIZE, ENSURE_POOL_SIZE, "WorkerLeaderEnsure", true))
 {
-    if (auto *routes = proxy_.GetLeaderRouteProvider(); routes != nullptr) {
-        subscription_ = routes->SubscribeLeaderChanges(
-            [this](const CoordinatorLeaderIdentity &identity) { OnLeaderChanged(identity); });
-        OnLeaderChanged(routes->GetLeaderCache());
-    }
 }
 
 WorkerLeaderReconciler::~WorkerLeaderReconciler()
@@ -72,11 +67,24 @@ WorkerLeaderReconciler::~WorkerLeaderReconciler()
     Shutdown();
 }
 
+Status WorkerLeaderReconciler::Init()
+{
+    CHECK_FAIL_RETURN_STATUS(!stopping_.load(std::memory_order_acquire), K_SHUTTING_DOWN,
+                             "Worker Leader reconciler is shutting down");
+    RETURN_IF_NOT_OK(proxy_.GetRouter(router_));
+    RETURN_IF_NOT_OK(proxy_.SetLeaderChangeHandler(
+        [this](const CoordinatorLeaderIdentity &identity) { OnLeaderChanged(identity); }));
+    const auto identity = router_->GetLeaderIdentity();
+    if (identity.has_value()) {
+        OnLeaderChanged(*identity);
+    }
+    return Status::OK();
+}
+
 bool WorkerLeaderReconciler::SameIdentity(const CoordinatorLeaderIdentity &left, const CoordinatorLeaderIdentity &right)
 {
-    return left.hasLeader == right.hasLeader && left.address.ToString() == right.address.ToString()
-           && left.coordinatorId == right.coordinatorId && left.leaderTerm == right.leaderTerm
-           && left.routeEpoch == right.routeEpoch;
+    return left.address.ToString() == right.address.ToString() && left.coordinatorId == right.coordinatorId
+           && left.leaderTerm == right.leaderTerm && left.routeEpoch == right.routeEpoch;
 }
 
 bool WorkerLeaderReconciler::IsCurrentIdentityLocked(const CoordinatorLeaderIdentity &identity) const
@@ -86,7 +94,7 @@ bool WorkerLeaderReconciler::IsCurrentIdentityLocked(const CoordinatorLeaderIden
 
 void WorkerLeaderReconciler::OnLeaderChanged(const CoordinatorLeaderIdentity &identity)
 {
-    if (stopping_.load(std::memory_order_acquire) || !identity.hasLeader || identity.coordinatorId.empty()) {
+    if (stopping_.load(std::memory_order_acquire) || identity.coordinatorId.empty()) {
         return;
     }
     // InitKeepAlive owns the first normal membership Put. It synchronously calls Reconcile(true) only when
@@ -126,19 +134,19 @@ void WorkerLeaderReconciler::NotifyMembershipReady(const std::string &coordinato
     if (stopping_.load(std::memory_order_acquire) || coordinatorId.empty()) {
         return;
     }
-    const auto *routes = proxy_.GetLeaderRouteProvider();
-    if (routes == nullptr) {
+    const auto identity = router_->GetLeaderIdentity();
+    if (!identity.has_value() || identity->coordinatorId.empty()) {
         return;
     }
-    const auto identity = routes->GetLeaderCache();
-    if (!identity.hasLeader || identity.coordinatorId.empty()) {
+    if (identity->coordinatorId == coordinatorId) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            lastEnsuredIdentity_ = *identity;
+        }
+        reporter_.NotifyMembershipReady(*identity);
         return;
     }
-    if (identity.coordinatorId == coordinatorId) {
-        reporter_.NotifyMembershipReady(identity);
-        return;
-    }
-    ScheduleEnsure(identity, false, false);
+    ScheduleEnsure(*identity, false, false);
 }
 
 Status WorkerLeaderReconciler::Reconcile(bool waitForCompletion)
@@ -155,32 +163,30 @@ Status WorkerLeaderReconciler::ReconcileMembership(bool waitForCompletion, bool 
 {
     CHECK_FAIL_RETURN_STATUS(!stopping_.load(std::memory_order_acquire), K_SHUTTING_DOWN,
                              "Worker Leader reconciler is shutting down");
-    auto *routes = proxy_.GetLeaderRouteProvider();
-    CHECK_FAIL_RETURN_STATUS(routes != nullptr, K_NOT_READY, "Coordinator Leader route is unavailable");
-    auto identity = routes->GetLeaderCache();
-    CHECK_FAIL_RETURN_STATUS(identity.hasLeader && !identity.coordinatorId.empty(), K_NOT_READY,
+    auto identity = router_->GetLeaderIdentity();
+    CHECK_FAIL_RETURN_STATUS(identity.has_value() && !identity->coordinatorId.empty(), K_NOT_READY,
                              "Coordinator Leader identity is unavailable");
     if (!waitForCompletion) {
         // Keepalive proved that the membership key or its revision is stale. Queue one more Ensure even when an
         // in-flight request later publishes the same Leader identity.
-        ScheduleEnsure(identity, true, completeRejoin);
+        ScheduleEnsure(*identity, true, completeRejoin);
         return Status::OK();
     }
     Status lastStatus(K_TRY_AGAIN, "Coordinator Leader changed during synchronous membership reconciliation");
     for (size_t attempt = 0; attempt < SYNC_ENSURE_MAX_ATTEMPTS; ++attempt) {
-        identity = routes->GetLeaderCache();
-        CHECK_FAIL_RETURN_STATUS(identity.hasLeader && !identity.coordinatorId.empty(), K_NOT_READY,
+        identity = router_->GetLeaderIdentity();
+        CHECK_FAIL_RETURN_STATUS(identity.has_value() && !identity->coordinatorId.empty(), K_NOT_READY,
                                  "Coordinator Leader identity is unavailable");
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            pendingIdentity_ = identity;
+            pendingIdentity_ = *identity;
         }
-        lastStatus = ReconcileIdentity(identity, true, false);
+        lastStatus = ReconcileIdentity(*identity, true, false);
         if (lastStatus.IsOk() || lastStatus.GetCode() != K_TRY_AGAIN) {
             return lastStatus;
         }
         if (attempt + 1 < SYNC_ENSURE_MAX_ATTEMPTS) {
-            std::this_thread::sleep_for(EnsureRetryBackoff(identity, backend_.GetWatcherAddr(), attempt));
+            std::this_thread::sleep_for(EnsureRetryBackoff(*identity, backend_.GetWatcherAddr(), attempt));
         }
     }
     return lastStatus;
@@ -199,16 +205,14 @@ Status WorkerLeaderReconciler::ReconcileIdentity(const CoordinatorLeaderIdentity
             return Status::OK();
         }
     }
-    auto *routes = proxy_.GetLeaderRouteProvider();
-    CHECK_FAIL_RETURN_STATUS(routes != nullptr, K_NOT_READY, "Coordinator Leader route is unavailable");
-
     // Recreate membership in three ordered steps for a true Rejoin: close local admissions, install a fresh key, then
     // publish the returned revision. Keep the destructive cleanup bound to the pass that also publishes RESTARTING, so
     // a plain membership reconcile never runs the recreate gate.
     if (completeRejoin) {
         RETURN_IF_NOT_OK(backend_.PrepareMembershipRecreate());
-        const auto currentAfterCleanup = routes->GetLeaderCache();
-        CHECK_FAIL_RETURN_STATUS(SameIdentity(currentAfterCleanup, identity), K_TRY_AGAIN,
+        const auto currentAfterCleanup = router_->GetLeaderIdentity();
+        CHECK_FAIL_RETURN_STATUS(currentAfterCleanup.has_value() && SameIdentity(*currentAfterCleanup, identity),
+                                 K_TRY_AGAIN,
                                  "Coordinator Leader changed during membership recreate cleanup");
     }
 
@@ -218,9 +222,10 @@ Status WorkerLeaderReconciler::ReconcileIdentity(const CoordinatorLeaderIdentity
             return SendMembershipEnsure(identity, payload, revision);
         },
         completeRejoin));
-    const auto currentAfterInstall = routes->GetLeaderCache();
-    CHECK_FAIL_RETURN_STATUS(SameIdentity(currentAfterInstall, identity), K_TRY_AGAIN,
-                             "Coordinator Leader changed during membership installation");
+    const auto currentAfterInstall = router_->GetLeaderIdentity();
+    CHECK_FAIL_RETURN_STATUS(
+        currentAfterInstall.has_value() && SameIdentity(*currentAfterInstall, identity), K_TRY_AGAIN,
+        "Coordinator Leader changed during membership installation");
     if (completeRejoin) {
         HostPort localAddress;
         RETURN_IF_NOT_OK(localAddress.ParseString(backend_.GetWatcherAddr()));
@@ -249,8 +254,8 @@ Status WorkerLeaderReconciler::SendMembershipEnsure(
     request.set_ttl_ms(payload.ttlMs);
     coordinator::EnsureLeaderMembershipRspPb response;
     RETURN_IF_NOT_OK(proxy_.EnsureLeaderMembership(request, response));
-    auto *routes = proxy_.GetLeaderRouteProvider();
-    CHECK_FAIL_RETURN_STATUS(routes != nullptr && SameIdentity(routes->GetLeaderCache(), identity), K_TRY_AGAIN,
+    const auto currentIdentity = router_->GetLeaderIdentity();
+    CHECK_FAIL_RETURN_STATUS(currentIdentity.has_value() && SameIdentity(*currentIdentity, identity), K_TRY_AGAIN,
                              "Coordinator Leader changed during membership ensure");
     CHECK_FAIL_RETURN_STATUS(
         response.result() == coordinator::EnsureLeaderMembershipRspPb::ACCEPTED,
@@ -357,7 +362,9 @@ void WorkerLeaderReconciler::Shutdown()
 {
     stopping_.store(true, std::memory_order_release);
     retryCv_.notify_all();
-    subscription_.reset();
+    if (router_ != nullptr) {
+        static_cast<void>(proxy_.SetLeaderChangeHandler({}));
+    }
     std::unique_ptr<ThreadPool> ensurePool;
     {
         std::lock_guard<std::mutex> lock(mutex_);

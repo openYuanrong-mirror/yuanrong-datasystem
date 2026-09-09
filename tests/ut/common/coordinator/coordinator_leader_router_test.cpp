@@ -3,7 +3,9 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
+ *
  * http://www.apache.org/licenses/LICENSE-2.0
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -12,8 +14,10 @@
  */
 #include "datasystem/common/coordinator/coordinator_leader_router.h"
 
+#include <algorithm>
 #include <chrono>
-#include <functional>
+#include <future>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -22,458 +26,736 @@
 
 namespace datasystem {
 namespace {
-constexpr char COORDINATOR_ID[] = "0123456789abcdef";
+using Router = CoordinatorLeaderRouter;
+using State = Router::RpcResponseHeader::State;
 
-class RouterDiscovery final : public IDeadlineAwareCoordinatorDiscovery {
-public:
-    explicit RouterDiscovery(std::vector<std::string> addresses) : addresses_(std::move(addresses)) {}
+Router::RpcResult Response(State state, Status status = Status::OK(), std::string leaderAddress = {},
+                           std::string coordinatorId = "coordinator-1", uint64_t leaderTerm = 1)
+{
+    Router::RpcResponseHeader header;
+    header.state = state;
+    header.leaderAddress = std::move(leaderAddress);
+    header.coordinatorId = std::move(coordinatorId);
+    header.leaderTerm = leaderTerm;
+    return { std::move(status), std::move(header) };
+}
 
-    Status GetCoordinators(std::vector<std::string> &addresses) override
+Router::RpcResult TransportError(StatusCode code)
+{
+    return { Status(code, "injected transport error"), std::nullopt };
+}
+
+class CoordinatorLeaderRouterTest : public ::testing::Test {
+protected:
+    Router::Dependencies Dependencies()
     {
-        addresses = addresses_;
-        return Status::OK();
+        return {
+            .getCandidateSnapshot = [this] {
+                ++snapshotCalls;
+                if (snapshots.empty()) {
+                    return std::vector<std::string>{};
+                }
+                const auto index = std::min(snapshotCalls - 1, snapshots.size() - 1);
+                return snapshots[index];
+            },
+            .refreshCandidates = [this] { ++refreshCalls; },
+            .publishLeaderIdentity =
+                [this](const Router::LeaderIdentity &identity) { publishedIdentities.emplace_back(identity); },
+            .now = [this] { return now; },
+            .wait = [this](std::chrono::milliseconds duration) {
+                waits.emplace_back(duration);
+                now += duration;
+            },
+        };
     }
 
-    Status GetCoordinators(std::chrono::steady_clock::time_point, std::vector<std::string> &addresses) override
+    Router::TimePoint Deadline(std::chrono::milliseconds timeout) const
     {
-        ++deadlineAwareCalls_;
-        if (deadlineAwareStatus_.IsError()) {
-            return deadlineAwareStatus_;
-        }
-        if (deadlineAwareHook_) {
-            deadlineAwareHook_();
-        }
-        addresses = addresses_;
-        return Status::OK();
+        return now + timeout;
     }
 
-    size_t DeadlineAwareCalls() const { return deadlineAwareCalls_; }
-    void SetDeadlineAwareHook(std::function<void()> hook)
-    {
-        deadlineAwareHook_ = std::move(hook);
-    }
-    void SetAddresses(std::vector<std::string> addresses)
-    {
-        addresses_ = std::move(addresses);
-    }
-    void SetDeadlineAwareStatus(Status status)
-    {
-        deadlineAwareStatus_ = std::move(status);
-    }
-
-private:
-    std::vector<std::string> addresses_;
-    size_t deadlineAwareCalls_{ 0 };
-    Status deadlineAwareStatus_;
-    std::function<void()> deadlineAwareHook_;
+    Router::TimePoint now{};
+    std::vector<std::vector<std::string>> snapshots;
+    size_t snapshotCalls{ 0 };
+    size_t refreshCalls{ 0 };
+    std::vector<std::chrono::milliseconds> waits;
+    std::vector<Router::LeaderIdentity> publishedIdentities;
 };
 
-HostPort Address(const std::string &value)
+TEST_F(CoordinatorLeaderRouterTest, RejectsInvalidExecution)
 {
-    HostPort address;
-    EXPECT_TRUE(address.ParseString(value).IsOk());
-    return address;
+    Router router(Dependencies());
+    const auto rpc = [](const HostPort &, std::chrono::milliseconds) { return Response(State::SERVING); };
+
+    EXPECT_EQ(router.Execute({}, Deadline(std::chrono::seconds(1)), std::chrono::milliseconds(10),
+                             std::chrono::milliseconds(1))
+                  .GetCode(),
+              K_INVALID);
+    EXPECT_EQ(router.Execute(rpc, now, std::chrono::milliseconds(10), std::chrono::milliseconds(1)).GetCode(),
+              K_RPC_DEADLINE_EXCEEDED);
+    EXPECT_EQ(router.Execute(rpc, Deadline(std::chrono::seconds(1)), std::chrono::milliseconds::zero(),
+                             std::chrono::milliseconds(1))
+                  .GetCode(),
+              K_INVALID);
+    EXPECT_EQ(router.Execute(rpc, Deadline(std::chrono::seconds(1)), std::chrono::milliseconds(10),
+                             std::chrono::milliseconds::zero())
+                  .GetCode(),
+              K_INVALID);
 }
 
-coordinator::ResponseHeader LeaderHeader(uint64_t term, coordinator::ResponseHeader::ServingStatePb state)
+TEST_F(CoordinatorLeaderRouterTest, ReturnsNotReadyForEmptyCandidateSnapshot)
 {
-    coordinator::ResponseHeader header;
-    header.set_coordinator_id(COORDINATOR_ID);
-    header.set_is_leader(true);
-    header.set_leader_term(term);
-    header.set_serving_state(state);
-    return header;
-}
+    Router router(Dependencies());
 
-coordinator::ResponseHeader RecoveringLeaderHeader(uint64_t term)
-{
-    auto header = LeaderHeader(term, coordinator::ResponseHeader::LEADER_RECOVERING);
-    header.set_is_leader(false);
-    header.set_leader_address("127.0.0.1:30001");
-    return header;
-}
-
-TEST(CoordinatorLeaderRouterTest, RetriesFollowerRedirectWithinOneLogicalCall)
-{
-    auto discovery = std::make_shared<RouterDiscovery>(std::vector<std::string>{ "127.0.0.1:30001" });
-    CoordinatorLeaderRouter router(discovery, { Address("127.0.0.1:30001") });
-    std::vector<std::string> attempted;
-
-    const auto status = router.Execute([&](const HostPort &address, int32_t, coordinator::ResponseHeader &header,
-                                           bool &hasHeader) {
-        attempted.emplace_back(address.ToString());
-        hasHeader = true;
-        if (address.ToString() == "127.0.0.1:30001") {
-            header = LeaderHeader(7, coordinator::ResponseHeader::FOLLOWER_SERVING);
-            header.set_is_leader(false);
-            header.set_leader_address("127.0.0.1:30002");
-            return Status::OK();
-        }
-        header = LeaderHeader(7, coordinator::ResponseHeader::LEADER_SERVING);
-        return Status::OK();
-    });
-
-    EXPECT_TRUE(status.IsOk());
-    ASSERT_EQ(attempted.size(), 2);
-    EXPECT_EQ(attempted[1], "127.0.0.1:30002");
-    EXPECT_EQ(router.GetLeaderCache().address.ToString(), "127.0.0.1:30002");
-}
-
-TEST(CoordinatorLeaderRouterTest, PreservesFollowerRouteStatusWhenRedirectLeaderAndRemainingCandidatesAreDead)
-{
-    auto now = std::chrono::steady_clock::time_point{};
-    auto discovery =
-        std::make_shared<RouterDiscovery>(std::vector<std::string>{ "127.0.0.1:30001", "127.0.0.1:30003" });
-    CoordinatorLeaderRouter router(discovery, { Address("127.0.0.1:30001"), Address("127.0.0.1:30003") },
-                                   [&now] { return now; },
-                                   [&now](std::chrono::milliseconds) { now += std::chrono::milliseconds(3'000); },
-                                   std::chrono::milliseconds(3'000));
-    std::vector<std::string> attempted;
-
-    const auto status = router.Execute([&attempted](const HostPort &address, int32_t,
-                                                    coordinator::ResponseHeader &header, bool &hasHeader) {
-        attempted.emplace_back(address.ToString());
-        if (address.ToString() == "127.0.0.1:30001") {
-            hasHeader = true;
-            header = LeaderHeader(7, coordinator::ResponseHeader::FOLLOWER_SERVING);
-            header.set_is_leader(false);
-            header.set_leader_address("127.0.0.1:30002");
-            return Status::OK();
-        }
-        hasHeader = false;
-        return Status(K_RPC_PEER_DEAD, "injected dead Coordinator");
-    });
+    const auto status =
+        router.Execute([](const HostPort &, std::chrono::milliseconds) { return Response(State::SERVING); },
+                       Deadline(std::chrono::seconds(1)), std::chrono::milliseconds(10),
+                       std::chrono::milliseconds(1));
 
     EXPECT_EQ(status.GetCode(), K_NOT_READY);
-    EXPECT_EQ(attempted, (std::vector<std::string>{ "127.0.0.1:30001", "127.0.0.1:30002", "127.0.0.1:30003",
-                                                   "127.0.0.1:30001", "127.0.0.1:30002", "127.0.0.1:30003" }));
+    EXPECT_FALSE(router.GetLeaderIdentity().has_value());
 }
 
-TEST(CoordinatorLeaderRouterTest, PreservesCoordinatorStatusWhenDeadlineExpiresBeforeRedirectDispatch)
+TEST_F(CoordinatorLeaderRouterTest, CachesServingLeaderAndPrefersItOnTheNextCall)
 {
-    auto now = std::chrono::steady_clock::time_point{};
-    auto discovery = std::make_shared<RouterDiscovery>(std::vector<std::string>{ "127.0.0.1:30001" });
-    CoordinatorLeaderRouter router(discovery, { Address("127.0.0.1:30001") }, [&now] { return now; }, {},
-                                   std::chrono::milliseconds(3'000));
-
-    const auto status = router.Execute([&now](const HostPort &, int32_t, coordinator::ResponseHeader &header,
-                                              bool &hasHeader) {
-        hasHeader = true;
-        header = LeaderHeader(7, coordinator::ResponseHeader::FOLLOWER_SERVING);
-        header.set_is_leader(false);
-        header.set_leader_address("127.0.0.1:30002");
-        now += std::chrono::milliseconds(3'000);
-        return Status::OK();
-    });
-
-    EXPECT_EQ(status.GetCode(), K_NOT_READY);
-}
-
-TEST(CoordinatorLeaderRouterTest, PreservesCoordinatorStatusWhenDiscoveryHitsDeadline)
-{
-    auto now = std::chrono::steady_clock::time_point{};
-    auto discovery = std::make_shared<RouterDiscovery>(std::vector<std::string>{ "127.0.0.1:30001" });
-    discovery->SetDeadlineAwareStatus(Status(K_RPC_DEADLINE_EXCEEDED, "injected discovery deadline"));
-    CoordinatorLeaderRouter router(discovery, { Address("127.0.0.1:30001") }, [&now] { return now; },
-                                   [&now](std::chrono::milliseconds delay) { now += delay; });
-
-    const auto status = router.Execute([](const HostPort &, int32_t, coordinator::ResponseHeader &header,
-                                          bool &hasHeader) {
-        hasHeader = true;
-        header = LeaderHeader(7, coordinator::ResponseHeader::FOLLOWER_SERVING);
-        header.set_is_leader(false);
-        return Status::OK();
-    });
-
-    EXPECT_EQ(status.GetCode(), K_NOT_READY);
-}
-
-TEST(CoordinatorLeaderRouterTest, RecoveringLeaderRequiresRecoveryControlRequest)
-{
-    auto now = std::chrono::steady_clock::time_point{};
-    auto discovery = std::make_shared<RouterDiscovery>(std::vector<std::string>{ "127.0.0.1:30001" });
-    CoordinatorLeaderRouter router(discovery, { Address("127.0.0.1:30001") }, [&now] { return now; },
-                                   [&now](std::chrono::milliseconds) { now += std::chrono::seconds(3); });
-    const auto attempt = [](const HostPort &, int32_t, coordinator::ResponseHeader &header, bool &hasHeader) {
-        hasHeader = true;
-        header = RecoveringLeaderHeader(7);
-        return Status::OK();
+    snapshots = { { "127.0.0.1:30001" }, { "127.0.0.1:30002" } };
+    Router router(Dependencies());
+    std::vector<std::string> attempts;
+    auto rpc = [&attempts](const HostPort &address, std::chrono::milliseconds) {
+        attempts.emplace_back(address.ToString());
+        return Response(State::SERVING);
     };
 
-    EXPECT_EQ(router.Execute(attempt).GetCode(), K_NOT_READY);
-    EXPECT_TRUE(router.Execute(attempt, true).IsOk());
+    ASSERT_TRUE(router.Execute(rpc, Deadline(std::chrono::seconds(1)), std::chrono::milliseconds(10),
+                               std::chrono::milliseconds(1))
+                    .IsOk());
+    ASSERT_TRUE(router.Execute(rpc, Deadline(std::chrono::seconds(1)), std::chrono::milliseconds(10),
+                               std::chrono::milliseconds(1))
+                    .IsOk());
+
+    EXPECT_EQ(attempts, (std::vector<std::string>{ "127.0.0.1:30001", "127.0.0.1:30001" }));
+    ASSERT_TRUE(router.GetLeaderIdentity().has_value());
+    EXPECT_EQ(router.GetLeaderIdentity()->address.ToString(), "127.0.0.1:30001");
+    ASSERT_EQ(publishedIdentities.size(), 1);
+    EXPECT_EQ(publishedIdentities[0].address.ToString(), "127.0.0.1:30001");
+    EXPECT_EQ(publishedIdentities[0].coordinatorId, "coordinator-1");
+    EXPECT_EQ(publishedIdentities[0].leaderTerm, 1);
+    EXPECT_EQ(publishedIdentities[0].routeEpoch, 1);
 }
 
-TEST(CoordinatorLeaderRouterTest, RejectsLateLowerTermHeaderWithoutReplacingCache)
+TEST_F(CoordinatorLeaderRouterTest, TriesFollowerRedirectBeforeRemainingCandidates)
 {
-    auto now = std::chrono::steady_clock::time_point{};
-    auto discovery =
-        std::make_shared<RouterDiscovery>(std::vector<std::string>{ "127.0.0.1:30001", "127.0.0.1:30002" });
-    CoordinatorLeaderRouter router(discovery, { Address("127.0.0.1:30001"), Address("127.0.0.1:30002") },
-                                   [&now] { return now; },
-                                   [&now](std::chrono::milliseconds delay) { now += delay; },
-                                   std::chrono::milliseconds(3'000));
-
-    ASSERT_TRUE(router.Execute([](const HostPort &, int32_t, coordinator::ResponseHeader &header, bool &hasHeader) {
-        hasHeader = true;
-        header = LeaderHeader(9, coordinator::ResponseHeader::LEADER_SERVING);
-        return Status::OK();
-    }).IsOk());
-    const auto status = router.Execute([](const HostPort &, int32_t, coordinator::ResponseHeader &header,
-                                          bool &hasHeader) {
-        hasHeader = true;
-        header = LeaderHeader(8, coordinator::ResponseHeader::LEADER_SERVING);
-        return Status::OK();
-    });
-
-    EXPECT_EQ(status.GetCode(), K_NOT_READY);
-    EXPECT_EQ(router.GetLeaderCache().leaderTerm, 9);
-}
-
-TEST(CoordinatorLeaderRouterTest, PublishesOnlyRealLeaderIdentityChanges)
-{
-    auto discovery = std::make_shared<RouterDiscovery>(std::vector<std::string>{ "127.0.0.1:30001" });
-    CoordinatorLeaderRouter router(discovery, { Address("127.0.0.1:30001") });
-    size_t notificationCount = 0;
-    auto subscription = router.SubscribeLeaderChanges(
-        [&notificationCount](const CoordinatorLeaderIdentity &) { ++notificationCount; });
-
-    const auto attempt = [](const HostPort &, int32_t, coordinator::ResponseHeader &header, bool &hasHeader) {
-        hasHeader = true;
-        header = LeaderHeader(3, coordinator::ResponseHeader::LEADER_SERVING);
-        return Status::OK();
-    };
-    ASSERT_TRUE(router.Execute(attempt).IsOk());
-    ASSERT_TRUE(router.Execute(attempt).IsOk());
-
-    EXPECT_EQ(notificationCount, 1);
-    EXPECT_EQ(router.GetLeaderCache().routeEpoch, 1);
-}
-
-TEST(CoordinatorLeaderRouterTest, PrefersCachedLeaderBeforeDiscoveryCandidates)
-{
-    auto discovery =
-        std::make_shared<RouterDiscovery>(std::vector<std::string>{ "127.0.0.1:30001", "127.0.0.1:30002" });
-    CoordinatorLeaderRouter router(discovery, { Address("127.0.0.1:30001"), Address("127.0.0.1:30002") });
-    ASSERT_TRUE(router.Execute([](const HostPort &address, int32_t, coordinator::ResponseHeader &header,
-                                  bool &hasHeader) {
-        hasHeader = true;
-        if (address.ToString() == "127.0.0.1:30002") {
-            header = LeaderHeader(4, coordinator::ResponseHeader::LEADER_SERVING);
-            return Status::OK();
-        }
-        header = LeaderHeader(4, coordinator::ResponseHeader::FOLLOWER_SERVING);
-        header.set_is_leader(false);
-        return Status::OK();
-    }).IsOk());
-
-    std::vector<std::string> attempts;
-    ASSERT_TRUE(router.Execute([&attempts](const HostPort &address, int32_t, coordinator::ResponseHeader &header,
-                                            bool &hasHeader) {
-        attempts.emplace_back(address.ToString());
-        hasHeader = true;
-        header = LeaderHeader(4, coordinator::ResponseHeader::LEADER_SERVING);
-        return Status::OK();
-    }).IsOk());
-    ASSERT_FALSE(attempts.empty());
-    EXPECT_EQ(attempts.front(), "127.0.0.1:30002");
-}
-
-TEST(CoordinatorLeaderRouterTest, ReservesDeadlineForAlternativesWhenCachedLeaderIsDead)
-{
-    auto now = std::chrono::steady_clock::time_point{};
-    auto discovery =
-        std::make_shared<RouterDiscovery>(std::vector<std::string>{ "127.0.0.1:30001", "127.0.0.1:30002" });
-    CoordinatorLeaderRouter router(discovery, { Address("127.0.0.1:30001"), Address("127.0.0.1:30002") },
-                                   [&now] { return now; }, {}, std::chrono::milliseconds(3'000));
-    ASSERT_TRUE(router.Execute([](const HostPort &address, int32_t, coordinator::ResponseHeader &header,
-                                  bool &hasHeader) {
-        hasHeader = true;
-        header = LeaderHeader(4, address.ToString() == "127.0.0.1:30002"
-                                     ? coordinator::ResponseHeader::LEADER_SERVING
-                                     : coordinator::ResponseHeader::FOLLOWER_SERVING);
-        header.set_is_leader(address.ToString() == "127.0.0.1:30002");
-        return Status::OK();
-    }).IsOk());
-
-    std::vector<std::string> attempts;
-    const auto status = router.Execute([&](const HostPort &address, int32_t timeoutMs,
-                                          coordinator::ResponseHeader &header, bool &hasHeader) {
-        attempts.emplace_back(address.ToString());
-        if (address.ToString() == "127.0.0.1:30002") {
-            now += std::chrono::milliseconds(timeoutMs);
-            hasHeader = false;
-            return Status(K_RPC_PEER_DEAD, "injected dead cached leader");
-        }
-        hasHeader = true;
-        header = LeaderHeader(5, coordinator::ResponseHeader::LEADER_SERVING);
-        return Status::OK();
-    });
-
-    EXPECT_TRUE(status.IsOk());
-    EXPECT_EQ(attempts, (std::vector<std::string>{ "127.0.0.1:30002", "127.0.0.1:30001" }));
-    EXPECT_LT(now.time_since_epoch(), std::chrono::milliseconds(3'000));
-}
-
-TEST(CoordinatorLeaderRouterTest, UsesOneDiscoveryRefreshAfterCandidateAttemptsFail)
-{
-    auto discovery = std::make_shared<RouterDiscovery>(std::vector<std::string>{ "127.0.0.1:30002" });
-    CoordinatorLeaderRouter router(discovery, { Address("127.0.0.1:30001") });
+    snapshots = { { "127.0.0.1:30001", "127.0.0.1:30003" } };
+    Router router(Dependencies());
     std::vector<std::string> attempts;
 
-    const auto status = router.Execute([&attempts](const HostPort &address, int32_t,
-                                                   coordinator::ResponseHeader &header, bool &hasHeader) {
-        attempts.emplace_back(address.ToString());
-        hasHeader = true;
-        if (address.ToString() == "127.0.0.1:30002") {
-            header = LeaderHeader(2, coordinator::ResponseHeader::LEADER_SERVING);
-            return Status::OK();
-        }
-        header = LeaderHeader(2, coordinator::ResponseHeader::FOLLOWER_SERVING);
-        header.set_is_leader(false);
-        return Status::OK();
-    });
-
-    EXPECT_TRUE(status.IsOk());
-    EXPECT_EQ(discovery->DeadlineAwareCalls(), 1UL);
-    ASSERT_EQ(attempts.size(), 2UL);
-    EXPECT_EQ(attempts[1], "127.0.0.1:30002");
-}
-
-TEST(CoordinatorLeaderRouterTest, PreservesLastFailureWhenRefreshHasNoNewCandidate)
-{
-    auto now = std::chrono::steady_clock::time_point{};
-    auto discovery = std::make_shared<RouterDiscovery>(std::vector<std::string>{ "127.0.0.1:30001" });
-    CoordinatorLeaderRouter router(discovery, { Address("127.0.0.1:30001") }, [&now] { return now; },
-                                   [&now](std::chrono::milliseconds) { now += std::chrono::milliseconds(3'000); },
-                                   std::chrono::milliseconds(3'000));
-    size_t calls = 0;
-
-    const auto status = router.Execute([&calls](const HostPort &, int32_t, coordinator::ResponseHeader &, bool &) {
-        ++calls;
-        return Status(K_RPC_UNAVAILABLE, "injected failure");
-    });
-
-    EXPECT_EQ(status.GetCode(), K_RPC_UNAVAILABLE);
-    EXPECT_EQ(calls, 2UL);
-    EXPECT_EQ(discovery->DeadlineAwareCalls(), 1UL);
-}
-
-TEST(CoordinatorLeaderRouterTest, PreservesNotReadyWhenDiscoveryRefreshConsumesDeadline)
-{
-    auto now = std::chrono::steady_clock::time_point{};
-    auto discovery = std::make_shared<RouterDiscovery>(std::vector<std::string>{ "127.0.0.1:30001" });
-    discovery->SetDeadlineAwareHook([&now] { now += std::chrono::milliseconds(3'000); });
-    CoordinatorLeaderRouter router(
-        discovery, { Address("127.0.0.1:30001") }, [&now] { return now; }, {}, std::chrono::milliseconds(3'000));
-
-    const auto status = router.Execute([](const HostPort &, int32_t, coordinator::ResponseHeader &, bool &) {
-        return Status(K_NOT_READY, "topology bootstrap is not ready");
-    });
-
-    EXPECT_EQ(status.GetCode(), K_NOT_READY);
-    EXPECT_EQ(discovery->DeadlineAwareCalls(), 1UL);
-}
-
-TEST(CoordinatorLeaderRouterTest, RefreshesUntilDiscoveryReturnsANewLeaderBeforeDeadline)
-{
-    auto now = std::chrono::steady_clock::time_point{};
-    auto discovery = std::make_shared<RouterDiscovery>(std::vector<std::string>{ "127.0.0.1:30001" });
-    bool publishNewLeader = false;
-    CoordinatorLeaderRouter router(
-        discovery, { Address("127.0.0.1:30001") }, [&now] { return now; },
-        [&now, &discovery, &publishNewLeader](std::chrono::milliseconds delay) {
-            now += delay;
-            if (!publishNewLeader) {
-                discovery->SetAddresses({ "127.0.0.1:30002" });
-                publishNewLeader = true;
+    const auto status = router.Execute(
+        [&attempts](const HostPort &address, std::chrono::milliseconds) {
+            attempts.emplace_back(address.ToString());
+            if (address.ToString() == "127.0.0.1:30001") {
+                return Response(State::NOT_LEADER, Status(K_NOT_READY, "injected follower"), "127.0.0.1:30002");
             }
-        });
+            return Response(State::SERVING);
+        },
+        Deadline(std::chrono::seconds(1)), std::chrono::milliseconds(10), std::chrono::milliseconds(1));
+
+    EXPECT_TRUE(status.IsOk());
+    EXPECT_EQ(attempts, (std::vector<std::string>{ "127.0.0.1:30001", "127.0.0.1:30002" }));
+}
+
+TEST_F(CoordinatorLeaderRouterTest, FollowerWithoutRedirectAdvancesToNextCandidate)
+{
+    snapshots = { { "127.0.0.1:30001", "127.0.0.1:30002" } };
+    Router router(Dependencies());
     std::vector<std::string> attempts;
 
-    const auto status = router.Execute([&attempts](const HostPort &address, int32_t,
-                                                   coordinator::ResponseHeader &header, bool &hasHeader) {
-        attempts.emplace_back(address.ToString());
-        hasHeader = true;
-        if (address.ToString() == "127.0.0.1:30002") {
-            header = LeaderHeader(2, coordinator::ResponseHeader::LEADER_SERVING);
-            return Status::OK();
-        }
-        return Status(K_RPC_UNAVAILABLE, "injected failure");
-    });
+    const auto status = router.Execute(
+        [&attempts](const HostPort &address, std::chrono::milliseconds) {
+            attempts.emplace_back(address.ToString());
+            return address.ToString() == "127.0.0.1:30001"
+                       ? Response(State::NOT_LEADER, Status(K_NOT_READY, "injected follower"))
+                       : Response(State::SERVING);
+        },
+        Deadline(std::chrono::seconds(1)), std::chrono::milliseconds(10), std::chrono::milliseconds(1));
 
     EXPECT_TRUE(status.IsOk());
-    EXPECT_EQ(discovery->DeadlineAwareCalls(), 2UL);
-    ASSERT_EQ(attempts.size(), 3UL);
-    EXPECT_EQ(attempts[2], "127.0.0.1:30002");
+    EXPECT_EQ(attempts, (std::vector<std::string>{ "127.0.0.1:30001", "127.0.0.1:30002" }));
 }
 
-TEST(CoordinatorLeaderRouterTest, RetriesSameCandidateAfterDiscoveryRefresh)
+TEST_F(CoordinatorLeaderRouterTest, ReturnsServingLeaderBusinessErrorWithoutFailover)
 {
-    auto now = std::chrono::steady_clock::time_point{};
-    auto discovery = std::make_shared<RouterDiscovery>(std::vector<std::string>{ "127.0.0.1:30001" });
-    CoordinatorLeaderRouter router(discovery, { Address("127.0.0.1:30001") }, [&now] { return now; },
-                                   [&now](std::chrono::milliseconds delay) { now += delay; });
+    snapshots = { { "127.0.0.1:30001", "127.0.0.1:30002" } };
+    Router router(Dependencies());
     size_t attempts = 0;
 
-    const auto status = router.Execute([&attempts](const HostPort &, int32_t, coordinator::ResponseHeader &header,
-                                                  bool &hasHeader) {
-        ++attempts;
-        hasHeader = true;
-        header = LeaderHeader(2, attempts == 1 ? coordinator::ResponseHeader::FOLLOWER_SERVING
-                                               : coordinator::ResponseHeader::LEADER_SERVING);
-        header.set_is_leader(attempts > 1);
-        return Status::OK();
-    });
+    const auto status = router.Execute(
+        [&attempts](const HostPort &, std::chrono::milliseconds) {
+            ++attempts;
+            return Response(State::SERVING, Status(K_INVALID, "injected business error"));
+        },
+        Deadline(std::chrono::seconds(1)), std::chrono::milliseconds(10), std::chrono::milliseconds(1));
+
+    EXPECT_EQ(status.GetCode(), K_INVALID);
+    EXPECT_EQ(attempts, 1);
+}
+
+TEST_F(CoordinatorLeaderRouterTest, ReturnsUnspecifiedProtocolErrorWithoutRetry)
+{
+    snapshots = { { "127.0.0.1:30001", "127.0.0.1:30002" } };
+    Router router(Dependencies());
+    size_t attempts = 0;
+
+    const auto status = router.Execute(
+        [&attempts](const HostPort &, std::chrono::milliseconds) {
+            ++attempts;
+            return Response(State::UNSPECIFIED, Status(K_INVALID, "injected protocol error"));
+        },
+        Deadline(std::chrono::seconds(1)), std::chrono::milliseconds(10), std::chrono::milliseconds(1));
+
+    EXPECT_EQ(status.GetCode(), K_INVALID);
+    EXPECT_EQ(attempts, 1);
+    EXPECT_EQ(refreshCalls, 0);
+}
+
+TEST_F(CoordinatorLeaderRouterTest, StopsAfterOneRoundWhenAllCandidatesHaveTransportErrors)
+{
+    snapshots = { { "127.0.0.1:30001", "127.0.0.1:30002" } };
+    Router router(Dependencies());
+    size_t attempts = 0;
+
+    const auto status = router.Execute(
+        [&attempts](const HostPort &, std::chrono::milliseconds) {
+            return TransportError(++attempts == 1 ? K_RPC_DEADLINE_EXCEEDED : K_RPC_PEER_DEAD);
+        },
+        Deadline(std::chrono::seconds(1)), std::chrono::milliseconds(10), std::chrono::milliseconds(1));
+
+    EXPECT_EQ(status.GetCode(), K_RPC_PEER_DEAD);
+    EXPECT_EQ(attempts, 2);
+    EXPECT_EQ(snapshotCalls, 1);
+    EXPECT_EQ(refreshCalls, 1);
+    EXPECT_TRUE(waits.empty());
+}
+
+TEST_F(CoordinatorLeaderRouterTest, ReadsFreshSnapshotForNextRoundAfterCoordinatorResponse)
+{
+    snapshots = { { "127.0.0.1:30001" }, { "127.0.0.1:30002" } };
+    Router router(Dependencies());
+    std::vector<std::string> attempts;
+
+    const auto status = router.Execute(
+        [&attempts](const HostPort &address, std::chrono::milliseconds) {
+            attempts.emplace_back(address.ToString());
+            return address.ToString() == "127.0.0.1:30001"
+                       ? Response(State::NOT_LEADER, Status(K_NOT_READY, "injected no leader"))
+                       : Response(State::SERVING);
+        },
+        Deadline(std::chrono::seconds(1)), std::chrono::milliseconds(10), std::chrono::milliseconds(1));
 
     EXPECT_TRUE(status.IsOk());
-    EXPECT_EQ(attempts, 2UL);
-    EXPECT_EQ(discovery->DeadlineAwareCalls(), 1UL);
+    EXPECT_EQ(attempts, (std::vector<std::string>{ "127.0.0.1:30001", "127.0.0.1:30002" }));
+    EXPECT_EQ(snapshotCalls, 2);
+    EXPECT_EQ(refreshCalls, 1);
+    EXPECT_EQ(waits, (std::vector<std::chrono::milliseconds>{ std::chrono::milliseconds(1) }));
 }
 
-TEST(CoordinatorLeaderRouterTest, ReturnsNotReadyImmediatelyForBusinessRpcToRecoveringLeader)
+TEST_F(CoordinatorLeaderRouterTest, DefersRedirectCycleToTheNextRound)
 {
-    auto now = std::chrono::steady_clock::time_point{};
-    auto discovery = std::make_shared<RouterDiscovery>(std::vector<std::string>{ "127.0.0.1:30001" });
-    bool waited = false;
-    CoordinatorLeaderRouter router(discovery, { Address("127.0.0.1:30001") }, [&now] { return now; },
-                                   [&now, &waited](std::chrono::milliseconds delay) {
-                                       waited = true;
-                                       now += delay;
-                                   });
-    size_t attempts = 0;
+    snapshots = { { "127.0.0.1:30001", "127.0.0.1:30002" } };
+    Router router(Dependencies());
+    std::vector<std::string> attempts;
 
-    const auto status = router.Execute([&attempts](const HostPort &, int32_t, coordinator::ResponseHeader &header,
-                                           bool &hasHeader) {
-        ++attempts;
-        hasHeader = true;
-        header = RecoveringLeaderHeader(7);
-        return Status::OK();
-    });
+    const auto status = router.Execute(
+        [&attempts](const HostPort &address, std::chrono::milliseconds) {
+            attempts.emplace_back(address.ToString());
+            if (attempts.size() == 3) {
+                return Response(State::SERVING);
+            }
+            const auto redirect =
+                address.ToString() == "127.0.0.1:30001" ? "127.0.0.1:30002" : "127.0.0.1:30001";
+            return Response(State::NOT_LEADER, Status(K_NOT_READY, "injected redirect cycle"), redirect);
+        },
+        Deadline(std::chrono::seconds(1)), std::chrono::milliseconds(10), std::chrono::milliseconds(1));
+
+    EXPECT_TRUE(status.IsOk());
+    EXPECT_EQ(attempts, (std::vector<std::string>{ "127.0.0.1:30001", "127.0.0.1:30002",
+                                                  "127.0.0.1:30001" }));
+    EXPECT_EQ(snapshotCalls, 2);
+}
+
+TEST_F(CoordinatorLeaderRouterTest, TriesNextCandidateWhenRecoveringLeaderBecomesUnreachable)
+{
+    snapshots = { { "127.0.0.1:30001", "127.0.0.1:30002" } };
+    Router router(Dependencies());
+    std::vector<std::string> attempts;
+
+    const auto status = router.Execute(
+        [&attempts](const HostPort &address, std::chrono::milliseconds) {
+            attempts.emplace_back(address.ToString());
+            if (attempts.size() == 1) {
+                return Response(State::RECOVERING, Status(K_NOT_READY, "injected recovery"));
+            }
+            if (address.ToString() == "127.0.0.1:30001") {
+                return TransportError(K_RPC_PEER_DEAD);
+            }
+            return Response(State::SERVING);
+        },
+        Deadline(std::chrono::milliseconds(10)), std::chrono::milliseconds(10), std::chrono::milliseconds(1));
+
+    EXPECT_TRUE(status.IsOk());
+    EXPECT_EQ(attempts, (std::vector<std::string>{ "127.0.0.1:30001", "127.0.0.1:30001",
+                                                  "127.0.0.1:30002" }));
+    EXPECT_EQ(snapshotCalls, 1);
+}
+
+TEST_F(CoordinatorLeaderRouterTest, FollowsRedirectWhenRecoveringCoordinatorBecomesFollower)
+{
+    snapshots = { { "127.0.0.1:30001" } };
+    Router router(Dependencies());
+    std::vector<std::string> attempts;
+
+    const auto status = router.Execute(
+        [&attempts](const HostPort &address, std::chrono::milliseconds) {
+            attempts.emplace_back(address.ToString());
+            if (attempts.size() == 1) {
+                return Response(State::RECOVERING, Status(K_NOT_READY, "injected recovery"));
+            }
+            if (address.ToString() == "127.0.0.1:30001") {
+                return Response(State::NOT_LEADER, Status(K_NOT_READY, "injected follower"), "127.0.0.1:30002");
+            }
+            return Response(State::SERVING);
+        },
+        Deadline(std::chrono::milliseconds(10)), std::chrono::milliseconds(10), std::chrono::milliseconds(1));
+
+    EXPECT_TRUE(status.IsOk());
+    EXPECT_EQ(attempts, (std::vector<std::string>{ "127.0.0.1:30001", "127.0.0.1:30001",
+                                                  "127.0.0.1:30002" }));
+}
+
+TEST_F(CoordinatorLeaderRouterTest, BoundsEveryAttemptByMaximumTimeoutAndRemainingDeadline)
+{
+    snapshots = { { "127.0.0.1:30001", "127.0.0.1:30002" } };
+    Router router(Dependencies());
+    std::vector<std::chrono::milliseconds> timeouts;
+
+    const auto status = router.Execute(
+        [this, &timeouts](const HostPort &address, std::chrono::milliseconds timeout) {
+            timeouts.emplace_back(timeout);
+            if (address.ToString() == "127.0.0.1:30001") {
+                now += timeout;
+                return TransportError(K_RPC_PEER_DEAD);
+            }
+            return Response(State::SERVING);
+        },
+        Deadline(std::chrono::milliseconds(15)), std::chrono::milliseconds(10), std::chrono::milliseconds(1));
+
+    EXPECT_TRUE(status.IsOk());
+    EXPECT_EQ(timeouts, (std::vector<std::chrono::milliseconds>{ std::chrono::milliseconds(7),
+                                                                 std::chrono::milliseconds(8) }));
+}
+
+TEST_F(CoordinatorLeaderRouterTest, RecoveringLeaderRetainsApplicationStatusAtDeadline)
+{
+    snapshots = { { "127.0.0.1:30001" } };
+    Router router(Dependencies());
+    std::vector<std::chrono::milliseconds> timeouts;
+
+    const auto status = router.Execute(
+        [&timeouts](const HostPort &, std::chrono::milliseconds timeout) {
+            timeouts.emplace_back(timeout);
+            return Response(State::RECOVERING, Status(K_NOT_READY, "injected recovery"));
+        },
+        Deadline(std::chrono::milliseconds(25)), std::chrono::milliseconds(10), std::chrono::milliseconds(10));
 
     EXPECT_EQ(status.GetCode(), K_NOT_READY);
-    EXPECT_EQ(attempts, 1UL);
-    EXPECT_FALSE(waited);
+    EXPECT_EQ(timeouts, (std::vector<std::chrono::milliseconds>{ std::chrono::milliseconds(10),
+                                                                 std::chrono::milliseconds(10),
+                                                                 std::chrono::milliseconds(5) }));
+    ASSERT_TRUE(router.GetLeaderIdentity().has_value());
+    EXPECT_EQ(router.GetLeaderIdentity()->address.ToString(), "127.0.0.1:30001");
+    EXPECT_EQ(publishedIdentities.size(), 1);
 }
 
-TEST(CoordinatorLeaderRouterTest, StopsBeforeDispatchWhenTheSharedDeadlineExpires)
+TEST_F(CoordinatorLeaderRouterTest, RecoveryControlAcceptsRecoveringLeader)
 {
-    auto now = std::chrono::steady_clock::time_point{};
-    auto discovery = std::make_shared<RouterDiscovery>(std::vector<std::string>{ "127.0.0.1:30001" });
-    CoordinatorLeaderRouter router(discovery, { Address("127.0.0.1:30001") }, [&now] {
-        const auto result = now;
-        now += std::chrono::milliseconds(3'000);
-        return result;
-    }, {}, std::chrono::milliseconds(3'000));
-    size_t calls = 0;
+    snapshots = { { "127.0.0.1:30001", "127.0.0.1:30002" } };
+    Router router(Dependencies());
+    size_t attempts = 0;
 
-    const auto status = router.Execute([&calls](const HostPort &, int32_t, coordinator::ResponseHeader &, bool &) {
-        ++calls;
-        return Status::OK();
-    });
+    const auto status = router.Execute(
+        [&attempts](const HostPort &, std::chrono::milliseconds) {
+            ++attempts;
+            return Response(State::RECOVERING, Status::OK(), {}, "coordinator-recovering", 7);
+        },
+        Deadline(std::chrono::seconds(1)), std::chrono::milliseconds(10), std::chrono::milliseconds(1), true);
 
-    EXPECT_EQ(status.GetCode(), K_RPC_DEADLINE_EXCEEDED);
-    EXPECT_EQ(calls, 0UL);
+    EXPECT_TRUE(status.IsOk());
+    EXPECT_EQ(attempts, 1);
+    EXPECT_TRUE(waits.empty());
+    ASSERT_EQ(publishedIdentities.size(), 1);
+    EXPECT_EQ(publishedIdentities[0].address.ToString(), "127.0.0.1:30001");
+    EXPECT_EQ(publishedIdentities[0].coordinatorId, "coordinator-recovering");
+    EXPECT_EQ(publishedIdentities[0].leaderTerm, 7);
 }
+
+TEST_F(CoordinatorLeaderRouterTest, PublishesEachLeaderIdentityOnce)
+{
+    snapshots = { { "127.0.0.1:30001" } };
+    Router router(Dependencies());
+    size_t attempts = 0;
+
+    const auto status = router.Execute(
+        [&attempts](const HostPort &, std::chrono::milliseconds) {
+            ++attempts;
+            if (attempts == 1) {
+                return Response(State::RECOVERING, Status(K_NOT_READY, "injected recovery"), {}, "coordinator-1", 1);
+            }
+            return Response(State::SERVING, Status::OK(), {}, "coordinator-1", 1);
+        },
+        Deadline(std::chrono::seconds(1)), std::chrono::milliseconds(10), std::chrono::milliseconds(1));
+
+    EXPECT_TRUE(status.IsOk());
+    ASSERT_EQ(publishedIdentities.size(), 1);
+    EXPECT_EQ(publishedIdentities[0].routeEpoch, 1);
+}
+
+TEST_F(CoordinatorLeaderRouterTest, PublishesChangedLeaderWithIncreasingRouteEpoch)
+{
+    snapshots = { { "127.0.0.1:30001" }, { "127.0.0.1:30002" } };
+    Router router(Dependencies());
+
+    ASSERT_TRUE(router
+                    .Execute(
+                        [](const HostPort &, std::chrono::milliseconds) {
+                            return Response(State::SERVING, Status::OK(), {}, "coordinator-1", 1);
+                        },
+                        Deadline(std::chrono::seconds(1)), std::chrono::milliseconds(10),
+                        std::chrono::milliseconds(1))
+                    .IsOk());
+    ASSERT_TRUE(router
+                    .Execute(
+                        [](const HostPort &address, std::chrono::milliseconds) {
+                            if (address.ToString() == "127.0.0.1:30001") {
+                                return TransportError(K_RPC_PEER_DEAD);
+                            }
+                            return Response(State::SERVING, Status::OK(), {}, "coordinator-2", 2);
+                        },
+                        Deadline(std::chrono::seconds(1)), std::chrono::milliseconds(10),
+                        std::chrono::milliseconds(1))
+                    .IsOk());
+
+    ASSERT_EQ(publishedIdentities.size(), 2);
+    EXPECT_EQ(publishedIdentities[0].routeEpoch, 1);
+    EXPECT_EQ(publishedIdentities[1].address.ToString(), "127.0.0.1:30002");
+    EXPECT_EQ(publishedIdentities[1].coordinatorId, "coordinator-2");
+    EXPECT_EQ(publishedIdentities[1].leaderTerm, 2);
+    EXPECT_EQ(publishedIdentities[1].routeEpoch, 2);
+}
+
+TEST_F(CoordinatorLeaderRouterTest, RejectsLowerTermFromSameCoordinatorGeneration)
+{
+    snapshots = { { "127.0.0.1:30001" }, { "127.0.0.1:30002" } };
+    Router router(Dependencies());
+
+    ASSERT_TRUE(router
+                    .Execute(
+                        [](const HostPort &, std::chrono::milliseconds) {
+                            return Response(State::SERVING, Status::OK(), {}, "coordinator-2", 2);
+                        },
+                        Deadline(std::chrono::seconds(1)), std::chrono::milliseconds(10),
+                        std::chrono::milliseconds(1))
+                    .IsOk());
+    const auto status = router.Execute(
+        [](const HostPort &address, std::chrono::milliseconds) {
+            return address.ToString() == "127.0.0.1:30001"
+                       ? Response(State::SERVING, Status::OK(), {}, "coordinator-2", 1)
+                       : TransportError(K_RPC_PEER_DEAD);
+        },
+        Deadline(std::chrono::seconds(1)), std::chrono::milliseconds(10), std::chrono::milliseconds(1));
+
+    EXPECT_EQ(status.GetCode(), K_RPC_PEER_DEAD);
+    ASSERT_EQ(publishedIdentities.size(), 1);
+    EXPECT_EQ(publishedIdentities[0].coordinatorId, "coordinator-2");
+}
+
+TEST_F(CoordinatorLeaderRouterTest, AcceptsLowerTermFromNewCoordinatorGeneration)
+{
+    snapshots = { { "127.0.0.1:30001" }, { "127.0.0.1:30002" } };
+    Router router(Dependencies());
+
+    ASSERT_TRUE(router
+                    .Execute(
+                        [](const HostPort &, std::chrono::milliseconds) {
+                            return Response(State::SERVING, Status::OK(), {}, "coordinator-1", 94);
+                        },
+                        Deadline(std::chrono::seconds(1)), std::chrono::milliseconds(10),
+                        std::chrono::milliseconds(1))
+                    .IsOk());
+    const auto status = router.Execute(
+        [](const HostPort &address, std::chrono::milliseconds) {
+            return address.ToString() == "127.0.0.1:30001"
+                       ? TransportError(K_RPC_PEER_DEAD)
+                       : Response(State::SERVING, Status::OK(), {}, "coordinator-2", 45);
+        },
+        Deadline(std::chrono::seconds(1)), std::chrono::milliseconds(10), std::chrono::milliseconds(1));
+
+    EXPECT_TRUE(status.IsOk());
+    ASSERT_EQ(publishedIdentities.size(), 2);
+    EXPECT_EQ(publishedIdentities[1].address.ToString(), "127.0.0.1:30002");
+    EXPECT_EQ(publishedIdentities[1].coordinatorId, "coordinator-2");
+    EXPECT_EQ(publishedIdentities[1].leaderTerm, 45);
+    EXPECT_EQ(publishedIdentities[1].routeEpoch, 2);
+}
+
+TEST_F(CoordinatorLeaderRouterTest, RejectedResponseCannotReturnSuccessAtDeadline)
+{
+    snapshots = { { "127.0.0.1:30001" } };
+    Router router(Dependencies());
+    auto execute = [&](uint64_t term) {
+        return router.Execute(
+            [term](const HostPort &, std::chrono::milliseconds) {
+                return Response(State::SERVING, Status::OK(), {}, "coordinator", term);
+            },
+            Deadline(std::chrono::milliseconds(3)), std::chrono::milliseconds(1),
+            std::chrono::milliseconds(1));
+    };
+    ASSERT_TRUE(execute(2).IsOk());
+    const auto status = execute(1);
+    EXPECT_EQ(status.GetCode(), K_TRY_AGAIN);
+    EXPECT_NE(status.GetMsg().find("127.0.0.1:30001"), std::string::npos);
+    ASSERT_EQ(publishedIdentities.size(), 1);
+    EXPECT_EQ(router.GetLeaderIdentity()->leaderTerm, 2);
+}
+
+TEST_F(CoordinatorLeaderRouterTest, RecoveringSuccessAtDeadlineIncludesAddress)
+{
+    snapshots = { { "127.0.0.1:30001" } };
+    Router router(Dependencies());
+    const auto status = router.Execute(
+        [](const HostPort &, std::chrono::milliseconds) { return Response(State::RECOVERING); },
+        Deadline(std::chrono::milliseconds(3)), std::chrono::milliseconds(1),
+        std::chrono::milliseconds(1));
+    EXPECT_EQ(status.GetCode(), K_NOT_READY);
+    EXPECT_NE(status.GetMsg().find("127.0.0.1:30001"), std::string::npos);
+}
+
+TEST_F(CoordinatorLeaderRouterTest, RecoveringRetryReservesBudgetForAlternative)
+{
+    snapshots = { { "127.0.0.1:30001", "127.0.0.1:30002" } };
+    Router router(Dependencies());
+    std::vector<std::chrono::milliseconds> budgets;
+    std::vector<std::string> attempts;
+    const auto status = router.Execute(
+        [&](const HostPort &address, std::chrono::milliseconds timeout) {
+            attempts.push_back(address.ToString());
+            budgets.push_back(timeout);
+            if (attempts.size() == 1) {
+                return Response(State::RECOVERING, Status(K_NOT_READY, "recovering"));
+            }
+            if (address.ToString() == "127.0.0.1:30001") {
+                now += timeout;
+                return TransportError(K_RPC_DEADLINE_EXCEEDED);
+            }
+            return Response(State::SERVING);
+        },
+        Deadline(std::chrono::milliseconds(10)), std::chrono::milliseconds(10),
+        std::chrono::milliseconds(1));
+    EXPECT_TRUE(status.IsOk());
+    EXPECT_EQ(attempts, (std::vector<std::string>{
+                           "127.0.0.1:30001", "127.0.0.1:30001", "127.0.0.1:30002" }));
+    EXPECT_EQ(budgets, (std::vector<std::chrono::milliseconds>{
+                          std::chrono::milliseconds(5), std::chrono::milliseconds(4),
+                          std::chrono::milliseconds(5) }));
+}
+
+TEST_F(CoordinatorLeaderRouterTest, LateResponseRetriesCurrentLeaderWithinSameCall)
+{
+    snapshots = { { "127.0.0.1:30001" }, { "127.0.0.1:30002" } };
+    Router router(Dependencies());
+    const auto deadline = Deadline(std::chrono::seconds(1));
+    auto execute = [&](const Router::RpcCall &rpc) {
+        return router.Execute(rpc, deadline, std::chrono::milliseconds(10), std::chrono::milliseconds(1));
+    };
+    ASSERT_TRUE(execute([](const HostPort &, std::chrono::milliseconds) {
+        return Response(State::SERVING, Status::OK(), {}, "old", 94);
+    }).IsOk());
+    std::promise<void> entered;
+    std::promise<void> release;
+    auto released = release.get_future();
+    std::vector<std::string> attempts;
+    auto oldCall = std::async(std::launch::async, [&] {
+        return execute([&](const HostPort &address, std::chrono::milliseconds) {
+            attempts.push_back(address.ToString());
+            if (attempts.size() == 1) {
+                entered.set_value();
+                released.wait();
+                return Response(State::SERVING, Status::OK(), {}, "old", 94);
+            }
+            return Response(State::SERVING, Status::OK(), {}, "new", 45);
+        });
+    });
+    entered.get_future().wait();
+    const auto switched = execute([](const HostPort &address, std::chrono::milliseconds) {
+        return address.ToString() == "127.0.0.1:30001"
+                   ? TransportError(K_RPC_PEER_DEAD)
+                   : Response(State::SERVING, Status::OK(), {}, "new", 45);
+    });
+    release.set_value();
+    EXPECT_TRUE(switched.IsOk());
+    EXPECT_TRUE(oldCall.get().IsOk());
+    EXPECT_EQ(attempts, (std::vector<std::string>{ "127.0.0.1:30001", "127.0.0.1:30002" }));
+    ASSERT_EQ(publishedIdentities.size(), 2);
+    EXPECT_EQ(router.GetLeaderIdentity()->coordinatorId, "new");
+    EXPECT_EQ(router.GetLeaderIdentity()->routeEpoch, 2);
+    EXPECT_EQ(refreshCalls, 0);
+    EXPECT_TRUE(waits.empty());
+}
+
+TEST_F(CoordinatorLeaderRouterTest, RedirectDuplicateDoesNotDiluteRecoveringBudget)
+{
+    snapshots = { { "127.0.0.1:30001", "127.0.0.1:30002", "127.0.0.1:30003" } };
+    Router router(Dependencies());
+    size_t calls = 0;
+    std::vector<std::chrono::milliseconds> budgets;
+    const auto status = router.Execute(
+        [&](const HostPort &, std::chrono::milliseconds timeout) {
+            budgets.push_back(timeout);
+            ++calls;
+            if (calls == 1) {
+                return Response(State::NOT_LEADER, Status(K_NOT_READY, "redirect"), "127.0.0.1:30002");
+            }
+            if (calls == 2) {
+                return Response(State::RECOVERING, Status(K_NOT_READY, "recovering"));
+            }
+            return Response(State::SERVING);
+        },
+        Deadline(std::chrono::milliseconds(12)), std::chrono::milliseconds(12),
+        std::chrono::milliseconds(1));
+    EXPECT_TRUE(status.IsOk());
+    EXPECT_EQ(budgets, (std::vector<std::chrono::milliseconds>{
+                          std::chrono::milliseconds(4), std::chrono::milliseconds(6),
+                          std::chrono::milliseconds(5) }));
+}
+
+TEST_F(CoordinatorLeaderRouterTest, ConcurrentObservationOfSameIdentityDoesNotRetry)
+{
+    snapshots = { { "127.0.0.1:30001" } };
+    Router router(Dependencies());
+    size_t calls = 0;
+    const auto status = router.Execute(
+        [&](const HostPort &, std::chrono::milliseconds) {
+            ++calls;
+            EXPECT_TRUE(router.Execute(
+                [](const HostPort &, std::chrono::milliseconds) { return Response(State::SERVING); },
+                Deadline(std::chrono::seconds(1)), std::chrono::milliseconds(10),
+                std::chrono::milliseconds(1)).IsOk());
+            return Response(State::SERVING);
+        },
+        Deadline(std::chrono::seconds(1)), std::chrono::milliseconds(10), std::chrono::milliseconds(1));
+    EXPECT_TRUE(status.IsOk());
+    EXPECT_EQ(calls, 1);
+    EXPECT_EQ(publishedIdentities.size(), 1);
+    EXPECT_TRUE(waits.empty());
+}
+
+TEST_F(CoordinatorLeaderRouterTest, HeaderlessBusinessErrorWithFollowersRetainsNotReady)
+{
+    snapshots = { { "127.0.0.1:30001", "127.0.0.1:30002", "127.0.0.1:30003" } };
+    Router router(Dependencies());
+    size_t calls = 0;
+    const auto status = router.Execute(
+        [&](const HostPort &address, std::chrono::milliseconds) -> Router::RpcResult {
+            ++calls;
+            now += std::chrono::microseconds(100);
+            if (address.ToString() == "127.0.0.1:30001") {
+                return { Status(K_NOT_READY, "cluster topology is recovering"), std::nullopt };
+            }
+            return Response(State::NOT_LEADER, Status::OK(), "127.0.0.1:30001");
+        },
+        Deadline(std::chrono::milliseconds(3)), std::chrono::milliseconds(3),
+        std::chrono::milliseconds(1));
+    EXPECT_EQ(status.GetCode(), K_NOT_READY);
+    EXPECT_EQ(calls, 6);
+}
+
+TEST_F(CoordinatorLeaderRouterTest, UnattemptedCandidateCannotOverwriteAcceptedResponse)
+{
+    snapshots = { { "127.0.0.1:30001", "127.0.0.1:30002" } };
+    for (const auto elapsed : { std::chrono::microseconds(1500), std::chrono::microseconds(2000) }) {
+        Router router(Dependencies());
+        size_t calls = 0;
+        const auto status = router.Execute(
+            [&](const HostPort &, std::chrono::milliseconds) {
+                ++calls;
+                now += elapsed;
+                return Response(State::NOT_LEADER, Status(K_NOT_READY, "leader election pending"));
+            },
+            Deadline(std::chrono::milliseconds(2)), std::chrono::milliseconds(2),
+            std::chrono::milliseconds(1));
+        EXPECT_EQ(status.GetCode(), K_NOT_READY);
+        EXPECT_EQ(status.GetMsg(), "leader election pending");
+        EXPECT_EQ(calls, 1);
+    }
+}
+
+TEST_F(CoordinatorLeaderRouterTest, LaterRoundTransportFailurePreservesAcceptedResponse)
+{
+    snapshots = { { "127.0.0.1:30001" } };
+    Router router(Dependencies());
+    size_t calls = 0;
+    const auto status = router.Execute(
+        [&](const HostPort &, std::chrono::milliseconds) {
+            if (++calls == 1) {
+                return Response(State::NOT_LEADER, Status(K_NOT_READY, "leader election pending"));
+            }
+            return TransportError(K_RPC_PEER_DEAD);
+        },
+        Deadline(std::chrono::milliseconds(3)), std::chrono::milliseconds(1),
+        std::chrono::milliseconds(1));
+    EXPECT_EQ(status.GetCode(), K_NOT_READY);
+    EXPECT_EQ(status.GetMsg(), "leader election pending");
+    EXPECT_EQ(calls, 3);
+}
+
+TEST_F(CoordinatorLeaderRouterTest, DeadlineWithoutAcceptedResponseRemainsTimeout)
+{
+    snapshots = { { "127.0.0.1:30001", "127.0.0.1:30002" } };
+    Router router(Dependencies());
+    size_t calls = 0;
+    const auto status = router.Execute(
+        [&](const HostPort &, std::chrono::milliseconds) {
+            ++calls;
+            now += std::chrono::milliseconds(2);
+            return TransportError(K_RPC_DEADLINE_EXCEEDED);
+        },
+        Deadline(std::chrono::milliseconds(2)), std::chrono::milliseconds(2),
+        std::chrono::milliseconds(1));
+    EXPECT_EQ(status.GetCode(), K_RPC_DEADLINE_EXCEEDED);
+    EXPECT_EQ(calls, 1);
+}
+
+TEST_F(CoordinatorLeaderRouterTest, RepeatedRouteChangesRespectOriginalDeadline)
+{
+    snapshots = { { "127.0.0.1:30001" } };
+    Router router(Dependencies());
+    const auto deadline = Deadline(std::chrono::milliseconds(3));
+    size_t calls = 0;
+    const auto status = router.Execute(
+        [&](const HostPort &, std::chrono::milliseconds) {
+            const auto id = std::to_string(++calls);
+            EXPECT_TRUE(router.Execute(
+                [&](const HostPort &, std::chrono::milliseconds) {
+                    return Response(State::SERVING, Status::OK(), {}, id);
+                },
+                deadline, std::chrono::milliseconds(1), std::chrono::milliseconds(1)).IsOk());
+            now += std::chrono::milliseconds(1);
+            return Response(State::SERVING, Status::OK(), {}, "late");
+        },
+        deadline, std::chrono::milliseconds(1), std::chrono::milliseconds(1));
+    EXPECT_EQ(status.GetCode(), K_RPC_DEADLINE_EXCEEDED);
+    EXPECT_EQ(calls, 3);
+    EXPECT_EQ(now, deadline);
+    EXPECT_EQ(router.GetLeaderIdentity()->coordinatorId, "3");
+}
+
 }  // namespace
 }  // namespace datasystem

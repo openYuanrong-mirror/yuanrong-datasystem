@@ -430,7 +430,7 @@ private:
      */
     Status InitializeOwnedComponents(std::chrono::seconds nodeDeadTimeout,
                                      std::chrono::milliseconds scaleInCollectWindow);
-    void InitializeCoordinatorComponents();
+    Status InitializeCoordinatorComponents();
 
     Status RestoreReadyAfterLocalRecovery();
     Status PublishMissingLocalMemberEvidence();
