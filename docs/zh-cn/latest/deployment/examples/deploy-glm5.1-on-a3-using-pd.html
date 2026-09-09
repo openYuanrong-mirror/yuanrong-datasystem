@@ -967,7 +967,6 @@ cp<span class="w"> </span>/vllm-workspace/vllm-ascend/examples/disaggregated_pre
 
 <span class="c1"># Yuanrong</span>
 <span class="nb">export</span><span class="w"> </span><span class="nv">DS_WORKER_ADDR</span><span class="o">=</span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">local_ip</span><span class="si">}</span><span class="s2">:18481&quot;</span>
-<span class="nb">unset</span><span class="w"> </span>GOOGLE_LOGTOSTDERR<span class="w"> </span>GOOGLE_ALSOLOGTOSTDERR
 <span class="nb">export</span><span class="w"> </span><span class="nv">PYTHONHASHSEED</span><span class="o">=</span><span class="m">0</span>
 
 vllm<span class="w"> </span>serve<span class="w"> </span>/data/GLM-5.1-w8a8<span class="w"> </span><span class="se">\</span>
@@ -1066,7 +1065,6 @@ vllm<span class="w"> </span>serve<span class="w"> </span>/data/GLM-5.1-w8a8<span
 
 <span class="c1"># Yuanrong</span>
 <span class="nb">export</span><span class="w"> </span><span class="nv">DS_WORKER_ADDR</span><span class="o">=</span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">local_ip</span><span class="si">}</span><span class="s2">:18481&quot;</span>
-<span class="nb">unset</span><span class="w"> </span>GOOGLE_LOGTOSTDERR<span class="w"> </span>GOOGLE_ALSOLOGTOSTDERR
 <span class="nb">export</span><span class="w"> </span><span class="nv">PYTHONHASHSEED</span><span class="o">=</span><span class="m">0</span>
 
 vllm<span class="w"> </span>serve<span class="w"> </span>/data/GLM-5.1-w8a8<span class="w"> </span><span class="se">\</span>

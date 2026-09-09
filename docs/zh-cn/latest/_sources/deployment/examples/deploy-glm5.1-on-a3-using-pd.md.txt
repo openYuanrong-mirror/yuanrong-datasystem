@@ -373,7 +373,6 @@ dscli start --interleave 0-7 -w \
 
     # Yuanrong
     export DS_WORKER_ADDR="${local_ip}:18481"
-    unset GOOGLE_LOGTOSTDERR GOOGLE_ALSOLOGTOSTDERR
     export PYTHONHASHSEED=0
 
     vllm serve /data/GLM-5.1-w8a8 \
@@ -474,7 +473,6 @@ dscli start --interleave 0-7 -w \
 
     # Yuanrong
     export DS_WORKER_ADDR="${local_ip}:18481"
-    unset GOOGLE_LOGTOSTDERR GOOGLE_ALSOLOGTOSTDERR
     export PYTHONHASHSEED=0
 
     vllm serve /data/GLM-5.1-w8a8 \
