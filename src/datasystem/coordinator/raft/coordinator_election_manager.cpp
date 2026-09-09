@@ -53,7 +53,6 @@ constexpr char kCoordinatorRaftLogSegmentPrefix[] = "log_";
 constexpr char kCoordinatorRaftInProgressLogSegmentPrefix[] = "log_inprogress_";
 constexpr size_t kCoordinatorRaftLogIndexWidth = 20;
 constexpr size_t kCoordinatorRaftClosedLogIndexCount = 2;
-constexpr char K_COORDINATOR_BOOTSTRAP_TRACE_PREFIX[] = "CoordinatorBootstrap;";
 constexpr std::chrono::milliseconds kBootstrapExchangeInterval{ 100 };
 constexpr std::chrono::milliseconds kBootstrapRpcTimeout{ 100 };
 constexpr std::chrono::seconds K_BOOTSTRAP_OBSERVATION_TTL{ 1 };
@@ -101,7 +100,7 @@ std::string GetCoordinatorBootstrapTraceId()
 {
     auto traceId = Trace::Instance().GetTraceID();
     if (traceId.empty()) {
-        traceId = std::string(K_COORDINATOR_BOOTSTRAP_TRACE_PREFIX) + GetStringUuid();
+        traceId = Trace::GenerateComponentTraceId("CoordinatorBootstrap");
     }
     return traceId;
 }

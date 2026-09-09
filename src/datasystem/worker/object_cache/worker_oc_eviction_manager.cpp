@@ -393,7 +393,7 @@ Status WorkerOcEvictionManager::Init(const std::shared_ptr<ObjectGlobalRefTable<
     akSkManager_ = std::move(akSkManager);
     scheduleEvictionRunning_.store(true, std::memory_order_release);
     scheduleEvictThreadPool_->Submit([this]() {
-        Trace::Instance().SetTraceNewID("EvictionTimer;" + GetStringUuid(), true);
+        Trace::Instance().SetTraceNewID(Trace::GenerateComponentTraceId("EvictionTimer"), true);
         Timer timer;
         while (scheduleEvictionRunning_.load(std::memory_order_acquire) && !IsTermSignalReceived()) {
             auto evictInterval = 10;

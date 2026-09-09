@@ -338,7 +338,7 @@ void HashRingRefresher::UpdateWorkerList(const ::datasystem::ClusterTopologyPb &
 void HashRingRefresher::RefreshLoop()
 {
     while (running_.load()) {
-        TraceGuard traceGuard = Trace::Instance().SetTraceNewID("HashRingRefresh;" + GetStringUuid());
+        TraceGuard traceGuard = Trace::Instance().SetTraceNewID(Trace::GenerateComponentTraceId("HashRingRefresh"));
         forceRefresh_.exchange(false, std::memory_order_acq_rel);
         DoRefresh(true);
 

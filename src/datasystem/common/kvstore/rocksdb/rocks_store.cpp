@@ -314,7 +314,7 @@ Status RocksStore::PutWithOrderingKey(const std::string &tableName, const std::s
         // tag when called from a background thread that has no active Trace.
         auto callerTraceID = Trace::Instance().GetTraceID();
         if (callerTraceID.empty()) {
-            callerTraceID = "RocksStoreAsync;" + GetStringUuid();
+            callerTraceID = Trace::GenerateComponentTraceId("RocksStoreAsync");
         }
         auto future = asyncThreadPool_->Submit(orderingKey, [this, tableHandle, key, value, callerTraceID]() {
             TraceGuard traceGuard = Trace::Instance().SetTraceNewID(callerTraceID);
@@ -345,7 +345,7 @@ Status RocksStore::BatchPut(const std::string &tableName, std::unordered_map<std
     } else if (mode_ == RocksdbWriteMode::ASYNC) {
         auto callerTraceID = Trace::Instance().GetTraceID();
         if (callerTraceID.empty()) {
-            callerTraceID = "RocksStoreAsync;" + GetStringUuid();
+            callerTraceID = Trace::GenerateComponentTraceId("RocksStoreAsync");
         }
         auto future = asyncThreadPool_->Submit(tableName, [this, tableHandle, metaInfos, callerTraceID]() {
             TraceGuard traceGuard = Trace::Instance().SetTraceNewID(callerTraceID);
@@ -375,7 +375,7 @@ Status RocksStore::BatchDelete(const std::string &tableName, std::unordered_map<
     } else if (mode_ == RocksdbWriteMode::ASYNC) {
         auto callerTraceID = Trace::Instance().GetTraceID();
         if (callerTraceID.empty()) {
-            callerTraceID = "RocksStoreAsync;" + GetStringUuid();
+            callerTraceID = Trace::GenerateComponentTraceId("RocksStoreAsync");
         }
         auto future = asyncThreadPool_->Submit(tableName, [this, tableHandle, metaInfos, callerTraceID]() {
             TraceGuard traceGuard = Trace::Instance().SetTraceNewID(callerTraceID);
@@ -440,7 +440,7 @@ Status RocksStore::Get(const std::string &tableName, const std::string &key, std
     } else if (mode_ == RocksdbWriteMode::ASYNC) {
         auto callerTraceID = Trace::Instance().GetTraceID();
         if (callerTraceID.empty()) {
-            callerTraceID = "RocksStoreAsync;" + GetStringUuid();
+            callerTraceID = Trace::GenerateComponentTraceId("RocksStoreAsync");
         }
         auto future = asyncThreadPool_->Submit(key, [this, key, tableHandle, &rc, &value, callerTraceID]() {
             TraceGuard traceGuard = Trace::Instance().SetTraceNewID(callerTraceID);
@@ -489,7 +489,7 @@ Status RocksStore::GetAll(const std::string &tableName, std::vector<std::pair<st
     } else if (mode_ == RocksdbWriteMode::ASYNC) {
         auto callerTraceID = Trace::Instance().GetTraceID();
         if (callerTraceID.empty()) {
-            callerTraceID = "RocksStoreAsync;" + GetStringUuid();
+            callerTraceID = Trace::GenerateComponentTraceId("RocksStoreAsync");
         }
         auto future = asyncThreadPool_->Submit(tableName,
             [this, readOptions, tableHandle, &outKeyValues, callerTraceID]() {
@@ -539,7 +539,7 @@ Status RocksStore::PrefixSearch(const std::string &tableName, const std::string 
     } else if (mode_ == RocksdbWriteMode::ASYNC) {
         auto callerTraceID = Trace::Instance().GetTraceID();
         if (callerTraceID.empty()) {
-            callerTraceID = "RocksStoreAsync;" + GetStringUuid();
+            callerTraceID = Trace::GenerateComponentTraceId("RocksStoreAsync");
         }
         auto future = asyncThreadPool_->Submit(tableName,
             [this, prefixKey, tableHandle, &outKeyValues, callerTraceID]() {
@@ -581,7 +581,7 @@ Status RocksStore::DeleteWithOrderingKey(const std::string &tableName, const std
     } else if (mode_ == RocksdbWriteMode::ASYNC) {
         auto callerTraceID = Trace::Instance().GetTraceID();
         if (callerTraceID.empty()) {
-            callerTraceID = "RocksStoreAsync;" + GetStringUuid();
+            callerTraceID = Trace::GenerateComponentTraceId("RocksStoreAsync");
         }
         auto future = asyncThreadPool_->Submit(orderingKey, [this, tableHandle, key, callerTraceID]() {
             TraceGuard traceGuard = Trace::Instance().SetTraceNewID(callerTraceID);
@@ -618,7 +618,7 @@ Status RocksStore::DeleteBatchAcrossTables(const std::vector<TableKey> &tableKey
     } else if (mode_ == RocksdbWriteMode::ASYNC) {
         auto callerTraceID = Trace::Instance().GetTraceID();
         if (callerTraceID.empty()) {
-            callerTraceID = "RocksStoreAsync;" + GetStringUuid();
+            callerTraceID = Trace::GenerateComponentTraceId("RocksStoreAsync");
         }
         auto future = asyncThreadPool_->Submit(orderingKey, [this, resolvedKeys, callerTraceID, &rc]() {
             TraceGuard traceGuard = Trace::Instance().SetTraceNewID(callerTraceID);
@@ -656,7 +656,7 @@ Status RocksStore::PrefixDelete(const std::string &tableName, const std::string 
     } else if (mode_ == RocksdbWriteMode::ASYNC) {
         auto callerTraceID = Trace::Instance().GetTraceID();
         if (callerTraceID.empty()) {
-            callerTraceID = "RocksStoreAsync;" + GetStringUuid();
+            callerTraceID = Trace::GenerateComponentTraceId("RocksStoreAsync");
         }
         auto future = asyncThreadPool_->Submit(tableName,
             [this, tableHandle, options, prefixKey, endKey, callerTraceID]() {

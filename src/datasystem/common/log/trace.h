@@ -170,6 +170,14 @@ public:
      */
     static Trace &Instance();
 
+    // Generate an owned component ID without changing the current trace context.
+    template <size_t N>
+    static std::string GenerateComponentTraceId(const char (&component)[N])
+    {
+        static_assert(N > 1 && N - 1 <= TRACEID_PREFIX_SIZE, "Component trace name must contain 1 to 36 bytes");
+        return GenerateComponentTraceIdImpl(component, N - 1);
+    }
+
     /**
      * @brief Set traceID to thread_local.(The traceID is the automatically generated UUID)
      * @note This method is used to set traceID for external interfaces to simplify code compilation.
@@ -400,6 +408,8 @@ public:
     static const int TRACEID_EXCEED_MAX_SIZE_LOG_INTERVAL = 60;
 
 private:
+    static std::string GenerateComponentTraceIdImpl(const char *component, size_t componentSize);
+
     Trace() = default;
     friend struct RequestContext;  // Allows per-bthread Trace in RequestContext for brpc M:N isolation
 

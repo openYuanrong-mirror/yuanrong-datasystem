@@ -157,7 +157,8 @@ void EnsureReaperLocked()
         g_reaperRunning = true;
         g_reaperThread = std::thread([] {
             while (ProcessDeferredQueueBatch()) {
-                TraceGuard traceGuard = Trace::Instance().SetTraceNewID("StreamCloseReaper;" + GetStringUuid());
+                TraceGuard traceGuard =
+                    Trace::Instance().SetTraceNewID(Trace::GenerateComponentTraceId("StreamCloseReaper"));
                 // Continue polling until the queue is empty.
             }
         });

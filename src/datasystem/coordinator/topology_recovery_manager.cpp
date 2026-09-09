@@ -1125,7 +1125,7 @@ void TopologyRecoveryManager::DelayedReconcileLoop()
 {
     bool stopped = false;
     while (!stopped) {
-        TraceGuard traceGuard = Trace::Instance().SetTraceNewID("DelayedReconcile;" + GetStringUuid());
+        TraceGuard traceGuard = Trace::Instance().SetTraceNewID(Trace::GenerateComponentTraceId("DelayedReconcile"));
         std::vector<std::string> dueClusters;
         {
             std::unique_lock<std::mutex> lock(mutex_);

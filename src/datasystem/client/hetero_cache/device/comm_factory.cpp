@@ -229,7 +229,6 @@ void CommFactory::CreateCommInRecv(int32_t localDeviceId, const std::string &rem
     auto traceId = Trace::Instance().GetTraceID();
     auto process = [this, comm, localDeviceId, remoteDeviceId, remoteClientId, isSameNode, traceId]() mutable {
         TraceGuard traceGuard = Trace::Instance().SetTraceNewID(traceId);
-        TraceGuard subTraceGuard = Trace::Instance().SetSubTraceID(GetSubCommIdForIdentifier(comm));
         INJECT_POINT("CreateCommInRecv.sleep");
         PerfPoint point(PerfKey::CLIENT_CREATE_HCCL_IN_RECV);
         auto localClientId = clientWorkerApi_->clientId_;
@@ -317,22 +316,11 @@ void CommFactory::DestroyComm(std::string commId)
     }
 }
 
-std::string CommFactory::GetSubCommIdForIdentifier(std::shared_ptr<CommWrapperBase> &comm)
-{
-    const size_t SUB_STR_LENGTH = 7;
-    std::string commId = comm->GetCommId();
-    if (commId.size() >= SUB_STR_LENGTH) {
-        return FormatString("[%s]", commId.substr(0, SUB_STR_LENGTH));
-    }
-    return FormatString("[%s]", commId);
-}
-
 Status CommFactory::ProcessCommCreationInSend(std::shared_ptr<CommWrapperBase> comm, int32_t localDeviceId,
                                               int32_t remoteDeviceId, const std::string &remoteClientId,
                                               bool isSameNode, const std::string &traceId)
 {
     TraceGuard traceGuard = Trace::Instance().SetTraceNewID(traceId);
-    TraceGuard subTraceGuard = Trace::Instance().SetSubTraceID(GetSubCommIdForIdentifier(comm));
     INJECT_POINT("CreateCommInSend.sleep");
     PerfPoint point(PerfKey::CLIENT_CREATE_HCCL_IN_SEND);
     auto localClientId = clientWorkerApi_->clientId_;

@@ -120,6 +120,22 @@ TraceGuard::~TraceGuard()
     Reset();
 }
 
+std::string Trace::GenerateComponentTraceIdImpl(const char *component, size_t componentSize)
+{
+    char uuid[UUID_STRING_BUFFER_SIZE];
+    auto rc = GetStringUuid(uuid, sizeof(uuid));
+    if (rc.IsError()) {
+        LOG(ERROR) << "GetStringUuid failed: " << rc.ToString();
+        return "";
+    }
+    std::string traceId;
+    traceId.reserve(componentSize + 1 + SHORT_UUID_SIZE);
+    traceId.append(component, componentSize);
+    traceId.push_back(';');
+    traceId.append(uuid + UUID_STRING_SIZE - SHORT_UUID_SIZE, SHORT_UUID_SIZE);
+    return traceId;
+}
+
 TraceGuard Trace::SetTraceUUID()
 {
     if (traceID_[0] != '\0') {
