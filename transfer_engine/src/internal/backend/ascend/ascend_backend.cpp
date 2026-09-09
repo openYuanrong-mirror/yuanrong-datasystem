@@ -759,10 +759,10 @@ Result AscendBackend::RegisterOneLocked(uint64_t addr, uint64_t length, bool *re
     mem.handle = handle;
     registeredMems_[addr] = mem;
     *registeredNew = true;
-    TE_LOG_INFO << "hixl register memory success"
-                << ", addr=0x" << std::hex << addr << std::dec
-                << ", length=" << length
-                << ", device_id=" << localDeviceId_;
+    TE_VLOG_1 << "hixl register memory success"
+              << ", addr=0x" << std::hex << addr << std::dec
+              << ", length=" << length
+              << ", device_id=" << localDeviceId_;
     return Result::OK();
 }
 
@@ -794,10 +794,10 @@ Result AscendBackend::UnregisterOneLocked(uint64_t addr, uint64_t length, bool f
     if (unregistered != nullptr) {
         *unregistered = true;
     }
-    TE_LOG_INFO << "hixl unregister memory success"
-                << ", addr=0x" << std::hex << addr << std::dec
-                << ", length=" << length
-                << ", device_id=" << localDeviceId_;
+    TE_VLOG_1 << "hixl unregister memory success"
+              << ", addr=0x" << std::hex << addr << std::dec
+              << ", length=" << length
+              << ", device_id=" << localDeviceId_;
     return Result::OK();
 }
 
