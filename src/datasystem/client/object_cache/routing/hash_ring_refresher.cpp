@@ -17,6 +17,7 @@
 #include "datasystem/client/object_cache/routing/hash_ring_refresher.h"
 
 #include <algorithm>
+#include <exception>
 #include <utility>
 
 #include "datasystem/common/ak_sk/hasher.h"
@@ -100,7 +101,7 @@ Status HashRingRefresher::InitialFetch(const HostPort &initialWorkerAddr)
         workerList_.push_back(initialWorkerAddr);
         nextWorkerIndex_ = 0;
     }
-    return DoRefresh(false);
+    return DoRefreshSafely(false);
 }
 
 Status HashRingRefresher::StartPeriodicRefresh(int64_t intervalMs)
@@ -156,7 +157,6 @@ bool HashRingRefresher::ForceRefresh()
 
 std::vector<HostPort> HashRingRefresher::BeginRefreshRound(size_t &startIndex)
 {
-    // Copy worker list under lock to avoid data race with InitialFetch
     std::vector<HostPort> workers;
     startIndex = 0;
     {
@@ -196,14 +196,14 @@ Status HashRingRefresher::DoRefresh(bool stopAware)
 
         const uint64_t requestedVersion = currentVersion_.load(std::memory_order_acquire);
         const auto timeoutMs = stopAware ? BACKGROUND_REFRESH_RPC_TIMEOUT_MS : 0;
-        Status st = fetchRpc_(worker, requestedVersion, ring, masterAddress, newVersion, changed, hostIdMap, timeoutMs);
-        if (st.IsError()) {
+        Status status = fetchRpc_(worker, requestedVersion, ring, masterAddress, newVersion, changed, hostIdMap,
+                                  timeoutMs);
+        if (status.IsError()) {
             LOG(WARNING) << "[Routing] Skip failed hash ring refresh from " << worker.ToString()
-                         << ", requested version: " << requestedVersion << ", status: " << st.ToString();
+                         << ", requested version: " << requestedVersion << ", status: " << status.ToString();
             continue;
         }
         reachedWorker = true;
-
         if (!changed) {
             continue;
         }
@@ -213,8 +213,7 @@ Status HashRingRefresher::DoRefresh(bool stopAware)
                 return publish;
             }
             LOG(WARNING) << "Ignore stale hash ring response from " << worker.ToString()
-                         << ", requested version: " << requestedVersion
-                         << ", response version: " << newVersion;
+                         << ", requested version: " << requestedVersion << ", response version: " << newVersion;
             continue;
         }
         auto publish = PublishHashRing(newVersion, std::move(ring), std::move(hostIdMap), false);
@@ -224,10 +223,20 @@ Status HashRingRefresher::DoRefresh(bool stopAware)
         }
         return publish;
     }
-    if (reachedWorker) {
-        return Status::OK();
+    return reachedWorker ? Status::OK() : Status(K_NOT_FOUND, "No reachable worker for hash ring refresh");
+}
+
+Status HashRingRefresher::DoRefreshSafely(bool stopAware)
+{
+    try {
+        return DoRefresh(stopAware);
+    } catch (const std::exception &error) {
+        LOG(ERROR) << "Hash ring refresh callback threw: " << error.what();
+        return Status(K_RUNTIME_ERROR, "Hash ring refresh callback threw");
+    } catch (...) {
+        LOG(ERROR) << "Hash ring refresh callback threw";
+        return Status(K_RUNTIME_ERROR, "Hash ring refresh callback threw");
     }
-    return Status(K_NOT_FOUND, "No reachable worker for hash ring refresh");
 }
 
 bool HashRingRefresher::TryPublishEpochReset(const HostPort &worker, uint64_t requestedVersion, uint64_t newVersion,
@@ -340,7 +349,7 @@ void HashRingRefresher::RefreshLoop()
     while (running_.load()) {
         TraceGuard traceGuard = Trace::Instance().SetTraceNewID(Trace::GenerateComponentTraceId("HashRingRefresh"));
         forceRefresh_.exchange(false, std::memory_order_acq_rel);
-        DoRefresh(true);
+        (void)DoRefreshSafely(true);
 
         auto deadlineMs = forceRefreshDeadlineMs_.load(std::memory_order_acquire);
         INJECT_POINT_NO_RETURN("HashRingRefresher.RefreshLoop.afterDeadlineRead");

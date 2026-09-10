@@ -107,16 +107,27 @@ bool RemoteUbPortHealthVerifier::RequestVerification(const HostPort &peer, const
         return false;
     }
     std::lock_guard<std::mutex> lock(mutex_);
-    auto [iter, inserted] = peers_.try_emplace(
-        peer, PeerState{ incarnation, 0, nowMs, std::nullopt, std::nullopt, false, false, false, true, std::nullopt });
+    auto [iter, inserted] = peers_.try_emplace(peer);
     if (inserted) {
+        iter->second.incarnation = incarnation;
+        iter->second.nextQueryMs = nowMs;
+        iter->second.verificationPending = true;
         return true;
     }
     auto &state = iter->second;
     if (state.incarnation != incarnation) {
-        state = PeerState{ incarnation, state.generation + 1, nowMs, std::nullopt, std::nullopt,
-                           false, false, false, true, std::nullopt };
+        const uint64_t generation = state.generation + 1;
+        state = PeerState{};
+        state.incarnation = incarnation;
+        state.generation = generation;
+        state.nextQueryMs = nowMs;
+        state.verificationPending = true;
         return true;
+    }
+    if (state.inFlight) {
+        const bool firstPendingTrigger = !state.triggerPending;
+        state.triggerPending = true;
+        return firstPendingTrigger;
     }
     if (!state.inFlight && !state.isolated
         && state.nextQueryMs == std::numeric_limits<uint64_t>::max()) {
@@ -159,7 +170,14 @@ void RemoteUbPortHealthVerifier::ScheduleAfterCompletion(
 {
     if (state.summaryHintPending) {
         state.summaryHintPending = false;
+        state.triggerPending = false;
         state.nextQueryMs = nowMs;
+        completion.retryScheduled = true;
+    } else if (state.triggerPending) {
+        state.triggerPending = false;
+        state.nextQueryMs = state.lastQueryMs.has_value()
+                                ? std::max(nowMs, UbProbeRetryAt(*state.lastQueryMs, queryIntervalMs_))
+                                : nowMs;
         completion.retryScheduled = true;
     } else if (state.isolated || state.verificationPending) {
         state.nextQueryMs = UbProbeRetryAt(nowMs, queryIntervalMs_);
@@ -177,9 +195,11 @@ RemoteUbPortHealthVerifier::AcceptedSummaryTransition RemoteUbPortHealthVerifier
                                || !IsSameUbPortHealth(*state.lastPortHealth, portHealth);
     const bool recoveredAfterRetry = state.lastLoggedRetryStatus.has_value();
     const bool wasIsolated = state.isolated;
+    const bool triggerPending = state.triggerPending;
+    state.triggerPending = false;
     state.lastLoggedRetryStatus.reset();
     state.lastPortHealth = portHealth;
-    state.verificationPending = false;
+    state.verificationPending = triggerPending;
     completion.evidenceAccepted = true;
     if (ShouldIsolateForUbPortHealth(portHealth)) {
         state.isolated = true;
@@ -187,11 +207,27 @@ RemoteUbPortHealthVerifier::AcceptedSummaryTransition RemoteUbPortHealthVerifier
     } else {
         state.isolated = false;
         state.summaryHintPending = false;
-        state.nextQueryMs = std::numeric_limits<uint64_t>::max();
+        if (triggerPending) {
+            state.nextQueryMs = state.lastQueryMs.has_value()
+                                    ? std::max(nowMs, UbProbeRetryAt(*state.lastQueryMs, queryIntervalMs_))
+                                    : nowMs;
+            completion.retryScheduled = true;
+        } else {
+            state.nextQueryMs = std::numeric_limits<uint64_t>::max();
+        }
     }
     const bool logResponse = healthChanged || recoveredAfterRetry || wasIsolated != state.isolated;
     const char *decision = state.isolated ? "ISOLATE" : (wasIsolated ? "RECOVER" : "ALLOW");
-    return { logResponse, decision };
+    return { logResponse, recoveredAfterRetry, decision };
+}
+
+void RemoteUbPortHealthVerifier::CompressIsolatedDeadlinesLocked(const HostPort &completedPeer, uint64_t nowMs)
+{
+    for (auto &[peer, state] : peers_) {
+        if (peer != completedPeer && state.isolated && !state.inFlight && state.nextQueryMs > nowMs) {
+            state.nextQueryMs = nowMs;
+        }
+    }
 }
 
 RemoteUbQueryCompletion RemoteUbPortHealthVerifier::Complete(
@@ -210,7 +246,14 @@ RemoteUbQueryCompletion RemoteUbPortHealthVerifier::Complete(
     RemoteUbQueryCompletion completion;
     auto completionStatus = ValidateQueryCompletion(ticket, summary, queryStatus, state.lastPortHealth);
     if (completionStatus.IsError()) {
-        ScheduleAfterCompletion(state, nowMs, completion);
+        if (completionStatus.GetCode() == K_NOT_SUPPORTED) {
+            state.summaryHintPending = false;
+            state.triggerPending = false;
+            state.nextQueryMs = UbProbeRetryAt(nowMs, REMOTE_UB_PORT_HEALTH_UNSUPPORTED_RETRY_INTERVAL_MS);
+            completion.retryScheduled = true;
+        } else {
+            ScheduleAfterCompletion(state, nowMs, completion);
+        }
         const bool logRetry = completion.retryScheduled
                               && (!state.lastLoggedRetryStatus.has_value()
                                   || *state.lastLoggedRetryStatus != completionStatus.GetCode());
@@ -227,6 +270,9 @@ RemoteUbQueryCompletion RemoteUbPortHealthVerifier::Complete(
 
     const auto portHealth = *summary->portHealth;
     const auto transition = ApplyAcceptedSummaryLocked(state, portHealth, nowMs, completion);
+    if (transition.recoveredAfterRetry) {
+        CompressIsolatedDeadlinesLocked(ticket.peer, nowMs);
+    }
     lock.unlock();
     if (transition.logResponse) {
         LogQueryResponse(ticket, portHealth, transition.decision);
@@ -268,12 +314,6 @@ void RemoteUbPortHealthVerifier::ReconcileTopology(
                    ? peers_.erase(iter)
                    : std::next(iter);
     }
-}
-
-void RemoteUbPortHealthVerifier::Cancel(const HostPort &peer)
-{
-    std::lock_guard<std::mutex> lock(mutex_);
-    peers_.erase(peer);
 }
 
 std::optional<uint64_t> RemoteUbPortHealthVerifier::NextQueryDeadlineMs() const

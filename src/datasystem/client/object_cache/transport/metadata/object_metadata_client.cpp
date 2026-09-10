@@ -28,6 +28,7 @@
 
 #include "datasystem/common/inject/inject_point.h"
 #include "datasystem/common/log/log.h"
+#include "datasystem/common/object_cache/provider_ub_failure_detail.h"
 #include "datasystem/common/rdma/fast_transport_base.h"
 #include "datasystem/common/rdma/fast_transport_manager_wrapper.h"
 #include "datasystem/common/rpc/brpc_status_util.h"
@@ -431,12 +432,17 @@ void ObjectMetadataClient::DelayReleaseUbBuffers(InlineRequestContext &context, 
     }
 }
 
-bool ObjectMetadataClient::HandleUbTransportStatus(ObjectMetadataItem &item, const QueryAndGetResultPb &result,
+bool ObjectMetadataClient::HandleUbTransportStatus(const HostPort &provider, ObjectMetadataItem &item,
+                                                   const QueryAndGetResultPb &result,
                                                    InlineRequestContext &context) const
 {
     if (context.mode != InlineTransportMode::UB || !result.has_status()
         || result.status().error_code() == K_OK) {
         return false;
+    }
+    if (result.has_provider_ub_failure_detail()
+        && IsClientUbWritebackAckTimeout(provider, result.provider_ub_failure_detail())) {
+        TriggerClientLocalUbPortHealthQuery();
     }
     auto buffer = context.ubBuffers.find(&item);
     if (buffer != context.ubBuffers.end()) {
@@ -466,7 +472,7 @@ Status ObjectMetadataClient::BuildQueryRequest(const HostPort &address, const Ob
     return AddInlineDataRequest(items, context, request);
 }
 
-Status ObjectMetadataClient::ApplyResults(const ObjectMetadataBatch &items,
+Status ObjectMetadataClient::ApplyResults(const HostPort &provider, const ObjectMetadataBatch &items,
                                           const QueryAndGetRspPb &response,
                                           std::vector<RpcMessage> &payloads, InlineRequestContext &context) const
 {
@@ -474,18 +480,19 @@ Status ObjectMetadataClient::ApplyResults(const ObjectMetadataBatch &items,
     CHECK_FAIL_RETURN_STATUS(static_cast<size_t>(response.results_size()) == items.size(), K_RUNTIME_ERROR,
                              "QueryAndGet result count does not match requested keys");
     for (size_t i = 0; i < items.size(); ++i) {
-        RETURN_IF_NOT_OK(ApplyResult(*items[i], response.results(static_cast<int>(i)), payloads, context));
+        RETURN_IF_NOT_OK(ApplyResult(provider, *items[i], response.results(static_cast<int>(i)), payloads, context));
     }
     return Status::OK();
 }
 
-Status ObjectMetadataClient::ApplyResult(ObjectMetadataItem &item, const QueryAndGetResultPb &result,
-                                         std::vector<RpcMessage> &payloads, InlineRequestContext &context) const
+Status ObjectMetadataClient::ApplyResult(const HostPort &provider, ObjectMetadataItem &item,
+                                         const QueryAndGetResultPb &result, std::vector<RpcMessage> &payloads,
+                                         InlineRequestContext &context) const
 {
     const auto &location = result.location();
     CHECK_FAIL_RETURN_STATUS(location.object_key() == item.objectKey, K_RUNTIME_ERROR,
                              "QueryAndGet result key does not match request order");
-    const bool hasUbTransportError = HandleUbTransportStatus(item, result, context);
+    const bool hasUbTransportError = HandleUbTransportStatus(provider, item, result, context);
     if (location.object_locations_size() == 0) {
         item.status = Status(K_NOT_FOUND, "Object was not found");
         return Status::OK();
@@ -610,7 +617,7 @@ Status ObjectMetadataClient::Query(const HostPort &address, const ObjectMetadata
     QueryAndGetRspPb response;
     std::vector<RpcMessage> payloads;
     RETURN_IF_NOT_OK(QueryWithRetry(address, items, response, payloads, context, recorder ? &*recorder : nullptr));
-    return ApplyResults(items, response, payloads, context);
+    return ApplyResults(address, items, response, payloads, context);
 }
 
 Status ObjectMetadataClient::QueryAndGet(const HostPort &address, const ObjectMetadataBatch &items,

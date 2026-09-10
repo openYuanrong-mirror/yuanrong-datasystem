@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "datasystem/client/object_cache/routing/i_worker_filter.h"
+#include "datasystem/client/object_cache/routing/worker_ub_health_registry.h"
 #include "datasystem/common/object_cache/peer_ub_admission.h"
 #include "datasystem/protos/cluster_topology.pb.h"
 #include "datasystem/protos/object_posix.pb.h"
@@ -34,9 +35,13 @@ struct WriteTargetUbRecoveryCandidate {
 class UbHealthFilter : public IWorkerFilter {
 public:
     UbHealthFilter();
+    explicit UbHealthFilter(std::shared_ptr<WorkerUbHealthRegistry> ubHealthRegistry);
     ~UbHealthFilter() override = default;
 
+    bool ObserveSummary(const UbHealthSummary &summary, const std::string &expectedIncarnation);
     bool ApplySummary(const UbHealthSummary &summary, const std::string &expectedIncarnation);
+    void SetRemotePortHealthVerificationTrigger(
+        PeerUbAdmission::RemotePortHealthVerificationTrigger trigger);
     void ApplyTopologyIncarnations(const ::datasystem::ClusterTopologyPb &ring);
     bool ReportProviderFailure(const HostPort &provider, const ProviderUbFailureDetailPb &detail);
     bool ReportWriteTargetFailure(const HostPort &worker, const Status &status,
@@ -45,6 +50,7 @@ public:
     void ReportLateWriteTargetFailure(const UrmaLateCompletion &completion, uint64_t peerToken) noexcept;
     bool IsAvailable(const HostPort &addr) const override;
     bool IsWriteTargetAvailable(const HostPort &addr) const;
+    bool SupportsPortHealthVerification(const HostPort &addr) const;
     std::vector<HostPort> GetUnavailableWriteTargets() const;
     std::optional<UbPathState> GetWriteTargetObservation(const HostPort &addr) const;
     std::optional<UbPathState> GetLocalObservation(const HostPort &addr) const;
@@ -65,10 +71,14 @@ private:
 
     void ReconcileLocalObservationWithTrustedIncarnationLocked(const HostPort &worker,
                                                                const std::string &incarnation);
+    void ReconcileWriteTargetObservationLocked(const HostPort &worker,
+                                               const std::string &incarnation);
+    void DropRemovedObservationsLocked(const std::unordered_set<HostPort> &workers);
+    void EnablePortHealthVerificationIfSupportedLocked(const HostPort &worker);
     void PublishWriteTargetCompletionGenerationsLocked(const std::unordered_set<HostPort> &workers);
     void RefreshWriteTargetCompletionGenerationLocked(const HostPort &worker);
 
-    UbHealthSummaryCache cache_;
+    std::shared_ptr<WorkerUbHealthRegistry> ubHealthRegistry_;
     PeerUbAdmission localAdmission_;
     std::shared_ptr<PeerUbAdmission> writeTargetAdmission_;
     // Trusted incarnation updates and Provider failure reports serialize through this mutex so a restart

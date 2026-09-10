@@ -67,7 +67,8 @@ list(APPEND CLIENT_SRCS
         object_cache/routing/routing_rpc_client.cpp
         object_cache/routing/state_filter.cpp
         object_cache/routing/ub_health_filter.cpp
-        object_cache/routing/worker_router.cpp)
+        object_cache/routing/worker_router.cpp
+        object_cache/routing/worker_ub_health_registry.cpp)
 
 list(APPEND CLIENT_DEPEND_LIBS
         ${SECUREC_LIBRARY}
@@ -103,6 +104,7 @@ list(APPEND CLIENT_DEPEND_LIBS
         coordinator_protos_client
         cluster_membership_codec_client
         cluster_topology_keyspace
+        remote_ub_port_health_verifier
         dl
         client_mmap_static
         ${BRPC_LIBRARIES}

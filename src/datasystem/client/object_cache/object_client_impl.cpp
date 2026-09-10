@@ -703,9 +703,30 @@ Status ObjectClientImpl::InitTransportLayer()
     RETURN_RUNTIME_ERROR_IF_NULL(transportSignature_);
     RETURN_RUNTIME_ERROR_IF_NULL(asyncGetRPCPool_);
     RETURN_RUNTIME_ERROR_IF_NULL(asyncReleasePool_);
-    if (ubHealthFilter_ == nullptr) {
-        ubHealthFilter_ = std::make_shared<client::UbHealthFilter>();
+    EnsureUbHealthRoutingState();
+    auto transportLayer = std::make_unique<client::TransportLayer>(
+        transportSignature_, asyncGetRPCPool_, fastTransportMemSize_, BuildTransportLayerOptions());
+    RETURN_IF_NOT_OK(transportLayer->Init());
+    transportLayer_ = std::move(transportLayer);
+    for (size_t i = 0; i < workerApi_.size(); ++i) {
+        failover_->ConfigureUrmaDataPlaneFailureCallback(static_cast<WorkerNode>(i), workerApi_[i]);
     }
+    LOG(INFO) << "Client transport layer initialized";
+    return Status::OK();
+}
+
+void ObjectClientImpl::EnsureUbHealthRoutingState()
+{
+    if (ubHealthRegistry_ == nullptr) {
+        ubHealthRegistry_ = std::make_shared<client::WorkerUbHealthRegistry>();
+    }
+    if (ubHealthFilter_ == nullptr) {
+        ubHealthFilter_ = std::make_shared<client::UbHealthFilter>(ubHealthRegistry_);
+    }
+}
+
+client::TransportLayerOptions ObjectClientImpl::BuildTransportLayerOptions()
+{
     BrpcChannelConfig channelConfig;
     channelConfig.timeout_ms = requestTimeoutMs_;
     channelConfig.connect_timeout_ms = connectTimeoutMs_;
@@ -723,6 +744,32 @@ Status ObjectClientImpl::InitTransportLayer()
     // local client cannot initialize UB; a non-SHM endpoint retains the existing fail-fast behavior.
     options.allowUbRuntimeFailure = workerApi_[currentNode_]->IsShmEnable();
     options.readSourceFilter = ubHealthFilter_;
+    options.localPortHealthObserver = ubHealthRegistry_;
+    ConfigureTransportUbHealthCallbacks(options);
+    ConfigureTransportRoutingCallbacks(options);
+    return options;
+}
+
+void ObjectClientImpl::ConfigureTransportUbHealthCallbacks(client::TransportLayerOptions &options)
+{
+    std::weak_ptr<client::UbHealthFilter> weakUbHealthFilter(ubHealthFilter_);
+    options.ubHealthSummaryHook = [weakUbHealthFilter](const UbHealthSummary &summary) {
+        auto filter = weakUbHealthFilter.lock();
+        if (filter == nullptr) {
+            return;
+        }
+        (void)filter->ObserveSummary(summary, summary.incarnation);
+    };
+    options.verifiedUbHealthSummaryHook = [weakUbHealthFilter](const UbHealthSummary &summary) {
+        auto filter = weakUbHealthFilter.lock();
+        if (filter != nullptr) {
+            (void)filter->ApplySummary(summary, summary.incarnation);
+        }
+    };
+}
+
+void ObjectClientImpl::ConfigureTransportRoutingCallbacks(client::TransportLayerOptions &options)
+{
     options.metadataFailureHandler = [this](const HostPort &owner, const Status &status) {
         HandleMetadataOwnerFailure(owner, status);
     };
@@ -733,15 +780,6 @@ Status ObjectClientImpl::InitTransportLayer()
                       << worker.ToString() << ", status: " << status.ToString();
         }
     };
-    auto transportLayer = std::make_unique<client::TransportLayer>(
-        transportSignature_, asyncGetRPCPool_, fastTransportMemSize_, std::move(options));
-    RETURN_IF_NOT_OK(transportLayer->Init());
-    transportLayer_ = std::move(transportLayer);
-    for (size_t i = 0; i < workerApi_.size(); ++i) {
-        failover_->ConfigureUrmaDataPlaneFailureCallback(static_cast<WorkerNode>(i), workerApi_[i]);
-    }
-    LOG(INFO) << "Client transport layer initialized";
-    return Status::OK();
 }
 
 Status ObjectClientImpl::ApplyRoutingWorkerSnapshot(uint64_t ringVersion,
@@ -806,9 +844,7 @@ Status ObjectClientImpl::InitRouting(const HostPort &initialWorker, bool initial
     CHECK_FAIL_RETURN_STATUS(!initialWorker.Empty(), K_NOT_READY,
                              "Initial worker address is unavailable for routing initialization");
     RETURN_IF_NOT_OK(InitDataPlacementPolicy());
-    if (ubHealthFilter_ == nullptr) {
-        ubHealthFilter_ = std::make_shared<client::UbHealthFilter>();
-    }
+    EnsureUbHealthRoutingState();
     RETURN_RUNTIME_ERROR_IF_NULL(transportSignature_);
     BrpcChannelConfig channelConfig;
     channelConfig.timeout_ms =
@@ -821,20 +857,10 @@ Status ObjectClientImpl::InitRouting(const HostPort &initialWorker, bool initial
     auto sdkHostIdCache =
         std::make_shared<std::string>(serviceDiscovery_ == nullptr ? "" : serviceDiscovery_->GetHostId());
     auto hostIdUnresolvedWarned = std::make_shared<bool>(false);
-    auto ringUpdateHook = [this, initialWorker, initialWorkerIsLocal, sdkHostIdCache, hostIdUnresolvedWarned](
-                              uint64_t ringVersion, const ::datasystem::ClusterTopologyPb &ring,
-                              const std::unordered_map<std::string, std::string> &hostIdMap,
-                              bool epochResetConfirmed) {
-        ResolveRoutingSdkHostId(initialWorker, initialWorkerIsLocal, hostIdMap,
-                                *sdkHostIdCache, *hostIdUnresolvedWarned);
-        if (transportLayer_ != nullptr) {
-            return ApplyRoutingWorkerSnapshot(ringVersion, ring, hostIdMap, *sdkHostIdCache, epochResetConfirmed);
-        }
-        ubHealthFilter_->ApplyTopologyIncarnations(ring);
-        return Status::OK();
-    };
+    auto ringUpdateHook =
+        BuildRoutingUpdateHook(initialWorker, initialWorkerIsLocal, sdkHostIdCache, hostIdUnresolvedWarned);
     auto routing = std::make_shared<client::Routing>(
-        std::move(channelConfig), transportSignature_, std::move(ringUpdateHook),
+        std::move(channelConfig), transportSignature_, std::move(ringUpdateHook), ubHealthRegistry_,
         std::vector<std::shared_ptr<client::IWorkerFilter>>{ ubHealthFilter_ },
         client::Routing::DEFAULT_REFRESH_INTERVAL_MS, [this](uint64_t version) {
             if (transportLayer_ != nullptr) {
@@ -845,6 +871,24 @@ Status ObjectClientImpl::InitRouting(const HostPort &initialWorker, bool initial
     std::atomic_store(&routing_, std::move(routing));
     LOG(INFO) << "[Routing] Object client routing initialized from worker " << initialWorker.ToString();
     return Status::OK();
+}
+
+client::HashRingRefresher::RingUpdateHook ObjectClientImpl::BuildRoutingUpdateHook(
+    const HostPort &initialWorker, bool initialWorkerIsLocal,
+    const std::shared_ptr<std::string> &sdkHostIdCache,
+    const std::shared_ptr<bool> &hostIdUnresolvedWarned)
+{
+    return [this, initialWorker, initialWorkerIsLocal, sdkHostIdCache, hostIdUnresolvedWarned](
+               uint64_t ringVersion, const ::datasystem::ClusterTopologyPb &ring,
+               const std::unordered_map<std::string, std::string> &hostIdMap, bool epochResetConfirmed) {
+        ResolveRoutingSdkHostId(initialWorker, initialWorkerIsLocal, hostIdMap,
+                                *sdkHostIdCache, *hostIdUnresolvedWarned);
+        if (transportLayer_ != nullptr) {
+            return ApplyRoutingWorkerSnapshot(ringVersion, ring, hostIdMap, *sdkHostIdCache, epochResetConfirmed);
+        }
+        ubHealthFilter_->ApplyTopologyIncarnations(ring);
+        return Status::OK();
+    };
 }
 
 Status ObjectClientImpl::InitClientWorkerConnect(bool enableHeartbeat, bool initWithWorker,

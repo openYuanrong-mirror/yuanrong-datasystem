@@ -122,7 +122,7 @@ private:
                                       int32_t &routeDegradationRetries, TransportPhaseLatencyRecorder *recorder);
     void DelayReleaseUbBuffers(InlineRequestContext &context, const Status &reason,
                                const std::string &reasonSource) const;
-    bool HandleUbTransportStatus(ObjectMetadataItem &item, const QueryAndGetResultPb &result,
+    bool HandleUbTransportStatus(const HostPort &provider, ObjectMetadataItem &item, const QueryAndGetResultPb &result,
                                  InlineRequestContext &context) const;
 
     /**
@@ -180,7 +180,7 @@ private:
      * @param[in,out] context Inline-request context.
      * @return K_OK on success; the error code otherwise.
      */
-    Status ApplyResults(const ObjectMetadataBatch &items, const QueryAndGetRspPb &response,
+    Status ApplyResults(const HostPort &provider, const ObjectMetadataBatch &items, const QueryAndGetRspPb &response,
                         std::vector<RpcMessage> &payloads, InlineRequestContext &context) const;
 
     /**
@@ -191,7 +191,7 @@ private:
      * @param[in,out] context Inline-request context.
      * @return K_OK on success; the error code otherwise.
      */
-    Status ApplyResult(ObjectMetadataItem &item, const QueryAndGetResultPb &result,
+    Status ApplyResult(const HostPort &provider, ObjectMetadataItem &item, const QueryAndGetResultPb &result,
                        std::vector<RpcMessage> &payloads, InlineRequestContext &context) const;
 
     /**

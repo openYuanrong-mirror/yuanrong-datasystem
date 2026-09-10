@@ -258,6 +258,8 @@ public:
                                     std::vector<std::string> &outFailedKeys, PerfPoint &point);
 
 private:
+    void ObserveGetProviderUbFailure(const std::shared_ptr<IClientWorkerApi> &workerApi, const GetRspPb &rsp);
+
     std::vector<std::shared_ptr<IClientWorkerApi>> &workerApi_;
     std::unique_ptr<client::MmapManager> &mmapManager_;
     ClientMemoryRefTable *memoryRefCount_;

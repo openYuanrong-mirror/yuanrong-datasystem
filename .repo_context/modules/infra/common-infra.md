@@ -227,23 +227,50 @@ MADV_HUGEPAGE)` to the shared-memory memfd mapping after `mmap` succeeds when th
     recovery generation; that
     generation advances on successful peer recovery and trusted Worker-incarnation replacement. Reads, writes without
     a live observer, and WRs rejected before provider submission retain the original immediate deletion behavior.
-  - Worker recovery probes preserve the raw `UrmaWriteFailure` through posting and CQE wait. A status-4 probe failure
-    isolates the probing Worker's local sender, while CQE status `9` isolates the remote probe endpoint. When that
-    endpoint is not the current recovery subject, the probe token is cancelled back to its previous failure state so
-    one fault cannot be reassigned to the unrelated subject. Soft `SUSPECT` verification keeps admission open while
-    the probe is in flight; a probe failure without authoritative status `4` or `9` remains `SUSPECT` and retries with
-    bounded backoff. Recovery probes for an already hard-unavailable subject remain fail-closed.
-  - `UrmaManager` owns one client-process `UbPortHealthMonitor` bound to the lifetime of its URMA context. Client-side
+  - Recovery probes preserve the raw `UrmaWriteFailure` through posting and CQE wait. With a local port monitor
+    or remote verifier attached, E4/E9 and diagnostic probe completion trigger verification rather than deciding node
+    admission. Only confirmed local facts or independent remote Query responses may isolate/recover that node.
+    Unconverted peer paths retain their existing path-probe policy; one peer's failure must not be attributed to another.
+  - The vendor-neutral contract is `common/object_cache/ub_port_health.h`; Provider returns `vector<UbPortStatus>`
+    and Monitor validates/aggregates it into immutable snapshots and summaries. `UrmaManager` owns one shared
+    `UbPortHealthMonitor` bound to its URMA context; Client/Worker consumers register weak observers. Client-side
     CQE status `4` only wakes an asynchronous `urma_user_ctl(BONDP_USER_CTL_QUERY_PORT_STATUS)` query. A failed or
     invalid query leaves admission unchanged; a valid all-BAD result rejects all Host object data APIs with
     `K_URMA_WORKER_UNAVAILABLE`. Once isolated, any GOOD port immediately reopens admission, but one-second polling
     continues until all ports are GOOD so a partial recovery can be observed and can regress to all-BAD safely.
-    The request hot path reads one process-wide scalar atomic admission state and never copies the monitor `shared_ptr`,
-    calls the provider, or takes the monitor lock. Repeated CQE-4 triggers are coalesced while a query is pending.
-    Monitor initialization failure follows the existing UB-runtime policy: required UB initialization returns the
-    error, while an optional SHM endpoint logs the failure and continues with SHM/TCP. An unexpected missing monitor is
-    rate-limited in logs while preserving the defined fail-open behavior. Shutdown prevents monitor recreation,
-    removes and joins the monitor, clears its published admission state, and then tears down the URMA context.
+    The Client request hot path reads one scalar atomic admission state updated by an existing weak Monitor observer,
+    without copying the monitor `shared_ptr`, calling the provider, or taking the monitor lock. Repeated CQE triggers
+    are coalesced before acquiring the monitor mutex. Monitor initialization failure follows the existing UB-runtime
+    policy: required UB initialization returns the error, while an optional SHM endpoint logs the failure and continues
+    with SHM/TCP. An unexpected missing monitor is rate-limited in logs while preserving the defined fail-open behavior.
+    Shutdown prevents monitor recreation, joins outstanding queries/callbacks, clears published snapshot/admission
+    state, and then tears down the URMA context. Restart collects fresh facts while preserving the previous health epoch
+    fence. Shared Monitor startup still schedules the initial query needed by the routing health view.
+    Pending refresh retains last-confirmed local admission. Query failures never invent all-down facts and pending
+    refresh retries remain rate-limited. `ReadSummaryForQuery` reads cached facts and requests coalesced refresh
+    without waiting for Provider; stale/in-flight replies are pending. `WorkerRouter`'s frozen DTO is declared in
+    `client/object_cache/routing/ub_routing_health.h`; aggregate healthy count is derived, not stored separately.
+    `WorkerSelfPortHealth` binds the context monitor without owning its lifetime. Query services read its cache
+    and preserve pending state in the encoded response. Cache validity spans one provider interval plus one remote
+    verification interval (two seconds), so a completed asynchronous refresh is observable at a one-second RPC cadence.
+    The provider and isolated-peer query intervals remain one second; invalid/pending facts cannot change admission.
+    Client read/write fault callbacks feed the shared `RemoteUbPortHealthVerifier`; passive sidecars only update
+    `WorkerUbHealthRegistry` or request verification. Sidecar callbacks may overlap; registry incarnation and
+    health-epoch fences reject stale observations before one complete state is published. The router Getter atomically
+    aliases the frozen DTO from that immutable state for observed routable (`ACTIVE` or `LEAVING`) workers;
+    topology reconciliation prunes departed workers and stale incarnations without creating UNKNOWN entries for
+    workers the Client has never contacted. A verified write-target recovery advances its late-CQE generation fence.
+    Due verification is ordered by deadline, with address only breaking ties. Client dispatch never waits for a batch;
+    each completion frees one of four outstanding query slots and wakes reconcile. A CQE arriving during an in-flight
+    query retains one rate-limited follow-up. Workers without the Query capability retry after 30 seconds rather than
+    consuming a slot every second, and the first successful response after a retry compresses other isolated-peer
+    deadlines to bound recovery spread. Passive summary hints only accelerate peers already tracked by the verifier;
+    they are not a discovery path. Shutdown drains at most the current four-query wave, whose RPC deadline is one
+    second, before destroying endpoint dependencies. Registry publication COW-updates topology, health, verified
+    admission, and the routing DTO together; an unchanged topology returns before those copies. Retired snapshots
+    release after unlock.
+    The private client admission observer is declared in `common/rdma/client_port_health_admission_observer.h`;
+    moving this header does not change the atomic gate layout or observer lifetime.
     `tests/ut/common/rdma/ub_port_health_test.cpp` covers monitor state and lifecycle branches;
     `tests/ut/common/rdma/urma_port_status_provider_test.cpp` covers the mock ABI-to-provider path; and the mock-only
     Client CQE-4 case in `tests/st/client/object_cache/urma_object_client_test.cpp` covers asynchronous query, Host Get

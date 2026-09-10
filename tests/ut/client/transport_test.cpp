@@ -2529,6 +2529,29 @@ TEST(DataPlaneManagerTest, ShmFirstInitAllowsOptionalUbRuntimeFailure)
     EXPECT_FALSE(IsUrmaEnabled());
 }
 
+TEST(TransportLayerTest, OptionalUbInitFailureDoesNotFailMonitorConfiguration)
+{
+    constexpr char mode[] = "transport-layer-optional-ub";
+    if (!IsInitPolicyChild(mode)) {
+        RunInitPolicyTestInFreshProcess(
+            "OptionalUbInitFailureDoesNotFailMonitorConfiguration", mode, "TransportLayerTest");
+        return;
+    }
+
+    FLAGS_enable_urma = false;
+    ASSERT_TRUE(inject::Set("FastTransportManager.Initialize", "return(0)").IsOk());
+    auto taskPool = std::make_shared<ThreadPool>(0, 1, "transport-init-test");
+    TransportLayerOptions options;
+    options.initializeUbRuntime = true;
+    options.allowUbRuntimeFailure = true;
+    options.releasePool = taskPool;
+    TransportLayer layer(MakeSignature(), taskPool, ConnectOptions{}.fastTransportMemSize, std::move(options));
+
+    EXPECT_TRUE(layer.Init().IsOk());
+    layer.Shutdown();
+    EXPECT_FALSE(IsUrmaEnabled());
+}
+
 TEST(DataPlaneManagerTest, DirectPipelineForcesUbRuntimeInitialization)
 {
     constexpr char mode[] = "direct-pipeline";

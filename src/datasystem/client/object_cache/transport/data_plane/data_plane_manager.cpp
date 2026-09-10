@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <exception>
 #include <mutex>
 #include <unordered_set>
 #include <utility>
@@ -44,6 +45,47 @@
 
 namespace datasystem {
 namespace client {
+
+DataPlaneManager::UbHealthCallbackState::UbHealthCallbackState(DataPlaneManager *manager) : manager_(manager)
+{
+}
+
+void DataPlaneManager::UbHealthCallbackState::Detach()
+{
+    std::unique_lock<std::mutex> lock(mutex_);
+    manager_ = nullptr;
+    drained_.wait(lock, [this] { return activeObservers_ == 0; });
+}
+
+void DataPlaneManager::UbHealthCallbackState::ObserveSummary(const UbHealthSummary &summary)
+{
+    DataPlaneManager *manager = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (manager_ == nullptr) {
+            return;
+        }
+        manager = manager_;
+        ++activeObservers_;
+    }
+    try {
+        manager->ObserveUbHealthSummary(summary);
+    } catch (const std::exception &error) {
+        LOG(ERROR) << "Client UB health observation callback threw: " << error.what();
+    } catch (...) {
+        LOG(ERROR) << "Client UB health observation callback threw";
+    }
+    FinishObservation();
+}
+
+void DataPlaneManager::UbHealthCallbackState::FinishObservation()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (--activeObservers_ == 0) {
+        drained_.notify_all();
+    }
+}
+
 namespace {
 
 constexpr uint32_t TRANSPORT_STATE_LOG_RATE = 100;
@@ -188,13 +230,22 @@ DataPlaneManager::DataPlaneManager(std::shared_ptr<Signature> signature, uint64_
                                    bool enableClientDirectPipelineH2D, int32_t pipelineThreadNum,
                                    std::shared_ptr<ThreadPool> releasePool, bool initializeUbRuntime,
                                    bool allowUbRuntimeFailure,
-                                   std::shared_ptr<HostMemoryPinManager> hostMemoryPinManager)
+                                   std::shared_ptr<HostMemoryPinManager> hostMemoryPinManager,
+                                   UbHealthSummaryApplyHook ubHealthSummaryHook,
+                                   UbHealthSummaryApplyHook verifiedUbHealthSummaryHook,
+                                   std::function<void()> ubHealthWakeHook,
+                                   std::function<bool(const HostPort &)> ubPortHealthCapabilityCheck)
     : signature_(std::move(signature)), channelConfig_(std::move(channelConfig)),
       ubBufferProvider_(std::move(ubBufferProvider)), fastTransportMemSize_(fastTransportMemSize),
       initializeUbRuntime_(initializeUbRuntime), allowUbRuntimeFailure_(allowUbRuntimeFailure),
+      ubHealthSummaryHook_(std::move(ubHealthSummaryHook)),
+      verifiedUbHealthSummaryHook_(std::move(verifiedUbHealthSummaryHook)),
+      ubHealthWakeHook_(std::move(ubHealthWakeHook)),
+      ubPortHealthCapabilityCheck_(std::move(ubPortHealthCapabilityCheck)),
       enableClientDirectPipelineH2D_(enableClientDirectPipelineH2D), pipelineThreadNum_(pipelineThreadNum),
       releasePool_(std::move(releasePool)), hostMemoryPinManager_(std::move(hostMemoryPinManager))
 {
+    ubHealthCallbackState_ = std::make_shared<UbHealthCallbackState>(this);
 }
 
 DataPlaneManager::DataPlaneLease::~DataPlaneLease() = default;
@@ -249,6 +300,9 @@ Status DataPlaneManager::CreateWorkerRpcClient(const HostPort &workerAddr, std::
 {
     auto rpcClient = std::make_shared<WorkerRpcClient>(workerAddr, signature_, channelConfig_);
     RETURN_IF_NOT_OK(rpcClient->Init());
+    auto callbackState = ubHealthCallbackState_;
+    rpcClient->SetUbHealthSummaryCallback(
+        [callbackState](const UbHealthSummary &summary) { callbackState->ObserveSummary(summary); });
     out = std::move(rpcClient);
     VLOG(1) << "[TransportGet][Connection] RPC connection ready, endpoint: " << workerAddr.ToString();
     return Status::OK();
@@ -521,6 +575,227 @@ Status DataPlaneManager::ProbeProviderUbRecovery(const HostPort &workerAddr, con
     CHECK_FAIL_RETURN_STATUS(response.probe_performed(), K_NOT_READY,
                              "Provider did not perform the Worker-to-Client UB recovery probe");
     return Status::OK();
+}
+
+Status DataPlaneManager::QueryUbPortHealth(const HostPort &workerAddr, const std::string &expectedIncarnation,
+                                           int32_t timeoutMs, UbHealthSummary &summary)
+{
+    summary = UbHealthSummary{};
+    std::shared_ptr<WorkerRpcClient> rpcClient;
+    RETURN_IF_NOT_OK(GetOrCreateRpcClient(workerAddr, rpcClient));
+    QueryUbPortHealthRspPb response;
+    RETURN_IF_NOT_OK(rpcClient->QueryUbPortHealth(expectedIncarnation, timeoutMs, response));
+    CHECK_FAIL_RETURN_STATUS(response.has_health_summary(), K_INVALID,
+                             "UB port health query response has no summary");
+    RETURN_IF_NOT_OK(DecodeUbHealthSummary(response.health_summary(), summary));
+    CHECK_FAIL_RETURN_STATUS(summary.worker == workerAddr, K_INVALID,
+                             "UB port health query response Worker does not match RPC endpoint");
+    CHECK_FAIL_RETURN_STATUS(expectedIncarnation.empty() || summary.incarnation == expectedIncarnation,
+                             K_NOT_READY, "UB port health query response has a different Worker incarnation");
+    return Status::OK();
+}
+
+bool DataPlaneManager::RequestUbPortHealthVerification(const HostPort &workerAddr)
+{
+    if (shutdown_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    auto snapshot = std::atomic_load(&endpointAdmissionSnapshot_);
+    if (snapshot == nullptr || snapshot->workerIncarnations == nullptr) {
+        return false;
+    }
+    auto incarnation = snapshot->workerIncarnations->find(workerAddr);
+    if (incarnation == snapshot->workerIncarnations->end()) {
+        return false;
+    }
+    const bool scheduled = ubPortHealthVerifier_.RequestVerification(
+        workerAddr, incarnation->second,
+        static_cast<uint64_t>(GetSteadyClockTimeStampMs()));
+    if (scheduled && ubHealthWakeHook_) {
+        ubHealthWakeHook_();
+    }
+    return scheduled;
+}
+
+void DataPlaneManager::ObserveUbHealthSummary(const UbHealthSummary &summary)
+{
+    if (shutdown_.load(std::memory_order_acquire)) {
+        return;
+    }
+    auto topology = std::atomic_load(&endpointAdmissionSnapshot_);
+    if (topology == nullptr || topology->workerIncarnations == nullptr) {
+        return;
+    }
+    auto incarnation = topology->workerIncarnations->find(summary.worker);
+    if (incarnation == topology->workerIncarnations->end()
+        || incarnation->second != summary.incarnation
+        || !observedUbHealthSummaries_.Apply(summary, incarnation->second)) {
+        return;
+    }
+    auto accepted = observedUbHealthSummaries_.Get(summary.worker);
+    if (!accepted.has_value()) {
+        return;
+    }
+    if (ubHealthSummaryHook_) {
+        try {
+            ubHealthSummaryHook_(*accepted);
+        } catch (const std::exception &error) {
+            LOG(ERROR) << "Client passive UB health hook threw: " << error.what();
+        } catch (...) {
+            LOG(ERROR) << "Client passive UB health hook threw";
+        }
+    }
+    if (!accepted->portHealth.has_value()) {
+        return;
+    }
+    const bool hinted = ubPortHealthVerifier_.NotifySummaryHint(
+        *accepted, static_cast<uint64_t>(GetSteadyClockTimeStampMs()));
+    if (ShouldIsolateForUbPortHealth(*accepted->portHealth)) {
+        const bool requested = RequestUbPortHealthVerification(accepted->worker);
+        if (hinted && !requested && ubHealthWakeHook_) {
+            ubHealthWakeHook_();
+        }
+        return;
+    }
+    if (hinted && ubHealthWakeHook_) {
+        ubHealthWakeHook_();
+    }
+}
+
+void DataPlaneManager::RunDueUbPortHealthVerification()
+{
+    std::lock_guard<bthread::Mutex> lock(lifecycleMutex_);
+    if (shutdown_.load(std::memory_order_acquire)) {
+        return;
+    }
+    const auto nowMs = static_cast<uint64_t>(GetSteadyClockTimeStampMs());
+    // Bound each dispatch pass even when completions or submission failures are immediate.
+    for (size_t dispatched = 0; dispatched < cluster::REMOTE_UB_PORT_HEALTH_MAX_CONCURRENT_QUERIES; ++dispatched) {
+        if (ubPortHealthQueriesInFlight_.load(std::memory_order_acquire) >=
+            cluster::REMOTE_UB_PORT_HEALTH_MAX_CONCURRENT_QUERIES) {
+            break;
+        }
+        auto ticket = ubPortHealthVerifier_.TryBeginDue(nowMs);
+        if (!ticket.has_value()) {
+            break;
+        }
+        ubPortHealthQueriesInFlight_.fetch_add(1, std::memory_order_acq_rel);
+        std::shared_ptr<std::atomic<bool>> unclaimed;
+        try {
+            // Submit may enqueue before throwing: only the task or catch path owns completion.
+            unclaimed = std::make_shared<std::atomic<bool>>(true);
+            INJECT_POINT_NO_RETURN("DataPlaneManager.DispatchUbPortHealthQuery", [] {
+                throw std::runtime_error("Injected query dispatch failure");
+            });
+            (void)ubPortHealthQueryPool_->Submit([this, ticket = *ticket, unclaimed] {
+                if (unclaimed->exchange(false)) {
+                    CompleteUbPortHealthVerification(ticket);
+                }
+            });
+        } catch (const std::exception &error) {
+            LOG(ERROR) << "Failed to dispatch Client UB port-health query: " << error.what();
+            if (unclaimed == nullptr || unclaimed->exchange(false)) {
+                ubPortHealthQueriesInFlight_.fetch_sub(1, std::memory_order_acq_rel);
+                FailUbPortHealthQueryDispatch(*ticket, error.what());
+            }
+        } catch (...) {
+            LOG(ERROR) << "Failed to dispatch Client UB port-health query";
+            if (unclaimed == nullptr || unclaimed->exchange(false)) {
+                ubPortHealthQueriesInFlight_.fetch_sub(1, std::memory_order_acq_rel);
+                FailUbPortHealthQueryDispatch(*ticket, "Failed to dispatch Client UB port-health query");
+            }
+        }
+    }
+}
+
+void DataPlaneManager::FailUbPortHealthQueryDispatch(const cluster::RemoteUbQueryTicket &ticket,
+                                                     const std::string &message) noexcept
+{
+    try {
+        auto completion = ubPortHealthVerifier_.Complete(
+            ticket, std::nullopt, Status(K_RUNTIME_ERROR, message),
+            static_cast<uint64_t>(GetSteadyClockTimeStampMs()));
+        if (completion.retryScheduled && ubHealthWakeHook_) {
+            ubHealthWakeHook_();
+        }
+    } catch (const std::exception &error) {
+        LOG(ERROR) << "Failed to finish Client UB health query dispatch: " << error.what();
+    } catch (...) {
+        LOG(ERROR) << "Failed to finish Client UB health query dispatch";
+    }
+}
+
+void DataPlaneManager::CompleteUbPortHealthVerification(
+    const cluster::RemoteUbQueryTicket &ticket) noexcept
+{
+    try {
+        UbHealthSummary summary;
+        Status rc;
+        try {
+            rc = QueryUbPortHealth(ticket.peer, ticket.incarnation,
+                                   static_cast<int32_t>(UB_REMOTE_PORT_HEALTH_QUERY_INTERVAL.count()), summary);
+        } catch (const std::exception &error) {
+            rc = Status(K_RUNTIME_ERROR, error.what());
+        } catch (...) {
+            rc = Status(K_RUNTIME_ERROR, "Client UB port-health query threw");
+        }
+        ApplyUbPortHealthCapabilityCheck(ticket, rc);
+        std::optional<UbHealthSummary> response;
+        if (rc.IsOk()) {
+            response = summary;
+        }
+        auto completion = ubPortHealthVerifier_.Complete(
+            ticket, response, rc, static_cast<uint64_t>(GetSteadyClockTimeStampMs()));
+        if (completion.evidenceAccepted && response.has_value() && verifiedUbHealthSummaryHook_) {
+            verifiedUbHealthSummaryHook_(*response);
+        }
+    } catch (const std::exception &error) {
+        LOG(ERROR) << "Failed to complete Client UB port-health query: " << error.what();
+    } catch (...) {
+        LOG(ERROR) << "Failed to complete Client UB port-health query";
+    }
+    ubPortHealthQueriesInFlight_.fetch_sub(1, std::memory_order_acq_rel);
+    // Every completion frees a slot, even a healthy result or a retired ticket.
+    if (ubHealthWakeHook_) {
+        try {
+            ubHealthWakeHook_();
+        } catch (const std::exception &error) {
+            LOG(ERROR) << "Client UB health wake hook threw: " << error.what();
+        } catch (...) {
+            LOG(ERROR) << "Client UB health wake hook threw";
+        }
+    }
+}
+
+void DataPlaneManager::ApplyUbPortHealthCapabilityCheck(const cluster::RemoteUbQueryTicket &ticket, Status &rc) const
+{
+    if (!rc.IsError() || ubPortHealthCapabilityCheck_ == nullptr) {
+        return;
+    }
+    try {
+        if (!ubPortHealthCapabilityCheck_(ticket.peer)) {
+            rc = Status(K_NOT_SUPPORTED, "Worker has not advertised UB port-health query capability");
+        }
+    } catch (const std::exception &error) {
+        LOG(ERROR) << "Client UB port-health capability check threw: " << error.what();
+    } catch (...) {
+        LOG(ERROR) << "Client UB port-health capability check threw";
+    }
+}
+
+std::optional<std::chrono::steady_clock::time_point> DataPlaneManager::GetUbPortHealthQueryDeadline() const
+{
+    if (ubPortHealthQueriesInFlight_.load(std::memory_order_acquire) >=
+        cluster::REMOTE_UB_PORT_HEALTH_MAX_CONCURRENT_QUERIES) {
+        return std::nullopt;
+    }
+    auto deadlineMs = ubPortHealthVerifier_.NextQueryDeadlineMs();
+    if (!deadlineMs.has_value()) {
+        return std::nullopt;
+    }
+    const auto nowMs = static_cast<uint64_t>(GetSteadyClockTimeStampMs());
+    return std::chrono::steady_clock::now()
+           + std::chrono::milliseconds(*deadlineMs > nowMs ? *deadlineMs - nowMs : 0);
 }
 
 Status DataPlaneManager::EstablishUbProbe(const HostPort &workerAddr, const std::shared_ptr<WorkerRpcClient> &rpcClient)
@@ -820,9 +1095,20 @@ Status DataPlaneManager::UpdateWorkerSnapshot(const WorkerSnapshot &snapshot)
                                  + std::to_string(workerSnapshotVersion_.load()) + " to "
                                  + std::to_string(snapshot.ringVersion));
     auto newLiveWorkers = std::make_shared<const std::unordered_set<std::string>>(std::move(liveWorkers));
+    auto workerIncarnations =
+        std::make_shared<const std::unordered_map<HostPort, std::string>>(snapshot.workerIncarnations);
     auto endpointAdmission = std::make_shared<const EndpointAdmissionSnapshot>(
-        snapshot.ringVersion, newLiveWorkers, snapshot.provisional, snapshot.provisional ? 0 : SteadyNowMs());
+        snapshot.ringVersion, newLiveWorkers, snapshot.provisional,
+        snapshot.provisional ? 0 : SteadyNowMs(), workerIncarnations);
     std::atomic_store(&endpointAdmissionSnapshot_, std::move(endpointAdmission));
+    ubPortHealthVerifier_.ReconcileTopology(snapshot.workerIncarnations);
+    std::unordered_set<HostPort> workers;
+    workers.reserve(snapshot.workerIncarnations.size());
+    for (const auto &[worker, incarnation] : snapshot.workerIncarnations) {
+        (void)incarnation;
+        workers.emplace(worker);
+    }
+    observedUbHealthSummaries_.ReconcileWorkers(workers);
     {
         std::lock_guard<bthread::Mutex> lock(probeMutex_);
         writeProbeWorkers_ = std::move(writeProbeWorkers);
@@ -847,7 +1133,7 @@ void DataPlaneManager::RecordRoutingRefresh(uint64_t ringVersion)
         return;
     }
     auto refreshed = std::make_shared<const EndpointAdmissionSnapshot>(
-        current->ringVersion, current->liveWorkers, false, SteadyNowMs());
+        current->ringVersion, current->liveWorkers, false, SteadyNowMs(), current->workerIncarnations);
     // A concurrent publication wins; old refresh evidence must not rearm the new generation.
     (void)std::atomic_compare_exchange_strong(&endpointAdmissionSnapshot_, &current, std::move(refreshed));
 }
@@ -901,6 +1187,11 @@ void DataPlaneManager::Shutdown()
     if (shutdown_.exchange(true, std::memory_order_acq_rel)) {
         return;
     }
+    ubHealthCallbackState_->Detach();
+
+    // Dispatch shares lifecycleMutex_. The non-dropping four-slot pool drains raw-this tasks before dependencies;
+    // each RPC is capped at one second, so shutdown waits for at most the outstanding query wave plus pool join.
+    ubPortHealthQueryPool_.reset();
 
     std::vector<std::shared_ptr<WorkerTransportEntry>> entries;
     entries.reserve(entries_.size());

@@ -17,6 +17,7 @@ ds_cc_library(
         "state_filter.cpp",
         "ub_health_filter.cpp",
         "worker_router.cpp",
+        "worker_ub_health_registry.cpp",
     ],
     hdrs = [
         "broken_filter.h",
@@ -26,7 +27,9 @@ ds_cc_library(
         "routing_rpc_client.h",
         "state_filter.h",
         "ub_health_filter.h",
+        "ub_routing_health.h",
         "worker_router.h",
+        "worker_ub_health_registry.h",
     ],
     deps = [
         ":data_placement_policy",

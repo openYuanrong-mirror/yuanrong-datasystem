@@ -216,39 +216,16 @@ void AttachPublishedSelfUbHealth(const WorkerOCServiceImpl &service, Response &r
     }
 }
 
-void AppendActiveUbHealthSummaries(const cluster::TopologySnapshot &snapshot,
-                                   const RoutingUbHealthMap &healthSummaries,
-                                   GetHashRingRspPb &rsp)
-{
-    for (const auto *member : snapshot.ActiveMembers()) {
-        auto summary = healthSummaries.find(member->identity.address);
-        if (summary != healthSummaries.end()
-            && summary->second.incarnation == member->identity.id) {
-            EncodeUbHealthSummary(summary->second, *rsp.add_worker_ub_health_summaries());
-        }
-    }
-}
 }  // namespace
 
 Status BuildGetHashRingResponse(const cluster::TopologySnapshot &snapshot, uint64_t requestedVersion,
                                 const std::string &masterAddress, GetHashRingRspPb &rsp,
                                 const std::string &requestedHostIdsDigest)
 {
-    static const RoutingUbHealthMap emptyHealthSummaries;
-    return BuildGetHashRingResponse(snapshot, requestedVersion, masterAddress, rsp, emptyHealthSummaries,
-                                    requestedHostIdsDigest);
-}
-
-Status BuildGetHashRingResponse(const cluster::TopologySnapshot &snapshot, uint64_t requestedVersion,
-                                const std::string &masterAddress, GetHashRingRspPb &rsp,
-                                const RoutingUbHealthMap &healthSummaries,
-                                const std::string &requestedHostIdsDigest)
-{
     rsp.Clear();
     rsp.set_version(snapshot.Version());
     rsp.set_master_address(masterAddress);
     rsp.set_host_ids_digest(snapshot.HostIdsDigest());
-    AppendActiveUbHealthSummaries(snapshot, healthSummaries, rsp);
     if (requestedVersion != 0 && requestedVersion == snapshot.Version()
         && (requestedHostIdsDigest.empty() || requestedHostIdsDigest == snapshot.HostIdsDigest())) {
         rsp.set_hash_ring_changed(false);
@@ -3283,10 +3260,7 @@ Status WorkerOCServiceImpl::GetHashRing(const GetHashRingReqPb &req, GetHashRing
     RETURN_RUNTIME_ERROR_IF_NULL(topologyEngine_);
     std::shared_ptr<const cluster::TopologySnapshot> snapshot;
     RETURN_IF_NOT_OK(membership_.GetSnapshot(snapshot));
-    auto healthSummaries = std::atomic_load(&routingUbHealthSnapshot_);
-    RETURN_RUNTIME_ERROR_IF_NULL(healthSummaries);
-    return BuildGetHashRingResponse(*snapshot, req.version(), FLAGS_master_address, rsp, *healthSummaries,
-                                    req.host_ids_digest());
+    return BuildGetHashRingResponse(*snapshot, req.version(), FLAGS_master_address, rsp, req.host_ids_digest());
 }
 
 struct WorkerOCServiceImpl::PublishedSelfUbHealth {
@@ -3383,14 +3357,6 @@ Status WorkerOCServiceImpl::QuerySelfUbPortHealth(const QueryUbPortHealthReqPb &
 void WorkerOCServiceImpl::ReplaceGlobalUbHealthSummaries(const std::vector<UbHealthSummary> &summaries)
 {
     ubAdmission_->ReplaceGlobalSummaries(summaries);
-    auto published = std::make_shared<RoutingUbHealthMap>();
-    published->reserve(summaries.size());
-    for (auto summary : summaries) {
-        auto endpoint = summary.worker.ToString();
-        published->emplace(std::move(endpoint), std::move(summary));
-    }
-    std::atomic_store(&routingUbHealthSnapshot_,
-                      std::shared_ptr<const RoutingUbHealthMap>(std::move(published)));
 }
 
 Status WorkerOCServiceImpl::DeleteDevObjects(const DeleteAllCopyReqPb &req, DeleteAllCopyRspPb &resp)

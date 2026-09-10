@@ -1049,6 +1049,19 @@ private:
 
     Status CheckLocalUbNodeAdmission() const;
 
+    void EnsureUbHealthRoutingState();
+
+    client::TransportLayerOptions BuildTransportLayerOptions();
+
+    void ConfigureTransportUbHealthCallbacks(client::TransportLayerOptions &options);
+
+    void ConfigureTransportRoutingCallbacks(client::TransportLayerOptions &options);
+
+    client::HashRingRefresher::RingUpdateHook BuildRoutingUpdateHook(
+        const HostPort &initialWorker, bool initialWorkerIsLocal,
+        const std::shared_ptr<std::string> &sdkHostIdCache,
+        const std::shared_ptr<bool> &hostIdUnresolvedWarned);
+
     Status ApplyRoutingWorkerSnapshot(uint64_t ringVersion, const ::datasystem::ClusterTopologyPb &ring,
                                       const std::unordered_map<std::string, std::string> &hostIdMap,
                                       const std::string &sdkHostId, bool epochResetConfirmed = false);
@@ -1329,6 +1342,7 @@ private:
     std::shared_ptr<const SensitiveValue> transportToken_;
     std::unique_ptr<client::TransportLayer> transportLayer_;
     std::shared_ptr<client::Routing> routing_;
+    std::shared_ptr<client::WorkerUbHealthRegistry> ubHealthRegistry_;
     std::shared_ptr<client::UbHealthFilter> ubHealthFilter_;
 
     // Listenworker needs to be placed at the bottom to ensure that it is destructed first.

@@ -229,11 +229,7 @@ struct ClientWorkerCommonApiAttribute {
         }
     }
 
-    void SetUbHealthSummaryCallback(UbHealthSummaryApplyHook callback)
-    {
-        std::lock_guard<std::mutex> lock(ubHealthSummaryCallbackMutex_);
-        ubHealthSummaryCallback_ = std::move(callback);
-    }
+    void SetUbHealthSummaryCallback(UbHealthSummaryApplyHook callback);
 
     std::atomic<int32_t> socketFd_{ -1 };
     std::string clientId_;
@@ -278,6 +274,8 @@ protected:
 
     void SetHeartbeatProperties(int32_t timeoutMs, const RegisterClientRspPb &rsp);
     void ConsumeHeartbeatUbHealthSummary(const HeartbeatRspPb &rsp, const char *source);
+    void ConsumeUbHealthSummary(const UbHealthSummaryPb &encoded, const char *source);
+    void DispatchUbHealthSummaryCallback(const UbHealthSummary &summary, const char *context);
 
     int64_t heartBeatTimeoutMs_{ 0 };
     std::mutex ubHealthSummaryCallbackMutex_;

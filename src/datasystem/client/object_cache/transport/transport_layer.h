@@ -34,6 +34,7 @@
 #include "datasystem/client/mmap_manager/host_memory_pin_manager.h"
 #include "datasystem/client/object_cache/routing/ub_health_filter.h"
 #include "datasystem/client/object_cache/transport/data_plane/data_plane_manager.h"
+#include "datasystem/common/object_cache/ub_port_health.h"
 #include "datasystem/client/object_cache/transport/object_read/object_read_flow.h"
 #include "datasystem/client/object_cache/transport/object_read/object_read_types.h"
 #include "datasystem/client/object_cache/transport/rpc/mset_request_builder.h"
@@ -67,10 +68,14 @@ struct TransportLayerOptions {
     // A same-host endpoint remains usable through SHM when optional UB prewarming fails.
     bool allowUbRuntimeFailure = false;
     std::shared_ptr<UbHealthFilter> readSourceFilter;
+    UbHealthSummaryApplyHook ubHealthSummaryHook;
+    UbHealthSummaryApplyHook verifiedUbHealthSummaryHook;
     // Synchronous client-lifecycle admission checked around transport retry backoff.
     std::function<Status()> retryAdmissionCheck;
     std::function<void(const HostPort &, const Status &)> metadataFailureHandler;
     std::function<void(const HostPort &, const Status &)> drainingFallbackHandler;
+    // Optional consumer of every client-local port-health change (for example logging or routing hand-off).
+    std::weak_ptr<IUbPortHealthObserver> localPortHealthObserver;
 };
 
 class TransportLayer {
@@ -87,6 +92,14 @@ public:
 
     /** @brief Reject all Host object data APIs when every client-local UB port is confirmed BAD. */
     Status CheckLocalNodeAdmission() const;
+
+    /** @brief E4/E9 local path evidence: requests a merged monitor refresh; does not isolate by itself. */
+    void ReportLocalPortHealthTrigger();
+
+    /** Observe CQE-9 evidence that a Worker writeback could not reach this Client. */
+    void ReportClientGetWritebackFailure(const HostPort &provider, const ProviderUbFailureDetailPb &detail);
+
+    std::optional<UbPortHealthSummary> GetLocalPortHealthSummary() const;
 
     /**
      * @brief Run a client-local UB write under the shared sender admission and classify its raw failure evidence.
@@ -176,6 +189,8 @@ public:
     bool ScheduleProviderRecoveryFromGlobalSummary(const HostPort &provider);
     std::function<void(const HostPort &)> MakeProviderRecoveryCallback() const;
     void RecordRoutingRefresh(uint64_t ringVersion);
+    void ObserveUbHealthSummary(const UbHealthSummary &summary);
+    UbHealthSummaryApplyHook GetUbHealthSummaryApplyHook() const;
 
     void Shutdown();
 
@@ -189,6 +204,8 @@ protected:
     Status CheckUbReadSource(const HostPort &workerAddr, AccessTransportKind &deniedKind) const;
 
 private:
+    Status ConfigureLocalPortHealth();
+
     struct LocalUbSenderState;
     struct LocalUbSenderOperation {
         LocalUbSenderOperation() = default;
@@ -284,6 +301,9 @@ private:
     std::shared_ptr<ThreadPool> ambiguousCreateCleanupPool_;
     std::shared_ptr<UbHealthFilter> healthFilter_;
     std::unique_ptr<ObjectReadFlow> objectRead_;
+    std::shared_ptr<UbPortHealthMonitor> localPortHealthMonitor_;
+    std::weak_ptr<IUbPortHealthObserver> localPortHealthObserver_;
+    bool allowUbRuntimeFailure_{ false };
     std::shared_ptr<LocalUbSenderState> localUbSenderState_;
     std::shared_ptr<ThreadPool> lateCompletionPool_{ std::make_shared<ThreadPool>(1, 1, "ub-late-cqe") };
     // ApplyWorkerSnapshot serializes admission publication with shutdown through reconcileMutex_.

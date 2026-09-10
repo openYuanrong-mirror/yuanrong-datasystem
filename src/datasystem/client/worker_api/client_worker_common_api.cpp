@@ -28,6 +28,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <ctime>
+#include <exception>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -202,14 +203,75 @@ void ClientWorkerCommonApiAttribute::ConsumeHeartbeatUbHealthSummary(const Heart
         return;
     }
 #endif
+    auto dispatch = [this](const UbHealthSummary &summary) {
+        DispatchUbHealthSummaryCallback(summary, "Heartbeat");
+    };
+    LOG_IF_ERROR(
+        datasystem::ApplyHeartbeatUbHealthSummary(rsp, hostPort_, ubHealthSummaryCache_, dispatch),
+        source);
+}
+
+void ClientWorkerCommonApiAttribute::DispatchUbHealthSummaryCallback(const UbHealthSummary &summary,
+                                                                     const char *context)
+{
     UbHealthSummaryApplyHook callback;
     {
         std::lock_guard<std::mutex> lock(ubHealthSummaryCallbackMutex_);
         callback = ubHealthSummaryCallback_;
     }
-    LOG_IF_ERROR(
-        datasystem::ApplyHeartbeatUbHealthSummary(rsp, hostPort_, ubHealthSummaryCache_, callback),
-        source);
+    if (!callback) {
+        return;
+    }
+    try {
+        callback(summary);
+    } catch (const std::exception &error) {
+        LOG(ERROR) << context << " UB health summary callback threw: " << error.what();
+    } catch (...) {
+        LOG(ERROR) << context << " UB health summary callback threw";
+    }
+}
+
+void ClientWorkerCommonApiAttribute::ConsumeUbHealthSummary(const UbHealthSummaryPb &encoded, const char *source)
+{
+    UbHealthSummary summary;
+    auto status = DecodeUbHealthSummary(encoded, summary);
+    if (status.IsError() || summary.worker != hostPort_) {
+        constexpr uint32_t invalidSummaryLogEveryN = 100;
+        LOG_FIRST_EVERY_N(WARNING, invalidSummaryLogEveryN)
+            << source << ": " << (status.IsError() ? status.ToString() : "Worker endpoint mismatch");
+        return;
+    }
+    if (!ubHealthSummaryCache_.Apply(summary, summary.incarnation)) {
+        return;
+    }
+    auto accepted = ubHealthSummaryCache_.Get(summary.worker);
+    if (!accepted.has_value()) {
+        return;
+    }
+    DispatchUbHealthSummaryCallback(*accepted, "Business");
+}
+
+void ClientWorkerCommonApiAttribute::SetUbHealthSummaryCallback(UbHealthSummaryApplyHook callback)
+{
+    UbHealthSummaryApplyHook installed;
+    {
+        std::lock_guard<std::mutex> lock(ubHealthSummaryCallbackMutex_);
+        ubHealthSummaryCallback_ = std::move(callback);
+        installed = ubHealthSummaryCallback_;
+    }
+    if (!installed) {
+        return;
+    }
+    auto current = ubHealthSummaryCache_.Get(hostPort_);
+    if (current.has_value()) {
+        try {
+            installed(*current);
+        } catch (const std::exception &error) {
+            LOG(ERROR) << "Initial UB health summary callback threw: " << error.what();
+        } catch (...) {
+            LOG(ERROR) << "Initial UB health summary callback threw";
+        }
+    }
 }
 
 IClientWorkerCommonApi::~IClientWorkerCommonApi() = default;

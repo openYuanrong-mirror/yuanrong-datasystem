@@ -42,6 +42,7 @@
 #include "datasystem/common/log/access_recorder.h"
 #include "datasystem/common/log/log.h"
 #include "datasystem/common/metrics/kv_metrics.h"
+#include "datasystem/common/object_cache/provider_ub_failure_detail.h"
 #include "datasystem/common/object_cache/ub_failure_classifier.h"
 #include "datasystem/common/rdma/fast_transport_manager_wrapper.h"
 #include "datasystem/common/rpc/api_deadline.h"
@@ -233,7 +234,7 @@ struct TransportLayer::LocalUbSenderState final : public UrmaLateCompletionObser
 
     void DispatchLateWriteTargetCompletion(const UrmaLateCompletion &completion, uint64_t peerToken)
     {
-        auto pool = lateCompletionPool;
+        auto pool = lateCompletionPool.lock();
         auto filter = healthFilter.lock();
         auto mutex = reconcileMutex.lock();
         auto cv = reconcileCv.lock();
@@ -242,12 +243,16 @@ struct TransportLayer::LocalUbSenderState final : public UrmaLateCompletionObser
         }
         auto weakState = weak_from_this();
         pool->Execute([weakState, filter, mutex, cv, completion, peerToken]() {
-            std::lock_guard<bthread::Mutex> lock(*mutex);
             auto state = weakState.lock();
             if (state == nullptr || state->IsShuttingDown()) {
                 return;
             }
             filter->ReportLateWriteTargetFailure(completion, peerToken);
+            std::lock_guard<bthread::Mutex> lock(*mutex);
+            state = weakState.lock();
+            if (state == nullptr || state->IsShuttingDown()) {
+                return;
+            }
             cv->notify_all();
         });
     }
@@ -279,7 +284,7 @@ struct TransportLayer::LocalUbSenderState final : public UrmaLateCompletionObser
     mutable std::shared_mutex mutex;
     std::weak_ptr<bthread::Mutex> reconcileMutex;
     std::weak_ptr<bthread::ConditionVariable> reconcileCv;
-    std::shared_ptr<ThreadPool> lateCompletionPool;
+    std::weak_ptr<ThreadPool> lateCompletionPool;
     std::weak_ptr<UbHealthFilter> healthFilter;
     std::mutex inFlightDrainMutex;
     std::condition_variable inFlightCv;
@@ -302,24 +307,41 @@ TransportLayer::TransportLayer(std::shared_ptr<Signature> signature, std::shared
     : advisor_(std::make_shared<TransportAdvisor>()),
       releasePool_(std::move(options.releasePool)),
       ambiguousCreateCleanupPool_(
-          std::make_shared<ThreadPool>(0, AMBIGUOUS_CREATE_CLEANUP_THREAD_NUM, "ambiguous-create-cleanup"))
+          std::make_shared<ThreadPool>(0, AMBIGUOUS_CREATE_CLEANUP_THREAD_NUM, "ambiguous-create-cleanup")),
+      allowUbRuntimeFailure_(options.allowUbRuntimeFailure)
 {
     localUbSenderState_ = std::make_shared<LocalUbSenderState>();
     localUbSenderState_->reconcileMutex = reconcileMutex_;
     localUbSenderState_->reconcileCv = reconcileCv_;
+    healthFilter_ = options.readSourceFilter == nullptr ? std::make_shared<UbHealthFilter>()
+                                                         : std::move(options.readSourceFilter);
+    std::weak_ptr<UbHealthFilter> weakHealthFilter(healthFilter_);
     auto ubBufferProvider = CreateDefaultUbReceiveBufferProvider();
+    auto supportsPortHealthVerification = [weakHealthFilter](const HostPort &peer) {
+        auto filter = weakHealthFilter.lock();
+        return filter != nullptr && filter->SupportsPortHealthVerification(peer);
+    };
     manager_ = std::make_shared<DataPlaneManager>(std::move(signature), fastTransportMemSize,
                                                   std::move(options.channelConfig), ubBufferProvider,
                                                   options.enableClientDirectPipelineH2D, options.pipelineThreadNum,
                                                   releasePool_, options.initializeUbRuntime,
-                                                  options.allowUbRuntimeFailure, options.hostMemoryPinManager);
+                                                  options.allowUbRuntimeFailure, options.hostMemoryPinManager,
+                                                  std::move(options.ubHealthSummaryHook),
+                                                  std::move(options.verifiedUbHealthSummaryHook),
+                                                  [this] { NotifyReconcile(); },
+                                                  std::move(supportsPortHealthVerification));
     auto retry = std::make_shared<DeadlineRetry>(std::move(options.retryAdmissionCheck));
     auto metadata = std::make_shared<ObjectMetadataClient>(manager_, retry, advisor_, std::move(ubBufferProvider),
                                                            GetConfiguredUbInlineBufferSize(),
                                                            std::move(options.metadataFailureHandler));
     auto executor = std::make_shared<DataPlaneExecutor>(manager_, advisor_, std::move(options.drainingFallbackHandler));
-    healthFilter_ = options.readSourceFilter == nullptr ? std::make_shared<UbHealthFilter>()
-                                                        : std::move(options.readSourceFilter);
+    std::weak_ptr<DataPlaneManager> weakManager(manager_);
+    healthFilter_->SetRemotePortHealthVerificationTrigger([weakManager](const HostPort &peer) {
+        auto manager = weakManager.lock();
+        if (manager != nullptr) {
+            (void)manager->RequestUbPortHealthVerification(peer);
+        }
+    });
     localUbSenderState_->lateCompletionPool = lateCompletionPool_;
     localUbSenderState_->healthFilter = healthFilter_;
     auto checkReadSource = [this](const HostPort &workerAddr, AccessTransportKind &deniedKind) {
@@ -333,6 +355,7 @@ TransportLayer::TransportLayer(std::shared_ptr<Signature> signature, std::shared
     auto replicas = std::make_shared<ReplicaReader>(std::move(executor), std::move(retry), taskPool,
                                                     std::move(checkReadSource), std::move(reportReadOutcome));
     objectRead_ = std::make_unique<ObjectReadFlow>(std::move(metadata), std::move(replicas), std::move(taskPool));
+    localPortHealthObserver_ = std::move(options.localPortHealthObserver);
 }
 
 TransportLayer::TransportLayer(std::shared_ptr<DataPlaneManager> dataPlaneManager,
@@ -361,11 +384,41 @@ TransportLayer::TransportLayer(std::shared_ptr<DataPlaneManager> dataPlaneManage
 
 bool TransportLayer::ReportProviderUbFailure(const HostPort &provider, const ProviderUbFailureDetailPb &detail)
 {
-    if (healthFilter_ == nullptr || !healthFilter_->ReportProviderFailure(provider, detail)) {
+    ReportClientGetWritebackFailure(provider, detail);
+    if (healthFilter_ == nullptr) {
         return false;
     }
-    NotifyReconcile();
-    return true;
+    const bool quarantined = healthFilter_->ReportProviderFailure(provider, detail);
+    if (quarantined) {
+        NotifyReconcile();
+    }
+    return quarantined;
+}
+
+void TransportLayer::ObserveUbHealthSummary(const UbHealthSummary &summary)
+{
+    if (manager_ != nullptr) {
+        manager_->ObserveUbHealthSummary(summary);
+    }
+}
+
+UbHealthSummaryApplyHook TransportLayer::GetUbHealthSummaryApplyHook() const
+{
+    std::weak_ptr<DataPlaneManager> weakManager(manager_);
+    return [weakManager](const UbHealthSummary &summary) {
+        auto manager = weakManager.lock();
+        if (manager != nullptr) {
+            manager->ObserveUbHealthSummary(summary);
+        }
+    };
+}
+
+void TransportLayer::ReportClientGetWritebackFailure(const HostPort &provider,
+                                                     const ProviderUbFailureDetailPb &detail)
+{
+    if (IsClientUbWritebackAckTimeout(provider, detail)) {
+        ReportLocalPortHealthTrigger();
+    }
 }
 
 Status TransportLayer::CheckUbReadSource(const HostPort &workerAddr, AccessTransportKind &deniedKind) const
@@ -427,9 +480,20 @@ Status TransportLayer::CheckLocalNodeAdmission() const
     return CheckClientLocalUbPortHealth();
 }
 
+void TransportLayer::ReportLocalPortHealthTrigger()
+{
+    TriggerClientLocalUbPortHealthQuery();
+}
+
+std::optional<UbPortHealthSummary> TransportLayer::GetLocalPortHealthSummary() const
+{
+    return localPortHealthMonitor_ == nullptr ? std::nullopt : localPortHealthMonitor_->GetSummary();
+}
+
 Status TransportLayer::RunClientLocalUbWrite(const HostPort &workerAddr, ObjectBufferInfo &bufferInfo,
                                              const std::function<Status()> &write)
 {
+    RETURN_IF_NOT_OK(CheckLocalNodeAdmission());
     LocalUbSenderOperation operation;
     RETURN_IF_NOT_OK(AcquireLocalUbSenderAdmission(TransportHint::UB_CANDIDATE, operation));
     bufferInfo.ubFailureReportRc = Status::OK();
@@ -479,10 +543,12 @@ bool TransportLayer::ReportWriteTargetUbFailure(const LocalUbSenderFailureView &
     const bool quarantined = healthFilter_->ReportWriteTargetFailure(
         failure.workerAddr, failure.status, failure.providerStatus, failure.cqeStatus);
     if (quarantined) {
+        NotifyReconcile();
+    }
+    if (quarantined) {
         LOG(ERROR) << "[CLIENT_UB_WRITE_TARGET_ISOLATION] Client UB write target quarantined, worker="
                    << failure.workerAddr.ToString() << ", status=" << failure.status.ToString()
                    << ", cqeStatus=" << *failure.cqeStatus;
-        NotifyReconcile();
     }
     return quarantined;
 }
@@ -604,6 +670,7 @@ Status TransportLayer::Init()
 {
     RETURN_RUNTIME_ERROR_IF_NULL(manager_);
     RETURN_IF_NOT_OK(manager_->Init());
+    RETURN_IF_NOT_OK(ConfigureLocalPortHealth());
     std::lock_guard<bthread::Mutex> lock(*reconcileMutex_);
     if (reconcileStarted_) {
         return Status::OK();
@@ -619,6 +686,33 @@ Status TransportLayer::Init()
     return Status::OK();
 }
 
+Status TransportLayer::ConfigureLocalPortHealth()
+{
+    if (!IsUrmaRuntimeConfigured()) {
+        return Status::OK();
+    }
+    auto status = GetLocalUbPortHealthMonitor(localPortHealthMonitor_);
+    if (status.IsError()) {
+        if (!allowUbRuntimeFailure_) {
+            return status;
+        }
+        LOG_FIRST_EVERY_N(WARNING, TRANSPORT_DIAG_LOG_RATE)
+            << "Optional Client UB port-health monitor is unavailable; continue with SHM/TCP: " << status;
+        return Status::OK();
+    }
+    if (!localPortHealthObserver_.expired()) {
+        status = localPortHealthMonitor_->AddObserver(localPortHealthObserver_);
+        if (status.IsError() && !allowUbRuntimeFailure_) {
+            return status;
+        }
+        if (status.IsError()) {
+            LOG_FIRST_EVERY_N(WARNING, TRANSPORT_DIAG_LOG_RATE)
+                << "Optional Client UB port-health observer registration failed; continue with SHM/TCP: " << status;
+        }
+    }
+    return Status::OK();
+}
+
 Status TransportLayer::ResolveMetadata(const ObjectReadRequest &input,
                                        std::vector<ObjectMetadataItem> &metadata)
 {
@@ -629,6 +723,7 @@ Status TransportLayer::ResolveMetadata(const ObjectReadRequest &input,
 Status TransportLayer::AcquireDirectUbEndpointLease(
     const HostPort &workerAddr, std::unique_ptr<DataPlaneManager::DataPlaneLease> &lease)
 {
+    RETURN_IF_NOT_OK(CheckLocalNodeAdmission());
     RETURN_IF_NOT_OK(manager_->AcquireDataPlaneLease(workerAddr, TransportHint::UB_CANDIDATE, lease));
     RETURN_RUNTIME_ERROR_IF_NULL(lease);
     RETURN_RUNTIME_ERROR_IF_NULL(lease->GetTransporter());
@@ -640,6 +735,7 @@ Status TransportLayer::AcquireDirectUbEndpointLease(
 Status TransportLayer::Get(const ObjectReadRequest &input, ObjectReadResult &output)
 {
     RETURN_RUNTIME_ERROR_IF_NULL(objectRead_);
+    RETURN_IF_NOT_OK(CheckLocalNodeAdmission());
     VLOG(1) << "[TransportGet][TransportLayer] Start Get, key count: " << input.items.size()
             << ", remaining deadline us: " << ApiDeadline::Instance().ApiRemainingUs();
     Status status = objectRead_->Run(input, output);
@@ -720,6 +816,7 @@ bool TransportLayer::IsSameHostWorker(const HostPort &workerAddr) const
 Status TransportLayer::Create(const HostPort &workerAddr, const std::string &objectKey, uint64_t dataSize,
                               TransportCreateParam param, std::shared_ptr<ObjectBuffer> &buffer)
 {
+    RETURN_IF_NOT_OK(CheckLocalNodeAdmission());
     RETURN_IF_NOT_OK(ValidateCreateRequest(objectKey, dataSize, param));
     INJECT_POINT("TransportLayer.Create.beforeTransport");
     RETURN_RUNTIME_ERROR_IF_NULL(manager_);
@@ -840,6 +937,7 @@ Status TransportLayer::Set(ObjectBuffer &buffer, const TransportSetParam &param)
 Status TransportLayer::Set(ObjectBuffer &buffer, const TransportSetParam &param, TransportSetResult &result)
 {
     result = TransportSetResult{};
+    RETURN_IF_NOT_OK(CheckLocalNodeAdmission());
     RETURN_RUNTIME_ERROR_IF_NULL(manager_);
     RETURN_RUNTIME_ERROR_IF_NULL(advisor_);
     const HostPort workerAddr = ObjectBufferInternal::GetInfo(buffer).workerAddr;
@@ -948,6 +1046,7 @@ Status TransportLayer::MCreate(const HostPort &workerAddr, const std::vector<std
                                const std::vector<uint64_t> &dataSizes, TransportCreateParam param,
                                std::vector<std::shared_ptr<ObjectBuffer>> &buffers)
 {
+    RETURN_IF_NOT_OK(CheckLocalNodeAdmission());
     RETURN_IF_NOT_OK(ValidateMultiCreateRequest(objectKeys, dataSizes, param));
     INJECT_POINT("TransportLayer.MCreate.beforeTransport");
     RETURN_RUNTIME_ERROR_IF_NULL(manager_);
@@ -1040,6 +1139,7 @@ Status TransportLayer::MSet(const std::vector<std::shared_ptr<ObjectBuffer>> &bu
                             TransportMSetResult &result)
 {
     result.Clear();
+    RETURN_IF_NOT_OK(CheckLocalNodeAdmission());
     RETURN_IF_NOT_OK(ValidateMSetRequest(buffers, param));
     RETURN_RUNTIME_ERROR_IF_NULL(manager_);
     RETURN_RUNTIME_ERROR_IF_NULL(advisor_);
@@ -1342,6 +1442,11 @@ bool TransportLayer::WaitForSnapshotOrStop(std::unique_lock<bthread::Mutex> &loc
             || (writeTargetDeadline.has_value() && *writeTargetDeadline < *probeDeadline)) {
             probeDeadline = writeTargetDeadline;
         }
+        auto portHealthDeadline = manager_->GetUbPortHealthQueryDeadline();
+        if (!probeDeadline.has_value()
+            || (portHealthDeadline.has_value() && *portHealthDeadline < *probeDeadline)) {
+            probeDeadline = portHealthDeadline;
+        }
         INJECT_POINT_NO_RETURN("TransportLayer.WaitForSnapshotOrStop.afterDeadlineCheck");
         if (probeDeadline.has_value()) {
             const auto now = std::chrono::steady_clock::now();
@@ -1379,6 +1484,7 @@ void TransportLayer::ReconcileLoop()
         }
         TryRecoverProviderUbSource();
         TryRecoverWriteTargetUbSource();
+        manager_->RunDueUbPortHealthVerification();
     }
 }
 
@@ -1413,6 +1519,7 @@ void TransportLayer::Shutdown()
     ambiguousCreateCleanupPool_.reset();
     releasePool_.reset();
     objectRead_.reset();
+    // UrmaManager owns the context monitor and drains it before context teardown.
     if (manager_ != nullptr) {
         manager_->Shutdown();
     }

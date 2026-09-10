@@ -39,6 +39,15 @@ UbHealthSummary Summary(uint32_t totalPorts, uint32_t badPorts, uint64_t healthE
     return summary;
 }
 
+UbHealthSummary SummaryFor(const HostPort &worker, const std::string &incarnation,
+                           uint32_t totalPorts, uint32_t badPorts, uint64_t healthEpoch)
+{
+    auto summary = Summary(totalPorts, badPorts, healthEpoch);
+    summary.worker = worker;
+    summary.incarnation = incarnation;
+    return summary;
+}
+
 }  // namespace
 
 TEST(RemoteUbPortHealthVerifierTest, ClientModeQueriesEverySecondUntilAnyPortRecovers)
@@ -137,6 +146,63 @@ TEST(RemoteUbPortHealthVerifierTest, ConcurrentTriggersProduceOneInFlightQuery)
         dispatcher.join();
     }
     EXPECT_EQ(tickets.load(std::memory_order_relaxed), 1u);
+}
+
+TEST(RemoteUbPortHealthVerifierTest, TriggerDuringQuerySchedulesOneRateLimitedFollowUp)
+{
+    RemoteUbPortHealthVerifier verifier;
+    ASSERT_TRUE(verifier.RequestVerification(WORKER, INCARNATION, 100));
+    auto ticket = verifier.TryBeginDue(100);
+    ASSERT_TRUE(ticket.has_value());
+
+    EXPECT_TRUE(verifier.RequestVerification(WORKER, INCARNATION, 150));
+    EXPECT_FALSE(verifier.RequestVerification(WORKER, INCARNATION, 160));
+    auto completion = verifier.Complete(*ticket, Summary(4, 0, 1), Status::OK(), 200);
+
+    EXPECT_TRUE(completion.retryScheduled);
+    EXPECT_EQ(verifier.NextQueryDeadlineMs(), 1'100u);
+}
+
+TEST(RemoteUbPortHealthVerifierTest, UnsupportedPeerUsesBoundedBackoff)
+{
+    RemoteUbPortHealthVerifier verifier;
+    ASSERT_TRUE(verifier.RequestVerification(WORKER, INCARNATION, 100));
+    auto ticket = verifier.TryBeginDue(100);
+    ASSERT_TRUE(ticket.has_value());
+
+    auto completion = verifier.Complete(
+        *ticket, std::nullopt, Status(K_NOT_SUPPORTED, "old Worker"), 120);
+
+    EXPECT_TRUE(completion.retryScheduled);
+    EXPECT_EQ(verifier.NextQueryDeadlineMs(), 30'120u);
+}
+
+TEST(RemoteUbPortHealthVerifierTest, SuccessfulRetryCompressesOtherIsolationDeadlines)
+{
+    const HostPort secondWorker("127.0.0.1", 18481);
+    constexpr char secondIncarnation[] = "second-incarnation";
+    RemoteUbPortHealthVerifier verifier;
+    ASSERT_TRUE(verifier.RequestVerification(WORKER, INCARNATION, 0));
+
+    auto failedTicket = verifier.TryBeginDue(0);
+    ASSERT_TRUE(failedTicket.has_value());
+    ASSERT_EQ(failedTicket->peer, WORKER);
+    ASSERT_TRUE(verifier.RequestVerification(secondWorker, secondIncarnation, 0));
+    verifier.Complete(*failedTicket, std::nullopt, Status(K_RPC_DEADLINE_EXCEEDED, "timeout"), 10);
+
+    auto isolatedTicket = verifier.TryBeginDue(10);
+    ASSERT_TRUE(isolatedTicket.has_value());
+    ASSERT_EQ(isolatedTicket->peer, secondWorker);
+    verifier.Complete(*isolatedTicket,
+                      SummaryFor(secondWorker, secondIncarnation, 4, 4, 1), Status::OK(), 120);
+    EXPECT_EQ(verifier.NextQueryDeadlineMs(), 1'010u);
+
+    auto retry = verifier.TryBeginDue(1'010);
+    ASSERT_TRUE(retry.has_value());
+    ASSERT_EQ(retry->peer, WORKER);
+    verifier.Complete(*retry, Summary(4, 0, 1), Status::OK(), 1'020);
+
+    EXPECT_EQ(verifier.NextQueryDeadlineMs(), 1'020u);
 }
 
 }  // namespace datasystem::cluster

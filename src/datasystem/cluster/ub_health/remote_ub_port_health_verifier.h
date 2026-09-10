@@ -30,6 +30,7 @@
 namespace datasystem::cluster {
 
 constexpr size_t REMOTE_UB_PORT_HEALTH_MAX_CONCURRENT_QUERIES = 4;
+constexpr uint64_t REMOTE_UB_PORT_HEALTH_UNSUPPORTED_RETRY_INTERVAL_MS = 30'000;
 struct RemoteUbQueryTicket {
     HostPort peer;
     std::string incarnation;
@@ -55,12 +56,12 @@ public:
                                      const Status &queryStatus, uint64_t nowMs);
     bool NotifySummaryHint(const UbHealthSummary &summary, uint64_t nowMs);
     void ReconcileTopology(const std::unordered_map<HostPort, std::string> &incarnations);
-    void Cancel(const HostPort &peer);
     std::optional<uint64_t> NextQueryDeadlineMs() const;
 
 private:
     struct AcceptedSummaryTransition {
         bool logResponse;
+        bool recoveredAfterRetry;
         const char *decision;
     };
 
@@ -73,6 +74,7 @@ private:
         bool inFlight = false;
         bool isolated = false;
         bool summaryHintPending = false;
+        bool triggerPending = false;
         bool verificationPending = false;
         std::optional<StatusCode> lastLoggedRetryStatus;
     };
@@ -82,6 +84,7 @@ private:
     AcceptedSummaryTransition ApplyAcceptedSummaryLocked(
         PeerState &state, const UbPortHealthSummary &portHealth, uint64_t nowMs,
         RemoteUbQueryCompletion &completion) const;
+    void CompressIsolatedDeadlinesLocked(const HostPort &completedPeer, uint64_t nowMs);
 
     const uint64_t queryIntervalMs_;
     mutable std::mutex mutex_;

@@ -1544,10 +1544,6 @@ private:
     mutable std::mutex selfUbHealthPublicationMutex_;
     mutable std::shared_ptr<const PublishedSelfUbHealth> publishedSelfUbHealthSummary_;
 
-    std::shared_ptr<const std::unordered_map<std::string, UbHealthSummary>> routingUbHealthSnapshot_{
-        std::make_shared<const std::unordered_map<std::string, UbHealthSummary>>()
-    };
-
     std::shared_ptr<WorkerOcServiceDeleteImpl> deleteProc_{ nullptr };
 
     std::shared_ptr<WorkerOcServiceGlobalReferenceImpl> gRefProc_{ nullptr };

@@ -20,10 +20,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <exception>
 #include <utility>
 
 #include "datasystem/common/inject/inject_point.h"
 #include "datasystem/common/log/latency_phase.h"
+#include "datasystem/common/object_cache/ub_health_summary_codec.h"
 #include "datasystem/common/perf/perf_manager.h"
 #include "datasystem/common/rdma/fast_transport_manager_wrapper.h"
 #include "datasystem/common/rpc/api_deadline.h"
@@ -35,6 +37,8 @@
 namespace datasystem {
 namespace client {
 namespace {
+constexpr uint32_t INVALID_UB_HEALTH_SIDECAR_LOG_EVERY_N = 100;
+
 
 Status GetRpcTimeout(int64_t maxRpcTimeoutMs, int32_t &rpcTimeoutMs)
 {
@@ -210,6 +214,9 @@ Status WorkerRpcClient::InvokeGetObject(GetObjectRemoteReqPb &request, GetObject
     options.SetTimeout(rpcTimeout);
     INJECT_POINT("client.transport.get_object_remote", []() { return Status::OK(); });
     Status rc = DoInvokeGetObject(options, request, response, payloads);
+    if (response.has_ub_health_summary()) {
+        ObserveUbHealthSummary(response.ub_health_summary());
+    }
     return rc.IsError() ? WithRpcDiag(rc, "GetObjectRemote", workerAddress_) : Status::OK();
 }
 
@@ -224,6 +231,9 @@ Status WorkerRpcClient::InvokeClientGet(GetReqPb &request, GetRspPb &response, s
     options.SetTimeout(rpcTimeout);
     INJECT_POINT("client.transport.worker_oc_get", []() { return Status::OK(); });
     Status rc = DoInvokeClientGet(options, request, response, payloads);
+    if (response.has_ub_health_summary()) {
+        ObserveUbHealthSummary(response.ub_health_summary());
+    }
     return rc.IsError() ? WithRpcDiag(rc, "WorkerOCService.Get", workerAddress_) : Status::OK();
 }
 
@@ -240,6 +250,9 @@ Status WorkerRpcClient::InvokeBatchGetObject(BatchGetObjectRemoteReqPb &request,
     options.SetTimeout(rpcTimeout);
     INJECT_POINT("client.transport.batch_get_object_remote", []() { return Status::OK(); });
     Status rc = DoInvokeBatchGetObject(options, request, response, payloads);
+    if (response.has_ub_health_summary()) {
+        ObserveUbHealthSummary(response.ub_health_summary());
+    }
     return rc.IsError() ? WithRpcDiag(rc, "BatchGetObjectRemote", workerAddress_) : Status::OK();
 }
 
@@ -262,6 +275,9 @@ Status WorkerRpcClient::InvokeQueryAndGet(QueryAndGetReqPb &request, QueryAndGet
     }
     INJECT_POINT("client.transport.query_and_get.after_dispatch");
     Status rc = DoInvokeQueryAndGet(options, request, response, payloads);
+    if (response.has_ub_health_summary()) {
+        ObserveUbHealthSummary(response.ub_health_summary());
+    }
     return rc.IsError() ? WithRpcDiag(rc, "QueryAndGet", workerAddress_) : Status::OK();
 }
 
@@ -395,6 +411,9 @@ Status WorkerRpcClient::InvokeSet(int64_t subTimeoutMs, PublishReqPb &request,
     const bool traceEnabled = IsClientLatencyTraceActive();
     const auto rpcStart = traceEnabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     Status rc = DoInvokeSet(options, request, response, payloads);
+    if (response.has_ub_health_summary()) {
+        ObserveUbHealthSummary(response.ub_health_summary());
+    }
     RecordRpcTotalLatency(LatencySummaryPhase::CLIENT_RPC_PUBLISH_TOTAL, traceEnabled, rpcStart);
     if (rc.IsError()) {
         if (request.is_retry() && request.is_seal() && rc.GetCode() == K_OC_ALREADY_SEALED) {
@@ -444,6 +463,9 @@ Status WorkerRpcClient::InvokeMultiSet(int64_t subTimeoutMs, MultiPublishReqPb &
     PerfPoint perfPoint(PerfKey::RPC_CLIENT_MULTI_PUBLISH_OBJECT);
     INJECT_POINT("WorkerRpcClient.InvokeMultiSet.beforeRpc");
     Status rc = DoInvokeMultiSet(options, request, response, payloads);
+    if (response.has_ub_health_summary()) {
+        ObserveUbHealthSummary(response.ub_health_summary());
+    }
     if (rc.IsError()) {
         return WithRpcDiag(rc, "MultiPublish", workerAddress_);
     }
@@ -524,6 +546,81 @@ Status WorkerRpcClient::ProbeProviderUbRecovery(const std::string &expectedWorke
     (void)response;
     return Status(K_NOT_SUPPORTED, "URMA Provider recovery probe is unavailable in this build");
 #endif
+}
+
+Status WorkerRpcClient::QueryUbPortHealth(const std::string &expectedWorkerIncarnation,
+                                          int32_t timeoutMs, QueryUbPortHealthRspPb &response)
+{
+    CHECK_FAIL_RETURN_STATUS(IsAlive(), K_RPC_UNAVAILABLE, "Routed worker RPC client is not initialized");
+    CHECK_FAIL_RETURN_STATUS(timeoutMs > 0, K_INVALID, "UB port health query timeout must be positive");
+    QueryUbPortHealthReqPb request;
+    request.set_expected_worker_incarnation(expectedWorkerIncarnation);
+    RETURN_IF_NOT_OK(signature_->GenerateSignature(request));
+    const auto configuredTimeout = channelConfig_.timeout_ms > 0 ? channelConfig_.timeout_ms : timeoutMs;
+    const auto rpcTimeout = static_cast<int32_t>(
+        std::min({ static_cast<int64_t>(timeoutMs), static_cast<int64_t>(configuredTimeout),
+                   static_cast<int64_t>(MAX_RPC_TIMEOUT_MS) }));
+    RpcOptions options;
+    options.SetTimeout(rpcTimeout);
+    auto rc = transportStub_->QueryUbPortHealth(options, request, response);
+    return rc.IsError() ? WithRpcDiag(rc, "QueryUbPortHealth", workerAddress_) : Status::OK();
+}
+
+void WorkerRpcClient::SetUbHealthSummaryCallback(UbHealthSummaryApplyHook callback)
+{
+    std::lock_guard<std::mutex> lock(ubHealthSummaryMutex_);
+    ubHealthSummaryCallback_ = std::move(callback);
+}
+
+void WorkerRpcClient::ObserveUbHealthSummary(const UbHealthSummaryPb &encoded)
+{
+    UbHealthSummary summary;
+    auto rc = DecodeUbHealthSummary(encoded, summary);
+    if (rc.IsError() || summary.worker != workerAddress_) {
+        const auto reason = rc.IsError() ? rc.ToString() : "Worker endpoint mismatch";
+        LOG_FIRST_EVERY_N(WARNING, INVALID_UB_HEALTH_SIDECAR_LOG_EVERY_N)
+            << "Ignore invalid business UB health sidecar from " << workerAddress_.ToString() << ": " << reason;
+        return;
+    }
+    auto current = std::atomic_load(&lastUbHealthSummary_);
+    if (current != nullptr && IsSameUbHealthSummary(*current, summary)) {
+        return;
+    }
+
+    UbHealthSummaryApplyHook callback;
+    {
+        std::lock_guard<std::mutex> lock(ubHealthSummaryMutex_);
+        current = std::atomic_load(&lastUbHealthSummary_);
+        if (current != nullptr && IsSameUbHealthSummary(*current, summary)) {
+            return;
+        }
+        if (current != nullptr) {
+            UbHealthSummary merged;
+            if (!MergeUbHealthSummary(current.get(), summary, merged)) {
+                LOG_FIRST_EVERY_N(WARNING, INVALID_UB_HEALTH_SIDECAR_LOG_EVERY_N)
+                    << "Ignore conflicting business UB health sidecar from " << workerAddress_.ToString()
+                    << ": same health epoch carries different port counts";
+                return;
+            }
+            summary = std::move(merged);
+            if (IsSameUbHealthSummary(*current, summary)) {
+                return;
+            }
+        }
+        std::atomic_store(&lastUbHealthSummary_,
+                          std::shared_ptr<const UbHealthSummary>(std::make_shared<UbHealthSummary>(summary)));
+        callback = ubHealthSummaryCallback_;
+    }
+    if (callback) {
+        try {
+            callback(summary);
+        } catch (const std::exception &error) {
+            LOG(ERROR) << "Business UB health sidecar callback threw for " << workerAddress_.ToString()
+                       << ": " << error.what();
+        } catch (...) {
+            LOG(ERROR) << "Business UB health sidecar callback threw for " << workerAddress_.ToString();
+        }
+    }
 }
 
 bool WorkerRpcClient::IsAlive() const

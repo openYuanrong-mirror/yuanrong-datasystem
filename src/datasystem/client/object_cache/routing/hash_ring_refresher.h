@@ -81,6 +81,7 @@ private:
     void RefreshLoop();
     std::vector<HostPort> BeginRefreshRound(size_t &startIndex);
     Status DoRefresh(bool stopAware);
+    Status DoRefreshSafely(bool stopAware);
     Status PublishHashRing(uint64_t newVersion, ::datasystem::ClusterTopologyPb &&ring,
                            std::unordered_map<std::string, std::string> &&hostIdMap, bool epochResetConfirmed);
     void UpdateWorkerList(const ::datasystem::ClusterTopologyPb &ring);

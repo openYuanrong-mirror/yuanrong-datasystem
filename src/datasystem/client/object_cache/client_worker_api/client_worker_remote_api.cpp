@@ -560,6 +560,9 @@ Status ClientWorkerRemoteApi::Get(const GetParam &getParam, uint32_t &version, G
         },
         []() { return Status::OK(); }, RETRY_ERROR_CODE, rpcTimeout);
     Trace::Instance().AddCommPhaseIfEnabled(LatencySummaryPhase::CLIENT_RPC_GET, traceEnabled);
+    if (rsp.has_ub_health_summary()) {
+        ConsumeUbHealthSummary(rsp.ub_health_summary(), "Ignore invalid Get UB health summary");
+    }
     const Status &finalStatus = uncertainGetStatus.IsError() ? uncertainGetStatus : getStatus;
 #ifdef USE_URMA
     if (NeedDelayReleaseShmUnit(finalStatus)) {
@@ -687,9 +690,12 @@ Status ClientWorkerRemoteApi::DoPublishRpc(PublishReqPb& req, PublishRspPb& rsp,
     return s;
 }
 
-Status ClientWorkerRemoteApi::HandlePublishResponse(Status status, const PublishRspPb& rsp, bool traceEnabled,
-                                                    const char* path, uint64_t elapsedUs)
+Status ClientWorkerRemoteApi::HandlePublishResponse(Status status, const PublishRspPb &rsp, bool traceEnabled,
+                                                    const char *path, uint64_t elapsedUs)
 {
+    if (rsp.has_ub_health_summary()) {
+        ConsumeUbHealthSummary(rsp.ub_health_summary(), "Ignore invalid Publish UB health summary");
+    }
     if (status.IsError()) {
         status = WithRpcDiag(status, "Publish", hostPort_);
     }
@@ -748,6 +754,9 @@ Status ClientWorkerRemoteApi::MultiPublish(const std::vector<std::shared_ptr<Obj
             { StatusCode::K_TRY_AGAIN, StatusCode::K_RPC_CANCELLED, StatusCode::K_RPC_DEADLINE_EXCEEDED,
               StatusCode::K_RPC_UNAVAILABLE, StatusCode::K_OUT_OF_MEMORY, StatusCode::K_SCALING },
             rpcTimeoutMs_);
+    if (rsp.has_ub_health_summary()) {
+        ConsumeUbHealthSummary(rsp.ub_health_summary(), "Ignore invalid MultiPublish UB health summary");
+    }
     if (status.IsError()) {
         status = WithRpcDiag(status, "MultiPublish", hostPort_);
     }
