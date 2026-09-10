@@ -1152,6 +1152,9 @@ Status OCMetadataManager::CreateMultiCopyMeta(const CreateMultiCopyMetaReqPb &re
                 continue;
             }
             if (isExpired) {
+                // The replica version is behind the current meta: the master ignores it, so the worker must
+                // drop the stale replica instead of keeping an unregistered copy.
+                response.add_failed_object_keys(elem.object_key());
                 continue;
             }
             updateKeyLocations.emplace(elem.object_key(), request.address());
@@ -1202,6 +1205,14 @@ Status OCMetadataManager::ProcessCopyMetaHelper(const std::string &address, cons
                   << ", request version: " << version;
         isExpired = true;
         return Status::OK();
+    }
+    // Checked under the exclusive meta accessor so the registration is serialized against the ttl
+    // delete flow: a location added after the delete snapshot would be erased with the whole meta
+    // and the replica would never be notified or invalidated again. The check and the emplace below
+    // are covered by this accessor, so a delete snapshot cannot fall between them.
+    if (expiredObjectManager_->CheckObjectInAsyncDeleteWithLock(objectKey)) {
+        RETURN_STATUS(StatusCode::K_TRY_AGAIN,
+                      FormatString("[ObjectKey]: %s %s", objectKey, ExpiredObjectManager::kBeingDeletedMark));
     }
     if (!accessor->second.locations.emplace(std::pair(address, AckState::ACK)).second) {
         accessor->second.locations.at(address) = AckState::ACK;
