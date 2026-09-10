@@ -71,6 +71,7 @@ DS_DECLARE_uint32(urma_poll_size);
 DS_DECLARE_uint32(urma_connection_size);
 DS_DECLARE_bool(urma_event_mode);
 DS_DECLARE_uint32(urma_perf_interval_ms);
+DS_DECLARE_bool(enable_urma_perf);
 
 namespace datasystem {
 namespace {
@@ -1040,6 +1041,12 @@ Status UrmaManager::GetOrRegisterSegment(const uint64_t &segAddress, const uint6
 
 Status UrmaManager::PerfThreadMain()
 {
+    // This is a startup-only flag. Disabled diagnostics must not invoke the provider's perf APIs.
+    const bool enabled = FLAGS_enable_urma_perf;
+    LOG(INFO) << "[URMA_PERF_CONTROL] enabled=" << static_cast<int>(enabled);
+    RETURN_OK_IF_TRUE(!enabled);
+    INJECT_POINT("UrmaManager.PerfBeforeSdk",
+                 []() { return Status(K_RUNTIME_ERROR, "Stop before perf SDK for testing"); });
     constexpr uint32_t perfBufferLen = 16 * 1024;
     constexpr int sleepIntervalMs = 10;
 
@@ -2218,10 +2225,75 @@ static Status ImportOutboundSegments(const UrmaHandshakeReqPb &handShake, UrmaCo
     return Status::OK();
 }
 
-Status UrmaManager::FinalizeOutboundConnection(const UrmaHandshakeRspPb &rsp)
+Status UrmaManager::InitializeOutboundConnection(const UrmaHandshakeReqPb &handShake,
+    const UrmaJfrInfo &remoteInfo, std::shared_ptr<UrmaConnection> &connection)
+{
+    std::unique_ptr<UrmaTargetJetty> targetJetty;
+    RETURN_IF_NOT_OK(ImportTargetJetty(remoteInfo, targetJetty, nullptr));
+    connection = std::make_shared<UrmaConnection>(std::move(targetJetty), remoteInfo);
+    return ImportOutboundSegments(handShake, *connection, *urmaResource_, importSegmentFlag_);
+}
+
+bool UrmaManager::TryReuseOutboundConnection(const std::shared_ptr<UrmaConnection> &connection,
+                                             const UrmaJfrInfo &remoteInfo, ConnectionOwnership ownership,
+                                             std::shared_ptr<UrmaConnection> *clientOwner)
+{
+    if (connection == nullptr || connection->GetUrmaJfrInfo().ToString() != remoteInfo.ToString()
+        || connection->IsCircuitBroken()) {
+        return false;
+    }
+    RetainFinalizedConnection(connection, ownership, clientOwner);
+    return true;
+}
+
+bool UrmaManager::FindReusableOutboundConnection(const std::string &id, const UrmaJfrInfo &remoteInfo,
+                                                 ConnectionOwnership ownership,
+                                                 std::shared_ptr<UrmaConnection> *clientOwner)
+{
+    // Healthy reuse needs only shared map access, but still observes the peer circuit breaker.
+    TbbUrmaConnectionMap::const_accessor existing;
+    return urmaConnectionMap_.find(existing, id)
+           && TryReuseOutboundConnection(existing->second, remoteInfo, ownership, clientOwner);
+}
+
+void UrmaManager::RetainClientConnection(const std::shared_ptr<UrmaConnection> &connection,
+                                         std::shared_ptr<UrmaConnection> &clientOwner)
+{
+    connection->clientOwners_.fetch_add(1, std::memory_order_relaxed);
+    clientOwner = connection;
+}
+
+void UrmaManager::MarkWorkerConnectionOwned(const std::shared_ptr<UrmaConnection> &connection)
+{
+    connection->workerOwned_.store(true, std::memory_order_relaxed);
+}
+
+void UrmaManager::RetainFinalizedConnection(const std::shared_ptr<UrmaConnection> &connection,
+                                            ConnectionOwnership ownership, std::shared_ptr<UrmaConnection> *clientOwner)
+{
+    if (ownership == ConnectionOwnership::CLIENT_REF) {
+        RetainClientConnection(connection, *clientOwner);
+    } else {
+        MarkWorkerConnectionOwned(connection);
+    }
+}
+
+Status UrmaManager::ValidateConnectionOwnership(ConnectionOwnership ownership,
+                                                const std::shared_ptr<UrmaConnection> *clientOwner)
+{
+    CHECK_FAIL_RETURN_STATUS(ownership != ConnectionOwnership::CLIENT_REF || clientOwner != nullptr, K_INVALID,
+                             "Client connection ownership requires an output owner");
+    CHECK_FAIL_RETURN_STATUS(ownership != ConnectionOwnership::WORKER_OWNED || clientOwner == nullptr, K_INVALID,
+                             "Worker connection ownership does not accept a client owner");
+    return Status::OK();
+}
+
+Status UrmaManager::FinalizeOutboundConnection(const UrmaHandshakeRspPb &rsp, ConnectionOwnership ownership,
+                                               std::shared_ptr<UrmaConnection> *clientOwner)
 {
     METRIC_TIMER(metrics::KvMetricId::URMA_CONNECTION_SETUP_LATENCY);
     PerfPoint point(PerfKey::URMA_FINALIZE_OUTBOUND_CONNECTION);
+    RETURN_IF_NOT_OK(ValidateConnectionOwnership(ownership, clientOwner));
     CHECK_FAIL_RETURN_STATUS(rsp.has_hand_shake(), K_INVALID, "UrmaHandshakeRspPb has no hand_shake");
 
     const auto &handShake = rsp.hand_shake();
@@ -2234,12 +2306,12 @@ Status UrmaManager::FinalizeOutboundConnection(const UrmaHandshakeRspPb &rsp)
     const std::string remoteConnectionId = requestAddress.ToString();
 
     std::shared_lock<std::shared_timed_mutex> l(remoteMapMutex_);
+    RETURN_OK_IF_TRUE(FindReusableOutboundConnection(remoteConnectionId, remoteInfo, ownership, clientOwner));
     std::shared_ptr<UrmaConnection> previous;
     TbbUrmaConnectionMap::accessor accessor;
     auto res = urmaConnectionMap_.insert(accessor, remoteConnectionId);
     if (!res && accessor->second != nullptr) {
-        RETURN_OK_IF_TRUE(accessor->second->GetUrmaJfrInfo().ToString() == remoteInfo.ToString()
-                         && !accessor->second->IsCircuitBroken());
+        RETURN_OK_IF_TRUE(TryReuseOutboundConnection(accessor->second, remoteInfo, ownership, clientOwner));
         previous = accessor->second;
         if (previous->GetUrmaJfrInfo().uniqueInstanceId == remoteInfo.uniqueInstanceId) {
             CHECK_FAIL_RETURN_STATUS(previous->CanReconnect(), K_URMA_TRY_AGAIN,
@@ -2257,17 +2329,15 @@ Status UrmaManager::FinalizeOutboundConnection(const UrmaHandshakeRspPb &rsp)
         }
     });
 
-    // Import the remote JFR as a target Jetty (no local Jetty needed at import time).
-    std::unique_ptr<UrmaTargetJetty> targetJetty;
-    RETURN_IF_NOT_OK(ImportTargetJetty(remoteInfo, targetJetty, nullptr));
-
-    auto connection = std::make_shared<UrmaConnection>(std::move(targetJetty), remoteInfo);
-
-    RETURN_IF_NOT_OK(ImportOutboundSegments(handShake, *connection, *urmaResource_, importSegmentFlag_));
+    std::shared_ptr<UrmaConnection> connection;
+    RETURN_IF_NOT_OK(InitializeOutboundConnection(handShake, remoteInfo, connection));
     if (previous != nullptr) {
         RETURN_IF_NOT_OK(connection->PrepareReplacement(*previous));
+        connection->workerOwned_.store(previous->workerOwned_.load(std::memory_order_relaxed),
+            std::memory_order_relaxed);
     }
-    accessor->second = std::move(connection);
+    accessor->second = connection;
+    RetainFinalizedConnection(connection, ownership, clientOwner);
     success = true;
     point.Record();
     return Status::OK();
@@ -3148,6 +3218,36 @@ Status UrmaManager::UrmaGatherWriteImpl(const RemoteSegInfo &remoteInfo,
         eventKeys.clear();
     }
     return Status::OK();
+}
+
+void UrmaManager::ReleaseClientConnection(const std::string &address,
+                                          const std::shared_ptr<UrmaConnection> &owner)
+{
+    if (owner == nullptr) {
+        LOG_FIRST_AND_EVERY_N(WARNING, K_URMA_WARNING_LOG_EVERY_N)
+            << "Skip releasing URMA client connection with an empty owner, remoteAddress: " << address;
+        return;
+    }
+    TbbUrmaConnectionMap::accessor accessor;
+    if (!urmaConnectionMap_.find(accessor, address)) {
+        LOG_FIRST_AND_EVERY_N(WARNING, K_URMA_WARNING_LOG_EVERY_N)
+            << "Skip releasing URMA client connection absent from the map, remoteAddress: " << address;
+        return;
+    }
+    if (accessor->second != owner) {
+        LOG(WARNING) << "Skip releasing replaced URMA client connection owner, remoteAddress: " << address;
+        return;
+    }
+    if (owner->clientOwners_ == 0) {
+        LOG_FIRST_AND_EVERY_N(WARNING, K_URMA_WARNING_LOG_EVERY_N)
+            << "Skip releasing URMA client connection with zero retained owners, remoteAddress: " << address;
+        return;
+    }
+    if (--owner->clientOwners_ != 0 || owner->workerOwned_.load(std::memory_order_relaxed)) {
+        return;
+    }
+    urmaConnectionMap_.erase(accessor);
+    // In-flight lane leases can still own this generation and its imported resources.
 }
 
 Status UrmaManager::RemoveRemoteResources(const std::string &connectionKey)

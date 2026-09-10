@@ -39,6 +39,7 @@
 #ifdef USE_URMA
 #include "datasystem/common/rdma/urma_manager.h"
 #endif
+#include "datasystem/common/util/raii.h"
 #include "datasystem/common/util/status_helper.h"
 
 namespace datasystem {
@@ -528,6 +529,16 @@ Status DataPlaneManager::EstablishUbProbe(const HostPort &workerAddr, const std:
     RETURN_RUNTIME_ERROR_IF_NULL(rpcClient);
     UrmaHandshakeRspPb response;
     RETURN_IF_NOT_OK(rpcClient->ExchangeUrmaConnectInfo(response));
+#ifdef USE_URMA
+    if (UrmaManager::IsUrmaEnabled()) {
+        auto &manager = UrmaManager::Instance();
+        std::shared_ptr<UrmaConnection> probeOwner;
+        RETURN_IF_NOT_OK(
+            manager.FinalizeOutboundConnection(response, UrmaManager::ConnectionOwnership::CLIENT_REF, &probeOwner));
+        Raii releaseProbe([&] { manager.ReleaseClientConnection(workerAddr.ToString(), probeOwner); });
+        return ProbeUbDataPlane(response);
+    }
+#endif
     RETURN_IF_NOT_OK(FinalizeOutboundConnection(response));
 #ifdef USE_URMA
     RETURN_IF_NOT_OK(ProbeUbDataPlane(response));

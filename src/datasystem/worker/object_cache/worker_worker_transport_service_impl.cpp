@@ -20,6 +20,7 @@
 #include "datasystem/worker/object_cache/worker_worker_transport_service_impl.h"
 
 #include <cstdint>
+#include <optional>
 #include <thread>
 
 #include "datasystem/utils/status.h"
@@ -87,6 +88,15 @@ Status WorkerWorkerTransportServiceImpl::WorkerWorkerExchangeUrmaConnectInfo(con
     return rc;
 }
 
+UbHealthSummary WorkerWorkerTransportServiceImpl::EncodeProbeHealthSummary(
+    const std::string &incarnation, ProviderUbRecoveryProbeRspPb &rsp) const
+{
+    auto summary = ocClientWorkerSvc_->BuildSelfUbHealthSummary();
+    summary.incarnation = incarnation;
+    EncodeUbHealthSummary(summary, *rsp.mutable_health_summary());
+    return summary;
+}
+
 Status WorkerWorkerTransportServiceImpl::ProbeProviderUbRecovery(const ProviderUbRecoveryProbeReqPb &req,
                                                                  ProviderUbRecoveryProbeRspPb &rsp)
 {
@@ -95,33 +105,48 @@ Status WorkerWorkerTransportServiceImpl::ProbeProviderUbRecovery(const ProviderU
     std::string workerIncarnation;
     RETURN_IF_NOT_OK(ResolveWorkerIncarnation(workerIncarnation));
 
-    auto summary = ocClientWorkerSvc_->BuildSelfUbHealthSummary();
-    summary.incarnation = workerIncarnation;
-    EncodeUbHealthSummary(summary, *rsp.mutable_health_summary());
+    auto summary = EncodeProbeHealthSummary(workerIncarnation, rsp);
     CHECK_FAIL_RETURN_STATUS(req.expected_worker_incarnation().empty()
                                  || req.expected_worker_incarnation() == workerIncarnation,
                              K_NOT_READY, "Worker incarnation changed before Provider UB recovery probe");
-    if (!summary.writable) {
-        return Status::OK();
-    }
-
 #ifdef USE_URMA
-    RETURN_IF_NOT_OK(ImportRecoveryProbeHandshake(req.hand_shake()));
-    UrmaHandshakeRspPb probeTarget;
-    probeTarget.mutable_recovery_probe_addr()->CopyFrom(req.recovery_probe_addr());
-    RETURN_IF_NOT_OK(ProbeUbDataPlane(probeTarget));
+    auto *admission = ocClientWorkerSvc_->GetUbAdmission();
+    CHECK_FAIL_RETURN_STATUS(admission != nullptr, K_NOT_READY, "Provider UB admission is unavailable");
+    std::optional<UbProbeToken> selfProbe;
+    if (!summary.writable) {
+        selfProbe = admission->TryBeginProbe(localWorker_, GetSteadyClockTimeStampMs());
+        if (!selfProbe.has_value()) {
+            return Status::OK();
+        }
+    }
+    Status probeStatus = ImportRecoveryProbeHandshake(req.hand_shake());
+    if (probeStatus.IsOk()) {
+        UrmaHandshakeRspPb probeTarget;
+        probeTarget.mutable_recovery_probe_addr()->CopyFrom(req.recovery_probe_addr());
+        probeStatus = ProbeUbDataPlane(probeTarget);
+    }
+    if (selfProbe.has_value()) {
+        (void)admission->CompleteProbe(*selfProbe, probeStatus, GetSteadyClockTimeStampMs(), false);
+    }
+    if (probeStatus.IsError()) {
+        (void)EncodeProbeHealthSummary(workerIncarnation, rsp);
+        return probeStatus;
+    }
     rsp.set_probe_performed(true);
     std::string verifiedIncarnation;
     RETURN_IF_NOT_OK(ResolveWorkerIncarnation(verifiedIncarnation));
-    auto verifiedSummary = ocClientWorkerSvc_->BuildSelfUbHealthSummary();
-    verifiedSummary.incarnation = verifiedIncarnation;
-    EncodeUbHealthSummary(verifiedSummary, *rsp.mutable_health_summary());
+    auto verifiedSummary = EncodeProbeHealthSummary(verifiedIncarnation, rsp);
+    const bool admissionEpochValid = selfProbe.has_value() ? verifiedSummary.epoch > summary.epoch
+                                                            : verifiedSummary.epoch == summary.epoch;
     CHECK_FAIL_RETURN_STATUS(verifiedIncarnation == workerIncarnation && verifiedSummary.writable
-                                 && verifiedSummary.epoch == summary.epoch,
+                                 && admissionEpochValid,
                              K_NOT_READY, "Worker identity or UB admission changed during Provider recovery probe");
     INJECT_POINT_NO_RETURN("WorkerWorkerTransportService.ProbeProviderUbRecovery.success");
     return Status::OK();
 #else
+    if (!summary.writable) {
+        return Status::OK();
+    }
     return Status(K_NOT_SUPPORTED, "URMA Provider recovery probe is unavailable in this build");
 #endif
 }

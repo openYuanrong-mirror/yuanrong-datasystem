@@ -82,10 +82,16 @@ void WorkerFailover::ConfigureUrmaDataPlaneFailureCallback(WorkerNode node,
         owner_.ubHealthFilter_ = std::make_shared<client::UbHealthFilter>();
     }
     std::weak_ptr<client::UbHealthFilter> weakUbHealthFilter(owner_.ubHealthFilter_);
-    workerApi->SetUbHealthSummaryCallback([weakUbHealthFilter](const UbHealthSummary &summary) {
+    auto recoverProvider = owner_.transportLayer_ == nullptr
+                               ? std::function<void(const HostPort &)>{}
+                               : owner_.transportLayer_->MakeProviderRecoveryCallback();
+    workerApi->SetUbHealthSummaryCallback([weakUbHealthFilter, recoverProvider](const UbHealthSummary &summary) {
         auto filter = weakUbHealthFilter.lock();
-        if (filter != nullptr) {
-            (void)filter->ApplySummary(summary, summary.incarnation);
+        if (filter == nullptr || !filter->ApplySummary(summary, summary.incarnation)) {
+            return;
+        }
+        if (!summary.writable && recoverProvider != nullptr) {
+            recoverProvider(summary.worker);
         }
     });
     if (!owner_.enableCrossNodeConnection_) {

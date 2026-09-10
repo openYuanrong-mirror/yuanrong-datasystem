@@ -48,6 +48,7 @@ extern char **environ;
 #undef private
 
 #include "datasystem/client/object_cache/routed_mode.h"
+#include "datasystem/client/object_cache/worker_failover.h"
 #include "datasystem/client/object_cache/transport/data_plane/data_plane_manager.h"
 #include "datasystem/client/worker_api/listen_worker.h"
 #include "datasystem/client/object_cache/transport/data_plane/shm_transporter.h"
@@ -277,13 +278,37 @@ Status MakeWorkerDrainingStatus()
     return Status(K_NOT_READY, "Worker is draining for ScaleIn");
 }
 
-std::shared_ptr<Routing> MakeSingleWorkerRouting(const HostPort &address)
+class RejectWorkerFilter : public IWorkerFilter {
+public:
+    explicit RejectWorkerFilter(size_t rejectCount) : rejectCount_(rejectCount)
+    {
+    }
+
+    bool IsAvailable(const HostPort &) const override
+    {
+        return checks_.fetch_add(1) >= rejectCount_;
+    }
+
+    size_t Checks() const
+    {
+        return checks_.load();
+    }
+
+private:
+    size_t rejectCount_;
+    mutable std::atomic<size_t> checks_{ 0 };
+};
+
+std::shared_ptr<Routing> MakeRouting(const std::vector<HostPort> &addresses,
+                                     std::vector<std::shared_ptr<IWorkerFilter>> additionalFilters = {})
 {
-    auto router = std::make_shared<WorkerRouter>("");
+    auto router = std::make_shared<WorkerRouter>("", std::move(additionalFilters));
     auto ring = std::make_shared<::datasystem::ClusterTopologyPb>();
     ring->set_tokens_per_member(1);
-    auto &worker = (*ring->mutable_members())[address.ToString()];
-    worker.set_state(::datasystem::MembershipPb::ACTIVE);
+    for (const auto &address : addresses) {
+        auto &worker = (*ring->mutable_members())[address.ToString()];
+        worker.set_state(::datasystem::MembershipPb::ACTIVE);
+    }
     auto hostIdMap = std::make_shared<std::unordered_map<std::string, std::string>>();
     std::unique_ptr<PreparedClusterTopology> prepared;
     auto status = PreparedClusterTopology::Create(std::move(*ring), prepared);
@@ -299,6 +324,12 @@ std::shared_ptr<Routing> MakeSingleWorkerRouting(const HostPort &address)
     auto routing = std::make_shared<Routing>(router, refresher);
     routing->initialized_.store(true);
     return routing;
+}
+
+std::shared_ptr<Routing> MakeSingleWorkerRouting(
+    const HostPort &address, std::vector<std::shared_ptr<IWorkerFilter>> additionalFilters = {})
+{
+    return MakeRouting({ address }, std::move(additionalFilters));
 }
 
 std::vector<ObjectMetadataItem> MakeMetadataItems(const std::vector<ObjectReadItem> &inputs)
@@ -537,6 +568,12 @@ public:
         return decreaseReferenceStatus;
     }
 
+    Status ExchangeUrmaConnectInfo(UrmaHandshakeRspPb &response) override
+    {
+        response = exchangeUrmaResponse;
+        return exchangeUrmaStatus;
+    }
+
     bool IsAlive() const override
     {
         return alive;
@@ -589,6 +626,8 @@ public:
     Status multiCreateInvokeStatus = Status::OK();
     Status multiSetInvokeStatus = Status::OK();
     Status decreaseReferenceStatus = Status::OK();
+    Status exchangeUrmaStatus = Status::OK();
+    UrmaHandshakeRspPb exchangeUrmaResponse;
     bool createResponseHasUrmaInfo = false;
     int64_t createResponseMetadataSize = 0;
     int32_t createResponseStoreFd = 0;
@@ -1145,6 +1184,18 @@ public:
         queryAndGetHandler;
     std::function<void(const HostPort &, FakeTransporter &)> configureTransporter;
     std::mutex mutex;
+};
+
+class ProbeDataPlaneManager : public DataPlaneManager {
+public:
+    ProbeDataPlaneManager() : DataPlaneManager(MakeSignature(), 0, {}, nullptr, false, 64, nullptr, false)
+    {
+    }
+
+    Status Establish(const HostPort &workerAddr, const std::shared_ptr<WorkerRpcClient> &rpcClient)
+    {
+        return EstablishUbProbe(workerAddr, rpcClient);
+    }
 };
 
 class FakeObjectMetadataClient : public ObjectMetadataClient {
@@ -2328,6 +2379,41 @@ TEST(ResolveSdkHostIdTest, AdoptsGenuineLocalBoundWorkerHostId)
             .empty());
 }
 
+TEST(DataPlaneManagerTest, ClientRecoveryProbeReleasesTemporaryConnectionOwner)
+{
+#ifdef USE_URMA
+    const bool enableUrma = FLAGS_enable_urma;
+    Raii restoreEnableUrma([enableUrma]() { FLAGS_enable_urma = enableUrma; });
+    FLAGS_enable_urma = true;
+    const HostPort worker = MakeAddress(2399);
+    UrmaJfrInfo info;
+    info.localAddress = worker;
+    info.uniqueInstanceId = "client-recovery-probe";
+    info.eid = std::string(16, '\0');
+    UrmaHandshakeRspPb response;
+    info.ToProto(*response.mutable_hand_shake());
+    auto &urmaManager = UrmaManager::Instance();
+    (void)urmaManager.RemoveRemoteDevice(worker.ToString());
+    Raii cleanup([&] { (void)urmaManager.RemoveRemoteDevice(worker.ToString()); });
+    TbbUrmaConnectionMap::accessor entry;
+    ASSERT_TRUE(urmaManager.urmaConnectionMap_.insert(entry, worker.ToString()));
+    auto connection = std::make_shared<UrmaConnection>(nullptr, info);
+    entry->second = connection;
+    entry.release();
+    auto rpcClient = std::make_shared<FakeWorkerRpcClient>(worker);
+    rpcClient->exchangeUrmaResponse = response;
+    ProbeDataPlaneManager manager;
+
+    EXPECT_EQ(manager.Establish(worker, rpcClient).GetCode(), K_NOT_SUPPORTED);
+
+    EXPECT_EQ(urmaManager.urmaConnectionMap_.count(worker.ToString()), 0U);
+    EXPECT_EQ(connection->clientOwners_.load(), 0U);
+    EXPECT_FALSE(connection->workerOwned_.load());
+#else
+    GTEST_SKIP() << "Client recovery probe ownership requires USE_URMA";
+#endif
+}
+
 TEST(DataPlaneManagerTest, ReusesRpcClientAndTransporterForSameAddress)
 {
     FakeDataPlaneManager manager;
@@ -2354,9 +2440,10 @@ bool IsInitPolicyChild(const char *mode)
     return marker != nullptr && marker == BuildInitPolicyChildMarker(mode, getppid());
 }
 
-void RunInitPolicyTestInFreshProcess(const char *testName, const char *mode)
+void RunInitPolicyTestInFreshProcess(const char *testName, const char *mode,
+                                      const char *suite = "DataPlaneManagerTest")
 {
-    const std::string filter = std::string("--gtest_filter=DataPlaneManagerTest.") + testName;
+    const std::string filter = std::string("--gtest_filter=") + suite + "." + testName;
     const std::string markerPrefix = std::string(INIT_POLICY_CHILD_ENV) + "=";
     const std::string marker = markerPrefix + BuildInitPolicyChildMarker(mode, getpid());
     constexpr char gtestRepeatEnvPrefix[] = "GTEST_REPEAT=";
@@ -4399,6 +4486,29 @@ TEST(ObjectClientTransportTest, LocalCacheSetRouteKeepsHealthyShmPathForUbQuaran
     EXPECT_EQ(retryRoute.directWorkerApi, nullptr);
 }
 
+TEST(ObjectClientTransportTest, MultiCreateExcludesQuarantinedWriteTarget)
+{
+    const auto quarantinedWorker = MakeAddress(31505);
+    auto manager = std::make_shared<FakeDataPlaneManager>();
+    ConnectOptions options;
+    options.host = quarantinedWorker.Host();
+    options.port = quarantinedWorker.Port();
+    object_cache::ObjectClientImpl client(options);
+    client.dataPlacementPolicy_ = DataPlacementPolicy::PREFERRED_META_OWNER;
+    client.ubHealthFilter_ = std::make_shared<UbHealthFilter>();
+    ASSERT_TRUE(client.ubHealthFilter_->ReportWriteTargetFailure(
+        quarantinedWorker, Status(K_URMA_ERROR, "remote ack timeout"), std::nullopt,
+        URMA_REMOTE_ACK_TIMEOUT_STATUS));
+    client.transportLayer_ = std::make_unique<TestTransportLayer>(manager);
+    std::atomic_store(&client.routing_, MakeSingleWorkerRouting(quarantinedWorker));
+    std::vector<std::shared_ptr<Buffer>> buffers;
+    std::vector<bool> exists;
+    const auto rc = client.routedMode_->MultiCreateRouted(
+        { "multi-create-quarantine" }, { 4 }, object_cache::FullParam{}, buffers, exists);
+    EXPECT_EQ(rc.GetCode(), K_NO_AVAILABLE_WORKER);
+    EXPECT_TRUE(manager->builtTransporters.empty());
+}
+
 TEST(ObjectClientTransportTest, ConnectOptionsPolicyDefaultsToPreferredSameNode)
 {
     ConnectOptions options;
@@ -4468,6 +4578,48 @@ TEST(ObjectClientTransportTest, ShutdownWaitsForAsyncWorkerSwitchTasks)
     EXPECT_EQ(client.asyncSwitchWorkerPool_, nullptr);
     EXPECT_EQ(client.asyncSwitchWorkerPoolHandle_, nullptr);
     EXPECT_TRUE(client.unavailableWorkerSwitchPending_.empty());
+}
+
+TEST(ObjectClientTransportTest, LateHealthSummaryDoesNotAccessDestroyedClient)
+{
+    class SummaryWorkerApi : public object_cache::ClientWorkerRemoteApi {
+    public:
+        explicit SummaryWorkerApi(const HostPort &address)
+            : IClientWorkerCommonApi(address, HeartbeatType::RPC_HEARTBEAT, false, nullptr),
+              ClientWorkerRemoteApi(address)
+        {
+        }
+        UbHealthSummaryApplyHook SnapshotCallback()
+        {
+            std::lock_guard<std::mutex> lock(ubHealthSummaryCallbackMutex_);
+            return ubHealthSummaryCallback_;
+        }
+    };
+    ConnectOptions options;
+    options.host = "127.0.0.1";
+    options.port = 31501;
+    auto client = std::make_unique<object_cache::ObjectClientImpl>(options);
+    auto api = std::make_shared<SummaryWorkerApi>(MakeAddress(31501));
+    client->workerApi_.emplace_back(api);
+    client->transportLayer_ = std::make_unique<TestTransportLayer>(std::make_shared<FakeDataPlaneManager>());
+    client->failover_->ConfigureUrmaDataPlaneFailureCallback(object_cache::LOCAL_WORKER, api);
+    auto copiedCallback = api->SnapshotCallback();
+    ASSERT_NE(copiedCallback, nullptr);
+    auto retainedFilter = client->ubHealthFilter_;
+    bool transition = false;
+    ASSERT_TRUE(client->clientStateManager_->ProcessInit(transition).IsOk());
+    client->clientStateManager_->CompleteHandler(false, transition);
+    ASSERT_TRUE(client->ShutDown(transition, true).IsOk());
+    client->clientStateManager_->CompleteHandler(false, transition);
+    EXPECT_EQ(api->SnapshotCallback(), nullptr);
+    client.reset();
+    UbHealthSummary summary;
+    summary.worker = MakeAddress(31501);
+    summary.incarnation = "late-summary";
+    summary.epoch = 1;
+    summary.writable = false;
+    copiedCallback(summary);
+    EXPECT_FALSE(retainedFilter->GetLocalObservation(summary.worker).has_value());
 }
 
 TEST(ObjectClientTransportTest, DirectGetRecoveryFailureForcesRingRefreshWithoutEagerSwitch)

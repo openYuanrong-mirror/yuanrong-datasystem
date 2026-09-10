@@ -562,7 +562,8 @@ Status FinalizeOutboundConnection(const UrmaHandshakeRspPb &rsp)
     (void)rsp;
 #ifdef USE_URMA
     if (UrmaManager::IsUrmaEnabled()) {
-        RETURN_IF_NOT_OK(UrmaManager::Instance().FinalizeOutboundConnection(rsp));
+        RETURN_IF_NOT_OK(
+            UrmaManager::Instance().FinalizeOutboundConnection(rsp, UrmaManager::ConnectionOwnership::WORKER_OWNED));
     }
 #endif
     return Status::OK();

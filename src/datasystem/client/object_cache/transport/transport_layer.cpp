@@ -379,6 +379,37 @@ Status TransportLayer::CheckUbReadSource(const HostPort &workerAddr, AccessTrans
     return Status(K_URMA_READ_SOURCE_DENIED, "Client UB read source denied: " + workerAddr.ToString());
 }
 
+bool TransportLayer::ScheduleProviderRecoveryFromGlobalSummary(const HostPort &provider)
+{
+    if (localUbSenderState_->IsShuttingDown() || healthFilter_ == nullptr
+        || !healthFilter_->SeedProviderRecoveryFromGlobalSummary(provider)) {
+        return false;
+    }
+    NotifyReconcile();
+    return true;
+}
+
+std::function<void(const HostPort &)> TransportLayer::MakeProviderRecoveryCallback() const
+{
+    std::weak_ptr<LocalUbSenderState> weakState(localUbSenderState_);
+    return [weakState](const HostPort &provider) {
+        auto state = weakState.lock();
+        if (state == nullptr) {
+            return;
+        }
+        auto filter = state->healthFilter.lock();
+        auto mutex = state->reconcileMutex.lock();
+        auto cv = state->reconcileCv.lock();
+        if (filter == nullptr || mutex == nullptr || cv == nullptr) {
+            return;
+        }
+        std::lock_guard<bthread::Mutex> lock(*mutex);
+        if (!state->IsShuttingDown() && filter->SeedProviderRecoveryFromGlobalSummary(provider)) {
+            cv->notify_one();
+        }
+    };
+}
+
 Status TransportLayer::CheckLocalUbSenderAdmission(TransportHint hint) const
 {
     CHECK_FAIL_RETURN_STATUS(!localUbSenderState_->IsShuttingDown(), K_SHUTTING_DOWN,

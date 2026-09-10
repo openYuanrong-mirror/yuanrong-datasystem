@@ -26,6 +26,9 @@
 #include "datasystem/client/object_cache/transport/transport_phase_latency_recorder.h"
 #include "datasystem/common/util/net_util.h"
 #include "datasystem/utils/status.h"
+#ifdef USE_URMA
+#include "datasystem/common/rdma/urma_resource.h"
+#endif
 
 namespace datasystem {
 namespace client {
@@ -58,6 +61,9 @@ private:
 
     HostPort workerAddr_;
     std::shared_ptr<WorkerRpcClient> rpcClient_;
+#ifdef USE_URMA
+    std::shared_ptr<UrmaConnection> clientOwner_;
+#endif
     std::atomic<bool> urmaReady_{ false };
     std::atomic<bool> supportsPayloadOnlyClientBatchGet_{ false };
 };

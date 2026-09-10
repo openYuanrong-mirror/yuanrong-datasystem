@@ -93,6 +93,86 @@ TEST(PeerUbAdmissionTest, ExplicitError9BlocksRemotePeer)
     EXPECT_EQ(state->lastFailureClass, UbFailureClass::REMOTE_UNAVAILABLE_ERROR9);
 }
 
+TEST(PeerUbAdmissionTest, TwoNodeS2SourceIsolationPreservesHealthyTarget)
+{
+    // Distinct node identities exercise admission ownership, not physical port emulation.
+    const HostPort source("127.0.0.1", 31501);
+    const HostPort target("127.0.0.2", 31501);
+    PeerUbAdmission sourceAdmission;
+    PeerUbAdmission targetAdmission;
+    sourceAdmission.SetSelfWorker(source);
+    targetAdmission.SetSelfWorker(target);
+    UbOpOutcome fault(source, UbOperationKind::MIGRATION_WRITE, Status(K_URMA_ERROR, "source local UB failure"));
+    fault.cqeStatus = 4;
+    sourceAdmission.ReportOutcome(fault);
+    auto sourceSummary = sourceAdmission.BuildSelfHealthSummary(source);
+    sourceSummary.incarnation = "source-node-1";
+    targetAdmission.ReplaceGlobalSummaries({ sourceSummary });
+
+    EXPECT_FALSE(sourceSummary.writable);
+    EXPECT_EQ(sourceAdmission.CheckWriteTarget(source, UbOperationKind::MIGRATION_WRITE).GetCode(),
+              K_URMA_WORKER_UNAVAILABLE);
+    EXPECT_EQ(targetAdmission.CheckReadSource(source).GetCode(), K_URMA_DATA_WORKER_UNAVAILABLE);
+    EXPECT_TRUE(sourceAdmission.CheckWriteTarget(target, UbOperationKind::MIGRATION_WRITE).IsOk());
+    EXPECT_TRUE(targetAdmission.CheckReadSource(target).IsOk());
+    EXPECT_TRUE(targetAdmission.CheckWriteTarget(target, UbOperationKind::MIGRATION_WRITE).IsOk());
+    EXPECT_TRUE(targetAdmission.BuildSelfHealthSummary(target).writable);
+}
+
+TEST(PeerUbAdmissionTest, TwoNodeS2RemoteFailureDoesNotBecomeTargetSelfIsolation)
+{
+    const HostPort source("127.0.0.1", 31501);
+    const HostPort target("127.0.0.2", 31501);
+    PeerUbAdmission targetAdmission;
+    targetAdmission.SetSelfWorker(target);
+    UbOpOutcome remote(source, UbOperationKind::WORKER_REMOTE_GET_WRITEBACK,
+                        Status(K_URMA_ERROR, "faulty source did not acknowledge"));
+    remote.cqeStatus = URMA_REMOTE_ACK_TIMEOUT_STATUS;
+    targetAdmission.ReportOutcome(remote);
+
+    EXPECT_EQ(targetAdmission.CheckReadSource(source).GetCode(), K_URMA_DATA_WORKER_UNAVAILABLE);
+    EXPECT_TRUE(targetAdmission.CheckReadSource(target).IsOk());
+    EXPECT_TRUE(targetAdmission.BuildSelfHealthSummary(target).writable);
+    const auto sourceState = targetAdmission.GetState(source);
+    ASSERT_TRUE(sourceState.has_value());
+    EXPECT_EQ(sourceState->lastFailureClass, UbFailureClass::REMOTE_UNAVAILABLE_ERROR9);
+}
+
+TEST(PeerUbAdmissionTest, TwoNodeS2RecoveryRequiresCurrentSummaryAndProbe)
+{
+    const HostPort source("127.0.0.1", 31501);
+    const HostPort target("127.0.0.2", 31501);
+    PeerUbAdmission sourceAdmission;
+    PeerUbAdmission targetAdmission;
+    sourceAdmission.SetSelfWorker(source);
+    targetAdmission.SetSelfWorker(target);
+    UbOpOutcome fault(source, UbOperationKind::MIGRATION_WRITE, Status(K_URMA_ERROR, "source UB failure"));
+    fault.cqeStatus = 4;
+    sourceAdmission.ReportOutcome(fault);
+    auto stale = sourceAdmission.BuildSelfHealthSummary(source);
+    stale.incarnation = "source-node-1";
+    targetAdmission.ReplaceGlobalSummaries({ stale });
+    fault.cqeStatus = URMA_REMOTE_ACK_TIMEOUT_STATUS;
+    targetAdmission.ReportOutcome(fault);
+    auto selfProbe = sourceAdmission.TryBeginProbe(source, std::numeric_limits<uint64_t>::max());
+    ASSERT_TRUE(selfProbe.has_value());
+    ASSERT_TRUE(sourceAdmission.CompleteProbe(*selfProbe, Status::OK(), 100, false));
+    EXPECT_EQ(targetAdmission.CheckReadSource(source).GetCode(), K_URMA_DATA_WORKER_UNAVAILABLE);
+    auto recovered = sourceAdmission.BuildSelfHealthSummary(source);
+    recovered.incarnation = stale.incarnation;
+    ASSERT_GT(recovered.epoch, stale.epoch);
+    targetAdmission.ReplaceGlobalSummaries({ recovered });
+    EXPECT_EQ(targetAdmission.CheckReadSource(source).GetCode(), K_URMA_DATA_WORKER_UNAVAILABLE);
+    auto peerProbe = targetAdmission.TryBeginProbe(source, std::numeric_limits<uint64_t>::max());
+    ASSERT_TRUE(peerProbe.has_value());
+    ASSERT_TRUE(targetAdmission.CompleteProbe(*peerProbe, Status::OK(), 101));
+    EXPECT_TRUE(targetAdmission.CheckReadSource(source).IsOk());
+    targetAdmission.ReplaceGlobalSummaries({ stale });
+    EXPECT_TRUE(targetAdmission.CheckReadSource(source).IsOk());
+    EXPECT_TRUE(targetAdmission.CheckReadSource(target).IsOk());
+    EXPECT_TRUE(targetAdmission.BuildSelfHealthSummary(target).writable);
+}
+
 TEST(PeerUbAdmissionTest, RpcTimeoutIsSuspectAndDoesNotHardBlock)
 {
     PeerUbAdmission admission;

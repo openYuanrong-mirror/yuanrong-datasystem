@@ -563,12 +563,17 @@ public:
         instanceId = localUrmaInfo_.uniqueInstanceId;
     }
 
+    enum class ConnectionOwnership { WORKER_OWNED, CLIENT_REF };
+
     /**
      * @brief Finalize initiator-side connection from handshake response.
      * @param[in] rsp Urma handshake response containing remote JFR and segment info.
      * @return Status of the call.
      */
-    Status FinalizeOutboundConnection(const UrmaHandshakeRspPb &rsp);
+    Status FinalizeOutboundConnection(const UrmaHandshakeRspPb &rsp, ConnectionOwnership ownership,
+                                      std::shared_ptr<UrmaConnection> *clientOwner = nullptr);
+
+    void ReleaseClientConnection(const std::string &address, const std::shared_ptr<UrmaConnection> &owner);
 
     /**
      * @brief Remove all URMA state associated with a client entity.
@@ -621,6 +626,19 @@ private:
         bool affinityOverride{ false };
     };
 
+    Status InitializeOutboundConnection(const UrmaHandshakeReqPb &handShake, const UrmaJfrInfo &remoteInfo,
+                                        std::shared_ptr<UrmaConnection> &connection);
+    bool TryReuseOutboundConnection(const std::shared_ptr<UrmaConnection> &connection, const UrmaJfrInfo &remoteInfo,
+                                    ConnectionOwnership ownership, std::shared_ptr<UrmaConnection> *clientOwner);
+    bool FindReusableOutboundConnection(const std::string &id, const UrmaJfrInfo &remoteInfo,
+                                        ConnectionOwnership ownership, std::shared_ptr<UrmaConnection> *clientOwner);
+    static void RetainClientConnection(const std::shared_ptr<UrmaConnection> &connection,
+                                       std::shared_ptr<UrmaConnection> &clientOwner);
+    static void MarkWorkerConnectionOwned(const std::shared_ptr<UrmaConnection> &connection);
+    static void RetainFinalizedConnection(const std::shared_ptr<UrmaConnection> &connection,
+                                          ConnectionOwnership ownership, std::shared_ptr<UrmaConnection> *clientOwner);
+    static Status ValidateConnectionOwnership(ConnectionOwnership ownership,
+                                              const std::shared_ptr<UrmaConnection> *clientOwner);
     UrmaManager();
 
     /**
