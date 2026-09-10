@@ -3879,15 +3879,16 @@ void WorkerOcServiceGetImpl::ReplacePrimaryAndPruneFailed(std::vector<std::strin
                 entry->WUnlock();
             }
         });
-        if (entry->Get() == nullptr || entry->Get() != identityIt->second) {
+        if (entry->Get() == nullptr) {
             continue;
         }
         auto *object = entry->Get();
+        const bool identityChanged = object != identityIt->second;
         const auto &meta = metaIt->second.meta();
         if (object->GetCreateTime() == meta.version() && object->GetDataSize() == meta.data_size()) {
             if (outcome.expiredIds.count(objectKey) != 0) {
                 object->stateInfo.SetMigrationExpired(true);
-            } else if (object->HasCompleteMigrationPayload()) {
+            } else if (identityChanged || object->HasCompleteMigrationPayload()) {
                 object->stateInfo.SetMigrationUnconfirmed(true);
             }
         }
@@ -3918,12 +3919,26 @@ master::ReplacePrimaryReqPb WorkerOcServiceGetImpl::BuildReplacePrimaryReq(
     return req;
 }
 
+bool WorkerOcServiceGetImpl::IsReplacePrimaryRedirectAdmitted(const HostPort &masterAddr, bool allowRedirect) const
+{
+    if (allowRedirect) {
+        return true;
+    }
+    const bool admitted = endpointPolicy_ != nullptr && endpointPolicy_->CheckEndpoint(masterAddr, false).IsOk();
+    LOG_IF(WARNING, !admitted) << "[NotifyRemoteGet] ReplacePrimary: redirect endpoint is not admitted "
+                               << masterAddr.ToString();
+    return admitted;
+}
+
 void WorkerOcServiceGetImpl::ReplacePrimaryForMasterGroup(const HostPort &masterAddr,
                                                           const std::vector<std::string> &objectKeys,
                                                           const std::string &sourceAddr, const QueryMetaMap &queryMetas,
                                                           ReplacePrimaryOutcome &outcome, bool allowRedirect)
 {
     const auto masterKey = masterAddr.ToString();
+    if (!IsReplacePrimaryRedirectAdmitted(masterAddr, allowRedirect)) {
+        return;
+    }
     std::shared_ptr<WorkerMasterOCApi> api;
     if (workerMasterApiManager_->GetWorkerMasterApi(masterAddr, api).IsError() || api == nullptr) {
         LOG(WARNING) << "[NotifyRemoteGet] ReplacePrimary: cannot get master API for " << masterKey;
@@ -4051,10 +4066,11 @@ void WorkerOcServiceGetImpl::ClearNeedDeleteForMigratedObjects(const std::vector
             auto *object = entry->Get();
             const auto &meta = metaIt->second.meta();
             if (object->GetCreateTime() != meta.version() || object->GetDataSize() != meta.data_size()
-                || object->stateInfo.IsMigrationUnconfirmed() || object->stateInfo.IsMigrationExpired()) {
+                || object->stateInfo.IsMigrationExpired()) {
                 continue;
             }
             VLOG(1) << FormatString("[NotifyRemoteGet] clear needDelete for object %s", objectKey);
+            object->stateInfo.SetMigrationUnconfirmed(false);
             object->stateInfo.SetNeedToDelete(false);
             object->stateInfo.SetPrimaryCopy(true);
         }

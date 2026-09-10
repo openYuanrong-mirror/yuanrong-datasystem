@@ -119,7 +119,7 @@ MetaDataRecoveryManager::MetaDataRecoveryManager(
 }
 
 MetaDataRecoveryManager::RecoverySummary MetaDataRecoveryManager::RecoverMetadataWithSummary(
-    const std::vector<std::string> &objectKeys, std::string stanbyAddr)
+    const std::vector<std::string> &objectKeys, std::string stanbyAddr, bool reportRecoveryErrors)
 {
     RecoverySummary summary;
     summary.requestedCount = objectKeys.size();
@@ -148,10 +148,10 @@ MetaDataRecoveryManager::RecoverySummary MetaDataRecoveryManager::RecoverMetadat
     std::vector<DispatchResult> results(groupedByMasterKeys.size());
     Status parallelRc = Parallel::ParallelFor<size_t>(
         0, groupedByMasterKeys.size(),
-        [this, &groupedByMasterKeys, &results](size_t start, size_t end) {
+        [this, &groupedByMasterKeys, &results, reportRecoveryErrors](size_t start, size_t end) {
             for (size_t idx = start; idx < end; ++idx) {
                 const auto *group = groupedByMasterKeys[idx];
-                results[idx] = SendRecoverRequest(group->first, group->second);
+                results[idx] = SendRecoverRequest(group->first, group->second, reportRecoveryErrors);
             }
         },
         1);
@@ -545,6 +545,10 @@ void MetaDataRecoveryManager::SendRecoverBatch(const HostPort &masterAddr, const
     if (req.metas_size() == 0) {
         return;
     }
+    Raii clearBatch([&req, &batchObjectKeys] {
+        req.clear_metas();
+        batchObjectKeys.clear();
+    });
     if (clusterAccess_.checkConnection == nullptr) {
         result.failedIds.insert(result.failedIds.end(), batchObjectKeys.begin(), batchObjectKeys.end());
         result.status = Status(K_RUNTIME_ERROR, "metadata recovery checkConnection callback is not set");
@@ -557,6 +561,7 @@ void MetaDataRecoveryManager::SendRecoverBatch(const HostPort &masterAddr, const
         result.status = rc;
         LOG(ERROR) << FormatString("CheckConnection failed, master: %s, status: %s", masterAddr.ToString(),
                                    rc.ToString());
+        return;
     }
 
     master::PushMetaToMasterRspPb rsp;
@@ -566,13 +571,41 @@ void MetaDataRecoveryManager::SendRecoverBatch(const HostPort &masterAddr, const
         result.status = rc;
         LOG(ERROR) << FormatString("Recover metadata failed, master: %s, status: %s", masterAddr.ToString(),
                                    rc.ToString());
+        return;
     }
-    req.clear_metas();
-    batchObjectKeys.clear();
+    ApplyRecoverBatchResponse(req.report_recovery_errors(), rsp, batchObjectKeys, result);
+}
+
+void MetaDataRecoveryManager::ApplyRecoverBatchResponse(bool reportRecoveryErrors,
+                                                        const master::PushMetaToMasterRspPb &rsp,
+                                                        const std::vector<std::string> &batchObjectKeys,
+                                                        DispatchResult &result)
+{
+    if (!reportRecoveryErrors) {
+        result.recoveredCount += batchObjectKeys.size();
+        return;
+    }
+    if (!rsp.recovery_errors_reported()) {
+        result.failedIds.insert(result.failedIds.end(), batchObjectKeys.begin(), batchObjectKeys.end());
+        result.status = Status(K_TRY_AGAIN, "metadata receiver did not acknowledge recovery error reporting");
+        return;
+    }
+    std::unordered_set<std::string> pending(batchObjectKeys.begin(), batchObjectKeys.end());
+    const auto failedBegin = result.failedIds.size();
+    for (const auto &objectKey : rsp.failed_object_keys()) {
+        if (pending.erase(objectKey) == 0) {
+            result.failedIds.resize(failedBegin);
+            result.failedIds.insert(result.failedIds.end(), batchObjectKeys.begin(), batchObjectKeys.end());
+            result.status = Status(K_RUNTIME_ERROR, "metadata recovery response contains an unknown or duplicate key");
+            return;
+        }
+        result.failedIds.emplace_back(objectKey);
+    }
+    result.recoveredCount += pending.size();
 }
 
 MetaDataRecoveryManager::DispatchResult MetaDataRecoveryManager::SendRecoverRequest(
-    const HostPort &masterAddr, const std::vector<std::string> &objectKeys) const
+    const HostPort &masterAddr, const std::vector<std::string> &objectKeys, bool reportRecoveryErrors) const
 {
     DispatchResult result;
     HostPort addr;
@@ -584,6 +617,7 @@ MetaDataRecoveryManager::DispatchResult MetaDataRecoveryManager::SendRecoverRequ
     constexpr size_t maxBatchSize = 500;
     master::PushMetaToMasterReqPb req;
     req.set_address(localAddress_.ToString());
+    req.set_report_recovery_errors(reportRecoveryErrors);
     std::vector<std::string> batchObjectKeys;
     batchObjectKeys.reserve(maxBatchSize);
     for (const auto &objectKey : objectKeys) {

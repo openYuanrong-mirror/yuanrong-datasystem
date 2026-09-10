@@ -2339,8 +2339,6 @@ Status UrmaManager::FinalizeOutboundConnection(const UrmaHandshakeRspPb &rsp, Co
     RETURN_IF_NOT_OK(InitializeOutboundConnection(handShake, remoteInfo, connection));
     if (previous != nullptr) {
         RETURN_IF_NOT_OK(connection->PrepareReplacement(*previous));
-        connection->workerOwned_.store(previous->workerOwned_.load(std::memory_order_relaxed),
-            std::memory_order_relaxed);
     }
     accessor->second = connection;
     RetainFinalizedConnection(connection, ownership, clientOwner);

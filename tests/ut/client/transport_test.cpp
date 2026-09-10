@@ -2414,6 +2414,43 @@ TEST(DataPlaneManagerTest, ClientRecoveryProbeReleasesTemporaryConnectionOwner)
 #endif
 }
 
+TEST(UbConnectionTest, TeardownUsesHandshakeConnectionKey)
+{
+#ifdef USE_URMA
+    const bool enableUrma = FLAGS_enable_urma;
+    Raii restoreEnableUrma([enableUrma]() { FLAGS_enable_urma = enableUrma; });
+    FLAGS_enable_urma = true;
+    const HostPort dialAddress = MakeAddress(2400);
+    const HostPort handshakeAddress = MakeAddress(2401);
+    UrmaJfrInfo info;
+    info.localAddress = handshakeAddress;
+    info.uniqueInstanceId = "handshake-key-owner";
+    info.eid = std::string(16, '\0');
+    UrmaHandshakeRspPb response;
+    info.ToProto(*response.mutable_hand_shake());
+    auto &manager = UrmaManager::Instance();
+    (void)manager.RemoveRemoteDevice(handshakeAddress.ToString());
+    Raii cleanup([&] { (void)manager.RemoveRemoteDevice(handshakeAddress.ToString()); });
+    TbbUrmaConnectionMap::accessor entry;
+    ASSERT_TRUE(manager.urmaConnectionMap_.insert(entry, handshakeAddress.ToString()));
+    auto owner = std::make_shared<UrmaConnection>(nullptr, info);
+    entry->second = owner;
+    entry.release();
+    auto rpcClient = std::make_shared<FakeWorkerRpcClient>(dialAddress);
+    rpcClient->exchangeUrmaResponse = response;
+    UbConnection connection(rpcClient);
+
+    ASSERT_TRUE(connection.Establish(dialAddress).IsOk());
+    EXPECT_EQ(owner->clientOwners_.load(), 1U);
+    connection.Teardown();
+
+    EXPECT_EQ(owner->clientOwners_.load(), 0U);
+    EXPECT_EQ(manager.urmaConnectionMap_.count(handshakeAddress.ToString()), 0U);
+#else
+    GTEST_SKIP() << "Handshake connection ownership requires USE_URMA";
+#endif
+}
+
 TEST(DataPlaneManagerTest, ReusesRpcClientAndTransporterForSameAddress)
 {
     FakeDataPlaneManager manager;

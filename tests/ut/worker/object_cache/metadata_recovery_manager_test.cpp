@@ -14,6 +14,7 @@
 /**
  * Description: Unit tests for metadata recovery manager.
  */
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -79,6 +80,8 @@ private:
 
 class TestWorkerMasterOCApi : public worker::WorkerMasterOCApi {
 public:
+    using PushHandler = std::function<Status(master::PushMetaToMasterReqPb &, master::PushMetaToMasterRspPb &)>;
+
     TestWorkerMasterOCApi(const HostPort &masterAddr, const HostPort &localAddr)
         : WorkerMasterOCApi(localAddr, nullptr), masterAddr_(masterAddr)
     {
@@ -115,11 +118,16 @@ public:
 
     Status PushMetadataToMaster(master::PushMetaToMasterReqPb &req, master::PushMetaToMasterRspPb &rsp) override
     {
-        (void)rsp;
         for (const auto &meta : req.metas()) {
             isRecoveredFlags_.emplace_back(meta.is_recovered());
         }
         batchSizes_.emplace_back(req.metas_size());
+        if (pushHandler_) {
+            return pushHandler_(req, rsp);
+        }
+        if (returnStatus_.IsOk() && req.report_recovery_errors()) {
+            rsp.set_recovery_errors_reported(true);
+        }
         return returnStatus_;
     }
 
@@ -173,9 +181,15 @@ public:
         return isRecoveredFlags_;
     }
 
+    void SetPushHandler(PushHandler handler)
+    {
+        pushHandler_ = std::move(handler);
+    }
+
 private:
     HostPort masterAddr_;
     Status returnStatus_{ Status::OK() };
+    PushHandler pushHandler_;
     std::vector<int> batchSizes_;
     std::vector<bool> isRecoveredFlags_;
 };
@@ -375,6 +389,70 @@ TEST_F(MetaDataRecoveryManagerTest, RecoverMetadataShouldReturnAllFailedIdsWhenM
     DS_ASSERT_NOT_OK(result.status);
     EXPECT_EQ(result.status.GetCode(), K_RPC_UNAVAILABLE);
     EXPECT_EQ(result.failedIds.size(), objectKeys.size());
+}
+
+TEST_F(MetaDataRecoveryManagerTest, StrictRecoveryReportsOnlyRejectedKeys)
+{
+    const std::vector<std::string> objectKeys{ "recovered", "rejected" };
+    for (const auto &objectKey : objectKeys) {
+        AddObject(objectKey);
+    }
+    HostPort masterAddr("127.0.0.1", 18501);
+    auto api = std::make_shared<TestWorkerMasterOCApi>(masterAddr, localAddress_);
+    api->SetPushHandler([](master::PushMetaToMasterReqPb &req, master::PushMetaToMasterRspPb &rsp) {
+        EXPECT_TRUE(req.report_recovery_errors());
+        rsp.set_recovery_errors_reported(true);
+        rsp.add_failed_object_keys("rejected");
+        return Status::OK();
+    });
+    workerMasterApiManager_->SetApi(masterAddr, api);
+
+    auto result = manager_->SendRecoverRequest(masterAddr, objectKeys, true);
+
+    DS_EXPECT_OK(result.status);
+    EXPECT_THAT(result.failedIds, ElementsAre("rejected"));
+    EXPECT_EQ(result.recoveredCount, 1U);
+}
+
+TEST_F(MetaDataRecoveryManagerTest, StrictRecoveryRejectsLegacyReceiverWithoutAcknowledgement)
+{
+    const std::vector<std::string> objectKeys{ "legacy-a", "legacy-b" };
+    for (const auto &objectKey : objectKeys) {
+        AddObject(objectKey);
+    }
+    HostPort masterAddr("127.0.0.1", 18501);
+    auto api = std::make_shared<TestWorkerMasterOCApi>(masterAddr, localAddress_);
+    api->SetPushHandler([](master::PushMetaToMasterReqPb &req, master::PushMetaToMasterRspPb &) {
+        EXPECT_TRUE(req.report_recovery_errors());
+        return Status::OK();
+    });
+    workerMasterApiManager_->SetApi(masterAddr, api);
+
+    auto result = manager_->SendRecoverRequest(masterAddr, objectKeys, true);
+
+    EXPECT_EQ(result.status.GetCode(), K_TRY_AGAIN);
+    EXPECT_THAT(result.failedIds, UnorderedElementsAreArray(objectKeys));
+    EXPECT_EQ(result.recoveredCount, 0U);
+}
+
+TEST_F(MetaDataRecoveryManagerTest, StrictRecoveryRejectsUnknownFailureKey)
+{
+    const std::vector<std::string> objectKeys{ "requested" };
+    AddObject(objectKeys.front());
+    HostPort masterAddr("127.0.0.1", 18501);
+    auto api = std::make_shared<TestWorkerMasterOCApi>(masterAddr, localAddress_);
+    api->SetPushHandler([](master::PushMetaToMasterReqPb &, master::PushMetaToMasterRspPb &rsp) {
+        rsp.set_recovery_errors_reported(true);
+        rsp.add_failed_object_keys("not-requested");
+        return Status::OK();
+    });
+    workerMasterApiManager_->SetApi(masterAddr, api);
+
+    auto result = manager_->SendRecoverRequest(masterAddr, objectKeys, true);
+
+    EXPECT_EQ(result.status.GetCode(), K_RUNTIME_ERROR);
+    EXPECT_THAT(result.failedIds, ElementsAre("requested"));
+    EXPECT_EQ(result.recoveredCount, 0U);
 }
 
 TEST_F(MetaDataRecoveryManagerTest, RecoverLocalEntries)

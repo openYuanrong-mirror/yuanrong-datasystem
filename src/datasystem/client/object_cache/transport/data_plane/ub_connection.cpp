@@ -80,6 +80,8 @@ Status UbConnection::EstablishUrma(TransportPhaseLatencyRecorder *recorder)
         recorder->RecordPhase("urma_connection_finalize", phaseBegin, TransportLatencyThreshold::PROCESS);
     }
     RETURN_IF_NOT_OK(status);
+    RETURN_RUNTIME_ERROR_IF_NULL(clientOwner_);
+    clientOwnerKey_ = clientOwner_->GetUrmaJfrInfo().localAddress.ToString();
     supportsPayloadOnlyClientBatchGet_.store(response.supports_payload_only_client_batch_get(),
                                              std::memory_order_release);
     urmaReady_.store(true, std::memory_order_release);
@@ -105,8 +107,9 @@ void UbConnection::Teardown()
     supportsPayloadOnlyClientBatchGet_.store(false, std::memory_order_release);
 #ifdef USE_URMA
     if (urmaReady_.exchange(false, std::memory_order_acq_rel)) {
-        UrmaManager::Instance().ReleaseClientConnection(workerAddr_.ToString(), clientOwner_);
+        UrmaManager::Instance().ReleaseClientConnection(clientOwnerKey_, clientOwner_);
         clientOwner_.reset();
+        clientOwnerKey_.clear();
     }
 #else
     urmaReady_.store(false, std::memory_order_release);

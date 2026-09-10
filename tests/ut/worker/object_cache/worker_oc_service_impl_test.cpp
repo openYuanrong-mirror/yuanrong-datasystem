@@ -283,7 +283,11 @@ public:
     Status PushMetadataToMaster(master::PushMetaToMasterReqPb &req,
                                 master::PushMetaToMasterRspPb &rsp) override
     {
-        return pushMetaHandler_ == nullptr ? Status::OK() : pushMetaHandler_(req, rsp);
+        auto status = pushMetaHandler_ == nullptr ? Status::OK() : pushMetaHandler_(req, rsp);
+        if (status.IsOk() && req.report_recovery_errors() && acknowledgeRecoveryErrors_) {
+            rsp.set_recovery_errors_reported(true);
+        }
+        return status;
     }
 
     Status CheckObjectDataLocation(master::CheckObjectDataLocationReqPb &req,
@@ -388,6 +392,7 @@ public:
     }
 
     PushMetaHandler pushMetaHandler_;
+    bool acknowledgeRecoveryErrors_{ true };
     CheckLocationHandler checkLocationHandler_;
 
     int CreateMetaCallCount() const
@@ -2135,6 +2140,8 @@ TEST_F(WorkerOcServiceImplTest, GiveUpReconciliationDoesNotBypassTopologyHealthG
         topologyRuntime_.Engine(), metadataRoute_, topologyRuntime_.Engine()->Membership(), &exitRequested_, true,
         true);
     restartImpl->healthPublicationEnabled_.store(true, std::memory_order_release);
+    constexpr int64_t elapsedReconciliationMs = 60'001;
+    restartImpl->lastReconTime_ = static_cast<int64_t>(GetSteadyClockTimeStampMs()) - elapsedReconciliationMs;
 
     DS_EXPECT_OK(restartImpl->GiveUpReconciliation());
 
@@ -3408,7 +3415,7 @@ TEST_F(WorkerOcServiceImplTest, DeferredGetCleanupRechecksMigrationState)
     EXPECT_EQ(objectTable_->Contains("expired-copy").GetCode(), K_NOT_FOUND);
 }
 
-TEST_F(WorkerOcServiceImplTest, TopologyCleanupRetainsUnconfirmedAndFencesOrdinaryDeletion)
+TEST_F(WorkerOcServiceImplTest, MasterDrivenCleanupRetainsUnconfirmedAndFencesOrdinaryDeletion)
 {
     Parallel::InitParallelThreadPool(1);
     const bool oldMetadataRecovery = FLAGS_enable_metadata_recovery;
@@ -3488,10 +3495,9 @@ TEST_F(WorkerOcServiceImplTest, TopologyCleanupRetainsUnconfirmedAndFencesOrdina
         localAddress_.ToString());
 
     ClearDataRetryIds retryIds;
-    dataClearImpl_->ClearTopologyFailureMatchedObjects(
-        { ordinaryObject, markerRaceObject, versionRaceObject, identityRaceObject, unconfirmedObject,
-          secondUnconfirmedObject },
-        retryIds);
+    dataClearImpl_->ClearMatchedObjects({ ordinaryObject, markerRaceObject, versionRaceObject, identityRaceObject,
+                                          unconfirmedObject, secondUnconfirmedObject },
+                                        retryIds);
     EXPECT_EQ(objectTable_->Contains(ordinaryObject).GetCode(), K_NOT_FOUND);
     EXPECT_TRUE(objectTable_->Contains(markerRaceObject).IsOk());
     EXPECT_TRUE(objectTable_->Contains(versionRaceObject).IsOk());
@@ -3581,7 +3587,7 @@ TEST_F(WorkerOcServiceImplTest, TopologyCleanupOrdinaryObjectsRespectMetadataRec
     dataClearImpl_.reset();
 }
 
-TEST_F(WorkerOcServiceImplTest, UnconfirmedRecoveryFailureEntersTopologyRetry)
+TEST_F(WorkerOcServiceImplTest, MasterDrivenUnconfirmedRecoveryFailureEntersTopologyRetry)
 {
     Parallel::InitParallelThreadPool(1);
     const bool oldMetadataRecovery = FLAGS_enable_metadata_recovery;
@@ -3614,7 +3620,7 @@ TEST_F(WorkerOcServiceImplTest, UnconfirmedRecoveryFailureEntersTopologyRetry)
                                                                     *endpointPolicy_, localAddress_.ToString());
 
     ClearDataRetryIds retryIds;
-    dataClearImpl_->ClearTopologyFailureMatchedObjects({ objectKey }, retryIds);
+    dataClearImpl_->ClearMatchedObjects({ objectKey }, retryIds);
 
     EXPECT_EQ(pushMetaCalls, 1U);
     EXPECT_THAT(retryIds.topologyCheckFailedIds, UnorderedElementsAre(objectKey));
@@ -3793,6 +3799,22 @@ TEST_F(WorkerOcServiceImplTest, ClearDataRetryImplShouldRouteFailedIdsToRetrySta
     EXPECT_THAT(nextRetryIds.topologyCheckFailedIds, UnorderedElementsAre("topology-next"));
     EXPECT_THAT(nextRetryIds.increaseFailedIds, UnorderedElementsAre("increase-next"));
     EXPECT_THAT(nextRetryIds.recoverAppRefFailedIds, UnorderedElementsAre("recover-next"));
+}
+
+TEST_F(WorkerOcServiceImplTest, TopologyRecoveryRetryUsesBoundedExponentialBackoff)
+{
+    ClearDataRetryIds ordinaryRetry;
+    EXPECT_EQ(dataClearImpl_->CalculateRetryIntervalMs(100, ordinaryRetry), 200U);
+
+    ClearDataRetryIds topologyRetry;
+    topologyRetry.topologyCheckFailedIds.emplace("recover-meta");
+    EXPECT_EQ(dataClearImpl_->CalculateRetryIntervalMs(0, topologyRetry), 200U);
+    EXPECT_EQ(dataClearImpl_->CalculateRetryIntervalMs(1, topologyRetry), 200U);
+    EXPECT_EQ(dataClearImpl_->CalculateRetryIntervalMs(2, topologyRetry), 400U);
+    EXPECT_EQ(dataClearImpl_->CalculateRetryIntervalMs(3, topologyRetry), 800U);
+    EXPECT_EQ(dataClearImpl_->CalculateRetryIntervalMs(5, topologyRetry), 3200U);
+    EXPECT_EQ(dataClearImpl_->CalculateRetryIntervalMs(6, topologyRetry), 5000U);
+    EXPECT_EQ(dataClearImpl_->CalculateRetryIntervalMs(100, topologyRetry), 5000U);
 }
 
 TEST_F(WorkerOcServiceImplTest, NotifyRemoteGetRejectsAfterIncomingMigrationAdmissionCloses)

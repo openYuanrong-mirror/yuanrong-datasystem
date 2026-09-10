@@ -939,6 +939,35 @@ TEST_F(OCMetadataManagerTopologyTest, QueryMetaRetriesWholeBatchWhenOneScaleOutK
     EXPECT_TRUE(payloads.empty());
 }
 
+TEST_F(OCMetadataManagerTopologyTest, RecoveryPushReportsPerKeyFailureOnlyWhenRequested)
+{
+    OCMetadataManager manager(akSkManager_, rocksStore_.get(), nullptr, nullptr, LOCAL_ADDRESS, nullptr, nullptr, false,
+                              HostPort(), LOCAL_ADDRESS, &localExiting_, "workerId");
+    manager.globalRefTable_ = std::make_unique<object_cache::ObjectGlobalRefTable<ImmutableString>>();
+    master::PushMetaToMasterReqPb request;
+    request.set_address(SURVIVOR_ADDRESS);
+    request.add_metas()->set_object_key("rejected");
+    request.add_metas()->set_object_key("recovered");
+    BINEXPECT_CALL(&OCMetadataManager::RecoveryMetaFromWorker, (testing::_, testing::_))
+        .Times(4)
+        .WillRepeatedly(testing::Invoke([](const std::string &, const ObjectMetaPb &meta) {
+            return meta.object_key() == "rejected" ? Status(K_KVSTORE_ERROR, "injected persistence failure")
+                                                   : Status::OK();
+        }));
+
+    request.set_report_recovery_errors(true);
+    master::PushMetaToMasterRspPb strictResponse;
+    DS_ASSERT_OK(manager.ProcessWorkerPushMeta(request, strictResponse));
+    EXPECT_TRUE(strictResponse.recovery_errors_reported());
+    EXPECT_THAT(strictResponse.failed_object_keys(), testing::ElementsAre("rejected"));
+
+    request.set_report_recovery_errors(false);
+    master::PushMetaToMasterRspPb legacyResponse;
+    DS_ASSERT_OK(manager.ProcessWorkerPushMeta(request, legacyResponse));
+    EXPECT_FALSE(legacyResponse.recovery_errors_reported());
+    EXPECT_TRUE(legacyResponse.failed_object_keys().empty());
+}
+
 TEST_F(OCMetadataManagerTopologyTest, AsyncDeleteAllCopyMetaDoesNotQueueRedirectedKeys)
 {
     cluster::TopologyState topology;

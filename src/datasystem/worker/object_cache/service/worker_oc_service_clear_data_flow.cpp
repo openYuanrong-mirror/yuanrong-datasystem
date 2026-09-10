@@ -46,6 +46,7 @@ namespace datasystem {
 namespace object_cache {
 namespace {
 constexpr uint64_t CLEAR_OBJECT_RETRY_INTERVAL_MS = 200;
+constexpr uint64_t TOPOLOGY_RECOVERY_MAX_RETRY_INTERVAL_MS = 5000;
 constexpr int CLEAR_DATA_THREAD_NUM = 1;
 constexpr size_t CHECK_OBJECT_DATA_LOCATION_BATCH = 500;
 constexpr size_t GET_MASTER_ERROR_SAMPLE_LIMIT = 3;
@@ -276,8 +277,18 @@ void WorkerOcServiceClearDataFlow::RetryClearDataAsync(const ClearDataReqPb &req
         TraceGuard traceGuard = Trace::Instance().SetTraceNewID(traceID);
         SubmitRetryClearDataAsync(req, retryTimes, retryIds);
     };
-    LOG_IF_ERROR(TimerQueue::GetInstance()->AddTimer(CLEAR_OBJECT_RETRY_INTERVAL_MS, retryTask, timer),
+    const auto retryIntervalMs = CalculateRetryIntervalMs(retryTimes, retryIds);
+    LOG_IF_ERROR(TimerQueue::GetInstance()->AddTimer(retryIntervalMs, retryTask, timer),
                  "Add retry ClearData timer failed");
+}
+
+uint64_t WorkerOcServiceClearDataFlow::CalculateRetryIntervalMs(uint64_t retryTimes, const ClearDataRetryIds &retryIds)
+{
+    if (retryIds.topologyCheckFailedIds.empty()) {
+        return CLEAR_OBJECT_RETRY_INTERVAL_MS;
+    }
+    const uint64_t exponent = retryTimes == 0 ? 0 : std::min<uint64_t>(retryTimes - 1, 5);
+    return std::min(CLEAR_OBJECT_RETRY_INTERVAL_MS << exponent, TOPOLOGY_RECOVERY_MAX_RETRY_INTERVAL_MS);
 }
 
 Status WorkerOcServiceClearDataFlow::GetMatchObjectIds(const ClearDataReqPb &req,
@@ -399,9 +410,7 @@ void WorkerOcServiceClearDataFlow::FilterObjectsNeedClearByMaster(const std::vec
 void WorkerOcServiceClearDataFlow::ClearMatchedObjects(const std::vector<std::string> &matchObjIds,
                                                        ClearDataRetryIds &retryIds)
 {
-    std::vector<std::string> needClearObjIds;
-    FilterObjectsNeedClearByMaster(matchObjIds, needClearObjIds, retryIds.clearFailedIds);
-    ClearNeedClearObjects(needClearObjIds);
+    ClearTopologyFailureMatchedObjects(matchObjIds, retryIds);
     LOG(INFO) << "clear data without meta in worker finished";
 }
 
@@ -418,7 +427,7 @@ void WorkerOcServiceClearDataFlow::ClearTopologyFailureMatchedObjects(const std:
         std::vector<std::string> needClearIds;
         FilterObjectsNeedClearByMaster(ordinaryClearIds, needClearIds, retryIds.topologyCheckFailedIds);
         if (FLAGS_enable_metadata_recovery) {
-            auto recovery = metadataRecoveryManager_->RecoverMetadataWithSummary(needClearIds, "");
+            auto recovery = metadataRecoveryManager_->RecoverMetadataWithSummary(needClearIds, "", true);
             if (recovery.status.IsError()) {
                 LOG(ERROR) << "RecoverMetadataWithSummary failed, status: " << recovery.status.ToString();
             }
@@ -479,7 +488,7 @@ void WorkerOcServiceClearDataFlow::RecoverUnconfirmedMigrationObjects(const std:
     if (objectKeys.empty() || metadataRecoveryManager_ == nullptr || !FLAGS_enable_metadata_recovery) {
         return;
     }
-    auto recovery = metadataRecoveryManager_->RecoverMetadataWithSummary(objectKeys, "");
+    auto recovery = metadataRecoveryManager_->RecoverMetadataWithSummary(objectKeys, "", true);
     failedIds.insert(recovery.failedIds.begin(), recovery.failedIds.end());
     if (recovery.status.IsError() || !recovery.failedIds.empty()) {
         const auto sampleEnd =
@@ -637,20 +646,5 @@ void WorkerOcServiceClearDataFlow::RetryRecoverMasterAppRef(const std::vector<st
     }
 }
 
-void WorkerOcServiceClearDataFlow::ClearNeedClearObjects(const std::vector<std::string> &needClearObjIds)
-{
-    if (needClearObjIds.empty()) {
-        return;
-    }
-    if (FLAGS_enable_metadata_recovery) {
-        auto summary = metadataRecoveryManager_->RecoverMetadataWithSummary(needClearObjIds, "");
-        if (summary.status.IsError()) {
-            LOG(ERROR) << "RecoverMetadataWithSummary failed, status: " << summary.status.ToString();
-        }
-        ClearObject(summary.failedIds);
-    } else {
-        ClearObject(needClearObjIds);
-    }
-}
 }  // namespace object_cache
 }  // namespace datasystem

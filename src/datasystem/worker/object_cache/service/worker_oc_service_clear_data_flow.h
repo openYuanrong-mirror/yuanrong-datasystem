@@ -177,6 +177,8 @@ private:
     void RetryClearDataAsync(const ClearDataReqPb &req, const ClearDataRetryIds &retryIds,
                              uint64_t retryTimes);
 
+    static uint64_t CalculateRetryIntervalMs(uint64_t retryTimes, const ClearDataRetryIds &retryIds);
+
     /**
      * @brief Select local objects matched by ranges or worker ids in the request.
      * @param[in] req Clear-data request used for object selection.
@@ -287,12 +289,6 @@ private:
      * @param[out] retryIds Failed object ids for the next retry round.
      */
     void RetryRecoverMasterAppRef(const std::vector<std::string> &objectKeys, ClearDataRetryIds &retryIds);
-
-    /**
-     * @brief Recover metadata if needed and then clear local object data.
-     * @param[in] needClearObjIds Object ids that should be removed locally.
-     */
-    void ClearNeedClearObjects(const std::vector<std::string> &needClearObjIds);
 
     std::shared_ptr<ObjectTable> objectTable_{ nullptr };
     std::shared_ptr<ObjectGlobalRefTable<ClientKey>> globalRefTable_{ nullptr };

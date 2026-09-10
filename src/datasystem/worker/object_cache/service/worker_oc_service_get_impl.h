@@ -1207,6 +1207,8 @@ private:
                                                        const std::string &sourceAddr,
                                                        const QueryMetaMap &queryMetas, bool allowRedirect);
 
+    bool IsReplacePrimaryRedirectAdmitted(const HostPort &masterAddr, bool allowRedirect) const;
+
     void ReplacePrimaryForMasterGroup(const HostPort &masterAddr, const std::vector<std::string> &objectKeys,
                                       const std::string &sourceAddr, const QueryMetaMap &queryMetas,
                                       ReplacePrimaryOutcome &outcome, bool allowRedirect);
