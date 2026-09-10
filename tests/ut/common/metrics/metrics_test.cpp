@@ -1125,6 +1125,7 @@ TEST_F(MetricsTest, kv_metric_urma_id_layout_test)
         { metrics::KvMetricId::WORKER_SHM_REF_HARD_RECLAIM_TOTAL, "worker_shm_ref_hard_reclaim_total" },
         { metrics::KvMetricId::CLIENT_AMBIGUOUS_CREATE_CLEANUP_DROPPED_TOTAL,
           "client_ambiguous_create_cleanup_dropped_total" },
+        { metrics::KvMetricId::WORKER_EVICT_PRETRIGGER_TOTAL, "worker_evict_pretrigger_total" },
     };
     EXPECT_EQ(static_cast<uint16_t>(metrics::KvMetricId::CLIENT_DIRECT_BATCH_GET_RPC_TOTAL), 95u);
     EXPECT_EQ(static_cast<uint16_t>(metrics::KvMetricId::CLIENT_DIRECT_BATCH_GET_OBJECT_TOTAL), 96u);
@@ -1137,7 +1138,8 @@ TEST_F(MetricsTest, kv_metric_urma_id_layout_test)
     EXPECT_EQ(static_cast<uint16_t>(metrics::KvMetricId::WORKER_TO_CLIENT_GET_SHM_TOTAL_BYTES), 141u);
     EXPECT_EQ(static_cast<uint16_t>(metrics::KvMetricId::WORKER_TO_CLIENT_GET_URMA_TOTAL_BYTES), 142u);
     EXPECT_EQ(static_cast<uint16_t>(metrics::KvMetricId::CLIENT_AMBIGUOUS_CREATE_CLEANUP_DROPPED_TOTAL), 144u);
-    EXPECT_EQ(static_cast<uint16_t>(metrics::KvMetricId::KV_METRIC_END), 145u);
+    EXPECT_EQ(static_cast<uint16_t>(metrics::KvMetricId::WORKER_EVICT_PRETRIGGER_TOTAL), 145u);
+    EXPECT_EQ(static_cast<uint16_t>(metrics::KvMetricId::KV_METRIC_END), 146u);
     for (size_t k = 0; k < sizeof(kTailMetrics) / sizeof(kTailMetrics[0]); ++k) {
         const auto wantId = static_cast<uint16_t>(kTailMetrics[k].id);
         const auto *desc = std::find_if(descs, descs + count,

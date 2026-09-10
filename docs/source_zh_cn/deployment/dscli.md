@@ -1372,7 +1372,6 @@ Coordinator 按该成员列表启动 Raft 选主。启用选主后，`coordinato
 | spill_file_open_limit | int | `512` | 是 | 溢出文件的最大打开文件描述符数量。若已打开文件数超过此值，系统将临时关闭部分文件以防止超出系统最大限制。在系统资源有限的情况下，应适当调低此数值 |
 | spill_enable_readahead | bool | `true` | 否 | 是否启用磁盘预读功能，当预读功能被禁用时，可以缓解KV语义 `Read` 接口偏移读取导致的读放大问题 |
 | eviction_reserve_mem_threshold_mb | int | `10240` | 否 | 内存预留阈值（MB），实际取值 min(shared_memory_size_mb × 0.1, eviction_reserve_mem_threshold_mb)；与 eviction_high_watermark_ratio 共同决定驱逐触发线。有效范围 100-102400 |
-| eviction_pretrigger_margin_mb | int | `0` | 否 | 对象缓存 Eviction 相对硬高水位的提前触发量（MiB），`0` 表示关闭。内存分配和 Rebalance 仍使用硬高水位。软触发线须高于 eviction_low_watermark_ratio 对应的低水位，否则自动禁用提前触发 |
 | eviction_high_watermark_ratio | double | `0.9` | 否 | 内存占用率高水位（比例 0.0-1.0，相对可用共享内存）。当占用内存达到 max(比例 × 共享内存, 共享内存 - eviction_reserve_mem_threshold_mb) 时触发驱逐。有效范围 0.02-1.0，须大于 eviction_low_watermark_ratio |
 | eviction_low_watermark_ratio | double | `0.8` | 否 | 内存占用率低水位（比例 0.0-1.0），后台驱逐运行直至占用率降至该比例及以下。有效范围 0.01-0.99，须小于 eviction_high_watermark_ratio |
 | spill_high_watermark_ratio | double | `0.8` | 否 | Spill 目录占用率高水位（相对 spill_size_limit 的比例 0.0-1.0）。有效范围 0.02-1.0，须大于 spill_low_watermark_ratio |

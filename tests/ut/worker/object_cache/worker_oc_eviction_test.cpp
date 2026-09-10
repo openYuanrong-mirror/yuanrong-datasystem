@@ -70,7 +70,6 @@ DS_DECLARE_string(master_address);
 DS_DECLARE_string(etcd_address);
 DS_DECLARE_double(eviction_high_watermark_ratio);
 DS_DECLARE_double(eviction_low_watermark_ratio);
-DS_DECLARE_uint32(eviction_pretrigger_margin_mb);
 DS_DECLARE_uint32(eviction_reserve_mem_threshold_mb);
 
 namespace datasystem {
@@ -1121,35 +1120,111 @@ TEST_F(EvictionManagerTest, AllocationOomReservesReplyTime)
     CheckOomRetryLimit(5, 0);
 }
 
-TEST_F(EvictionManagerTest, PretriggerWatermarkIsOnlyUsedWhenExplicitlyRequested)
+TEST_F(EvictionManagerTest, PretriggerMarginAutoReservesAverageObjectSize)
 {
     const auto savedHighWatermark = FLAGS_eviction_high_watermark_ratio;
     const auto savedLowWatermark = FLAGS_eviction_low_watermark_ratio;
     const auto savedReserveThreshold = FLAGS_eviction_reserve_mem_threshold_mb;
-    const auto savedPretriggerMargin = FLAGS_eviction_pretrigger_margin_mb;
     allocator->ResetForTest();
     DS_ASSERT_OK(allocator->Init(64 * MB_TO_BYTES));
     FLAGS_eviction_high_watermark_ratio = 0.8;
     FLAGS_eviction_low_watermark_ratio = 0.5;
     FLAGS_eviction_reserve_mem_threshold_mb = 16;
-    FLAGS_eviction_pretrigger_margin_mb = 8;
     RefreshWatermarkFactors();
 
     auto evictionManager = std::make_shared<WorkerOcEvictionManager>(
         objectTable_, HostPort("127.0.0.1", 31501), HostPort("127.0.0.1", 31500), GetTestMetadataRoute());
     auto globalRefTable = std::make_shared<ObjectGlobalRefTable<ClientKey>>();
     DS_ASSERT_OK(evictionManager->Init(globalRefTable, akSkManager_));
-    DS_ASSERT_OK(CreateObject("between-soft-and-hard-watermark", 47 * MB_TO_BYTES));
+    // Empty cache: the estimate falls back to the 1 MiB floor instead of dividing by zero.
+    EXPECT_EQ(1 * MB_TO_BYTES, evictionManager->EstimatePretriggerMarginBytes());
+
+    // 6 x 8 MiB objects: hard watermark is max(0.8 * 64, 64 - 16) = 51.2 MiB, the auto margin is the
+    // 8 MiB average, so the patrol fires anywhere in [43.2, 51.2) while the foreground hard-line
+    // check stays untouched at 48 MiB usage.
+    constexpr uint64_t objectSize = 8 * MB_TO_BYTES;
+    for (size_t i = 0; i < 6; ++i) {
+        auto key = "auto-pretrigger-" + std::to_string(i);
+        DS_ASSERT_OK(CreateObject(key, objectSize - GetMetaSize(objectSize), WriteMode::NONE_L2_CACHE, true, true));
+        evictionManager->Add(key);
+    }
+    EXPECT_GE(evictionManager->EstimatePretriggerMarginBytes(), objectSize);
 
     EXPECT_FALSE(EvictWhenMemoryExceedThrehold("", 0, evictionManager));
     EXPECT_TRUE(EvictWhenMemoryExceedPretriggerWatermark(evictionManager));
 
-    DS_ASSERT_OK(DeleteObject("between-soft-and-hard-watermark"));
     evictionManager.reset();
     FLAGS_eviction_high_watermark_ratio = savedHighWatermark;
     FLAGS_eviction_low_watermark_ratio = savedLowWatermark;
     FLAGS_eviction_reserve_mem_threshold_mb = savedReserveThreshold;
-    FLAGS_eviction_pretrigger_margin_mb = savedPretriggerMargin;
+    RefreshWatermarkFactors();
+}
+
+TEST_F(EvictionManagerTest, PretriggerAutoMarginFallsBackToHardWatermark)
+{
+    const auto savedHighWatermark = FLAGS_eviction_high_watermark_ratio;
+    const auto savedLowWatermark = FLAGS_eviction_low_watermark_ratio;
+    const auto savedReserveThreshold = FLAGS_eviction_reserve_mem_threshold_mb;
+    allocator->ResetForTest();
+    DS_ASSERT_OK(allocator->Init(64 * MB_TO_BYTES));
+    FLAGS_eviction_high_watermark_ratio = 0.8;
+    FLAGS_eviction_low_watermark_ratio = 0.5;
+    FLAGS_eviction_reserve_mem_threshold_mb = 16;
+    RefreshWatermarkFactors();
+
+    auto evictionManager = std::make_shared<WorkerOcEvictionManager>(
+        objectTable_, HostPort("127.0.0.1", 31501), HostPort("127.0.0.1", 31500), GetTestMetadataRoute());
+    auto globalRefTable = std::make_shared<ObjectGlobalRefTable<ClientKey>>();
+    DS_ASSERT_OK(evictionManager->Init(globalRefTable, akSkManager_));
+    // A single 47 MiB object: the auto margin would push the soft line (4.2 MiB) below the low
+    // watermark (32 MiB), so the patrol keeps the hard watermark and stays silent below it.
+    DS_ASSERT_OK(CreateObject("single-large-object", 47 * MB_TO_BYTES));
+    evictionManager->Add("single-large-object");
+    EXPECT_GE(evictionManager->EstimatePretriggerMarginBytes(), 47 * MB_TO_BYTES);
+
+    EXPECT_FALSE(EvictWhenMemoryExceedPretriggerWatermark(evictionManager));
+
+    DS_ASSERT_OK(DeleteObject("single-large-object"));
+    evictionManager.reset();
+    FLAGS_eviction_high_watermark_ratio = savedHighWatermark;
+    FLAGS_eviction_low_watermark_ratio = savedLowWatermark;
+    FLAGS_eviction_reserve_mem_threshold_mb = savedReserveThreshold;
+    RefreshWatermarkFactors();
+}
+
+TEST_F(EvictionManagerTest, PretriggerMarginRoundsUpToCoverAverageObject)
+{
+    const auto savedHighWatermark = FLAGS_eviction_high_watermark_ratio;
+    const auto savedLowWatermark = FLAGS_eviction_low_watermark_ratio;
+    const auto savedReserveThreshold = FLAGS_eviction_reserve_mem_threshold_mb;
+    allocator->ResetForTest();
+    DS_ASSERT_OK(allocator->Init(64 * MB_TO_BYTES));
+    FLAGS_eviction_high_watermark_ratio = 0.8;
+    FLAGS_eviction_low_watermark_ratio = 0.5;
+    FLAGS_eviction_reserve_mem_threshold_mb = 16;
+    RefreshWatermarkFactors();
+
+    auto evictionManager = std::make_shared<WorkerOcEvictionManager>(
+        objectTable_, HostPort("127.0.0.1", 31501), HostPort("127.0.0.1", 31500), GetTestMetadataRoute());
+    auto globalRefTable = std::make_shared<ObjectGlobalRefTable<ClientKey>>();
+    DS_ASSERT_OK(evictionManager->Init(globalRefTable, akSkManager_));
+    // 33 x 1.5 MiB objects: the 1.5 MiB average must round up to a 2 MiB margin, putting the soft
+    // watermark at 49.2 MiB. A floored 1 MiB margin (soft 50.2 MiB) would leave the 49.5 MiB usage
+    // in a residual dead band where neither the patrol nor rebalance can proceed.
+    constexpr uint64_t objectSize = 3 * MB_TO_BYTES / 2;
+    for (size_t i = 0; i < 33; ++i) {
+        auto key = "round-up-pretrigger-" + std::to_string(i);
+        DS_ASSERT_OK(CreateObject(key, objectSize - GetMetaSize(objectSize), WriteMode::NONE_L2_CACHE, true, true));
+        evictionManager->Add(key);
+    }
+
+    EXPECT_FALSE(EvictWhenMemoryExceedThrehold("", 0, evictionManager));
+    EXPECT_TRUE(EvictWhenMemoryExceedPretriggerWatermark(evictionManager));
+
+    evictionManager.reset();
+    FLAGS_eviction_high_watermark_ratio = savedHighWatermark;
+    FLAGS_eviction_low_watermark_ratio = savedLowWatermark;
+    FLAGS_eviction_reserve_mem_threshold_mb = savedReserveThreshold;
     RefreshWatermarkFactors();
 }
 

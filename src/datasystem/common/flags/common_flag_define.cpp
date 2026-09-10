@@ -104,10 +104,13 @@ DS_DEFINE_uint32(
     eviction_reserve_mem_threshold_mb, 10240,
     "The reserved memory (MB) is determined by min(shared_memory_size_mb*0.1, eviction_reserve_mem_threshold_mb). "
     "Eviction begins when memory drops below this threshold.The valid range is 100-102400.");
+// Deprecated no-op kept one release for upgrade compatibility: worker configs generated from the
+// template while this key existed still carry it, and an unknown flag fails worker startup. Nothing
+// reads the value; the patrol always auto-reserves the average cached object size.
 DS_DEFINE_uint32(
     eviction_pretrigger_margin_mb, 0,
-    "Margin in MiB below the object-cache eviction high watermark. 0 disables pretriggering. The hard high "
-    "watermark used by allocation and rebalance is unchanged.");
+    "Deprecated and ignored: the background eviction patrol now auto-reserves the average cached "
+    "object size. Remove this key from worker configs.");
 DS_DEFINE_double(eviction_high_watermark_ratio, 0.9,
                  "Memory usage high watermark (ratio of available shared memory, 0.0-1.0). Eviction starts when "
                  "occupied memory reaches max(ratio * memory, memory - eviction_reserve_mem_threshold_mb). Must be "

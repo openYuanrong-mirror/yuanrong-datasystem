@@ -178,7 +178,11 @@ enum class KvMetricId : uint16_t {
     WORKER_SHM_REF_HARD_RECLAIM_TOTAL = 143,
     // Ambiguous Create cleanup tasks dropped because the dedicated client cleanup pool cannot accept them.
     CLIENT_AMBIGUOUS_CREATE_CLEANUP_DROPPED_TOTAL = 144,
-    KV_METRIC_END = 145,
+    // Background eviction patrol rounds that decided to trigger at the active soft watermark (below
+    // the hard high watermark). Rounds where the auto margin degenerated back to the hard line are
+    // excluded; whether the eviction task then ran (e.g. policy-update window) shows in evict logs.
+    WORKER_EVICT_PRETRIGGER_TOTAL = 145,
+    KV_METRIC_END = 146,
 };
 
 Status InitKvMetrics();

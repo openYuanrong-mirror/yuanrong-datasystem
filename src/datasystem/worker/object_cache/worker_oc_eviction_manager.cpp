@@ -35,6 +35,7 @@
 
 #include "datasystem/common/log/log.h"
 #include "datasystem/common/inject/inject_point.h"
+#include "datasystem/common/metrics/kv_metrics.h"
 #include "datasystem/common/l2cache/persistence_api.h"
 #include "datasystem/common/object_cache/shm_guard.h"
 #include "datasystem/common/object_cache/eviction_policy_common.h"
@@ -1093,6 +1094,22 @@ uint64_t WorkerOcEvictionManager::GetLowWaterMark(CacheType cacheType)
                  maxMemorySize)
         * GetEvictionLowWaterFactor());
     return lowWater;
+}
+
+uint64_t WorkerOcEvictionManager::EstimatePretriggerMarginBytes()
+{
+    constexpr uint64_t MIN_PRETRIGGER_MARGIN_BYTES = 1024ULL * 1024ULL;
+    auto usedBytes = datasystem::memory::Allocator::Instance()->GetTotalRealMemoryUsage(
+        ServiceType::OBJECT, memory::CacheType::MEMORY);
+    size_t objectCount = 0;
+    {
+        std::shared_lock<std::shared_mutex> routeLock(policyRouteMutex_);
+        objectCount = policyRoute_.sourceList->Size();
+    }
+    if (objectCount == 0 || usedBytes < objectCount) {
+        return MIN_PRETRIGGER_MARGIN_BYTES;
+    }
+    return std::max(MIN_PRETRIGGER_MARGIN_BYTES, usedBytes / objectCount);
 }
 
 bool WorkerOcEvictionManager::IsAboveLowWaterMark(uint64_t needSize, size_t pendingSpillSize, CacheType cacheType)
@@ -3198,6 +3215,61 @@ std::string WorkerOcEvictionManager::GetActionName(Action action)
 }
 
 namespace {
+uint64_t GetHardHighWatermark(uint64_t maxAvailableMemorySize, uint64_t evictionThresholdMB)
+{
+    // Margin 0 makes GetEvictionTriggerWatermark return its internal hard-watermark copy, so this
+    // stays a forwarding instead of a third formula duplicate (cf. Allocator::GetMemoryAvailToHighWater).
+    return GetEvictionTriggerWatermark(maxAvailableMemorySize, static_cast<uint32_t>(evictionThresholdMB), 0);
+}
+
+// Select the watermark for the background eviction patrol: the hard high watermark lowered by the
+// average cached object size, so the patrol counts the next incoming object exactly like the
+// foreground allocation check already does (usage + needSize). Without this reserve the patrol can
+// stall one object below the hard watermark (issue #1117). GetEvictionTriggerWatermark falls back
+// to the hard line when the reserve would push the soft line to the low watermark.
+// The average estimate covers homogeneous and mixed loads; for a fully skewed stream (cache of
+// small objects, incoming objects all larger) the reserve may not cover the next object — small
+// inflow keeps raising usage past the soft line and heals. A percentile estimate can replace the
+// average later without reintroducing a configuration knob.
+uint64_t SelectPretriggerWatermark(const std::shared_ptr<WorkerOcEvictionManager> &evictionManager,
+                                   uint64_t maxAvailableMemorySize, uint64_t hardWatermark, uint64_t &marginMbOut)
+{
+    // Round up so the reserve always covers an average-sized object; a floor here would leave a
+    // residual dead band of (average - floored margin) below the hard watermark.
+    const uint64_t estimateBytes = evictionManager->EstimatePretriggerMarginBytes();
+    marginMbOut = std::max<uint64_t>(1, (estimateBytes + MB_TO_BYTES - 1) / MB_TO_BYTES);
+    marginMbOut = std::min(marginMbOut, static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()));
+    auto watermark = GetEvictionTriggerWatermark(maxAvailableMemorySize, FLAGS_eviction_reserve_mem_threshold_mb,
+                                                 static_cast<uint32_t>(marginMbOut));
+    if (watermark == hardWatermark) {
+        // The auto margin degenerated (soft line would not stay above the low watermark): the patrol
+        // silently runs on the hard line. Keep this visible so "soft line armed" and "priced out by
+        // skewed object sizes" stay distinguishable from the pre-trigger counter.
+        LOG_EVERY_T(INFO, LOG_TIME_LIMIT_LEVEL3) << FormatString(
+            "Pre-trigger margin %lu MiB does not fit above the low watermark; the patrol keeps the hard "
+            "high watermark this round",
+            marginMbOut);
+    }
+    return watermark;
+}
+
+struct PretriggerFireStats {
+    uint64_t usage = 0;
+    uint64_t softWatermark = 0;
+    uint64_t marginMb = 0;
+    uint64_t hardWatermark = 0;
+    uint64_t lowWatermark = 0;
+};
+
+void RecordPretriggerFire(const PretriggerFireStats &stats)
+{
+    METRIC_INC(metrics::KvMetricId::WORKER_EVICT_PRETRIGGER_TOTAL);
+    LOG_EVERY_T(INFO, LOG_TIME_LIMIT_LEVEL3) << FormatString(
+        "Pre-trigger eviction fired: usage %lu, soft watermark %lu (margin %lu MiB, average object), hard "
+        "watermark %lu, low watermark %lu",
+        stats.usage, stats.softWatermark, stats.marginMb, stats.hardWatermark, stats.lowWatermark);
+}
+
 bool CheckAndTriggerEviction(const std::string &keyInfo, uint64_t needSize,
                              const std::shared_ptr<WorkerOcEvictionManager> &evictionManager,
                              const EvictionTriggerOptions &options)
@@ -3207,14 +3279,10 @@ bool CheckAndTriggerEviction(const std::string &keyInfo, uint64_t needSize,
     uint64_t maxAvailableMemorySize = 0;
     memory::CacheType memCacheType = static_cast<memory::CacheType>(options.cacheType);
     uint64_t memThreshold = 0;
+    uint64_t pretriggerMarginMb = 0;
+    uint64_t pretriggerHardWatermark = 0;
     auto realObjMemoryUsed =
         datasystem::memory::Allocator::Instance()->GetTotalRealMemoryUsage(ServiceType::OBJECT, memCacheType);
-    auto getHardHighWatermark = [](uint64_t maxAvailableMemorySize, uint64_t evictionThresholdMB) {
-        return std::max(static_cast<uint64_t>(maxAvailableMemorySize * GetEvictionHighWaterFactor()),
-                        maxAvailableMemorySize > evictionThresholdMB * MB_TO_BYTES
-                            ? maxAvailableMemorySize - evictionThresholdMB * MB_TO_BYTES
-                            : 0);
-    };
     if (UINT64_MAX - realMemoryUsed < needSize) {
         // If needSize + realMemoryUsed > UINT64_MAX, it means that the needSize is very large,
         // it could never be success, so skip evict.
@@ -3226,21 +3294,28 @@ bool CheckAndTriggerEviction(const std::string &keyInfo, uint64_t needSize,
         maxAvailableMemorySize = std::min(
             datasystem::memory::Allocator::Instance()->GetMaxMemorySize(options.type, memCacheType),
             (datasystem::memory::Allocator::Instance()->GetTotalRealMemoryFree(memCacheType) + realMemoryUsed));
-        memThreshold = getHardHighWatermark(maxAvailableMemorySize, FLAGS_eviction_reserve_mem_threshold_mb);
-        if (options.usePretriggerWatermark && FLAGS_eviction_pretrigger_margin_mb > 0) {
-            memThreshold = GetEvictionTriggerWatermark(maxAvailableMemorySize, FLAGS_eviction_reserve_mem_threshold_mb,
-                                                       FLAGS_eviction_pretrigger_margin_mb);
+        memThreshold = GetHardHighWatermark(maxAvailableMemorySize, FLAGS_eviction_reserve_mem_threshold_mb);
+        if (options.usePretriggerWatermark) {
+            pretriggerHardWatermark = memThreshold;
+            memThreshold =
+                SelectPretriggerWatermark(evictionManager, maxAvailableMemorySize, memThreshold, pretriggerMarginMb);
         }
     } else if (options.type == ServiceType::STREAM) {
         realMemoryUsed =
             datasystem::memory::Allocator::Instance()->GetTotalRealMemoryUsage(ServiceType::STREAM) + realObjMemoryUsed;
         memOccupied = realMemoryUsed + needSize;
         maxAvailableMemorySize = datasystem::memory::Allocator::Instance()->GetMaxMemoryLimit();
-        memThreshold = getHardHighWatermark(maxAvailableMemorySize, FLAGS_eviction_reserve_mem_threshold_mb);
+        memThreshold = GetHardHighWatermark(maxAvailableMemorySize, FLAGS_eviction_reserve_mem_threshold_mb);
     }
     VLOG(1) << FormatString("Allocate memory for %s, size = %lu, memOccupied = %lu, memThreshold = %lu", keyInfo,
                             needSize, memOccupied, memThreshold);
     if (memOccupied >= memThreshold && realObjMemoryUsed > 0) {
+        if (options.usePretriggerWatermark && memThreshold < pretriggerHardWatermark) {
+            // Count only rounds the soft line actually armed: when the auto margin degenerated back
+            // to the hard line, the trigger is an ordinary hard-watermark round, not a pre-trigger.
+            RecordPretriggerFire({ realMemoryUsed, memThreshold, pretriggerMarginMb, pretriggerHardWatermark,
+                                   static_cast<uint64_t>(maxAvailableMemorySize * GetEvictionLowWaterFactor()) });
+        }
         PerfPoint evictPoint(PerfKey::WORKER_EVICT_TASK);
         evictionManager->Evict(needSize, options.cacheType);
         evictPoint.Record();
@@ -3259,6 +3334,12 @@ bool EvictWhenMemoryExceedThrehold(const std::string &keyInfo, uint64_t needSize
 
 bool EvictWhenMemoryExceedPretriggerWatermark(const std::shared_ptr<WorkerOcEvictionManager> &evictionManager)
 {
+    if (FLAGS_eviction_pretrigger_margin_mb != 0) {
+        // Deprecated no-op flag: kept one release so configs carrying the old key still start.
+        LOG_EVERY_T(WARNING, LOG_TIME_LIMIT_LEVEL3)
+            << "eviction_pretrigger_margin_mb is deprecated and ignored; the patrol auto-reserves the "
+               "average cached object size. Remove the key from worker config.";
+    }
     return CheckAndTriggerEviction("", 0, evictionManager, { ServiceType::OBJECT, CacheType::MEMORY, true });
 }
 
