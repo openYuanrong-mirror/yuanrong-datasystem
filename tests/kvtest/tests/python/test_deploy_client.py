@@ -3,10 +3,12 @@
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import patch, MagicMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
@@ -194,7 +196,7 @@ class TestGenConfig(unittest.TestCase):
     """Tests for cmd_gen_config output correctness."""
 
     def _run_gen_config(self, extra_args):
-        """Run gen-config with mocked _get_pods and return (deploy, config) dicts."""
+        """Run gen-config with mocked get_pods and return (deploy, config) dicts."""
         import argparse
         from deploy_client import cmd_gen_config
 
@@ -213,10 +215,14 @@ class TestGenConfig(unittest.TestCase):
 
             args = parser.parse_args(base_args)
 
-            # Mock _get_pods for kubectl tests
-            with patch.object(dc, '_get_pods', return_value=[
-                {'name': 'pod-0', 'ip': '10.0.0.1', 'node': 'node1'},
-                {'name': 'pod-1', 'ip': '10.0.0.2', 'node': 'node1'},
+            # Mock get_pods (imported into deploy_client from deploy_common)
+            # for kubectl-discovery tests. node + host_ip are needed by
+            # cmd_gen_config's per-node dict construction.
+            with patch.object(dc, 'get_pods', return_value=[
+                {'name': 'pod-0', 'ip': '10.0.0.1', 'node': 'node1',
+                 'host_ip': '10.0.0.1'},
+                {'name': 'pod-1', 'ip': '10.0.0.2', 'node': 'node1',
+                 'host_ip': '10.0.0.1'},
             ]):
                 cmd_gen_config(args)
 
@@ -575,6 +581,295 @@ class TestGenConfig(unittest.TestCase):
         self.assertIsNotNone(config)
         self.assertEqual(config.get('coordinator_address'), '127.0.0.1:31511')
         self.assertNotIn('etcd_address', config)
+
+
+class TestDoCleanLogs(unittest.TestCase):
+    """do_clean_logs: kill processes + remove run-time output, but preserve
+    the install-phase artifacts (kvtest binary, lib/, procmon.py,
+    standalone_launcher.py) so a re-deploy skips the ~100MB upload on
+    large clusters. Mirrors do_clean's two-phase kill (TERM then -9) so a
+    still-running binary doesn't race the rm on its own output files."""
+
+    def _make_deployer(self, remote_work_dir='/tmp/kvtest', nodes=None):
+        """Build a Deployer without touching disk: config_template is empty,
+        nodes come from deploy.json, and binary_path / VERSION are skipped."""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json',
+                                         delete=False) as tf:
+            json.dump({
+                'nodes': nodes or [{'host': '127.0.0.1', 'port': 9000}],
+                'remote_work_dir': remote_work_dir,
+            }, tf)
+            deploy_json = tf.name
+        try:
+            d = Deployer.__new__(Deployer)
+            d.deploy = json.load(open(deploy_json))
+            d.config_template = {}
+            d.base_dir = os.path.dirname(os.path.abspath(deploy_json))
+            d.nodes = d.deploy.get('nodes', [])
+            d.remote_work_dir = d.deploy.get('remote_work_dir', '')
+            d.binary_path = None
+            d.version = '?'
+            d.default_transport = d.deploy.get('transport', 'ssh')
+            d.default_ssh_user = d.deploy.get('ssh_user', 'root')
+            d.ssh_options = d.deploy.get('ssh_options', '')
+            d.enable_procmon = d.deploy.get('enable_procmon', False)
+            d.listen_port = 9000
+            d._host_locks = {}
+            return d
+        finally:
+            os.unlink(deploy_json)
+
+    def _node(self):
+        return {'host': '127.0.0.1', 'port': 9000, 'instance_id': '0'}
+
+    @patch('deploy_client.time.sleep')  # skip the real 1s sleeps in the kill phases
+    def test_preserves_binary_and_removes_run_time_output(self, mock_sleep):
+        # The single rm command must target ONLY run-time products
+        # (config_*.json, run.log, metrics_*, resource_monitor.csv, SDK logs)
+        # and must NOT match the install artifacts (kvtest, lib/, procmon.py,
+        # standalone_launcher.py). A glob regression here would silently turn
+        # clean-logs into clean and re-trigger the 100M+ upload.
+        d = self._make_deployer(remote_work_dir='/tmp/kvtest')
+        cmds = []
+
+        def fake_run_on(node, cmd, check=True, timeout=60, allow_timeout=False):
+            cmds.append(cmd)
+            # The verify step runs `test -x {remote_work_dir}/kvtest`; return
+            # rc=0 so the "binary preserved" branch is taken (the OK path).
+            if cmd.startswith('test -x '):
+                return subprocess.CompletedProcess(args=[], returncode=0,
+                                                    stdout='', stderr='')
+            return subprocess.CompletedProcess(args=[], returncode=0,
+                                                stdout='', stderr='')
+        d.run_on = fake_run_on
+
+        d.do_clean_logs()
+
+        # Find the single rm -rf command issued (kill commands don't contain rm)
+        rm_cmds = [c for c in cmds if c.startswith('rm -rf ')]
+        self.assertEqual(len(rm_cmds), 1)
+        rm = rm_cmds[0]
+        # Run-time products must be in the rm target list
+        self.assertIn('/tmp/kvtest/config_*.json', rm)
+        self.assertIn('/tmp/kvtest/run.log', rm)
+        self.assertIn('/tmp/kvtest/metrics_*', rm)
+        self.assertIn('/tmp/kvtest/resource_monitor.csv', rm)
+        self.assertIn('/root/.datasystem/logs/', rm)
+        # Install artifacts must NOT be removed -- the whole point of clean-logs.
+        # Check the rm target list (split by space) does not contain the bare
+        # remote_work_dir or any install artifact as a standalone token; the
+        # run-time globs (config_*.json etc.) legitimately share the dir prefix.
+        rm_tokens = rm.split()
+        self.assertNotIn('/tmp/kvtest', rm_tokens)
+        self.assertNotIn('/tmp/kvtest/', rm_tokens)
+        self.assertNotIn('/tmp/kvtest/kvtest', rm_tokens)
+        self.assertNotIn('/tmp/kvtest/lib', rm_tokens)
+        self.assertNotIn('/tmp/kvtest/lib/', rm_tokens)
+        self.assertNotIn('/tmp/kvtest/procmon.py', rm_tokens)
+        self.assertNotIn('/tmp/kvtest/standalone_launcher.py', rm_tokens)
+
+    @patch('deploy_client.time.sleep')
+    def test_two_phase_kill_then_rm_then_verify(self, mock_sleep):
+        # Order matters: kill (TERM) -> kill -9 -> rm run-time output ->
+        # verify binary survived. A still-running binary would otherwise keep
+        # writing to run.log / metrics_* while we're deleting them.
+        d = self._make_deployer()
+        cmds = []
+
+        def fake_run_on(node, cmd, check=True, timeout=60, allow_timeout=False):
+            cmds.append(cmd)
+            return subprocess.CompletedProcess(args=[], returncode=0,
+                                                stdout='', stderr='')
+        d.run_on = fake_run_on
+
+        d.do_clean_logs()
+
+        # 4 calls per node: TERM kill, -9 kill, rm run-time, test -x verify
+        self.assertEqual(len(cmds), 4)
+        self.assertIn('kill $p', cmds[0])         # Phase 1: graceful TERM
+        self.assertNotIn('kill -9', cmds[0])
+        self.assertIn('kill -9', cmds[1])        # Phase 2: force kill
+        self.assertTrue(cmds[2].startswith('rm -rf '))  # Phase 3: rm output
+        self.assertTrue(cmds[3].startswith('test -x '))  # Phase 4: verify
+
+    @patch('deploy_client.time.sleep')
+    def test_warns_when_binary_missing_after_clean(self, mock_sleep):
+        # If install never ran (or a prior clean wiped the binary), the verify
+        # `test -x` returns nonzero. The operator must see a WARNING so they
+        # run install before the next start (instead of a confusing
+        # "start FAILED: kvtest binary not found" on the next run).
+        d = self._make_deployer()
+
+        def fake_run_on(node, cmd, check=True, timeout=60, allow_timeout=False):
+            if cmd.startswith('test -x '):
+                return subprocess.CompletedProcess(args=[], returncode=1,
+                                                    stdout='', stderr='')
+            return subprocess.CompletedProcess(args=[], returncode=0,
+                                                stdout='', stderr='')
+        d.run_on = fake_run_on
+
+        # Should not raise; the warning is logged, do_clean_logs still
+        # returns normally (returns None, prints summary).
+        with patch('deploy_client.log_info') as mock_log:
+            d.do_clean_logs()
+            msgs = ' '.join(str(c) for c in mock_log.call_args_list)
+            self.assertIn('WARNING', msgs)
+            self.assertIn('kvtest binary missing', msgs)
+
+    @patch('deploy_client.time.sleep')
+    def test_kills_both_kvtest_and_procmon(self, mock_sleep):
+        # Both processes must be in the kill list: kvtest is the workload;
+        # procmon.py is the watchdog that would otherwise restart kvtest
+        # mid-clean and race the rm. Mirrors do_clean's kill pattern exactly.
+        d = self._make_deployer()
+        cmds = []
+
+        def fake_run_on(node, cmd, check=True, timeout=60, allow_timeout=False):
+            cmds.append(cmd)
+            return subprocess.CompletedProcess(args=[], returncode=0,
+                                                stdout='', stderr='')
+        d.run_on = fake_run_on
+
+        d.do_clean_logs()
+
+        # Both kill phases must target both pgrep -x kvtest and pgrep -x procmon.py
+        self.assertIn('pgrep -x kvtest', cmds[0])
+        self.assertIn('pgrep -x procmon.py', cmds[0])
+        self.assertIn('pgrep -x kvtest', cmds[1])
+        self.assertIn('pgrep -x procmon.py', cmds[1])
+
+
+class TestDoCollect(unittest.TestCase):
+    """do_collect: single-phase pipeline (per-node summary -> collect, no
+    global barrier), bounded pool, configurable summary-timeout, and
+    node_slice for manual batching. Replaces the prior two-phase design
+    where Phase 1 (summary) blocked on the slowest node for up to 60s
+    before Phase 2 (collect) could start."""
+
+    def _make_deployer(self, nodes=None):
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json',
+                                         delete=False) as tf:
+            json.dump({
+                'nodes': nodes or [
+                    {'host': '127.0.0.1', 'port': 9000, 'instance_id': '0'},
+                    {'host': '127.0.0.2', 'port': 9000, 'instance_id': '1'},
+                ],
+                'remote_work_dir': '/tmp/kvtest',
+            }, tf)
+            deploy_json = tf.name
+        try:
+            d = Deployer.__new__(Deployer)
+            d.deploy = json.load(open(deploy_json))
+            d.config_template = {}
+            d.base_dir = os.path.dirname(os.path.abspath(deploy_json))
+            d.nodes = d.deploy.get('nodes', [])
+            d.remote_work_dir = d.deploy.get('remote_work_dir', '')
+            d.binary_path = None
+            d.version = '?'
+            d.default_transport = d.deploy.get('transport', 'ssh')
+            d.default_ssh_user = d.deploy.get('ssh_user', 'root')
+            d.ssh_options = d.deploy.get('ssh_options', '')
+            d.enable_procmon = d.deploy.get('enable_procmon', False)
+            d.listen_port = 9000
+            d._host_locks = {}
+            return d
+        finally:
+            os.unlink(deploy_json)
+
+    @patch('deploy_client.time.sleep')
+    @patch('deploy_client.os.path.isdir', return_value=False)
+    def test_single_phase_summary_then_collect_per_node(self, mock_isdir, mock_sleep):
+        # Each node must trigger its own /summary then immediately collect
+        # its files in one thread -- no global barrier between summary and
+        # collect. Verify the /summary POST is issued per node and collect
+        # follows in the same thread.
+        d = self._make_deployer()
+        summary_cmds = []
+        collect_calls = []
+
+        def fake_run_on(node, cmd, check=True, timeout=60, allow_timeout=False):
+            if '/summary' in cmd:
+                summary_cmds.append((node['instance_id'], cmd))
+                return subprocess.CompletedProcess(args=[], returncode=0,
+                                                    stdout='', stderr='')
+            # collect_files / collect_sdk_logs ls / cat commands.
+            collect_calls.append((node['instance_id'], cmd))
+            return subprocess.CompletedProcess(args=[], returncode=0,
+                                                stdout='', stderr='')
+        d.run_on = fake_run_on
+        d.collect_files = lambda node, ld: collect_calls.append(
+            (node['instance_id'], 'collect_files'))
+        d.collect_sdk_logs = lambda node, ld, sd: collect_calls.append(
+            (node['instance_id'], 'collect_sdk_logs'))
+
+        with tempfile.TemporaryDirectory() as outdir:
+            d.do_collect(output_dir=outdir, summary_timeout=5)
+
+        # Both nodes must have triggered /summary.
+        iids = {iid for iid, _ in summary_cmds}
+        self.assertEqual(iids, {'0', '1'})
+        # Both nodes must have called collect_files + collect_sdk_logs.
+        collect_iids = {iid for iid, _ in collect_calls}
+        self.assertEqual(collect_iids, {'0', '1'})
+
+    @patch('deploy_client.time.sleep')
+    @patch('deploy_client.os.path.isdir', return_value=False)
+    def test_summary_timeout_caps_retries(self, mock_isdir, mock_sleep):
+        # A node whose /summary always fails (rc!=0) must exhaust
+        # summary_timeout then still collect. With summary_timeout=1 and
+        # _POLL_INTERVAL=2, the while loop body runs once (deadline passes
+        # before the second iteration's sleep). Verify the node still
+        # gets collected.
+        d = self._make_deployer(nodes=[
+            {'host': '127.0.0.1', 'port': 9000, 'instance_id': '0'},
+        ])
+        summary_count = [0]
+
+        def fake_run_on(node, cmd, check=True, timeout=60, allow_timeout=False):
+            if '/summary' in cmd:
+                summary_count[0] += 1
+                return subprocess.CompletedProcess(args=[], returncode=1,
+                                                    stdout='', stderr='')
+            return subprocess.CompletedProcess(args=[], returncode=0,
+                                                stdout='', stderr='')
+        d.run_on = fake_run_on
+        d.collect_files = lambda node, ld: None
+        d.collect_sdk_logs = lambda node, ld, sd: None
+
+        with tempfile.TemporaryDirectory() as outdir:
+            d.do_collect(output_dir=outdir, summary_timeout=1)
+
+        # /summary was retried at least once (timeout was honored).
+        self.assertGreaterEqual(summary_count[0], 1)
+
+    @patch('deploy_client.time.sleep')
+    @patch('deploy_client.os.path.isdir', return_value=False)
+    def test_node_slice_limits_nodes(self, mock_isdir, mock_sleep):
+        # node_slice=(offset, count) must limit collect to a deterministic
+        # slice. With 4 nodes and slice=(1, 2), only nodes[1] and nodes[2]
+        # should be collected.
+        nodes = [
+            {'host': f'127.0.0.{i}', 'port': 9000, 'instance_id': str(i)}
+            for i in range(4)
+        ]
+        d = self._make_deployer(nodes=nodes)
+        collected_iids = []
+
+        def fake_run_on(node, cmd, check=True, timeout=60, allow_timeout=False):
+            if '/summary' in cmd:
+                return subprocess.CompletedProcess(args=[], returncode=0,
+                                                    stdout='', stderr='')
+            return subprocess.CompletedProcess(args=[], returncode=0,
+                                                stdout='', stderr='')
+        d.run_on = fake_run_on
+        d.collect_files = lambda node, ld: collected_iids.append(node['instance_id'])
+        d.collect_sdk_logs = lambda node, ld, sd: None
+
+        with tempfile.TemporaryDirectory() as outdir:
+            d.do_collect(output_dir=outdir, summary_timeout=5,
+                         node_slice=(1, 2))
+
+        self.assertEqual(sorted(collected_iids), ['1', '2'])
 
 
 if __name__ == '__main__':

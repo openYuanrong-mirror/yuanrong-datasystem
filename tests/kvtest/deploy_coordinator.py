@@ -27,6 +27,7 @@ from deploy_common import (
     apply_config_overrides,
     check_process,
     cmd_check_impl,
+    cmd_clean_logs_shared,
     cmd_clean_shared,
     cmd_collect_shared,
     cmd_exec_shared,
@@ -447,6 +448,18 @@ def cmd_clean(args, pods):
                             'coordinator logs', args.timeout)
 
 
+def cmd_clean_logs(args, pods):
+    """Kill coordinators and clean logs but keep the standalone binary + lib.
+
+    Same as ``cmd_clean`` except ``--remote-dir`` (standalone mode) is
+    preserved: only ``stdout.log`` is removed, so a re-deploy skips the
+    100M+ binary+lib upload. dscli-mode behavior is identical to ``clean``.
+    """
+    return cmd_clean_logs_shared(args, pods, PROCESS_NAME,
+                                 PROCESS_NAME_STANDALONE, 'coordinator logs',
+                                 args.timeout)
+
+
 def cmd_install(args, pods):
     """Install coordinator: always install whl first, then optionally copy
     standalone binary (standalone mode adds the binary on top of the whl)."""
@@ -472,6 +485,19 @@ def main():
                                help='k8s namespace (default: default)')
     parent_parser.add_argument('--timeout', type=int, default=DEFAULT_TIMEOUT,
                                help=f'Operation timeout in seconds (default: {DEFAULT_TIMEOUT})')
+    parent_parser.add_argument('--count', type=int, default=None,
+                               help='Limit operation to N matching pods starting '
+                                    'at --offset (pods are sorted by name, so the '
+                                    'subset is deterministic across runs). Useful '
+                                    'for scale-in/out tests at specific sizes.')
+    parent_parser.add_argument('--offset', type=int, default=0,
+                               help='Skip the first N matching pods before applying '
+                                    '--count (default: 0).')
+    parent_parser.add_argument('--max-workers', type=int, default=None,
+                               help='Max concurrent pods for collect/clean/etc. '
+                                    'On large clusters (500+ pods) an unbounded '
+                                    'pool overloads the API server; default is '
+                                    'len(pods) (unbounded) for backward compat.')
 
     # Start subcommand
     parser_start = subparsers.add_parser('start', parents=[parent_parser],
@@ -574,6 +600,20 @@ def main():
     parser_clean.add_argument('--remote-dir', default='/tmp/ds_coordinator',
                               help='Remote directory holding the standalone binary '
                                    '(default: /tmp/ds_coordinator, must match install)')
+
+    # Clean-logs subcommand: same scope as clean but preserves the binary + lib
+    parser_clean_logs = subparsers.add_parser(
+        'clean-logs', parents=[parent_parser],
+        help='Kill coordinators and clean logs, but keep standalone binary + lib')
+    parser_clean_logs.add_argument('--remote-config', default='/tmp/coordinator.config',
+                                   help='Config path inside pod (default: /tmp/coordinator.config)')
+    parser_clean_logs.add_argument('-S', '--standalone', action='store_true', default=False,
+                                   help='Kill coordinator_test and remove only stdout.log under '
+                                        '--remote-dir, keeping the binary + lib/ '
+                                        '(standalone mode; must match install --remote-dir)')
+    parser_clean_logs.add_argument('--remote-dir', default='/tmp/ds_coordinator',
+                                   help='Remote directory holding the standalone binary '
+                                        '(default: /tmp/ds_coordinator, must match install)')
 
     # Install subcommand
     parser_install = subparsers.add_parser('install', parents=[parent_parser],
@@ -684,6 +724,24 @@ def main():
                      f'in namespace "{args.namespace}"')
             return 1
 
+        if args.count is not None:
+            if args.count <= 0:
+                log_error(f'ERROR: --count must be a positive integer, got {args.count}')
+                return 1
+            if args.offset < 0:
+                log_error(f'ERROR: --offset must be >= 0, got {args.offset}')
+                return 1
+            if args.offset >= len(pods):
+                log_error(f'ERROR: --offset {args.offset} reaches end of the '
+                          f'{len(pods)} pods matching prefixes {args.prefixes}')
+                return 1
+            if args.offset + args.count > len(pods):
+                log_error(f'ERROR: --offset {args.offset} + --count {args.count} '
+                          f'exceeds the {len(pods)} pods matching prefixes '
+                          f'{args.prefixes}')
+                return 1
+            pods = pods[args.offset:args.offset + args.count]
+
         log_info(f'Found {len(pods)} pods:')
         for p in pods:
             log_info(f'  {p["name"]} ({p["ip"]})')
@@ -703,6 +761,8 @@ def main():
         return cmd_collect(args, pods)
     elif args.action == 'clean':
         return cmd_clean(args, pods)
+    elif args.action == 'clean-logs':
+        return cmd_clean_logs(args, pods)
     elif args.action == 'install':
         return cmd_install(args, pods)
     elif args.action == 'deploy':

@@ -19,6 +19,7 @@ from deploy_common import (
     DEFAULT_TIMEOUT,
     apply_config_overrides,
     cmd_check_impl,
+    cmd_clean_logs_shared,
     cmd_clean_shared,
     cmd_collect_shared,
     cmd_exec_shared,
@@ -286,6 +287,18 @@ def cmd_clean(args, pods):
                             'worker logs', args.timeout)
 
 
+def cmd_clean_logs(args, pods):
+    """Kill workers and clean logs but keep the standalone binary + lib.
+
+    Same as ``cmd_clean`` except ``--remote-dir`` (standalone mode) is
+    preserved: only ``stdout.log`` is removed, so a re-deploy skips the
+    100M+ binary+lib upload. dscli-mode behavior is identical to ``clean``.
+    """
+    return cmd_clean_logs_shared(args, pods, PROCESS_NAME,
+                                 PROCESS_NAME_STANDALONE, 'worker logs',
+                                 args.timeout)
+
+
 def cmd_install(args, pods):
     """Install worker: always install whl first, then optionally copy
     standalone binary (standalone mode adds the binary on top of the whl)."""
@@ -325,6 +338,11 @@ def main():
                                     'scale out on top of an already-deployed base: '
                                     'e.g. deploy 1900 workers, then --offset 1900 '
                                     '--count 1 (or 10 / 50) to add more on top.')
+    parent_parser.add_argument('--max-workers', type=int, default=None,
+                               help='Max concurrent pods for collect/clean/etc. '
+                                    'On large clusters (500+ pods) an unbounded '
+                                    'pool overloads the API server; default is '
+                                    'len(pods) (unbounded) for backward compat.')
 
     # Start subcommand
     parser_start = subparsers.add_parser('start', parents=[parent_parser],
@@ -422,6 +440,20 @@ def main():
     parser_clean.add_argument('--remote-dir', default='/tmp/ds_worker',
                               help='Remote directory holding the standalone binary '
                                    '(default: /tmp/ds_worker, must match install)')
+
+    # Clean-logs subcommand: same scope as clean but preserves the binary + lib
+    parser_clean_logs = subparsers.add_parser(
+        'clean-logs', parents=[parent_parser],
+        help='Kill workers and clean logs, but keep standalone binary + lib')
+    parser_clean_logs.add_argument('--remote-config', default='/tmp/worker.config',
+                                   help='Config path inside pod (default: /tmp/worker.config)')
+    parser_clean_logs.add_argument('-S', '--standalone', action='store_true', default=False,
+                                   help='Kill worker_test and remove only stdout.log under '
+                                        '--remote-dir, keeping the binary + lib/ '
+                                        '(standalone mode; must match install --remote-dir)')
+    parser_clean_logs.add_argument('--remote-dir', default='/tmp/ds_worker',
+                                   help='Remote directory holding the standalone binary '
+                                        '(default: /tmp/ds_worker, must match install)')
 
     # Install subcommand
     parser_install = subparsers.add_parser('install', parents=[parent_parser],
@@ -544,6 +576,8 @@ def main():
         return cmd_collect(args, pods)
     elif args.action == 'clean':
         return cmd_clean(args, pods)
+    elif args.action == 'clean-logs':
+        return cmd_clean_logs(args, pods)
     elif args.action == 'install':
         return cmd_install(args, pods)
 

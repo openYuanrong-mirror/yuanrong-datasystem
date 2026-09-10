@@ -141,6 +141,13 @@ def get_pods(namespace, prefixes):
     regardless of the order prefixes were passed on the CLI. A WARNING is
     printed for each prefix that matched zero pods; callers decide whether
     an all-zero result is fatal.
+
+    Returns ``[{'name', 'ip', 'node', 'host_ip'}, ...]``. ``node`` is
+    ``spec.nodeName`` (the k8s node hostname) and ``host_ip`` is
+    ``status.hostIP`` (the k8s node InternalIP, set by the kubelet).
+    ``deploy_client`` needs both to build per-pod HOST_IP env and to spread
+    writer/reader instances across physical nodes; the worker/coordinator/jf
+    callers only read ``name``/``ip`` and ignore the extra fields.
     """
     try:
         out = subprocess.check_output(
@@ -167,7 +174,12 @@ def get_pods(namespace, prefixes):
         if name in seen:
             continue
         seen.add(name)
-        pods.append({'name': name, 'ip': pod_ip})
+        pods.append({
+            'name': name,
+            'ip': pod_ip,
+            'node': item.get('spec', {}).get('nodeName', ''),
+            'host_ip': item.get('status', {}).get('hostIP', ''),
+        })
     pods.sort(key=lambda p: p['name'])
     for p in prefixes:
         if not any(pod['name'].startswith(p) for pod in pods):
@@ -594,14 +606,22 @@ def collect_logs_from_pod(pod, namespace, log_dir, local_dir,
                           timeout=DEFAULT_TIMEOUT):
     """Collect log files from a single pod.
 
-    Also collects stdout.log from ``remote_dir`` when that directory exists
+    Primary path: stream all log files + resource_monitor.csv + stdout.log
+    in a single ``tar cf - {files} | kubectl exec`` round-trip, extracted
+    locally. This replaces the prior per-file ``base64 {file}`` loop which
+    fired ``N_files + 5`` kubectl exec calls per pod -- on 500+ pods that
+    was 7500+ API server round-trips (each a fresh TLS + impersonation
+    connection). The tar stream is binary-safe (no base64 33% inflation)
+    and gzip-compresses text logs 3-5x.
+
+    Fallback: if the tar stream fails (minimal image without ``tar``, or
+    kubectl stdout pipe broken), degrades to the legacy per-file base64
+    path so collect still works on any image. Also collects
+    ``stdout.log`` from ``remote_dir`` when that directory exists
     (standalone mode writes the binary's combined stdout+stderr to
-    ``{remote_dir}/stdout.log``; ``start_service_standalone`` sets that
-    path explicitly, so ``remote_dir`` -- not ``remote_config_dir`` -- is
-    where the file actually lives). The directory-existence gate means
-    dscli-mode collects (which never create ``remote_dir``) skip stdout.log
-    silently without needing a ``--standalone`` flag: if the dir is absent
-    there is nothing to collect.
+    ``{remote_dir}/stdout.log``); the directory-existence gate means
+    dscli-mode collects (which never create ``remote_dir``) skip
+    stdout.log silently without needing a ``--standalone`` flag.
     """
     pod_name = pod['name']
     pod_ip = pod['ip']
@@ -627,9 +647,45 @@ def collect_logs_from_pod(pod, namespace, log_dir, local_dir,
 
         log_info(f'  {pod_name} ({pod_ip}) -> found {len(log_files)} log files')
 
-        # Collect each log file using base64 to safely transfer
-        # binary/non-UTF-8 content. kubectl_exec uses text=True which fails
-        # on non-UTF-8 bytes in log files.
+        # Build the list of files to collect: log files + resource_monitor.csv
+        # from procmon dirs. Determine which procmon dirs to include so we
+        # can add resource_monitor.csv to the tar set.
+        procmon_dirs = set()
+        if remote_config_dir:
+            procmon_dirs.add(remote_config_dir)
+        if log_dir:
+            procmon_dirs.add(log_dir)
+        glob_dirs = {os.path.dirname(f) for f in log_files}
+        extra_csvs = []
+        for pdir in procmon_dirs:
+            if pdir in glob_dirs:
+                continue
+            extra_csvs.append(f'{pdir}/resource_monitor.csv')
+
+        # Determine stdout.log path (standalone mode).
+        stdout_remote = None
+        if remote_dir:
+            ls_remote = kubectl_exec(pod_name, namespace,
+                                     f'ls -d {remote_dir} 2>/dev/null',
+                                     check=False, timeout=timeout)
+            if ls_remote.returncode == 0:
+                stdout_remote = f'{remote_dir}/stdout.log'
+
+        # --- Primary: tar stream ---
+        # One kubectl exec pipes tar stdout to local tar extraction.
+        # Binary-safe, gzip-compressed, 1 round-trip for all files.
+        all_files = log_files + extra_csvs
+        if stdout_remote:
+            all_files.append(stdout_remote)
+        tar_file_list = ' '.join(shlex.quote(f) for f in all_files)
+        collected = _collect_via_tar_stream(
+            pod_name, namespace, tar_file_list, local_pod_dir, timeout)
+        if collected:
+            return True
+
+        # --- Fallback: per-file base64 (minimal image without tar) ---
+        log_info(f'  {pod_name} ({pod_ip}) -> tar stream failed, '
+                 f'falling back to per-file base64')
         for remote_path in log_files:
             try:
                 fname = os.path.basename(remote_path)
@@ -642,24 +698,10 @@ def collect_logs_from_pod(pod, namespace, log_dir, local_dir,
             except Exception as e:
                 log_info(f'    {os.path.basename(remote_path)} -> FAILED: {e}')
 
-        # Collect procmon resource_monitor.csv from remote_config_dir
-        # (start's fallback) and from log_dir (when config had log_dir from
-        # the start). This covers both scenarios: log_dir injected via --set
-        # (procmon in remote_config_dir) and log_dir in original config
-        # (procmon in log_dir).
-        procmon_dirs = set()
-        if remote_config_dir:
-            procmon_dirs.add(remote_config_dir)
-        if log_dir:
-            procmon_dirs.add(log_dir)
-        glob_dirs = {os.path.dirname(f) for f in log_files}
-        for pdir in procmon_dirs:
-            if pdir in glob_dirs:
-                continue
-            procmon_log = f'{pdir}/resource_monitor.csv'
+        for csv_path in extra_csvs:
             try:
                 result = kubectl_exec(pod_name, namespace,
-                                      f'base64 {procmon_log}', check=True, timeout=timeout)
+                                      f'base64 {csv_path}', check=True, timeout=timeout)
                 content = base64.b64decode(result.stdout)
                 local_path = os.path.join(local_pod_dir,
                                           'resource_monitor.csv')
@@ -668,32 +710,17 @@ def collect_logs_from_pod(pod, namespace, log_dir, local_dir,
             except Exception:
                 pass
 
-        # Collect stdout.log from remote_dir (standalone mode writes the
-        # binary's combined stdout+stderr to {remote_dir}/stdout.log, NOT
-        # {remote_config_dir}/stdout.log -- start_service_standalone sets
-        # log_path = f'{remote_dir}/stdout.log' explicitly). Gate on
-        # `ls -d {remote_dir}` so a dscli-mode pod (which never creates
-        # remote_dir) skips silently instead of erroring; this is what
-        # lets the same `collect` subcommand serve both modes with no
-        # --standalone flag. If the dir exists but stdout.log is absent
-        # (binary hasn't written yet, or crashed before redirect), the
-        # base64 call fails and we skip silently too.
-        if remote_dir:
-            ls_remote = kubectl_exec(pod_name, namespace,
-                                     f'ls -d {remote_dir} 2>/dev/null',
-                                     check=False, timeout=timeout)
-            if ls_remote.returncode == 0:
-                stdout_path = f'{remote_dir}/stdout.log'
-                try:
-                    result = kubectl_exec(pod_name, namespace,
-                                          f'base64 {stdout_path}', check=True,
-                                          timeout=timeout)
-                    content = base64.b64decode(result.stdout)
-                    local_path = os.path.join(local_pod_dir, 'stdout.log')
-                    with open(local_path, 'wb') as f:
-                        f.write(content)
-                except Exception:
-                    pass
+        if stdout_remote:
+            try:
+                result = kubectl_exec(pod_name, namespace,
+                                      f'base64 {stdout_remote}', check=True,
+                                      timeout=timeout)
+                content = base64.b64decode(result.stdout)
+                local_path = os.path.join(local_pod_dir, 'stdout.log')
+                with open(local_path, 'wb') as f:
+                    f.write(content)
+            except Exception:
+                pass
 
         return True
     except subprocess.TimeoutExpired:
@@ -704,17 +731,46 @@ def collect_logs_from_pod(pod, namespace, log_dir, local_dir,
         return False
 
 
+def _collect_via_tar_stream(pod_name, namespace, tar_file_list, local_dir,
+                            timeout=DEFAULT_TIMEOUT):
+    """Stream ``tar czf - {files}`` from a pod to local extraction.
+
+    One ``kubectl exec`` pipes the remote ``tar`` stdout through a local
+    ``tarfile`` reader. Returns True on success, False on any failure
+    (caller falls back to per-file base64). Gzip-compresses the stream
+    so text logs shrink 3-5x in transit.
+    """
+    cmd_str = f'tar czf - {tar_file_list} 2>/dev/null'
+    try:
+        r = subprocess.run(
+            ['kubectl', 'exec', '-n', namespace, pod_name, '--', 'sh', '-c', cmd_str],
+            capture_output=True, timeout=timeout)
+        if r.returncode != 0 or not r.stdout:
+            return False
+        import io
+        with tarfile.open(fileobj=io.BytesIO(r.stdout), mode='r:gz') as tar:
+            tar.extractall(path=local_dir)
+        return True
+    except Exception:
+        return False
+
+
 def clean_pod(pod, namespace, log_dir, remote_config_dir, process_name,
-              remote_dir=None, timeout=DEFAULT_TIMEOUT):
+              remote_dir=None, timeout=DEFAULT_TIMEOUT, keep_binary=False):
     """Kill the service process and clean logs in a single pod.
 
     ``remote_dir`` (standalone mode only) holds the standalone binary,
-    ``lib/`` .so deps, and ``stdout.log``; when set it is removed entirely
-    so a subsequent deploy starts from a clean state instead of stacking
-    stale binaries, leftover .so variants, and appended stdout logs. When
-    ``None`` (dscli mode), only ``log_dir`` and ``resource_monitor.csv`` are
-    touched -- the dscli install path installs into the package prefix, not
-    ``remote_dir``, so there is nothing of the deploy's own to remove.
+    ``lib/`` .so deps, and ``stdout.log``. By default (``keep_binary=False``)
+    it is removed entirely so a subsequent deploy starts from a clean state
+    instead of stacking stale binaries, leftover .so variants, and appended
+    stdout logs. When ``keep_binary=True`` (clean-logs), only
+    ``{remote_dir}/stdout.log`` is removed -- the binary and ``lib/`` .so
+    are preserved so a re-deploy skips the 100M+ upload. stdout.log must
+    still be deleted explicitly because the standalone binary appends to it
+    across runs. When ``remote_dir`` is ``None`` (dscli mode), only
+    ``log_dir`` and ``resource_monitor.csv`` are touched -- the dscli install
+    path installs into the package prefix, not ``remote_dir``, so there is
+    nothing of the deploy's own to remove and ``keep_binary`` is a no-op.
     """
     pod_name = pod['name']
     pod_ip = pod['ip']
@@ -728,8 +784,13 @@ def clean_pod(pod, namespace, log_dir, remote_config_dir, process_name,
                      f'rm -f {remote_config_dir}/resource_monitor.csv',
                      check=False, timeout=timeout)
         if remote_dir:
-            kubectl_exec(pod_name, namespace, f'rm -rf {remote_dir}',
-                         check=False, timeout=timeout)
+            if keep_binary:
+                kubectl_exec(pod_name, namespace,
+                             f'rm -f {remote_dir}/stdout.log',
+                             check=False, timeout=timeout)
+            else:
+                kubectl_exec(pod_name, namespace, f'rm -rf {remote_dir}',
+                             check=False, timeout=timeout)
 
         log_info(f'  {pod_name} ({pod_ip}) -> OK')
         return True
@@ -889,13 +950,17 @@ def cmd_kill_impl(pods, namespace, process_name, label, timeout=DEFAULT_TIMEOUT)
 
 
 def cmd_collect_impl(pods, namespace, remote_config, output_dir, label,
-                     remote_dir=None, timeout=DEFAULT_TIMEOUT):
+                     remote_dir=None, timeout=DEFAULT_TIMEOUT,
+                     max_workers=None):
     """Collect service logs from all pods.
 
     ``remote_dir`` (standalone mode) is where the binary's ``stdout.log``
     lives; ``collect_logs_from_pod`` gates on its existence so a None value
     (dscli mode, no ``--remote-dir`` passed) simply skips stdout.log
-    collection.
+    collection. ``max_workers`` bounds the ThreadPoolExecutor; on large
+    clusters (500-2000 pods) an unbounded pool overloads the API server
+    with concurrent TLS+impersonation connections, so callers should pass
+    ``--max-workers`` (defaults to ``len(pods)`` for backward compat).
     """
     log_dir, _ = read_remote_log_dir(namespace, pods, remote_config, timeout)
     if not log_dir:
@@ -906,27 +971,41 @@ def cmd_collect_impl(pods, namespace, remote_config, output_dir, label,
     log_info(f'Using log directory from remote config: {log_dir}')
     local_dir = output_dir
 
+    # Size the collect stagger window to the batch: a 500-pod collect fires
+    # 500 concurrent downloads; a random delay per pod spreads the wave.
+    # Window scales with batch size (same heuristic as install's stagger).
+    set_collect_stagger_window(min(30.0, len(pods) * 0.06))
+
     def do_op(pod):
+        delay = _collect_stagger_delay()
+        if delay > 0:
+            time.sleep(delay)
         return collect_logs_from_pod(pod, namespace, log_dir, local_dir,
                                      remote_config_dir=remote_config_dir,
                                      remote_dir=remote_dir, timeout=timeout)
-    return do_for_all_pods(pods, do_op, f'Collecting {label}')
+    return do_for_all_pods(pods, do_op, f'Collecting {label}',
+                           max_workers=max_workers)
 
 
 def cmd_clean_impl(pods, namespace, remote_config, process_name, label,
-                   remote_dir=None, timeout=DEFAULT_TIMEOUT):
+                   remote_dir=None, timeout=DEFAULT_TIMEOUT,
+                   keep_binary=False):
     """Kill service processes and clean log directories across all pods.
 
     ``remote_dir`` (standalone mode) is removed entirely per pod to drop the
     standalone binary, ``lib/`` .so deps, and ``stdout.log``. ``None`` keeps
     the legacy dscli-mode behavior (clean only ``log_dir`` + resource_monitor.csv).
+    ``keep_binary=True`` (clean-logs) removes only ``{remote_dir}/stdout.log``
+    and preserves the binary + lib/ so a re-deploy skips the 100M+ upload;
+    a no-op when ``remote_dir`` is ``None`` (dscli mode never touched it).
     """
     log_dir, _ = read_remote_log_dir(namespace, pods, remote_config, timeout)
     remote_config_dir = os.path.dirname(remote_config)
 
     def do_op(pod):
         return clean_pod(pod, namespace, log_dir, remote_config_dir,
-                         process_name, remote_dir=remote_dir, timeout=timeout)
+                         process_name, remote_dir=remote_dir, timeout=timeout,
+                         keep_binary=keep_binary)
     return do_for_all_pods(pods, do_op, f'Cleaning {label}')
 
 
@@ -1013,6 +1092,28 @@ def set_cp_stagger_window(seconds):
 def _cp_stagger_delay():
     import random
     return random.uniform(0, _cp_stagger_window[0])
+
+
+_collect_stagger_window = [0.0]
+
+
+def set_collect_stagger_window(seconds):
+    """Set the random pre-collect delay window for the current batch.
+
+    Mirrors ``set_cp_stagger_window`` but for the download direction: a
+    500-pod collect fires 500 concurrent ``kubectl exec tar`` downloads;
+    when they all start at once, each transfer's fair share of the local
+    downlink pushes every one past the kubectl timeout (all-or-nothing
+    failure). A random delay per pod, drawn from a window sized to the
+    batch, spreads the download wave into overlapping groups without
+    reducing per-pod parallelism.
+    """
+    _collect_stagger_window[0] = max(0.0, float(seconds))
+
+
+def _collect_stagger_delay():
+    import random
+    return random.uniform(0, _collect_stagger_window[0])
 
 
 def install_binary(pod, namespace, local_binary, local_lib_dir, remote_dir,
@@ -1465,15 +1566,18 @@ def cmd_collect_shared(args, pods, label, timeout=DEFAULT_TIMEOUT):
     default ``--remote-dir`` to the same value ``install`` / ``deploy``
     use, so a collect after a default deploy needs no extra flags. Falls
     back to ``None`` if the attr is missing (older callers, test stubs).
+    Forwards ``args.max_workers`` (when present) to bound the pool on
+    large clusters; ``None`` keeps the legacy unbounded behavior.
     """
     remote_dir = getattr(args, 'remote_dir', None)
+    max_workers = getattr(args, 'max_workers', None)
     return cmd_collect_impl(pods, args.namespace, args.remote_config,
                             args.output, label, remote_dir=remote_dir,
-                            timeout=timeout)
+                            timeout=timeout, max_workers=max_workers)
 
 
 def cmd_clean_shared(args, pods, process_name, process_name_standalone, label,
-                    timeout=DEFAULT_TIMEOUT):
+                     timeout=DEFAULT_TIMEOUT):
     """Kill service processes and clean log directories.
 
     Standalone mode (``--standalone``): kill ``process_name_standalone``
@@ -1491,6 +1595,29 @@ def cmd_clean_shared(args, pods, process_name, process_name_standalone, label,
         remote_dir = None
     return cmd_clean_impl(pods, args.namespace, args.remote_config,
                           proc, label, remote_dir=remote_dir, timeout=timeout)
+
+
+def cmd_clean_logs_shared(args, pods, process_name, process_name_standalone,
+                          label, timeout=DEFAULT_TIMEOUT):
+    """Kill service processes and clean log directories but keep the binary.
+
+    Mirrors ``cmd_clean_shared`` except the standalone binary, ``lib/`` .so
+    deps, and the ``remote_dir`` itself are preserved -- only
+    ``{remote_dir}/stdout.log`` is removed. Lets a re-deploy skip the
+    100M+ binary+lib upload on large clusters. Process selection and
+    ``--standalone``/``--remote-dir`` semantics match ``clean`` exactly;
+    in dscli mode (non-standalone) behavior is identical to ``clean``
+    since clean never touched the package-prefix install path either.
+    """
+    if getattr(args, 'standalone', False):
+        proc = process_name_standalone
+        remote_dir = getattr(args, 'remote_dir', None)
+    else:
+        proc = process_name
+        remote_dir = None
+    return cmd_clean_impl(pods, args.namespace, args.remote_config,
+                          proc, label, remote_dir=remote_dir, timeout=timeout,
+                          keep_binary=True)
 
 
 def cmd_kill_shared(args, pods, process_name_standalone, label,
