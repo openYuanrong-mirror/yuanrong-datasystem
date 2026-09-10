@@ -6,6 +6,7 @@ ds_cc_test(
     name = "cuda_host_memory_test",
     srcs = ["cuda_host_memory_test.cpp"],
     deps = [
+        "//src/datasystem/client/mmap_manager:mmap_table",
         "//src/datasystem/common/device/nvidia:cuda_host_memory",
     ],
 )

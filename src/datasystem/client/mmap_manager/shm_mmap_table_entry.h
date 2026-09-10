@@ -87,11 +87,13 @@ private:
         size_t successCount{ 0 };
         size_t attemptedFragmentCount{ 0 };
         size_t retryCount{ 0 };
+        bool stoppedByClientExit{ false };
     };
 
     void BuildPinRange();
     size_t GetPinFragmentCount() const;
     PinFragment GetPinFragment(size_t fragmentIndex) const;
+    bool IsClientExiting() const;
     bool PinHostMemoryFragment(size_t fragmentIndex);
     PinResult PinHostMemoryFragments();
     bool UnpinHostMemoryFragment(size_t fragmentIndex);

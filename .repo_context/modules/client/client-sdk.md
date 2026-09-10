@@ -138,7 +138,8 @@
     Buffer-returning `Get` variants expose the Worker SHM directly without waiting for registration or allocating a
     temporary Host buffer. Registration and unregistration divide each Worker mapping into fixed 64 MiB fragments
     (with a smaller tail fragment when needed) and wait 5 ms between fragments during normal Worker cleanup, including
-    voluntary scale-down. Object/KV Client shutdown skips the unregister interval. Client
+    voluntary scale-down. Object/KV Client shutdown stops registration after any in-flight fragment returns, skips all
+    remaining registration fragments and their intervals, and skips the unregister interval. Client
     `DsCudaMemcpyAsync` splits H2D/D2H ranges at those planned fragment boundaries only when the Host pointer belongs to
     a Worker SHM mapping; other Host memory is submitted as one copy. The pin task retains the mmap entry, so shutdown
     cannot unpin or unmap it while registration is still running. Per-fragment register/unregister start and finish
