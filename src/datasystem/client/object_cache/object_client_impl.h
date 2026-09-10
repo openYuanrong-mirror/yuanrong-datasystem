@@ -1269,7 +1269,8 @@ private:
     std::unique_ptr<Signature> signature_{ nullptr };
     std::vector<std::shared_ptr<IClientWorkerApi>> workerApi_;
     std::atomic<WorkerNode> currentNode_{ LOCAL_WORKER };
-    // One serialized pin queue and mmap range registry for every Worker connection owned by this Client.
+    // One pin queue, one deferred-unmap queue, and one operation mutex for every Worker connection
+    // owned by this Client.
     std::shared_ptr<client::HostMemoryPinManager> hostMemoryPinManager_;
     // Must stay declared before the dependencies it references (mmapManager_/transportLayer_/
     // pools/ref tables below): they are destroyed before boundMode_, whose destructor must

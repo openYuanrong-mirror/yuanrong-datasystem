@@ -5,11 +5,12 @@
  * you may not use this file except in compliance with the License.
  */
 
-/** Description: Client-wide serialized CUDA host-memory pinning/unpinning and shared-memory range lookup. */
+/** Description: Client-wide serialized CUDA host-memory pinning/unpinning, deferred unmapping, and range lookup. */
 #include "datasystem/client/mmap_manager/host_memory_pin_manager.h"
 
 #include <algorithm>
 #include <exception>
+#include <utility>
 
 #include "datasystem/client/mmap_manager/shm_mmap_table_entry.h"
 #include "datasystem/common/log/log.h"
@@ -17,8 +18,29 @@
 namespace datasystem {
 namespace client {
 
-HostMemoryPinManager::HostMemoryPinManager() : pinThread_(1, 1, "cuda_host_pin")
+HostMemoryPinManager::HostMemoryPinManager()
+    : unmapThread_(std::make_shared<ThreadPool>(1, 1, "cuda_host_unmap")), pinThread_(1, 1, "cuda_host_pin")
 {
+}
+
+std::shared_ptr<ShmMmapTableEntry> HostMemoryPinManager::CreateEntry(int fd, size_t mmapSize, std::string clientId)
+{
+    auto unmapThread = unmapThread_;
+    return std::shared_ptr<ShmMmapTableEntry>(
+        new ShmMmapTableEntry(fd, mmapSize, std::move(clientId)),
+        [unmapThread = std::move(unmapThread)](ShmMmapTableEntry *entry) noexcept {
+            try {
+                unmapThread->Execute([entry] { delete entry; });
+            } catch (const std::exception &e) {
+                LOG(ERROR) << "Submit Worker shared memory unmap task failed, entry: " << entry
+                           << ", fd: " << entry->GetFd() << ", error: " << e.what();
+                delete entry;
+            } catch (...) {
+                LOG(ERROR) << "Submit Worker shared memory unmap task failed with an unknown exception, entry: "
+                           << entry << ", fd: " << entry->GetFd();
+                delete entry;
+            }
+        });
 }
 
 void HostMemoryPinManager::Submit(const std::shared_ptr<ShmMmapTableEntry> &entry)

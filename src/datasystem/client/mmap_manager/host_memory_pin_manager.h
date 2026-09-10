@@ -5,7 +5,7 @@
  * you may not use this file except in compliance with the License.
  */
 
-/** Description: Client-wide serialized CUDA host-memory pinning/unpinning and shared-memory range lookup. */
+/** Description: Client-wide serialized CUDA host-memory pinning/unpinning, deferred unmapping, and range lookup. */
 #ifndef DATASYSTEM_CLIENT_MMAP_HOST_MEMORY_PIN_MANAGER_H
 #define DATASYSTEM_CLIENT_MMAP_HOST_MEMORY_PIN_MANAGER_H
 
@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "datasystem/client/mmap_manager/shm_mmap_table_entry.h"
@@ -27,6 +28,8 @@ public:
     HostMemoryPinManager();
     ~HostMemoryPinManager() = default;
 
+    std::shared_ptr<ShmMmapTableEntry> CreateEntry(int fd, size_t mmapSize, std::string clientId);
+
     void Submit(const std::shared_ptr<ShmMmapTableEntry> &entry);
 
     void MarkClientExiting();
@@ -34,10 +37,13 @@ public:
     Status GetMemcpySegmentSizes(const void *hostPointer, size_t size, std::vector<size_t> &segmentSizes);
 
 private:
-    ThreadPool pinThread_;
     std::shared_ptr<std::mutex> hostMemoryOperationMutex_{ std::make_shared<std::mutex>() };
     // Shared with mmap entries so delayed Buffer destruction still observes Client shutdown.
     std::shared_ptr<std::atomic<bool>> clientExiting_{ std::make_shared<std::atomic<bool>>(false) };
+    // Entry deleters retain this pool so delayed Buffer destruction can still complete unpin and munmap.
+    std::shared_ptr<ThreadPool> unmapThread_;
+    // Declared after unmapThread_ so destruction drains pending pin tasks before closing the unmap worker.
+    ThreadPool pinThread_;
     std::mutex entriesMutex_;
     std::vector<std::weak_ptr<ShmMmapTableEntry>> entries_;
 };

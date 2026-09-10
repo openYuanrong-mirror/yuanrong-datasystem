@@ -39,7 +39,7 @@ Status ShmMmapTable::MmapAndStoreFd(const int &clientFd, const int &workerFd, co
         if (workerFd > 0 && clientFd > 0) {
             LOG(INFO) << FormatString("Client id: %s, worker fd: %d, mmap the client fd %d, mmap size is %llu",
                                       clientId, workerFd, clientFd, mmapSize);
-            auto newEntry = std::make_shared<ShmMmapTableEntry>(clientFd, mmapSize, clientId);
+            auto newEntry = pinManager_->CreateEntry(clientFd, mmapSize, clientId);
             RETURN_IF_NOT_OK(newEntry->Init(enableHugeTlb_, tenantId));
             pinManager_->Submit(newEntry);
             mmapTable_[workerFd] = std::move(newEntry);

@@ -20,6 +20,7 @@
 #include "datasystem/client/mmap_manager/mmap_manager.h"
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <fcntl.h>
 #include <thread>
@@ -36,6 +37,7 @@
 
 #ifdef __linux__
 #include <linux/memfd.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
@@ -206,6 +208,52 @@ TEST_F(MmapManagerTest, TestCompatibilityConstructorRunsCudaHostMemoryPinInBackg
     ASSERT_EQ(0, close(memfd));
 #else
     GTEST_SKIP() << "Linux memfd + ShmMmapTable path only";
+#endif
+}
+
+TEST_F(MmapManagerTest, TestClearSchedulesWorkerMemoryUnmapInBackground)
+{
+#if defined(__linux__)
+    constexpr int mmapSize = 4096;
+    constexpr int workerFd = 905;
+    constexpr int unmapDelayMs = 1000;
+    int memfd = static_cast<int>(syscall(SYS_memfd_create, "mmap_mgr_async_unmap", MFD_ALLOW_SEALING));
+    ASSERT_GE(memfd, 0);
+    ASSERT_EQ(0, ftruncate(memfd, mmapSize));
+
+    auto api = std::make_shared<MmapUtFakeWorkerApi>(HostPort("127.0.0.1", 1));
+    api->SetTestMemfd(memfd);
+    auto pinManager = std::make_shared<HostMemoryPinManager>();
+    MmapManager mmapManager(api, false, pinManager);
+    auto unit = std::make_shared<ShmUnitInfo>(workerFd, static_cast<uint64_t>(mmapSize));
+    DS_ASSERT_OK(mmapManager.LookupUnitsAndMmapFd("tenant_ut", unit));
+    auto entry = mmapManager.GetMmapEntryByFd(workerFd);
+    ASSERT_NE(entry, nullptr);
+    for (int retry = 0; retry < 200 && !entry->IsCudaHostMemoryRegistrationDone(); ++retry) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_TRUE(entry->IsCudaHostMemoryRegistrationDone());
+    entry.reset();
+
+    ASSERT_TRUE(inject::Set("ShmMmapTableEntry.Unmap", "1*sleep(1000)").IsOk());
+    Raii clearInject([] { (void)inject::Clear("ShmMmapTableEntry.Unmap"); });
+    auto start = std::chrono::steady_clock::now();
+    mmapManager.ClearExpiredFds({ workerFd });
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
+    EXPECT_LT(elapsed.count(), unmapDelayMs / 2);
+
+    unsigned char residency = 0;
+    EXPECT_EQ(0, mincore(unit->pointer, mmapSize, &residency));
+    bool unmapped = false;
+    for (int retry = 0; retry < 200 && !unmapped; ++retry) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        errno = 0;
+        unmapped = mincore(unit->pointer, mmapSize, &residency) == -1 && errno == ENOMEM;
+    }
+    EXPECT_TRUE(unmapped);
+    ASSERT_EQ(0, close(memfd));
+#else
+    GTEST_SKIP() << "Linux memfd + asynchronous unmap path only";
 #endif
 }
 

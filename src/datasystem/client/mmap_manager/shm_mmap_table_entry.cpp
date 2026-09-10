@@ -244,6 +244,13 @@ Status ShmMmapTableEntry::GetMemcpySegmentSizes(const void *pointer, size_t size
 
 ShmMmapTableEntry::~ShmMmapTableEntry()
 {
+    try {
+        INJECT_POINT_NO_RETURN("ShmMmapTableEntry.Unmap");
+    } catch (const std::exception &e) {
+        LOG(WARNING) << "Worker shared memory unmap injection failed: " << e.what();
+    } catch (...) {
+        LOG(WARNING) << "Worker shared memory unmap injection failed with an unknown exception";
+    }
     if (pointer_ == nullptr || pointer_ == MAP_FAILED) {
         LOG(ERROR) << FormatString("Mmap pointer is invalid, client id: %s, fd: %d, it may be nullptr", clientId_,
                                    fd_);
