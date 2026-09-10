@@ -3,6 +3,17 @@ load("//bazel:build_defs.bzl", "ds_cc_test")
 package(default_visibility = ["//visibility:public"])
 
 ds_cc_test(
+    name = "remote_ub_port_health_verifier_test",
+    srcs = ["remote_ub_port_health_verifier_test.cpp"],
+    deps = [
+        "//src/datasystem/cluster:remote_ub_port_health_verifier",
+        "//src/datasystem/common/flags:dynamic_flag_config",
+        "//src/datasystem/common/util:raii",
+        "//tests/ut:ut_common",
+    ],
+)
+
+ds_cc_test(
     name = "ub_health_lease_sync_test",
     srcs = ["ub_health_lease_sync_test.cpp"],
     deps = [
@@ -53,6 +64,7 @@ test_suite(
         "ds_coordination_backend_session_test",
         "topology_controller_test",
         "topology_engine_test",
+        "remote_ub_port_health_verifier_test",
         "ub_health_lease_sync_test",
     ],
 )

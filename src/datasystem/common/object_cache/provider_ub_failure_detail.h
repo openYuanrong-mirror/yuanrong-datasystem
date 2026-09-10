@@ -15,15 +15,24 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <utility>
 
 #include "datasystem/common/object_cache/peer_ub_admission.h"
 #include "datasystem/common/rdma/fast_transport_base.h"
+#include "datasystem/common/util/status_helper.h"
 #include "datasystem/protos/object_posix.pb.h"
 
 namespace datasystem {
 constexpr const char *PROVIDER_LOCAL_UB_WRITE_FAILURE_SIDE = "provider_local_ub_write";
 constexpr const char *MIGRATION_LOCAL_UB_READ_FAILURE_SIDE = "migration_local_ub_read";
 constexpr const char *REMOTE_UB_ACK_TIMEOUT_FAILURE_SIDE = "remote_ub_ack_timeout";
+
+inline bool IsClientUbWritebackAckTimeout(const HostPort &provider, const ProviderUbFailureDetailPb &detail)
+{
+    return detail.operator_worker() == provider.ToString() && !detail.failed_endpoint().empty()
+           && detail.status_code() != K_OK && detail.failure_side() == REMOTE_UB_ACK_TIMEOUT_FAILURE_SIDE
+           && detail.has_cqe_status() && detail.cqe_status() == URMA_REMOTE_ACK_TIMEOUT_STATUS;
+}
 
 inline bool HasRawUrmaStatus(std::optional<int> providerStatus, std::optional<int> cqeStatus, int expected)
 {

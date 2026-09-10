@@ -3,6 +3,16 @@ load("//bazel:build_defs.bzl", "ds_cc_library")
 package(default_visibility = ["//visibility:public"])
 
 ds_cc_library(
+    name = "remote_ub_port_health_verifier",
+    srcs = ["ub_health/remote_ub_port_health_verifier.cpp"],
+    hdrs = ["ub_health/remote_ub_port_health_verifier.h"],
+    deps = [
+        "//src/datasystem/common/object_cache:ub_health",
+        "//src/datasystem/common/log:common_log",
+    ],
+)
+
+ds_cc_library(
     name = "cluster_membership_codec",
     srcs = ["membership/membership_value_codec.cpp"],
     hdrs = [
