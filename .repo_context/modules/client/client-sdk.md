@@ -859,3 +859,7 @@ handler. Clearing the Router handler synchronously excludes later callback acces
 
 - Should service discovery be documented as a C++-only advanced entrypoint for now, since Python constructors do not currently expose it directly?
 - Should `DsTensorClient` live in this module document permanently, or split into a future hetero/transfer-engine focused document once that area is deepened?
+
+## Coordinator Set admission redirects
+
+`ObjectClientImpl::ExecuteSetFlow` consumes typed pre-execution `WorkerRedirectPb` from Create / Publish. Each rejection carries at most three request-key-rotated candidates. The SDK retains the request deadline and hard exclusions, filters recommendations through existing placement and health rules, and immediately isolates a rejecting Worker through the existing routing filter until the next ring update. Only typed Coordinator admission rejections expand the distinct-address budget; ordinary errors keep the existing bound. `ClientWorkerRemoteApi::Publish` preserves ambiguous earlier RPC failures so a later redirect cannot authorize unsafe replay. Transport UT covers candidate preference, cross-request isolation, retry budgets, and ambiguous Publish results.

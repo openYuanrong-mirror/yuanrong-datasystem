@@ -41,17 +41,20 @@ bool BrokenFilter::IsAvailable(const HostPort &addr) const
 
 void BrokenFilter::OnWorkerStateChange(const HostPort &addr, StatusCode status)
 {
-    if (status != K_CLIENT_WORKER_DISCONNECT) {
-        return;  // Only connection failures feed the eviction burst counter.
+    const bool scaleDown = status == K_SCALE_DOWN;
+    if (!scaleDown && status != K_CLIENT_WORKER_DISCONNECT) {
+        return;
     }
     const std::string key = addr.ToString();
     const auto now = std::chrono::steady_clock::now();
+    const auto untilRingUpdate = std::chrono::steady_clock::time_point::max();
     bool done = false;
     while (!done) {
         auto old = std::atomic_load(&healthMap_);
         auto existing = old->find(key);
-        if (existing != old->end() && now < existing->second.brokenUntil) {
-            done = true;  // Already broken within TTL; ignore further failure signals.
+        if (existing != old->end() && now < existing->second.brokenUntil
+            && (!scaleDown || existing->second.brokenUntil == untilRingUpdate)) {
+            done = true;
         } else {
             auto next = std::make_shared<HealthMap>(*old);
             // Lazy-expire entries that are neither broken nor tracking a fresh burst.
@@ -67,13 +70,16 @@ void BrokenFilter::OnWorkerStateChange(const HostPort &addr, StatusCode status)
                 }
             }
             auto &health = (*next)[key];
-            if (health.consecutiveFailures == 0 || (now - health.windowStart > FAILURE_BURST_WINDOW)) {
+            if (scaleDown) {
+                health.brokenUntil = untilRingUpdate;
+                health.consecutiveFailures = 0;
+            } else if (health.consecutiveFailures == 0 || (now - health.windowStart > FAILURE_BURST_WINDOW)) {
                 health.consecutiveFailures = 1;
                 health.windowStart = now;
             } else {
                 health.consecutiveFailures += 1;
             }
-            if (health.consecutiveFailures >= EVICT_CONSECUTIVE_FAILURES) {
+            if (!scaleDown && health.consecutiveFailures >= EVICT_CONSECUTIVE_FAILURES) {
                 health.brokenUntil = now + BROKEN_TTL;
                 health.consecutiveFailures = 0;  // Reset; worker must fail N times again after TTL.
             }

@@ -41,6 +41,11 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <brpc/channel.h>
+#include <brpc/controller.h>
+#include "datasystem/protos/object_posix.brpc.stub.pb.h"
+#include "datasystem/common/log/log.h"
+
 extern char **environ;
 
 #define private public
@@ -4583,6 +4588,213 @@ TEST(ObjectClientTransportTest, RoutedShmBufferUsesTargetSessionLockId)
     EXPECT_EQ(std::string(static_cast<const char *>(buffer->ImmutableData()), DATA_SIZE), "data");
 }
 
+TEST(ObjectClientTransportTest, CoordinatorSetReachesFourthWorkerAfterThreeAdmissionRejections)
+{
+    const std::vector<HostPort> workers = {
+        MakeAddress(31521), MakeAddress(31522), MakeAddress(31523), MakeAddress(31524)
+    };
+    auto routing = MakeRouting(workers);
+    ASSERT_NE(routing, nullptr);
+    const std::string key = "coordinator-fourth-write-target";
+    std::vector<HostPort> routeOrder;
+    for (size_t i = 0; i < workers.size(); ++i) {
+        HostPort selected;
+        ASSERT_TRUE(routing->SelectWorker(key, DataPlacementPolicy::PREFERRED_META_OWNER, selected, routeOrder).IsOk());
+        routeOrder.emplace_back(selected);
+    }
+    auto manager = std::make_shared<FakeDataPlaneManager>();
+    manager->configureTransporter = [remaining = routeOrder.back()](const HostPort &address,
+                                                                   FakeTransporter &transporter) {
+        if (address != remaining) {
+            WorkerRedirectPb redirect;
+            redirect.set_request_not_executed(true);
+            transporter.createStatuses.emplace_back(
+                Status(K_SCALE_DOWN, "Worker is exiting now").WithExtra(redirect.SerializeAsString()));
+        }
+    };
+    ConnectOptions options;
+    options.host = workers.front().Host();
+    options.port = workers.front().Port();
+    object_cache::ObjectClientImpl client(options);
+    auto workerApi = std::make_shared<object_cache::ClientWorkerRemoteApi>(workers.front());
+    workerApi->clientId_ = "coordinator-set-admission-test";
+    client.workerApi_.emplace_back(workerApi);
+    client.enableLocalCache_ = false;
+    client.dataPlacementPolicy_ = DataPlacementPolicy::PREFERRED_META_OWNER;
+    client.transportLayer_ = std::make_unique<TestTransportLayer>(manager);
+    std::atomic_store(&client.routing_, routing);
+    ScopedRequestContext requestContext;
+    ApiDeadlineGuard deadline(1'000);
+    const uint8_t data[] = { 'd', 'a', 't', 'a' };
+    object_cache::FullParam param;
+
+    const auto rc = client.ExecuteSetFlow(key, data, sizeof(data), param, {}, 0, 0, 1'000);
+
+    EXPECT_TRUE(rc.IsOk()) << rc.ToString();
+    ASSERT_EQ(manager->builtTransporters.size(), 4U);
+    for (size_t i = 0; i < routeOrder.size(); ++i) {
+        EXPECT_EQ(manager->builtTransporters[i]->rpcClient->WorkerAddress(), routeOrder[i]);
+        EXPECT_EQ(manager->builtTransporters[i]->createCount, 1);
+    }
+    EXPECT_EQ(manager->builtTransporters.back()->setCount, 1);
+    EXPECT_EQ(manager->builtTransporters.back()->setPayloads, std::vector<std::string>({ "data" }));
+}
+
+TEST(ObjectClientTransportTest, CoordinatorSetCountsPreviouslyEvictedWorkerInRetryBudget)
+{
+    const std::vector<HostPort> workers = {
+        MakeAddress(31541), MakeAddress(31542), MakeAddress(31543), MakeAddress(31544), MakeAddress(31545)
+    };
+    auto routing = MakeRouting(workers);
+    ASSERT_NE(routing, nullptr);
+    const std::string key = "coordinator-fourth-write-target";
+    std::vector<HostPort> routeOrder;
+    for (size_t i = 0; i < workers.size(); ++i) {
+        HostPort selected;
+        ASSERT_TRUE(routing->SelectWorker(key, DataPlacementPolicy::PREFERRED_META_OWNER, selected, routeOrder).IsOk());
+        routeOrder.emplace_back(selected);
+    }
+    auto manager = std::make_shared<FakeDataPlaneManager>();
+    manager->configureTransporter = [remaining = routeOrder.back(), disconnected = routeOrder.front()](const HostPort &address,
+                                                                   FakeTransporter &transporter) {
+        if (address == disconnected) {
+            transporter.createStatuses.emplace_back(K_CLIENT_WORKER_DISCONNECT, "Connection closed before Create");
+        } else if (address != remaining) {
+            WorkerRedirectPb redirect;
+            redirect.set_request_not_executed(true);
+            transporter.createStatuses.emplace_back(
+                Status(K_SCALE_DOWN, "Worker is exiting now").WithExtra(redirect.SerializeAsString()));
+        }
+    };
+    ConnectOptions options;
+    options.host = workers.front().Host();
+    options.port = workers.front().Port();
+    object_cache::ObjectClientImpl client(options);
+    auto workerApi = std::make_shared<object_cache::ClientWorkerRemoteApi>(workers.front());
+    workerApi->clientId_ = "coordinator-set-admission-test";
+    client.workerApi_.emplace_back(workerApi);
+    client.enableLocalCache_ = false;
+    client.dataPlacementPolicy_ = DataPlacementPolicy::PREFERRED_META_OWNER;
+    client.transportLayer_ = std::make_unique<TestTransportLayer>(manager);
+    std::atomic_store(&client.routing_, routing);
+    ScopedRequestContext requestContext;
+    ApiDeadlineGuard deadline(1'000);
+    const uint8_t data[] = { 'd', 'a', 't', 'a' };
+    object_cache::FullParam param;
+
+    const auto rc = client.ExecuteSetFlow(key, data, sizeof(data), param, {}, 0, 0, 1'000);
+
+    EXPECT_TRUE(rc.IsOk()) << rc.ToString();
+    ASSERT_EQ(manager->builtTransporters.size(), 5U);
+    for (size_t i = 0; i < routeOrder.size(); ++i) {
+        EXPECT_EQ(manager->builtTransporters[i]->rpcClient->WorkerAddress(), routeOrder[i]);
+        EXPECT_EQ(manager->builtTransporters[i]->createCount, 1);
+    }
+    EXPECT_EQ(manager->builtTransporters.back()->setCount, 1);
+    EXPECT_EQ(manager->builtTransporters.back()->setPayloads, std::vector<std::string>({ "data" }));
+}
+
+TEST(ObjectClientTransportTest, CoordinatorPublishRedirectPreservesEarlierUnknownResult)
+{
+    class PublishSequenceChannel : public brpc::Channel {
+    public:
+        explicit PublishSequenceChannel(int firstError) : firstError_(firstError) {}
+        ~PublishSequenceChannel() override = default;
+        void CallMethod(const google::protobuf::MethodDescriptor *, google::protobuf::RpcController *controller,
+                        const google::protobuf::Message *request, google::protobuf::Message *response,
+                        google::protobuf::Closure *done) override
+        {
+            auto *cntl = static_cast<brpc::Controller *>(controller);
+            const auto &req = static_cast<const PublishReqPb &>(*request);
+            auto *rsp = static_cast<PublishRspPb *>(response);
+            rsp->Clear();
+            retryFlags.push_back(req.is_retry());
+            if (retryFlags.size() == 1 && firstError_ != 0) {
+                cntl->SetFailed(firstError_, "Publish response unavailable");
+            } else {
+                rsp->mutable_worker_redirect()->set_request_not_executed(true);
+            }
+            if (done != nullptr) {
+                done->Run();
+            }
+        }
+        std::vector<bool> retryFlags;
+    private:
+        int firstError_;
+    };
+    for (const int firstError : { ECONNRESET, EHOSTUNREACH, 0 }) {
+        Signature signature;
+        object_cache::ClientWorkerRemoteApi api(MakeAddress(31536), HeartbeatType::NO_HEARTBEAT, "", &signature);
+        api.clientId_ = "publish-ambiguity-test";
+        auto channel = std::make_shared<PublishSequenceChannel>(firstError);
+        auto stub = std::make_shared<WorkerOCService_BrpcGenericStub>(channel.get());
+        api.brpcSession_ = std::make_shared<object_cache::ClientWorkerRemoteApi::BrpcSession>(stub, channel);
+        auto info = std::make_shared<ObjectBufferInfo>();
+        info->objectKey = "publish-ambiguity";
+        info->dataSize = 1;
+        ScopedRequestContext context;
+        ApiDeadlineGuard deadline(1000);
+        const auto rc = api.Publish(info, true, false, {}, 0, 0, 1000);
+        EXPECT_EQ(rc.GetCode(), firstError == ECONNRESET ? K_RPC_NETWORK_BLIP : K_SCALE_DOWN) << rc.ToString();
+        if (rc.GetCode() == K_SCALE_DOWN) {
+            ASSERT_TRUE(rc.HasExtra());
+            WorkerRedirectPb redirect;
+            ASSERT_TRUE(redirect.ParseFromString(rc.GetExtra()));
+            EXPECT_TRUE(redirect.request_not_executed());
+        }
+        EXPECT_EQ(channel->retryFlags, firstError == 0 ? std::vector<bool>({ false })
+                                                       : std::vector<bool>({ false, true }));
+    }
+}
+
+TEST(ObjectClientTransportTest, CoordinatorRedirectPrefersReadyWorkerAndQuarantinesRejection)
+{
+    const auto boundWorker = MakeAddress(31531);
+    const auto readyWorker = MakeAddress(31532);
+    ConnectOptions options;
+    options.host = boundWorker.Host();
+    options.port = boundWorker.Port();
+    object_cache::ObjectClientImpl client(options);
+    auto workerApi = std::make_shared<object_cache::ClientWorkerRemoteApi>(boundWorker);
+    workerApi->clientId_ = "write-hint-test";
+    client.workerApi_.emplace_back(workerApi);
+    client.enableLocalCache_ = false;
+    auto routing = MakeRouting({ boundWorker, readyWorker });
+    std::atomic_store(&client.routing_, routing);
+    object_cache::SetRouteContext route;
+
+    ASSERT_TRUE(client.SelectSetRoute("hinted", {}, route, { readyWorker }).IsOk());
+    EXPECT_EQ(route.worker, readyWorker);
+    route = object_cache::SetRouteContext();
+    routing->UpdateState(boundWorker, K_SCALE_DOWN);
+    ASSERT_TRUE(client.SelectSetRoute("next-request", {}, route).IsOk());
+    EXPECT_EQ(route.worker, readyWorker);
+    route = object_cache::SetRouteContext();
+    ASSERT_TRUE(client.SelectSetRoute("stale-hints", { boundWorker }, route, { MakeAddress(31999) }).IsOk());
+    EXPECT_EQ(route.worker, readyWorker);
+    route = object_cache::SetRouteContext();
+    EXPECT_EQ(client.SelectSetRoute("all-tried", { boundWorker, readyWorker }, route).GetCode(),
+              K_NO_AVAILABLE_WORKER);
+}
+
+TEST(ObjectClientTransportTest, CoordinatorRedirectCannotOverrideRequiredSameNodePolicy)
+{
+    const auto worker = MakeAddress(31533);
+    ConnectOptions options;
+    options.host = worker.Host();
+    options.port = worker.Port();
+    object_cache::ObjectClientImpl client(options);
+    auto workerApi = std::make_shared<object_cache::ClientWorkerRemoteApi>(worker);
+    workerApi->clientId_ = "write-hint-placement-test";
+    client.workerApi_.emplace_back(workerApi);
+    client.enableLocalCache_ = false;
+    client.dataPlacementPolicy_ = DataPlacementPolicy::REQUIRED_SAME_NODE;
+    std::atomic_store(&client.routing_, MakeSingleWorkerRouting(worker));
+    object_cache::SetRouteContext route;
+
+    EXPECT_EQ(client.SelectSetRoute("strict-placement", {}, route, { worker }).GetCode(), K_NO_AVAILABLE_WORKER);
+}
+
 TEST(ObjectClientTransportTest, RoutedPublishReplaysScaleDownOnRemainingWorker)
 {
     const HostPort leavingWorker = MakeAddress(31511);
@@ -4628,6 +4840,62 @@ TEST(ObjectClientTransportTest, RoutedPublishReplaysScaleDownOnRemainingWorker)
     EXPECT_TRUE(remaining->setParams.front().isSeal);
     EXPECT_EQ(remaining->setParams.front().nestedKeys, std::unordered_set<std::string>({ "nested" }));
     EXPECT_TRUE(info->isSeal);
+    free(info->pointer);
+    info->pointer = nullptr;
+}
+
+TEST(ObjectClientTransportTest, CoordinatorRoutedPublishPreservesCandidateAndSharedAvoidance)
+{
+    const HostPort leavingWorker = MakeAddress(31511);
+    const HostPort remainingWorker = MakeAddress(31512);
+    auto manager = std::make_shared<FakeDataPlaneManager>();
+    manager->configureTransporter = [leavingWorker, remainingWorker](const HostPort &address, FakeTransporter &transporter) {
+        if (address == leavingWorker) {
+            WorkerRedirectPb redirect;
+            redirect.set_request_not_executed(true);
+            redirect.add_candidate_addresses(remainingWorker.ToString());
+            transporter.setStatuses.emplace_back(
+                Status(K_SCALE_DOWN, "Worker is exiting now").WithExtra(redirect.SerializeAsString()));
+        }
+    };
+    ConnectOptions options;
+    options.host = leavingWorker.Host();
+    options.port = leavingWorker.Port();
+    object_cache::ObjectClientImpl client(options);
+    auto workerApi = std::make_shared<object_cache::ClientWorkerRemoteApi>(leavingWorker);
+    workerApi->clientId_ = "routed-publish-scale-down-test";
+    client.workerApi_.emplace_back(workerApi);
+    client.enableLocalCache_ = false;
+    client.transportLayer_ = std::make_unique<TestTransportLayer>(manager);
+    std::atomic_store(&client.routing_, MakeRouting({ leavingWorker, MakeAddress(31515), remainingWorker }));
+    auto info = std::make_shared<ObjectBufferInfo>();
+    info->objectKey = "routed-publish-scale-down";
+    info->workerAddr = leavingWorker;
+    info->dataSize = 4;
+    info->pointer = static_cast<uint8_t *>(malloc(5));
+    ASSERT_NE(info->pointer, nullptr);
+    std::memcpy(info->pointer, "data", info->dataSize);
+    info->isRoutedWrite = true;
+    ScopedRequestContext requestContext;
+    ApiDeadlineGuard deadline(1'000);
+
+    ASSERT_TRUE(client.PublishRoutedBuffer(info, { "nested" }, true).IsOk());
+
+    ASSERT_EQ(manager->builtTransporters.size(), 2U);
+    const auto &leaving = manager->builtTransporters[0];
+    const auto &remaining = manager->builtTransporters[1];
+    EXPECT_EQ(leaving->rpcClient->WorkerAddress(), leavingWorker);
+    EXPECT_EQ(remaining->rpcClient->WorkerAddress(), remainingWorker);
+    EXPECT_EQ(leaving->setCount, 1);
+    EXPECT_EQ(remaining->createCount, 1);
+    EXPECT_EQ(remaining->setCount, 1);
+    EXPECT_EQ(remaining->setPayloads, std::vector<std::string>({ "data" }));
+    EXPECT_TRUE(remaining->setParams.front().isSeal);
+    EXPECT_EQ(remaining->setParams.front().nestedKeys, std::unordered_set<std::string>({ "nested" }));
+    EXPECT_TRUE(info->isSeal);
+    object_cache::SetRouteContext route;
+    ASSERT_TRUE(client.SelectSetRoute("next-write", {}, route).IsOk());
+    EXPECT_NE(route.worker, leavingWorker);
     free(info->pointer);
     info->pointer = nullptr;
 }

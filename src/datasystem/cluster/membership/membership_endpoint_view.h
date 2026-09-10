@@ -23,6 +23,7 @@
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "datasystem/cluster/membership/membership_types.h"
 #include "datasystem/cluster/runtime/topology_snapshot_state.h"
@@ -50,7 +51,7 @@ struct MemberEndpoint {
 
 /**
  * @brief Thread-safe composition of immutable topology identity and local endpoint observations.
- * The view owns only transient observations. It does not watch membership,
+ * The view owns only transient observations. It does not own membership watches,
  * decide Failure, select placement owners or write backend state.
  */
 class MembershipEndpointView final {
@@ -59,7 +60,18 @@ public:
      * @brief Bind the process-local endpoint view to the published Snapshot state.
      * @param[in] snapshots Snapshot holder that outlives this view.
      */
-    explicit MembershipEndpointView(const TopologySnapshotState &snapshots);
+    explicit MembershipEndpointView(const TopologySnapshotState &snapshots, bool enableWriteRedirect = false);
+
+    bool SupportsWriteRedirect() const noexcept;
+
+    // The runtime commits these advisory updates only while owning the source watch.
+    Status UpdateWriteCandidate(const std::string &address, bool ready, int64_t revision);
+
+    void ClearWriteCandidates();
+
+    std::vector<std::string> GetWriteCandidates(const std::string &excludedAddress,
+                                                const std::string &selectionKey,
+                                                size_t maxCandidates) const;
 
     /**
      * @brief Destroy all process-local observations.
@@ -131,6 +143,15 @@ private:
     EndpointAvailability ResolveLocalAvailability(const Member &member, uint64_t topologyVersion) const;
 
     const TopologySnapshotState &snapshots_;
+    const bool writeRedirectEnabled_;
+    struct WriteCandidateState {
+        int64_t revision{ 0 };
+        bool ready{ false };
+        size_t readyIndex{ 0 };
+    };
+    mutable std::shared_mutex writeCandidatesMutex_;
+    std::unordered_map<std::string, WriteCandidateState> writeCandidates_;
+    std::vector<std::string> readyCandidateAddresses_;
     // Mirrors whether observationsByAddress_ is empty so empty-table readers can avoid mutex_.
     std::atomic<bool> hasObservations_{ false };
     // Protects observationsByAddress_; writers update hasObservations_ while holding this mutex.

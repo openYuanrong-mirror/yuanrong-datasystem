@@ -60,6 +60,11 @@ public:
         return engine.HandleRuntimeEvent(RuntimeEvent{ RuntimeEventPayload{ std::move(event) } });
     }
 
+    static Status EnqueueCoordinationEvent(TopologyEngine &engine, CoordinationEvent event)
+    {
+        return engine.EnqueueCoordinationEvent(std::move(event));
+    }
+
     static void InvalidateCoordinatorWatches(TopologyEngine &engine)
     {
         auto *backend = dynamic_cast<DsCoordinationBackend *>(engine.memberBackend_.get());
@@ -893,6 +898,124 @@ TEST(TopologyEngineTest, ProbeEventInvokesOnlyWorkerProbeHandler)
         EXPECT_EQ(requests.back().probeRound, 8U);
         EXPECT_EQ(requests.back().target.address, "127.0.0.1:3");
     }
+    DS_ASSERT_OK(engine->Shutdown(std::chrono::steady_clock::now() + TEST_WAIT));
+}
+
+TEST(TopologyEngineTest, MembershipInitialSnapshotLargerThanEventQueueCompletes)
+{
+    testing::FakeCoordinatorServiceProxy proxy;
+    TestWatchIngress ingress;
+    NoopTopologyCallbacks callbacks;
+    const std::string clusterName = "large-membership-snapshot";
+    auto keys = MakeKeys(clusterName);
+    constexpr size_t PEERS = 2000;
+    auto topology = MakeTopologyWithPeer(1, PEERS);
+    for (size_t i = 1; i < topology.members.size(); ++i) {
+        topology.members[i].identity.id = std::string(16, 'x');
+        const auto encodedId = std::to_string(i);
+        topology.members[i].identity.id.replace(0, encodedId.size(), encodedId);
+    }
+    PutTopology(proxy, clusterName, topology);
+    MembershipValue membership;
+    membership.lifecycleState = MemberLifecycleState::READY;
+    std::string encoded;
+    DS_ASSERT_OK(MembershipValueCodec::Encode(membership, encoded));
+    for (size_t i = 1; i < topology.members.size(); ++i) {
+        DS_ASSERT_OK(proxy.PutRaw(keys->MembershipTable() + "/" + topology.members[i].identity.address, encoded));
+    }
+    auto engine = BuildEngine(proxy, ingress, callbacks, clusterName);
+    DS_ASSERT_OK(engine->Start());
+    EXPECT_EQ(engine->Membership().GetWriteCandidates(LOCAL_ADDRESS, "key", 3).size(), 3U);
+    EXPECT_EQ(engine->Membership().GetWriteCandidates(LOCAL_ADDRESS, "key", PEERS).size(), PEERS);
+    EXPECT_EQ(proxy.WatchCalls().size(), 4U);
+    DS_ASSERT_OK(engine->Shutdown(std::chrono::steady_clock::now() + TEST_WAIT));
+}
+
+TEST(TopologyEngineTest, CoordinatorMembershipHintsFenceLateEventsAndRebuildEmptyPeerSnapshot)
+{
+    testing::FakeCoordinatorServiceProxy proxy;
+    TestWatchIngress ingress;
+    NoopTopologyCallbacks callbacks;
+    const std::string clusterName = "membership-write-hints";
+    auto keys = MakeKeys(clusterName);
+    PutTopology(proxy, clusterName, MakeTopologyWithPeer());
+    const std::string peer = "127.0.0.1:10002";
+    const std::string key = keys->MembershipTable() + "/" + peer;
+    MembershipValue value;
+    value.lifecycleState = MemberLifecycleState::READY;
+    std::string ready;
+    DS_ASSERT_OK(MembershipValueCodec::Encode(value, ready));
+    DS_ASSERT_OK(proxy.PutRaw(key, ready));
+    auto engine = BuildEngine(proxy, ingress, callbacks, clusterName);
+    DS_ASSERT_OK(engine->Start());
+    auto candidates = [&] { return engine->Membership().GetWriteCandidates(LOCAL_ADDRESS, "key", 3); };
+    ASSERT_TRUE(WaitFor([&] { return candidates() == std::vector<std::string>({ peer }); }));
+    const auto watchId = FindWatchId(proxy, keys->MembershipTable() + "/");
+    value.lifecycleState = MemberLifecycleState::EXITING;
+    std::string exiting;
+    DS_ASSERT_OK(MembershipValueCodec::Encode(value, exiting));
+    DS_ASSERT_OK(ingress.Emit("coordinator-test", watchId,
+                              { CoordinationEventType::PUT, key, exiting, 2, 100 }));
+    DS_ASSERT_OK(ingress.Emit("coordinator-test", watchId,
+                              { CoordinationEventType::PUT, key, ready, 1, 99 }));
+    EXPECT_TRUE(candidates().empty());
+    DS_ASSERT_OK(ingress.Emit("coordinator-test", watchId,
+                              { CoordinationEventType::DELETE, key, "", 0, 102 }));
+    DS_ASSERT_OK(ingress.Emit("coordinator-test", watchId,
+                              { CoordinationEventType::PUT, key, ready, 3, 101 }));
+    EXPECT_TRUE(candidates().empty());
+    DS_ASSERT_OK(ingress.Emit("coordinator-test", watchId,
+                              { CoordinationEventType::PUT, key, ready, 4, 103 }));
+    ASSERT_TRUE(WaitFor([&] { return candidates() == std::vector<std::string>({ peer }); }));
+    int64_t revision = 0;
+    int64_t deleted = 0;
+    DS_ASSERT_OK(proxy.DeleteRange(key, "", deleted, revision, 0, COORDINATOR_NO_MOD_REVISION_CHECK));
+    TopologyEngineTestPeer::InvalidateCoordinatorWatches(*engine);
+    ASSERT_TRUE(WaitFor([&] { return candidates().empty(); }));
+    ASSERT_TRUE(WaitFor([&] {
+        const auto current = FindWatchId(proxy, keys->MembershipTable() + "/");
+        return current != watchId && TopologyEngineTestPeer::OwnsCoordinatorWatch(*engine, "coordinator-test", current);
+    }));
+    CoordinationEvent stale{ CoordinationEventType::PUT, key, ready, 5, 104 };
+    stale.sourceAuthorityId = "coordinator-test";
+    stale.sourceWatchId = watchId;
+    EXPECT_EQ(TopologyEngineTestPeer::EnqueueCoordinationEvent(*engine, std::move(stale)).GetCode(), K_NOT_READY);
+    EXPECT_TRUE(candidates().empty());
+    DS_ASSERT_OK(engine->Shutdown(std::chrono::steady_clock::now() + TEST_WAIT));
+}
+
+TEST(TopologyEngineTest, CoordinatorMembershipResetClearsCandidatesWithCompletelyEmptySnapshot)
+{
+    testing::FakeCoordinatorServiceProxy proxy;
+    TestWatchIngress ingress;
+    NoopTopologyCallbacks callbacks;
+    const std::string clusterName = "membership-write-hints";
+    auto keys = MakeKeys(clusterName);
+    PutTopology(proxy, clusterName, MakeTopologyWithPeer());
+    const std::string peer = "127.0.0.1:10002";
+    const std::string key = keys->MembershipTable() + "/" + peer;
+    MembershipValue value;
+    value.lifecycleState = MemberLifecycleState::READY;
+    std::string ready;
+    DS_ASSERT_OK(MembershipValueCodec::Encode(value, ready));
+    DS_ASSERT_OK(proxy.PutRaw(key, ready));
+    auto engine = BuildEngine(proxy, ingress, callbacks, clusterName);
+    DS_ASSERT_OK(engine->Start());
+    auto candidates = [&] { return engine->Membership().GetWriteCandidates(LOCAL_ADDRESS, "key", 3); };
+    ASSERT_TRUE(WaitFor([&] { return candidates() == std::vector<std::string>({ peer }); }));
+    const auto watchId = FindWatchId(proxy, keys->MembershipTable() + "/");
+    proxy.ReturnEmptyWatchSnapshotForKey(keys->MembershipTable() + "/");
+    TopologyEngineTestPeer::InvalidateCoordinatorWatches(*engine);
+    ASSERT_TRUE(WaitFor([&] { return candidates().empty(); }));
+    ASSERT_TRUE(WaitFor([&] {
+        const auto current = FindWatchId(proxy, keys->MembershipTable() + "/");
+        return current != watchId && TopologyEngineTestPeer::OwnsCoordinatorWatch(*engine, "coordinator-test", current);
+    }));
+    CoordinationEvent stale{ CoordinationEventType::PUT, key, ready, 5, 104 };
+    stale.sourceAuthorityId = "coordinator-test";
+    stale.sourceWatchId = watchId;
+    EXPECT_EQ(TopologyEngineTestPeer::EnqueueCoordinationEvent(*engine, std::move(stale)).GetCode(), K_NOT_READY);
+    EXPECT_TRUE(candidates().empty());
     DS_ASSERT_OK(engine->Shutdown(std::chrono::steady_clock::now() + TEST_WAIT));
 }
 

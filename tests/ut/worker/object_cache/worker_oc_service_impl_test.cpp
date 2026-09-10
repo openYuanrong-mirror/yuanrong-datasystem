@@ -3940,12 +3940,15 @@ TEST_F(WorkerOcServiceImplTest, DrainRejectsClientWritesWhenLeavingInterceptIsDi
 {
     ASSERT_NE(impl_->gMigrateProc_, nullptr);
     const bool savedLeavingIntercept = FLAGS_enable_leaving_intercept;
-    Raii restore([savedLeavingIntercept] {
+    const bool savedSkipAuthenticate = FLAGS_skip_authenticate;
+    Raii restore([savedLeavingIntercept, savedSkipAuthenticate] {
+        FLAGS_skip_authenticate = savedSkipAuthenticate;
         FLAGS_enable_leaving_intercept = savedLeavingIntercept;
         SetTopologyServingAdmission(true);
         SetUnhealthy();
     });
     FLAGS_enable_leaving_intercept = false;
+    FLAGS_skip_authenticate = true;
     SetTopologyServingAdmission(true);
     DS_ASSERT_OK(SetHealthProbe());
     ASSERT_TRUE(IsHealthy());
@@ -3967,18 +3970,25 @@ TEST_F(WorkerOcServiceImplTest, DrainRejectsClientWritesWhenLeavingInterceptIsDi
     req.set_object_key("write-after-drain");
     req.set_data_size(1);
     CreateRspPb rsp;
-    EXPECT_EQ(impl_->Create(req, rsp).GetCode(), K_SCALE_DOWN);
+    DS_ASSERT_OK(impl_->Create(req, rsp));
+    ASSERT_TRUE(rsp.has_worker_redirect());
+    EXPECT_TRUE(rsp.worker_redirect().request_not_executed());
+    EXPECT_EQ(rsp.worker_redirect().candidate_addresses_size(), 0);
+    EXPECT_EQ(objectTable_->GetSize(), 0);
 }
 
 TEST_F(WorkerOcServiceImplTest, ExitIntentRejectsRoutedCreateBeforeDataDrain)
 {
     const bool savedLeavingIntercept = FLAGS_enable_leaving_intercept;
-    Raii restore([savedLeavingIntercept] {
+    const bool savedSkipAuthenticate = FLAGS_skip_authenticate;
+    Raii restore([savedLeavingIntercept, savedSkipAuthenticate] {
+        FLAGS_skip_authenticate = savedSkipAuthenticate;
         FLAGS_enable_leaving_intercept = savedLeavingIntercept;
         SetTopologyServingAdmission(true);
         SetUnhealthy();
     });
     FLAGS_enable_leaving_intercept = false;
+    FLAGS_skip_authenticate = true;
     SetTopologyServingAdmission(true);
     DS_ASSERT_OK(SetHealthProbe());
     DS_ASSERT_OK(topologyRuntime_.StartWithActiveLocalMember(localAddress_));
@@ -3992,7 +4002,11 @@ TEST_F(WorkerOcServiceImplTest, ExitIntentRejectsRoutedCreateBeforeDataDrain)
     req.set_is_routed(true);
     CreateRspPb rsp;
 
-    EXPECT_EQ(impl_->Create(req, rsp).GetCode(), K_SCALE_DOWN);
+    DS_ASSERT_OK(impl_->Create(req, rsp));
+    ASSERT_TRUE(rsp.has_worker_redirect());
+    EXPECT_TRUE(rsp.worker_redirect().request_not_executed());
+    EXPECT_EQ(rsp.worker_redirect().candidate_addresses_size(), 0);
+    EXPECT_EQ(objectTable_->GetSize(), 0);
     EXPECT_FALSE(impl_->MigrateDataStarted());
 }
 

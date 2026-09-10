@@ -339,8 +339,10 @@ public:
 
     /**
      * @brief Mark the saved watch plan stale and enqueue a non-blocking exact-read doorbell.
+     * @param[in] coordinatorId Required current authority when watchId is nonzero.
+     * @param[in] watchId Fence invalidation to this active watch; zero invalidates unconditionally.
      */
-    void InvalidateWatches();
+    void InvalidateWatches(const std::string &coordinatorId = "", int64_t watchId = 0);
 
     /**
      * @brief Deliver one identity-bound Coordinator watch event.

@@ -480,3 +480,7 @@
 
 - Which worker flags are safe to classify as “hot config” versus startup-only in future docs?
 - Should hash-ring CLI operations live in this document permanently, or move to a deployment/ops-focused module later?
+
+## Coordinator write candidates
+
+Coordinator WORKER adds a membership-prefix watch. `TopologyEngine::EnqueueCoordinationEvent` consumes those events synchronously with watch-identity and per-address revision fencing; it does not enqueue the full membership snapshot. `MembershipEndpointView` owns an independently locked READY candidate index, read only when Create / Publish rejects admission. A request-key and rejecting-worker hash rotates the starting point; at most three ACTIVE, locally reachable candidates are copied after examining at most twelve entries. Candidate lookup takes the observation read lock before the candidate-index read lock; update paths take only one of these locks. RESET clears obsolete generations, including empty initial snapshots. Backend update lock order is backend watch, membership events, then candidate view. Topology engine contract tests cover initial replay, stale events, deletion, reset, and watch replacement.

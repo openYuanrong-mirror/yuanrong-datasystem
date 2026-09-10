@@ -85,7 +85,9 @@ TEST(TopologyRoleWatchPlanTest, BuildsOnlyRoleRequiredExactAndPrefixWatches)
     DS_ASSERT_OK(TopologyKeyHelper::Create("watch", keys));
     std::vector<WatchKey> watches;
     DS_ASSERT_OK(BuildTopologyRoleWatchPlan(TopologyRuntimeRole::WORKER, "127.0.0.1:1", *keys, 7, watches));
-    ASSERT_EQ(watches.size(), 3);
+    ASSERT_EQ(watches.size(), 4);
+    EXPECT_EQ(watches.back().tableName, keys->MembershipTable());
+    EXPECT_TRUE(watches.back().key.empty());
     EXPECT_EQ(watches[0].tableName, keys->TopologyTable());
     EXPECT_EQ(watches[0].key, TopologyKeyHelper::TopologyKey());
     EXPECT_EQ(watches[1].tableName, keys->NotifyTable());

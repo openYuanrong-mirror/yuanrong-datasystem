@@ -744,7 +744,11 @@ private:
     std::vector<HostPort> MergeWriteTargetExclusions(const std::vector<HostPort> &excludedWorkers) const;
 
     Status SelectSetRoute(const std::string &objectKey, const std::vector<HostPort> &excludedWorkers,
-                          SetRouteContext &routeContext);
+                          SetRouteContext &routeContext,
+                          const std::vector<HostPort> &preferredWorkers = {});
+
+    Status SelectSetRouteWithoutHints(const std::string &objectKey, const std::vector<HostPort> &excludedWorkers,
+                                     SetRouteContext &routeContext);
 
     client::TransportRequestContext BuildTransportRequestContext(const SetRouteContext &routeContext) const;
 
@@ -752,7 +756,8 @@ private:
                                const std::unordered_set<std::string> &nestedObjectKeys, bool isSeal);
 
     Status ReplayRoutedBuffer(const std::shared_ptr<ObjectBufferInfo> &bufferInfo,
-                              const std::unordered_set<std::string> &nestedObjectKeys, bool isSeal);
+                              const std::unordered_set<std::string> &nestedObjectKeys, bool isSeal,
+                              const Status &rejection = Status::OK());
 
     // Routed two-step MSet(vector<Buffer>) (lc=false batch). When every non-placeholder buffer is a
     // routed write, groups them by workerAddr and publishes per worker via transportLayer_->MSet;
@@ -772,10 +777,14 @@ private:
                                std::vector<HostPort> &excludedWorkers, bool safeWriteTargetReplay = false);
 
 
+    Status ExpandSetRedirectBudget(const std::vector<HostPort> &excludedWorkers,
+                                   size_t &maxAttempts, bool &initialized);
+
     Status ExecuteSetFlow(const std::string &objectKey, const uint8_t *data, uint64_t size, const FullParam &param,
                           const std::unordered_set<std::string> &nestedObjectKeys, uint32_t ttlSecond, int existence,
                           int32_t requestTimeoutMs, bool isSeal = false,
-                          std::vector<HostPort> excludedWorkers = {});
+                          std::vector<HostPort> excludedWorkers = {},
+                          const Status &initialRejection = Status::OK());
 
     friend Buffer;
     friend DeviceBuffer;

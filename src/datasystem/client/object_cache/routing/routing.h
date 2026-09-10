@@ -74,6 +74,8 @@ public:
 
     std::vector<HostPort> GetAvailableSameNodeWorkers() const;
 
+    std::vector<HostPort> GetAvailableWorkers() const;
+
     void UpdateState(const HostPort &addr, StatusCode status);
 
     bool ForceRefresh();

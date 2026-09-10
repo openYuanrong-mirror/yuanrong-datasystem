@@ -173,6 +173,10 @@ Status ClientWorkerLocalApi::Create(const std::string &objectKey, int64_t dataSi
                                      "Fail to generate signature when create data.");
     CreateRspPb rsp;
     RETURN_IF_NOT_OK(api_->WorkerOCCreate(workerOCService_, req, rsp));
+    if (rsp.has_worker_redirect()) {
+        return Status(K_SCALE_DOWN, "Worker rejected write before execution")
+            .WithExtra(rsp.worker_redirect().SerializeAsString());
+    }
     shmBuf->fd = rsp.store_fd();
     shmBuf->mmapSize = rsp.mmap_size();
     shmBuf->offset = static_cast<ptrdiff_t>(rsp.offset());
@@ -200,6 +204,10 @@ Status ClientWorkerLocalApi::Publish(const std::shared_ptr<ObjectBufferInfo> &bu
     }
     PublishRspPb rsp;
     RETURN_IF_NOT_OK(api_->WorkerOCPublish(workerOCService_, req, rsp, std::move(rms)));
+    if (rsp.has_worker_redirect()) {
+        return Status(K_SCALE_DOWN, "Worker rejected write before execution")
+            .WithExtra(rsp.worker_redirect().SerializeAsString());
+    }
     if (isShm) {
         METRIC_ADD(metrics::KvMetricId::CLIENT_PUT_SHM_WRITE_TOTAL_BYTES, bufferInfo->dataSize);
     } else {

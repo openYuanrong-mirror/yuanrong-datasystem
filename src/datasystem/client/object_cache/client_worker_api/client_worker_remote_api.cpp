@@ -20,6 +20,8 @@
 #include "datasystem/common/util/validator.h"
 #include "datasystem/client/object_cache/client_worker_api/client_worker_remote_api.h"
 
+#include <optional>
+
 #include <brpc/channel.h>
 #include "datasystem/protos/object_posix.brpc.stub.pb.h"
 // brpc headers above override LOG/VLOG/DLOG via butil/logging.h.
@@ -29,7 +31,6 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
-#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <utility>
@@ -139,6 +140,14 @@ void LogClientWorkerRpcDone(const char *operation, size_t count, const char *pat
     SLOW_LOG_IF_OR_VLOG(INFO, rpcThresholdUs > 0 && elapsedUs >= rpcThresholdUs, 1,
         FormatString("[Client/WorkerRpc] %s done, count: %zu, path: %s, costUs: %zu, rc: %s", operation,
                      count, path, elapsedUs, status.ToString()));
+}
+
+void ApplyCreateWorkerRedirectStatus(const CreateRspPb &response, Status &status)
+{
+    if (status.IsOk() && response.has_worker_redirect()) {
+        status = Status(K_SCALE_DOWN, "Worker rejected write before execution")
+                     .WithExtra(response.worker_redirect().SerializeAsString());
+    }
 }
 
 void FillCreateUrmaInfo(bool isUrmaEnabled, const CreateRspPb &rsp,
@@ -317,6 +326,7 @@ Status ClientWorkerRemoteApi::Create(const std::string &objectKey, int64_t dataS
         },
         []() { return Status::OK(); }, RETRY_ERROR_CODE,
         requestTimeoutMs > 0 ? requestTimeoutMs : rpcTimeoutMs_);
+    ApplyCreateWorkerRedirectStatus(rsp, status);
     status = WithRpcDiag(status, "Create", hostPort_);
     LogClientWorkerRpcDone("Create", 1, IsUrmaEnabled() && rsp.has_urma_info() ? "UB" : "SHM",
                            static_cast<uint64_t>(rpcTimer.ElapsedMicroSecond()), status);
@@ -651,16 +661,25 @@ Status ClientWorkerRemoteApi::Publish(const std::shared_ptr<ObjectBufferInfo> &b
     PublishRspPb rsp;
     PerfPoint perfPoint(PerfKey::RPC_CLIENT_PUBLISH_OBJECT);
     bool isRetry = false;
+    std::optional<Status> firstAmbiguousPublish;
     Timer rpcTimer;
     auto status =
         RetryOnError(
             static_cast<int32_t>(std::min<int64_t>(
             TimeoutDuration::CeilUsToMs(ApiDeadline::Instance().ApiRemainingUs()), MAX_RPC_TIMEOUT_MS)),
-            [this, &req, &rsp, &payloads, &isRetry](int32_t realRpcTimeout) {
-            return DoPublishRpc(req, rsp, payloads, isRetry, realRpcTimeout);
+            [this, &req, &rsp, &payloads, &isRetry, &firstAmbiguousPublish](int32_t realRpcTimeout) {
+            auto rc = DoPublishRpc(req, rsp, payloads, isRetry, realRpcTimeout);
+            if (!firstAmbiguousPublish.has_value() && IsRetryableRpcError(rc)
+                && !IsBrpcRequestDefinitelyNotSent(rc) && !IsBrpcServerApplicationError(rc)) {
+                firstAmbiguousPublish = rc;
+            }
+            return rc;
         },
         []() { return Status::OK(); }, RETRY_ERROR_CODE,
         requestTimeoutMs > 0 ? requestTimeoutMs : rpcTimeoutMs_);
+    if (status.IsError() && firstAmbiguousPublish.has_value()) {
+        status = *firstAmbiguousPublish;
+    }
     const auto *path = isShm ? "SHM" : (bufferInfo->ubUrmaDataInfo != nullptr ? "UB" : "TCP");
     RETURN_IF_NOT_OK(HandlePublishResponse(status, rsp, traceEnabled, path, rpcTimer.ElapsedMicroSecond()));
     RecordPublishWriteBytes(bufferInfo, isShm);
@@ -680,6 +699,10 @@ Status ClientWorkerRemoteApi::DoPublishRpc(PublishReqPb& req, PublishRspPb& rsp,
     RETURN_IF_NOT_OK(signature_->GenerateSignature(req));
     VLOG(1) << "Start to send rpc to publish object: " << req.object_key();
     Status s = DS_OC_DISPATCH(Publish, opts, req, rsp, payloads);
+    if (s.IsOk() && rsp.has_worker_redirect()) {
+        return Status(K_SCALE_DOWN, "Worker rejected write before execution")
+            .WithExtra(rsp.worker_redirect().SerializeAsString());
+    }
     if (req.is_retry() && req.is_seal() && s.GetCode() == K_OC_ALREADY_SEALED) {
         VLOG(1) << FormatString(
             "Object(%s) retry seal and returned K_OC_ALREADY_SEALED, success is also considered.",

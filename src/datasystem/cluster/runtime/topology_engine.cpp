@@ -486,7 +486,7 @@ TopologyEngine::TopologyEngine(std::unique_ptr<Builder::Config> config)
       repository_(*memberBackend_, *keys_),
       reader_(repository_),
       dispatcher_(options_.eventQueueCapacity),
-      membershipView_(snapshots_),
+      membershipView_(snapshots_, coordinatorProxy_ != nullptr),
       placement_(snapshots_, *algorithm_, options_.localAddress),
       executor_(options_.localAddress, repository_, snapshots_, *config->callbacks, dispatcher_,
                 membershipRestartHandler_, options_.executor)
@@ -632,12 +632,20 @@ Status TopologyEngine::EnqueueCoordinationEvent(CoordinationEvent &&event)
 {
     LOG_FIRST_AND_EVERY_N(INFO, TOPOLOGY_WATCH_EVENT_LOG_INTERVAL)
         << "CLUSTER_WATCH_EVENT cluster=" << options_.clusterName << " role=worker event=" << event.ToString();
+    const auto kind = keys_->ClassifyPhysicalKey(event.key, options_.localAddress);
+    if (coordinatorProxy_ != nullptr && kind == TopologyPhysicalKeyKind::MEMBERSHIP) {
+        auto rc = ApplyCoordinatorMembershipEvent(event);
+        if (rc.IsError() && rc.GetCode() != K_NOT_READY) {
+            static_cast<DsCoordinationBackend *>(memberBackend_.get())->InvalidateWatches(
+                event.sourceAuthorityId, event.sourceWatchId);
+        }
+        return rc;
+    }
     const bool probeEvent = coordinatorProxy_ != nullptr && event.type != CoordinationEventType::RESET
-                            && keys_->ClassifyPhysicalKey(event.key, options_.localAddress)
-                                   == TopologyPhysicalKeyKind::LOCAL_PROBE;
+                            && kind == TopologyPhysicalKeyKind::LOCAL_PROBE;
     auto rc = probeEvent ? dispatcher_.SubmitCoordinationUncoalesced(std::move(event))
                          : dispatcher_.SubmitCoordination(std::move(event));
-    if (probeEvent && rc.GetCode() == K_TRY_AGAIN && coordinatorProxy_ != nullptr) {
+    if (probeEvent && rc.GetCode() == K_TRY_AGAIN) {
         static_cast<DsCoordinationBackend *>(memberBackend_.get())->InvalidateWatches();
     }
     if (rc.IsError() && rc.GetCode() != K_TRY_AGAIN && rc.GetCode() != K_NOT_READY) {
@@ -1531,6 +1539,64 @@ bool TopologyEngine::RequireMembershipRejoinOnce(const char *reason)
     return !rejoinAlreadyRequired;
 }
 
+void TopologyEngine::ClearMembershipCandidatesLocked()
+{
+    membershipView_.ClearWriteCandidates();
+    membershipWatchAuthority_.clear();
+    membershipWatchId_ = 0;
+}
+
+void TopologyEngine::ClearStaleMembershipCandidates()
+{
+    std::string authority;
+    int64_t watchId;
+    {
+        std::lock_guard<std::mutex> lock(membershipEventsMutex_);
+        authority = membershipWatchAuthority_;
+        watchId = membershipWatchId_;
+    }
+    auto *backend = static_cast<DsCoordinationBackend *>(memberBackend_.get());
+    if (watchId == 0 || backend->OwnsWatchIdentity(authority, watchId)) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(membershipEventsMutex_);
+    if (membershipWatchAuthority_ == authority && membershipWatchId_ == watchId) {
+        ClearMembershipCandidatesLocked();
+    }
+}
+
+Status TopologyEngine::ApplyCoordinatorMembershipEvent(const CoordinationEvent &event)
+{
+    auto *backend = static_cast<DsCoordinationBackend *>(memberBackend_.get());
+    CHECK_FAIL_RETURN_STATUS(backend->OwnsWatchIdentity(event.sourceAuthorityId, event.sourceWatchId),
+                             K_NOT_READY, "Membership event belongs to an expired watch");
+    const auto prefix = keys_->MembershipTable() + "/";
+    CHECK_FAIL_RETURN_STATUS(event.key.rfind(prefix, 0) == 0 && event.revision > 0, K_INVALID,
+                             "Membership event key or revision is invalid");
+    const auto address = event.key.substr(prefix.size());
+    std::string canonicalAddress;
+    RETURN_IF_NOT_OK(TopologyKeyHelper::MembershipKey(address, canonicalAddress));
+    CHECK_FAIL_RETURN_STATUS(address == canonicalAddress, K_INVALID, "Membership address is not canonical");
+    bool ready = false;
+    if (event.type == CoordinationEventType::PUT) {
+        MembershipValue value;
+        RETURN_IF_NOT_OK(MembershipValueCodec::Decode(event.value, value));
+        ready = value.lifecycleState == MemberLifecycleState::READY;
+    } else {
+        CHECK_FAIL_RETURN_STATUS(event.type == CoordinationEventType::DELETE, K_INVALID,
+                                 "Unsupported membership event");
+    }
+    return backend->CommitIfCurrentWatch(event.sourceAuthorityId, event.sourceWatchId, [&] {
+        std::lock_guard<std::mutex> lock(membershipEventsMutex_);
+        if (membershipWatchAuthority_ != event.sourceAuthorityId || membershipWatchId_ != event.sourceWatchId) {
+            ClearMembershipCandidatesLocked();
+            membershipWatchAuthority_ = event.sourceAuthorityId;
+            membershipWatchId_ = event.sourceWatchId;
+        }
+        return membershipView_.UpdateWriteCandidate(address, ready, event.revision);
+    });
+}
+
 Status TopologyEngine::HandleRuntimeEvent(RuntimeEvent event)
 {
     if (auto *completion = std::get_if<TopologyCallbackCompletion>(&event.payload)) {
@@ -1543,6 +1609,9 @@ Status TopologyEngine::HandleRuntimeEvent(RuntimeEvent event)
         return Status::OK();
     }
     const auto kind = keys_->ClassifyPhysicalKey(coordination.key, options_.localAddress);
+    if (coordinatorProxy_ != nullptr && coordination.type == CoordinationEventType::RESET) {
+        ClearStaleMembershipCandidates();
+    }
     if (coordinatorProxy_ != nullptr && coordination.type == CoordinationEventType::PUT
         && kind == TopologyPhysicalKeyKind::LOCAL_PROBE) {
         return HandleWorkerProbeEvent(coordination);
