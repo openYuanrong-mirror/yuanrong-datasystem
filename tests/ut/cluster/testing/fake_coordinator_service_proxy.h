@@ -126,6 +126,15 @@ public:
     Status Range(const std::string &key, const std::string &rangeEnd, std::vector<KeyValueEntry> &kvs,
                  int64_t &revision, int32_t, std::string *coordinatorId) override
     {
+        std::function<void(const std::string &)> entryInterceptor;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            entryInterceptor = rangeEntryInterceptor_;
+        }
+        // Runs outside mutex_ so a blocking test interceptor cannot deadlock other proxy calls.
+        if (entryInterceptor != nullptr) {
+            entryInterceptor(key);
+        }
         std::lock_guard<std::mutex> lock(mutex_);
         if (key == nextRangeFailureKey_ && nextRangeFailureCode_ != K_OK && rangeFailureCount_ > 0) {
             const auto failureCode = nextRangeFailureCode_;
@@ -278,6 +287,12 @@ public:
         nextPutStatus_ = std::move(status);
     }
 
+    void SetRangeEntryInterceptor(std::function<void(const std::string &key)> interceptor)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        rangeEntryInterceptor_ = std::move(interceptor);
+    }
+
     void BlockNextPut()
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -427,6 +442,7 @@ private:
     StatusCode nextRangeFailureCode_{ K_OK };
     uint32_t rangeFailureCount_{ 0 };
     Status nextPutStatus_{ Status::OK() };
+    std::function<void(const std::string &key)> rangeEntryInterceptor_;
     bool blockNextPut_{ false };
     bool putBlocked_{ false };
     bool releasePut_{ false };

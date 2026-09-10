@@ -52,10 +52,13 @@ public:
 
     static std::string BuildBusinessOperationId(TopologyCallbackPhase phase, const TopologyExecutionFence &fence);
 
+    /**
+     * @brief Derive the deterministic task id of one task; executors and tests rely on this stable derivation.
+     */
+    static std::string BuildTaskId(const TopologyTask &task);
+
 private:
     friend class TopologyTaskExecutor;
-
-    static std::string BuildTaskId(const TopologyTask &task);
 };
 
 }  // namespace datasystem::cluster
