@@ -121,7 +121,7 @@ private:
         const std::vector<std::string> &normalizedCandidates, std::chrono::steady_clock::time_point now);
     Status TryBuildStartPlan(RaftStartPlan &startPlan);
     Status TryBuildCommittedStartPlanLocked(const std::vector<std::string> &activePeers, RaftStartPlan &startPlan,
-                                            bool &decided) const;
+                                            bool &decided);
     Status TryBuildFreshStartPlanLocked(const std::vector<std::string> &activePeers,
                                         std::chrono::steady_clock::time_point now, RaftStartPlan &startPlan,
                                         bool &decided);
@@ -161,6 +161,7 @@ private:
     RaftBootstrapState bootstrapState_;
     Status bootstrapStatus_;
     bool bootstrapStopRequested_{ false };
+    bool missingLocalDataWarningLogged_{ false };
     size_t bootstrapRetryWaiters_{ 0 };
     size_t bootstrapProbeCursor_{ 0 };
     std::thread bootstrapThread_;

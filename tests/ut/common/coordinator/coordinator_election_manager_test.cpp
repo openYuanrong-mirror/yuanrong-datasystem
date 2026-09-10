@@ -582,7 +582,7 @@ TEST(CoordinatorElectionManagerTest, QuorumConfirmedCommittedConfigurationOverri
     }
 }
 
-TEST(CoordinatorElectionManagerTest, MissingDataWarningRequiresConfirmedExistingLocalMember)
+TEST(CoordinatorElectionManagerTest, MissingDataWarningRequiresReportedExistingLocalMember)
 {
     const std::vector<std::string> existingPeers{ kPeer2, kPeer3, kPeer4 };
     for (const bool includesLocalPeer : { false, true }) {
@@ -600,13 +600,42 @@ TEST(CoordinatorElectionManagerTest, MissingDataWarningRequiresConfirmedExisting
         const auto status = manager->TryBuildStartPlan(plan);
         const auto logs = testing::internal::GetCapturedStderr();
 
-        EXPECT_EQ(logs.find("COORDINATOR_RAFT_EXISTING_MEMBER_WITHOUT_LOCAL_DATA"), std::string::npos);
+        EXPECT_EQ(logs.find("COORDINATOR_RAFT_EXISTING_MEMBER_WITHOUT_LOCAL_DATA") != std::string::npos,
+                  includesLocalPeer);
         if (includesLocalPeer) {
             EXPECT_EQ(status.GetCode(), K_NOT_READY);
         } else {
             DS_ASSERT_OK(status);
             EXPECT_TRUE(std::holds_alternative<WaitingToJoinPlan>(plan));
         }
+    }
+}
+
+TEST(CoordinatorElectionManagerTest, MissingDataWarningWithoutQuorumIsOncePerStartup)
+{
+    const std::vector<std::string> peers{ kPeer1, kPeer2, kPeer3, kPeer4, kPeer5 };
+    for (const size_t activeCount : { 3, 4, 5 }) {
+        SCOPED_TRACE(activeCount);
+        auto state = std::make_shared<DependencyState>();
+        auto manager = MakeManager(state, peers.size());
+        SendObservation(*manager, MakeObservation(kPeer2, 5, {}, RAFT_BOOTSTRAP_STARTED, peers));
+        SendObservation(*manager, MakeObservation(kPeer3, 5, {}, RAFT_BOOTSTRAP_STARTED, peers));
+        for (size_t i = 3; i < activeCount; ++i) {
+            SendObservation(*manager, MakeObservation(peers[i], 5, { peers[i] }));
+        }
+        RaftStartPlan plan;
+        testing::internal::CaptureStderr();
+        const auto first = manager->TryBuildStartPlan(plan);
+        const auto retry = manager->TryBuildStartPlan(plan);
+        const auto logs = testing::internal::GetCapturedStderr();
+        EXPECT_EQ(first.GetCode(), K_NOT_READY);
+        EXPECT_EQ(retry.GetCode(), K_NOT_READY);
+        EXPECT_EQ(state->createNodeCalls, 0);
+        const std::string marker = "COORDINATOR_RAFT_EXISTING_MEMBER_WITHOUT_LOCAL_DATA";
+        const auto warning = logs.find(marker);
+        ASSERT_NE(warning, std::string::npos);
+        EXPECT_EQ(logs.find(marker, warning + marker.size()), std::string::npos);
+        EXPECT_NE(logs.find("confirmations=2 required_quorum=3"), std::string::npos);
     }
 }
 
