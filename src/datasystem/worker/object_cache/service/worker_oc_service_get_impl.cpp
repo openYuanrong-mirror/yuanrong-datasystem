@@ -2794,6 +2794,13 @@ void WorkerOcServiceGetImpl::AsyncUpdateSingleLocationFunc(UpdateLocationTask &&
             DeleteObjectsMetaUnacked({ { task.GetParams().front().objectKey, task.GetParams().front().version } });
             ClearObjectsByObjectKeys({ { task.GetParams().front().objectKey, task.GetParams().front().version } });
         }
+    } else if (rc.IsOk() && task.GetParams().front().version > 0 && rsp.version() == 0) {
+        // The master ignored the registration because the replica version is behind the current meta.
+        // The copy would never be registered, notified or invalidated again, so roll it back.
+        LOG(INFO) << FormatString("The pulled replica of objectKey(%s) is behind the current meta, roll it back.",
+                                  task.GetParams().front().objectKey);
+        DeleteObjectsMetaUnacked({ { task.GetParams().front().objectKey, task.GetParams().front().version } });
+        ClearObjectsByObjectKeys({ { task.GetParams().front().objectKey, task.GetParams().front().version } });
     } else if (rc.IsError()) {
         LOG(INFO) << "Update location info failed, the object key is " << task.GetParams().front().objectKey;
         DeleteObjectsMetaUnacked({ { task.GetParams().front().objectKey, task.GetParams().front().version } });

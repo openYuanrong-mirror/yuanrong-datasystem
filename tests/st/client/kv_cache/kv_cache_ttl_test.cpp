@@ -16,6 +16,8 @@
  */
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <chrono>
+#include <thread>
 
 #include "common.h"
 #include "datasystem/common/flags/common_flags.h"
@@ -391,6 +393,123 @@ TEST_F(KVClientL2CacheTest, TestWriteBackGetAfterDel)
     DS_ASSERT_OK(client0->Del(key));
     std::string outVal;
     DS_ASSERT_NOT_OK(client0->Get(key, outVal));
+}
+
+namespace {
+// Return true when the key is still readable via the given client.
+bool IsReadable(const std::shared_ptr<KVClient> &client, const std::string &key)
+{
+    std::string value;
+    return client->Get(key, value).IsOk();
+}
+}  // namespace
+
+// The buffer path (Create -> MemoryCopy -> Set) must honor the object ttl exactly like the
+// string Set path: local and remote readers lose the object after expiry.
+TEST_F(KVCacheTtlTest, CreateMemoryCopySetBufferTtl)
+{
+    const std::string key = "kv_ttl_buffer_k1";
+    const std::string value(64, 'a');
+    SetParam param{ .writeMode = WriteMode::NONE_L2_CACHE, .ttlSecond = 1 };
+
+    std::shared_ptr<Buffer> buf;
+    DS_ASSERT_OK(client1->Create(key, value.size(), param, buf));
+    DS_ASSERT_OK(buf->MemoryCopy(value.data(), value.size()));
+    DS_ASSERT_OK(client1->Set(buf));
+
+    std::string out;
+    EXPECT_EQ(client1->Get(key, out), Status::OK());
+    EXPECT_EQ(client2->Get(key, out), Status::OK());
+
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+    EXPECT_NE(client1->Get(key, out), Status::OK());
+    EXPECT_NE(client2->Get(key, out), Status::OK());
+}
+
+// Churn regression for the ttl orphan-replica leak: concurrent kvtest-style
+// Get-miss -> Create -> MemoryCopy -> Set loops over a key pool with a short ttl.
+// Re-created objects refresh their ttl while the load runs; after the load stops,
+// every key must expire for local and remote readers. While the master deletes a
+// generation, concurrent pulls on other workers must not leave a permanently
+// readable replica behind.
+class KVCacheTtlLoadTest : public KVCacheTtlTest {
+public:
+    int GetTestCaseTimeoutSecs() const override
+    {
+        return 180;
+    }
+};
+
+TEST_F(KVCacheTtlLoadTest, LEVEL1_CreateMemoryCopySetBufferTtlChurn)
+{
+    constexpr int kKeyNum = 16;
+    constexpr int kLoadSeconds = 12;
+    const std::string value(64, 'a');
+    SetParam param{ .writeMode = WriteMode::NONE_L2_CACHE, .ttlSecond = 1 };
+
+    std::vector<std::string> keys;
+    for (int i = 0; i < kKeyNum; ++i) {
+        keys.emplace_back("kv_ttl_churn_k" + std::to_string(i));
+    }
+
+    std::vector<std::shared_ptr<KVClient>> clients;
+    for (uint32_t i = 0; i < 3; ++i) {
+        std::shared_ptr<KVClient> client;
+        InitTestKVClient(i, client, 60000, false, 6000);
+        clients.push_back(client);
+    }
+
+    std::atomic<bool> stop{ false };
+    std::atomic<uint64_t> totalSets{ 0 };
+    auto loadFn = [&](const std::shared_ptr<KVClient> &client, int threadIdx) {
+        uint64_t sets = 0;
+        while (!stop.load(std::memory_order_acquire)) {
+            for (int i = 0; i < kKeyNum && !stop.load(std::memory_order_acquire); ++i) {
+                const std::string &key = keys[i];
+                std::string out;
+                if (client->Get(key, out).IsOk()) {
+                    continue;  // cache hit
+                }
+                std::shared_ptr<Buffer> buf;
+                if (client->Create(key, value.size(), param, buf).IsError()) {
+                    continue;  // ttl delete race, retry in the next round
+                }
+                (void)buf->MemoryCopy(value.data(), value.size());
+                if (client->Set(buf).IsError()) {
+                    continue;
+                }
+                ++sets;
+            }
+        }
+        totalSets.fetch_add(sets);
+        LOG(INFO) << "Churn load thread " << threadIdx << " finished: sets=" << sets;
+    };
+
+    std::vector<std::thread> threads;
+    for (size_t i = 0; i < clients.size(); ++i) {
+        threads.emplace_back(loadFn, clients[i], static_cast<int>(i));
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(kLoadSeconds));
+    stop.store(true, std::memory_order_release);
+    for (auto &t : threads) {
+        t.join();
+    }
+    ASSERT_GT(totalSets.load(), 0u) << "churn load must have published objects";
+
+    // After the load stops the last generation of every key must expire everywhere:
+    // no worker may keep a readable orphan replica.
+    DS_ASSERT_OK(cluster_->WaitForExpectedResult(
+        [&keys, &clients]() {
+            for (const auto &key : keys) {
+                for (const auto &client : clients) {
+                    if (IsReadable(client, key)) {
+                        return Status(K_NOT_READY, "expired object is still readable: " + key);
+                    }
+                }
+            }
+            return Status::OK();
+        },
+        30, K_OK));
 }
 }  // namespace st
 }  // namespace datasystem

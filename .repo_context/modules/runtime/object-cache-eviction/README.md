@@ -352,6 +352,11 @@
   - eviction `RemoveMeta`、primary end-life `DeleteAllCopyMeta` 和同步 fallback 都只允许初始 metadata
     owner 重定向一次；转发请求使用 `redirect=false`，目标若仍返回 redirect、`meta_is_moving` 或 failed
     ids，则相关对象保留重试资格，不继续递归转发。
+  - TTL 删除窗口（`ExpiredObjectManager` readyExpiredObjects，pop→cleanup）内 master 必须拒绝
+    `CreateCopyMeta`/`CreateMultiCopyMeta` 的副本注册，并把版本落后于当前 meta 的注册按 failed 返回；
+    worker 侧 `AsyncUpdate*LocationFunc` 对这些失败回滚刚 dump 的本地副本（`DeleteObjectsMetaUnacked` +
+    `ClearObjectsByObjectKeys`）。否则该副本会比 meta 活得久且永远收不到失效/删除通知，经 worker 本地读
+    路径（`RLockGetObjectFromMem` 不查 master、不查 TTL）永久可读。
 - Observability or debugging hooks:
   - Logs: `Eviction start`, `Evict is going on`, `EvictionList size before/after evict`, `Spill eviction list size before/after evict`。
   - Worker primary end-life 使用 `PRIMARY_END_LIFE_DIAG` 标记 `eviction_summary`、`dequeue`、`route_group`、
