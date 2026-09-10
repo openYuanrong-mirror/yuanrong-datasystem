@@ -60,6 +60,8 @@ enum class ObjectFlag : uint16_t {
     HETERO = 1u << 8,
     IS_EMPTY = 1u << 9,
     IS_INCOMPLETE = 1u << 10,
+    MIGRATION_UNCONFIRMED = 1u << 11,
+    MIGRATION_EXPIRED = 1u << 12,
 };
 
 enum class ModeFlag : uint16_t {
@@ -141,6 +143,21 @@ public:
         return TESTFLAG(stateBitmap_, ObjectFlag::NEED_TO_DELETE);
     }
 
+    bool IsMigrationUnconfirmed() const
+    {
+        return TESTFLAG(stateBitmap_, ObjectFlag::MIGRATION_UNCONFIRMED);
+    }
+
+    bool IsMigrationExpired() const
+    {
+        return TESTFLAG(stateBitmap_, ObjectFlag::MIGRATION_EXPIRED);
+    }
+
+    bool IsEligibleForDeferredGetCleanup() const
+    {
+        return IsNeedToDelete() && !IsMigrationUnconfirmed() && !IsMigrationExpired();
+    }
+
     /**
      * @brief getter function to get the data format of the object.
      * @return the data format of the object.
@@ -181,6 +198,8 @@ public:
 
         if (primaryCopy) {
             SETFLAG(stateBitmap_, ObjectFlag::PRIMARY_COPY);
+            CLEARFLAG(stateBitmap_, ObjectFlag::MIGRATION_UNCONFIRMED);
+            CLEARFLAG(stateBitmap_, ObjectFlag::MIGRATION_EXPIRED);
         }
     }
 
@@ -220,6 +239,25 @@ public:
 
         if (needToDelete) {
             SETFLAG(stateBitmap_, ObjectFlag::NEED_TO_DELETE);
+        }
+    }
+
+    void SetMigrationUnconfirmed(bool migrationUnconfirmed)
+    {
+        CLEARFLAG(stateBitmap_, ObjectFlag::MIGRATION_UNCONFIRMED);
+        if (migrationUnconfirmed) {
+            SETFLAG(stateBitmap_, ObjectFlag::MIGRATION_UNCONFIRMED);
+            CLEARFLAG(stateBitmap_, ObjectFlag::MIGRATION_EXPIRED);
+        }
+    }
+
+    void SetMigrationExpired(bool migrationExpired)
+    {
+        CLEARFLAG(stateBitmap_, ObjectFlag::MIGRATION_EXPIRED);
+        if (migrationExpired) {
+            SETFLAG(stateBitmap_, ObjectFlag::MIGRATION_EXPIRED);
+            CLEARFLAG(stateBitmap_, ObjectFlag::MIGRATION_UNCONFIRMED);
+            CLEARFLAG(stateBitmap_, ObjectFlag::PRIMARY_COPY);
         }
     }
 

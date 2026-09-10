@@ -465,6 +465,12 @@ bool MetaDataRecoveryManager::FillRecoveredMeta(const std::string &objectKey, Ob
     if ((*currSafeObj)->IsBinary() && (*currSafeObj)->IsInvalid()) {
         return false;
     }
+    if ((*currSafeObj)->stateInfo.IsMigrationExpired()) {
+        return false;
+    }
+    if ((*currSafeObj)->stateInfo.IsMigrationUnconfirmed() && !(*currSafeObj)->HasCompleteUnconfirmedPayload()) {
+        return false;
+    }
 
     metadata.set_object_key(objectKey);
     metadata.set_data_size((*currSafeObj)->GetDataSize());
@@ -478,8 +484,10 @@ bool MetaDataRecoveryManager::FillRecoveredMeta(const std::string &objectKey, Ob
     configPb->set_data_format(static_cast<uint32_t>((*currSafeObj)->stateInfo.GetDataFormat()));
     configPb->set_consistency_type(static_cast<uint32_t>((*currSafeObj)->modeInfo.GetConsistencyType()));
     configPb->set_cache_type(static_cast<uint32_t>((*currSafeObj)->modeInfo.GetCacheType()));
-    configPb->set_is_replica(!(*currSafeObj)->stateInfo.IsPrimaryCopy());
-    if ((*currSafeObj)->stateInfo.IsPrimaryCopy()) {
+    const bool recoverAsPrimary = (*currSafeObj)->stateInfo.IsPrimaryCopy()
+                                  || (*currSafeObj)->stateInfo.IsMigrationUnconfirmed();
+    configPb->set_is_replica(!recoverAsPrimary);
+    if (recoverAsPrimary) {
         metadata.set_primary_address(localAddress_.ToString());
     } else if (!(*currSafeObj)->GetAddress().empty()) {
         metadata.set_primary_address((*currSafeObj)->GetAddress());

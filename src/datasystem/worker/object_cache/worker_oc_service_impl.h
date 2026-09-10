@@ -963,6 +963,8 @@ public:
     Status NotifyRemoteGet(const NotifyRemoteGetReqPb &req, NotifyRemoteGetRspPb &rsp);
 
 private:
+    enum class DeleteEligibility { UNCONDITIONAL, DEFERRED_GET_CLEANUP };
+
     Status InitThreadResources();
     Status InitRecoveryServices();
     Status VerifyClientWriteAdmission(bool isRouted);
@@ -1193,9 +1195,11 @@ private:
      * @brief Delete object if memory ref count is 0, otherwise set buffer invalid.
      * @param[in] objectKey The object key.
      * @param[in] version The version of the object.
+     * @param[in] eligibility Select unconditional deletion or deferred Get cleanup eligibility.
      * @return Status of the call
      */
-    Status DeleteObject(const std::string &objectKey, uint64_t version = 0);
+    Status DeleteObject(const std::string &objectKey, uint64_t version = 0,
+                        DeleteEligibility eligibility = DeleteEligibility::UNCONDITIONAL);
 
     /**
      * @brief Create or update metadata to master, object will be unlocked during requesting master.

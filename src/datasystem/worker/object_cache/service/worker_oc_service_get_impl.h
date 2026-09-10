@@ -1099,6 +1099,7 @@ private:
 
     struct NotifyRemoteGetProcessContext {
         std::unordered_map<std::string, std::list<std::pair<std::list<GetObjectInfo>, uint64_t>>> &groups;
+        const std::vector<std::string> &reusedPayloadIds;
         std::map<ReadKey, LockedEntity> &lockedEntries;
         NotifyRemoteGetRspPb &response;
         std::set<ReadKey> &pendingObjects;
@@ -1110,6 +1111,28 @@ private:
         bool isSpill{ false };
     };
 
+    struct ReplacePrimaryOutcome {
+        std::unordered_set<std::string> confirmedIds;
+        std::unordered_set<std::string> expiredIds;
+        std::unordered_set<std::string> failedIds;
+    };
+
+    using MigratedObjectIdentities = std::unordered_map<std::string, const ObjectInterface *>;
+
+    MigratedObjectIdentities PrepareMigratedObjectFinalization(const std::vector<std::string> &successIds,
+                                                               std::map<ReadKey, LockedEntity> &lockedEntries,
+                                                               bool isSpill);
+    static void LogNotifyRemoteGetPullResult(const std::vector<std::string> &successIds, size_t metadataCount,
+                                             const Status &lastStatus);
+
+    Status FetchNotifyRemoteGetGroup(const std::string &address,
+                                     std::list<std::pair<std::list<GetObjectInfo>, uint64_t>> &infoList,
+                                     BatchGetObjectOutput output);
+    void PrepareNotifyRemoteGetGroups(const NotifyRemoteGetReqPb &req, const std::set<ReadKey> &pendingObjects,
+                                      std::map<ReadKey, LockedEntity> &lockedEntries, QueryMetaMap &queryMetas,
+                                      std::unordered_map<std::string,
+                                          std::list<std::pair<std::list<GetObjectInfo>, uint64_t>>> &groups,
+                                      std::vector<std::string> &reusedPayloadIds);
     Status ProcessRemoteGetInNotificationImpl(NotifyRemoteGetProcessContext &context);
 
     void AttachNotifyRemoteGetUbFailure(const std::unordered_map<std::string, uint64_t> &epochsBefore,
@@ -1135,11 +1158,14 @@ private:
 
     void ClearNeedDeleteForMigratedObjects(const std::vector<std::string> &successIds,
                                            std::map<ReadKey, LockedEntity> &lockedEntries,
-                                           bool isSpill);
+                                           const MigratedObjectIdentities &objectIdentities,
+                                           const QueryMetaMap &queryMetas, bool isSpill);
 
     void CollectUnconfirmedVersions(const std::unordered_set<std::string> &unconfirmedIds,
                                     std::map<ReadKey, LockedEntity> &lockedEntries,
                                     std::map<std::string, uint64_t> &unconfirmedObjectVersions);
+
+    static bool CanReuseUnconfirmedMigrationPayload(const ObjectMetaPb &meta, const LockedEntity &entry, bool isSpill);
 
     void ConfirmCopyMetaForNotifyRemoteGet(const std::vector<std::string> &dataSuccessIds,
                                            const QueryMetaMap &queryMetas, std::vector<std::string> &confirmedIds,
@@ -1151,24 +1177,22 @@ private:
     // master metadata is never updated during NotifyRemoteGet migration. Call
     // ReplacePrimary to switch master's primary to the target so Get requests route
     // to the target after the source releases its data. Without this, data is lost.
-    void ReplacePrimaryForNotifyRemoteGet(const std::vector<std::string> &successIds,
-                                          const QueryMetaMap &queryMetas, NotifyRemoteGetRspPb &rsp);
+    ReplacePrimaryOutcome ReplacePrimaryForNotifyRemoteGet(const std::vector<std::string> &successIds,
+                                                           const QueryMetaMap &queryMetas, NotifyRemoteGetRspPb &rsp);
 
     // When enable_data_replication=false, call ReplacePrimary to switch master's primary
-    // to the target, then remove failed objects from successIds so their needDelete is not
-    // cleared (target can reclaim orphan copies).
-    void ReplacePrimaryAndPruneFailed(std::vector<std::string> &successIds,
-                                      const QueryMetaMap &queryMetas, NotifyRemoteGetRspPb &rsp,
-                                      bool isSpill);
+    // to the target. Failed objects retain needDelete and are marked for topology cleanup protection.
+    void ReplacePrimaryAndPruneFailed(std::vector<std::string> &successIds, const QueryMetaMap &queryMetas,
+                                      NotifyRemoteGetRspPb &rsp, std::map<ReadKey, LockedEntity> &lockedEntries,
+                                      const MigratedObjectIdentities &objectIdentities, bool isSpill);
 
     master::ReplacePrimaryReqPb BuildReplacePrimaryReq(const std::vector<std::string> &objectKeys,
-                                                      const std::string &sourceAddr,
-                                                      const QueryMetaMap &queryMetas);
+                                                       const std::string &sourceAddr,
+                                                       const QueryMetaMap &queryMetas, bool allowRedirect);
 
-    void ReplacePrimaryForMasterGroup(const HostPort &masterAddr,
-                                      const std::vector<std::string> &objectKeys,
-                                      const std::string &sourceAddr,
-                                      const QueryMetaMap &queryMetas, NotifyRemoteGetRspPb &rsp);
+    void ReplacePrimaryForMasterGroup(const HostPort &masterAddr, const std::vector<std::string> &objectKeys,
+                                      const std::string &sourceAddr, const QueryMetaMap &queryMetas,
+                                      ReplacePrimaryOutcome &outcome, bool allowRedirect);
 
     bool ClassifyCopyMetaConfirmationResult(const master::CreateMultiCopyMetaRspPb &rsp, const Status &status,
                                             const std::vector<std::string> &objectKeys,

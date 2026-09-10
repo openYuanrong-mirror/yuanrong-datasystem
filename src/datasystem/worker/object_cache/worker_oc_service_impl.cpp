@@ -483,8 +483,9 @@ Status WorkerOCServiceImpl::Init()
     RETURN_IF_NOT_OK(InitThreadResources());
     RETURN_IF_NOT_OK(evictionManager_->Init(globalRefTable_, akSkManager_));
     RETURN_IF_NOT_OK(InitL2Cache());
-    WorkerRequestManager::SetDeleteObjectsFunc(
-        [this](const std::string &objectKey, uint64_t version) -> Status { return DeleteObject(objectKey, version); });
+    WorkerRequestManager::SetDeleteObjectsFunc([this](const std::string &objectKey, uint64_t version) -> Status {
+        return DeleteObject(objectKey, version, DeleteEligibility::DEFERRED_GET_CLEANUP);
+    });
     workerDevOcManager_ = std::make_shared<WorkerDeviceOcManager>(this);
     lastReconTime_ = GetSteadyClockTimeStampMs();  // Record current timestamp in case we need reconciliation.
     RETURN_IF_NOT_OK(StartDecreaseReferenceProcess());
@@ -2328,18 +2329,25 @@ Status WorkerOCServiceImpl::RecoveryClient(const ClientKey &clientId, const std:
     return Status::OK();
 }
 
-Status WorkerOCServiceImpl::DeleteObject(const std::string &objectKey, uint64_t version)
+Status WorkerOCServiceImpl::DeleteObject(const std::string &objectKey, uint64_t version, DeleteEligibility eligibility)
 {
     std::shared_ptr<SafeObjType> entry;
     RETURN_IF_NOT_OK(objectTable_->Get(objectKey, entry));
     ObjectKV objectKV(objectKey, *entry);
-    auto func = [this, &objectKV, version] {
+    auto func = [this, &objectKV, version, eligibility] {
         uint64_t currentVersion = objectKV.GetObjEntry()->GetCreateTime();
         if (version > 0 && version != currentVersion) {
             LOG(WARNING) << FormatString(
                 "[ObjectKey %s] version not match, try delete version is %zu but current version is %zu, skip "
                 "delete",
                 objectKV.GetObjKey(), version, currentVersion);
+            return Status::OK();
+        }
+        const auto &state = objectKV.GetObjEntry()->stateInfo;
+        // A queued Get cleanup can outlive migration confirmation without a version change.
+        if (eligibility == DeleteEligibility::DEFERRED_GET_CLEANUP && !state.IsEligibleForDeferredGetCleanup()) {
+            VLOG(1) << "[ObjectKey " << objectKV.GetObjKey() << "] Skip obsolete Get cleanup, version: "
+                    << currentVersion;
             return Status::OK();
         }
         return deleteProc_->ClearObject(objectKV);

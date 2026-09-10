@@ -49,6 +49,7 @@ constexpr uint64_t CLEAR_OBJECT_RETRY_INTERVAL_MS = 200;
 constexpr int CLEAR_DATA_THREAD_NUM = 1;
 constexpr size_t CHECK_OBJECT_DATA_LOCATION_BATCH = 500;
 constexpr size_t GET_MASTER_ERROR_SAMPLE_LIMIT = 3;
+constexpr uint32_t MIGRATION_RECOVERY_LOG_EVERY_N = 100;
 const std::string WORKER_OC_SERVICE_CLEAR_DATA_FLOW = "WorkerOcServiceClearDataFlow";
 
 void InsertFailedIds(const std::vector<std::string> &objectKeys, std::unordered_set<std::string> &failedIds)
@@ -192,7 +193,7 @@ void WorkerOcServiceClearDataFlow::SubmitOwnedTopologyCleanup(OwnedTopologyClear
             return;
         }
         ClearDataRetryIds retryIds;
-        ClearMatchedObjects(request.objectIds, retryIds);
+        ClearTopologyFailureMatchedObjects(request.objectIds, retryIds);
         RebuildRefForMatchedObjects(request.objectIds, retryIds);
         if (!retryIds.Empty()) {
             LOG(WARNING) << "Topology cleanup needs retry, operation: " << request.businessOperationId
@@ -308,12 +309,16 @@ void WorkerOcServiceClearDataFlow::ClearDataRetryImpl(const ClearDataReqPb &req,
                                                       ClearDataRetryIds &nextRetryIds)
 {
     LOG(INFO) << "retry clear data without meta in worker, clear failed object size: "
-              << retryIds.clearFailedIds.size() << ", increase failed object size: "
+              << retryIds.clearFailedIds.size() << ", topology check failed object size: "
+              << retryIds.topologyCheckFailedIds.size() << ", increase failed object size: "
               << retryIds.increaseFailedIds.size() << ", recover app ref failed object size: "
               << retryIds.recoverAppRefFailedIds.size();
     std::vector<std::string> retryClearObjectKeys{ retryIds.clearFailedIds.begin(), retryIds.clearFailedIds.end() };
     (void)req;
     ClearMatchedObjects(retryClearObjectKeys, nextRetryIds);
+    std::vector<std::string> retryTopologyCheckKeys{ retryIds.topologyCheckFailedIds.begin(),
+                                                    retryIds.topologyCheckFailedIds.end() };
+    ClearTopologyFailureMatchedObjects(retryTopologyCheckKeys, nextRetryIds);
     std::vector<std::string> retryIncreaseObjectKeys{ retryIds.increaseFailedIds.begin(),
                                                       retryIds.increaseFailedIds.end() };
     RetryIncreaseMasterRef(retryIncreaseObjectKeys, nextRetryIds);
@@ -340,6 +345,9 @@ void WorkerOcServiceClearDataFlow::FillCheckObjectDataLocationReq(
             continue;
         }
         Raii unLockRaii([&currSafeObj]() { currSafeObj->RUnlock(); });
+        if (currSafeObj->Get() == nullptr) {
+            continue;
+        }
         auto *objectVersion = req.add_object_versions();
         objectVersion->set_object_key(objectKey);
         objectVersion->set_version((*currSafeObj)->GetCreateTime());
@@ -395,6 +403,123 @@ void WorkerOcServiceClearDataFlow::ClearMatchedObjects(const std::vector<std::st
     FilterObjectsNeedClearByMaster(matchObjIds, needClearObjIds, retryIds.clearFailedIds);
     ClearNeedClearObjects(needClearObjIds);
     LOG(INFO) << "clear data without meta in worker finished";
+}
+
+void WorkerOcServiceClearDataFlow::ClearTopologyFailureMatchedObjects(const std::vector<std::string> &matchObjIds,
+                                                                      ClearDataRetryIds &retryIds)
+{
+    for (size_t start = 0; start < matchObjIds.size(); start += CHECK_OBJECT_DATA_LOCATION_BATCH) {
+        const auto end = std::min(start + CHECK_OBJECT_DATA_LOCATION_BATCH, matchObjIds.size());
+        std::vector<std::string> batch(matchObjIds.begin() + start, matchObjIds.begin() + end);
+        std::vector<std::string> ordinaryClearIds;
+        std::vector<std::string> unconfirmedMigrationIds;
+        TopologyCleanupSnapshots ordinarySnapshots;
+        PartitionTopologyCleanupObjects(batch, ordinaryClearIds, unconfirmedMigrationIds, ordinarySnapshots);
+        std::vector<std::string> needClearIds;
+        FilterObjectsNeedClearByMaster(ordinaryClearIds, needClearIds, retryIds.topologyCheckFailedIds);
+        if (FLAGS_enable_metadata_recovery) {
+            auto recovery = metadataRecoveryManager_->RecoverMetadataWithSummary(needClearIds, "");
+            if (recovery.status.IsError()) {
+                LOG(ERROR) << "RecoverMetadataWithSummary failed, status: " << recovery.status.ToString();
+            }
+            ClearTopologyObjects(recovery.failedIds, ordinarySnapshots);
+        } else {
+            ClearTopologyObjects(needClearIds, ordinarySnapshots);
+        }
+        RecoverUnconfirmedMigrationObjects(unconfirmedMigrationIds, retryIds.topologyCheckFailedIds);
+    }
+}
+
+void WorkerOcServiceClearDataFlow::PartitionTopologyCleanupObjects(
+    const std::vector<std::string> &objectKeys, std::vector<std::string> &ordinaryClearIds,
+    std::vector<std::string> &unconfirmedMigrationIds,
+    TopologyCleanupSnapshots &ordinarySnapshots)
+{
+    ordinaryClearIds.reserve(objectKeys.size());
+    unconfirmedMigrationIds.reserve(objectKeys.size());
+    ordinarySnapshots.reserve(objectKeys.size());
+    for (const auto &objectKey : objectKeys) {
+        std::shared_ptr<SafeObjType> entry;
+        if (objectTable_->Get(objectKey, entry).IsError()) {
+            continue;
+        }
+        auto status = entry->RLock();
+        if (status.IsError()) {
+            LOG(WARNING) << FormatString("[ObjectKey %s] Lock object for topology cleanup failed: %s", objectKey,
+                                         status.ToString());
+            continue;
+        }
+        {
+            Raii unlock([&entry]() { entry->RUnlock(); });
+            if (entry->Get() == nullptr) {
+                continue;
+            }
+            if ((*entry)->HasCompleteUnconfirmedPayload()) {
+                unconfirmedMigrationIds.emplace_back(objectKey);
+                continue;
+            }
+            ordinarySnapshots.emplace(
+                objectKey,
+                TopologyCleanupSnapshot{ entry, entry->Get(), (*entry)->GetShmUnit(), (*entry)->GetCreateTime(),
+                                         (*entry)->stateInfo.IsPrimaryCopy(), (*entry)->stateInfo.IsNeedToDelete(),
+                                         (*entry)->stateInfo.IsMigrationExpired() });
+        }
+        ordinaryClearIds.emplace_back(objectKey);
+    }
+    if (!unconfirmedMigrationIds.empty()) {
+        LOG_FIRST_AND_EVERY_N(WARNING, MIGRATION_RECOVERY_LOG_EVERY_N)
+            << "Partition complete unconfirmed migration payloads during topology cleanup, object size: "
+            << unconfirmedMigrationIds.size();
+    }
+}
+
+void WorkerOcServiceClearDataFlow::RecoverUnconfirmedMigrationObjects(const std::vector<std::string> &objectKeys,
+                                                                      std::unordered_set<std::string> &failedIds)
+{
+    if (objectKeys.empty() || metadataRecoveryManager_ == nullptr || !FLAGS_enable_metadata_recovery) {
+        return;
+    }
+    auto recovery = metadataRecoveryManager_->RecoverMetadataWithSummary(objectKeys, "");
+    failedIds.insert(recovery.failedIds.begin(), recovery.failedIds.end());
+    if (recovery.status.IsError() || !recovery.failedIds.empty()) {
+        const auto sampleEnd =
+            recovery.failedIds.begin() + std::min(recovery.failedIds.size(), GET_MASTER_ERROR_SAMPLE_LIMIT);
+        const std::vector<std::string> failedSamples(recovery.failedIds.begin(), sampleEnd);
+        LOG(ERROR) << "Recover unconfirmed migration metadata: requested=" << objectKeys.size()
+                   << ", failed=" << recovery.failedIds.size() << ", failedSamples=[" << VectorToString(failedSamples)
+                   << "], status=" << recovery.status.ToString();
+    }
+}
+
+void WorkerOcServiceClearDataFlow::ClearTopologyObjects(
+    const std::vector<std::string> &objectKeys, const TopologyCleanupSnapshots &checkedSnapshots)
+{
+    for (const auto &objectKey : objectKeys) {
+        auto checked = checkedSnapshots.find(objectKey);
+        if (checked == checkedSnapshots.end()) {
+            continue;
+        }
+        const auto &entry = checked->second.entry;
+        auto status = entry->WLock();
+        if (status.IsError()) {
+            LOG(WARNING) << FormatString("[ObjectKey %s] Lock object for final topology cleanup failed: %s", objectKey,
+                                         status.ToString());
+            continue;
+        }
+        Raii unlock([&entry]() { entry->WUnlock(); });
+        const auto &snapshot = checked->second;
+        auto *object = entry->Get();
+        if (object == nullptr || object->HasCompleteUnconfirmedPayload() || object != snapshot.objectIdentity
+            || object->GetShmUnit() != snapshot.shmUnit || object->GetCreateTime() != snapshot.version
+            || object->stateInfo.IsPrimaryCopy() != snapshot.primary
+            || object->stateInfo.IsNeedToDelete() != snapshot.needDelete
+            || object->stateInfo.IsMigrationExpired() != snapshot.migrationExpired) {
+            continue;
+        }
+        ObjectKV objectKV(objectKey, *entry);
+        LOG_IF_ERROR(deleteProc_->ClearObject(objectKV),
+                     FormatString("Failed to erase object %s from object table", objectKey));
+    }
 }
 
 void WorkerOcServiceClearDataFlow::ClearObject(const std::vector<std::string> &objectKeys)

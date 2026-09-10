@@ -22,6 +22,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -48,17 +49,20 @@ public:
      */
     struct ClearDataRetryIds {
         std::unordered_set<std::string> clearFailedIds;
+        std::unordered_set<std::string> topologyCheckFailedIds;
         std::unordered_set<std::string> increaseFailedIds;
         std::unordered_set<std::string> recoverAppRefFailedIds;
 
         bool Empty() const
         {
-            return clearFailedIds.empty() && increaseFailedIds.empty() && recoverAppRefFailedIds.empty();
+            return clearFailedIds.empty() && topologyCheckFailedIds.empty() && increaseFailedIds.empty()
+                   && recoverAppRefFailedIds.empty();
         }
 
         size_t Size() const
         {
-            return clearFailedIds.size() + increaseFailedIds.size() + recoverAppRefFailedIds.size();
+            return clearFailedIds.size() + topologyCheckFailedIds.size() + increaseFailedIds.size()
+                   + recoverAppRefFailedIds.size();
         }
     };
 
@@ -136,6 +140,17 @@ private:
         std::vector<std::string> objectIds;
     };
 
+    struct TopologyCleanupSnapshot {
+        std::shared_ptr<SafeObjType> entry;
+        const ObjectInterface *objectIdentity;
+        std::shared_ptr<ShmUnit> shmUnit;
+        uint64_t version;
+        bool primary;
+        bool needDelete;
+        bool migrationExpired;
+    };
+    using TopologyCleanupSnapshots = std::unordered_map<std::string, TopologyCleanupSnapshot>;
+
     /**
      * @brief Submit callback-independent topology cleanup input to the existing retry workflow.
      * @param[in] request Owned cleanup facts that remain valid after the topology callback returns.
@@ -206,10 +221,9 @@ private:
      * @param[out] needClearObjectKeys Object ids that still need local cleanup.
      * @param[out] failedIds Object ids whose master-side check failed.
      */
-    void CheckNeedClearObjectsByMasterInBatches(const std::shared_ptr<worker::WorkerMasterOCApi> &workerMasterApi,
-                                                const std::vector<std::string> &objectKeys,
-                                                std::vector<std::string> &needClearObjectKeys,
-                                                std::unordered_set<std::string> &failedIds) const;
+    void CheckNeedClearObjectsByMasterInBatches(
+        const std::shared_ptr<worker::WorkerMasterOCApi> &workerMasterApi, const std::vector<std::string> &objectKeys,
+        std::vector<std::string> &needClearObjectKeys, std::unordered_set<std::string> &failedIds) const;
 
     /**
      * @brief Ask masters which matched objects still need local cleanup.
@@ -227,6 +241,23 @@ private:
      * @param[out] retryIds Failed object ids for later clear retries.
      */
     void ClearMatchedObjects(const std::vector<std::string> &matchObjIds, ClearDataRetryIds &retryIds);
+
+    /**
+     * @brief Clear ordinary stale copies while preserving unconfirmed migration payloads.
+     */
+    void ClearTopologyFailureMatchedObjects(const std::vector<std::string> &matchObjIds,
+                                            ClearDataRetryIds &retryIds);
+
+    void PartitionTopologyCleanupObjects(const std::vector<std::string> &objectKeys,
+                                         std::vector<std::string> &ordinaryClearIds,
+                                         std::vector<std::string> &unconfirmedMigrationIds,
+                                         TopologyCleanupSnapshots &ordinarySnapshots);
+
+    void RecoverUnconfirmedMigrationObjects(const std::vector<std::string> &objectKeys,
+                                            std::unordered_set<std::string> &failedIds);
+
+    void ClearTopologyObjects(const std::vector<std::string> &objectKeys,
+                              const TopologyCleanupSnapshots &checkedSnapshots);
 
     /**
      * @brief Keep only objects that still have local ref state and need ref rebuild.

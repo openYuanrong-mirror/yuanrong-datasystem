@@ -345,6 +345,16 @@ struct ObjectInterface {
         return GetShmUnit() != nullptr && !stateInfo.IsIncomplete();
     }
 
+    bool HasCompleteMigrationPayload() const
+    {
+        return IsBinary() && !stateInfo.IsCacheInvalid() && IsShmUnitExistsAndComplete();
+    }
+
+    bool HasCompleteUnconfirmedPayload() const
+    {
+        return stateInfo.IsMigrationUnconfirmed() && HasCompleteMigrationPayload();
+    }
+
     #ifdef BUILD_HETERO
     virtual void SetRemoteHostInfo(const std::string &clientCommId,
                                    const std::shared_ptr<RemoteH2DHostInfoPb> &remoteH2DHostInfo)
