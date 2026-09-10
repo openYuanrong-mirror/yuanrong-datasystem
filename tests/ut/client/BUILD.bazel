@@ -20,6 +20,14 @@ ds_cc_test(
 )
 
 ds_cc_test(
+    name = "discovery_backoff_test",
+    srcs = ["discovery_backoff_test.cpp"],
+    deps = [
+        "//src/datasystem/client/object_cache:object_client",
+    ],
+)
+
+ds_cc_test(
     name = "urma_runtime_policy_test",
     srcs = ["urma_runtime_policy_test.cpp"],
     deps = [

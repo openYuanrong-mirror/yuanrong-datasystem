@@ -120,7 +120,8 @@ private:
     CandidateRoundResult TryCandidates(std::deque<std::string> candidates, const RpcCall &rpc, TimePoint deadline,
                                        std::chrono::milliseconds maxRpcTimeout,
                                        std::chrono::milliseconds retryInterval, bool recoveryControl,
-                                       Status &lastStatus, bool &hasCoordinatorResponse);
+                                       std::unordered_set<std::string> &attempted, Status &lastStatus,
+                                       bool &hasCoordinatorResponse);
     CandidateAttemptResult TryCandidate(const std::string &address, const RpcCall &rpc, TimePoint deadline,
                                         std::chrono::milliseconds maxRpcTimeout,
                                         std::chrono::milliseconds retryInterval, bool recoveryControl,

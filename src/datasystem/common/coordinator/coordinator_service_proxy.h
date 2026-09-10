@@ -43,6 +43,9 @@ class RpcOptions;
 using CoordinatorLeaderIdentity = CoordinatorLeaderRouter::LeaderIdentity;
 
 constexpr int32_t DEFAULT_COORDINATOR_RPC_TIMEOUT_MS = 3'000;
+// Routing budget for idempotent read-only polling RPCs (worker discovery); passed as the RPC
+// timeout so the router deadline matches. Lifecycle operations (Put/CAS/KeepAlive/Watch) keep 3000ms.
+constexpr int32_t READ_ONLY_ROUTE_BUDGET_MS = 1'000;
 
 class ICoordinatorServiceProxy {
 public:

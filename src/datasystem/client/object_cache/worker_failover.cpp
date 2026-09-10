@@ -20,6 +20,7 @@
 #include "datasystem/client/object_cache/worker_failover.h"
 
 #include <algorithm>
+#include <chrono>
 #include <random>
 
 #include <bthread/mutex.h>
@@ -557,6 +558,7 @@ void WorkerFailover::GetStandbyWorkersForSwitch(const std::shared_ptr<IClientWor
                          << rc.ToString();
             others = currentApi->GetStandbyWorkers();
         } else {
+            MarkDiscoveryRecovered();
             const HostPort &selfAddr = currentApi->hostPort_;
             auto append = [&selfAddr](const std::vector<std::string> &addrs, std::vector<HostPort> &out) {
                 for (const auto &addr : addrs) {
@@ -824,10 +826,35 @@ bool WorkerFailover::TrySwitchBackToLocalWorker()
     }
 }
 
+bool WorkerFailover::IsCoordinatorReachabilityFailure(const Status &status) const
+{
+    switch (status.GetCode()) {
+        case K_RPC_UNAVAILABLE:
+        case K_RPC_DEADLINE_EXCEEDED:
+        case K_RPC_PEER_DEAD:
+            return true;
+        default:
+            return false;
+    }
+}
+
+void WorkerFailover::MarkDiscoveryRecovered() const
+{
+    if (discoveryBackoff_.OnSuccess()) {
+        LOG(INFO) << "[Switch] Discovery recovered, backoff reset";
+    }
+}
+
 bool WorkerFailover::GetPreferredLocalWorkerToRecover(WorkerNode &oldNode, HostPort &localAddress,
                                                       HeartbeatType &heartbeatType)
 {
     if (owner_.serviceDiscovery_ == nullptr || !owner_.serviceDiscovery_->HasHostAffinity()) {
+        return false;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (discoveryBackoff_.IsBlocked(now)) {
+        constexpr int logIntervalS = 10;
+        LOG_EVERY_T(INFO, logIntervalS) << "[Switch] Discovery probe deferred by coordinator backoff";
         return false;
     }
 
@@ -850,8 +877,16 @@ bool WorkerFailover::GetPreferredLocalWorkerToRecover(WorkerNode &oldNode, HostP
     if (rc.IsError()) {
         constexpr int times = 10;
         LOG_EVERY_T(INFO, times) << "[Switch] Same-node worker is not ready yet: " << rc.ToString();
+        if (IsCoordinatorReachabilityFailure(rc)) {
+            const int32_t backoffMs = discoveryBackoff_.OnFailure(std::chrono::steady_clock::now());
+            LOG(INFO) << "[Switch] Discovery unreachable, back off " << backoffMs
+                      << "ms before next heartbeat probe";
+        } else {
+            MarkDiscoveryRecovered();
+        }
         return false;
     }
+    MarkDiscoveryRecovered();
     localAddress = HostPort(workerIp, workerPort);
     return true;
 }

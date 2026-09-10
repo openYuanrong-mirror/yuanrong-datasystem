@@ -360,8 +360,9 @@ Status CoordinatorServiceDiscovery::ObtainWorkers(std::vector<std::string> &same
 
     std::vector<KeyValueEntry> kvs;
     int64_t revision = 0;
-    RETURN_IF_NOT_OK_PRINT_ERROR_MSG(coordinatorProxy_->Range(clusterTablePrefix, rangeEnd, kvs, revision),
-                                     "Failed to fetch cluster info from coordinator.");
+    RETURN_IF_NOT_OK_PRINT_ERROR_MSG(
+        coordinatorProxy_->Range(clusterTablePrefix, rangeEnd, kvs, revision, READ_ONLY_ROUTE_BUDGET_MS),
+        "Failed to fetch cluster info from coordinator.");
 
     for (const auto &kv : kvs) {
         AppendReadyWorkerFromProto(kv.key, kv.value, hostId_, sameHost, other, workersStateCount);

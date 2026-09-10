@@ -20,6 +20,7 @@
 #ifndef DATASYSTEM_CLIENT_OBJECT_CACHE_WORKER_FAILOVER_H
 #define DATASYSTEM_CLIENT_OBJECT_CACHE_WORKER_FAILOVER_H
 
+#include "datasystem/client/object_cache/discovery_backoff.h"
 #include "datasystem/client/object_cache/object_client_impl.h"
 #include "datasystem/common/log/log.h"
 
@@ -110,10 +111,16 @@ public:
     bool WaitStandbyWorkerReady(const std::shared_ptr<IClientWorkerApi> &clientWorkerApi);
 
 private:
+    bool IsCoordinatorReachabilityFailure(const Status &status) const;
+    void MarkDiscoveryRecovered() const;
+
     // Callbacks installed on owner_'s listener/workerApi capture `this`; safety relies on
     // ObjectClientImpl::ShutDown draining async switches first and clearing the URMA
     // data-plane callbacks on workerApi_ before any member destruction.
     ObjectClientImpl &owner_;
+    // Gates heartbeat-driven discovery only; explicit worker switches keep their own path.
+    // Mutable: const failover paths also reset it when they prove the coordinator reachable.
+    mutable DiscoveryBackoff discoveryBackoff_;
 };
 
 // Shared by ObjectClientImpl::PickFallbackWorker (init path) and GetStandbyWorkersForSwitch (switch path).
