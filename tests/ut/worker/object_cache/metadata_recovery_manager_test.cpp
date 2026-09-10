@@ -288,6 +288,38 @@ TEST_F(MetaDataRecoveryManagerTest, BuildGroupedByMasterUsesTopologyPlacement)
     EXPECT_THAT(grouped[HostPort()], ElementsAre("key-missing"));
 }
 
+TEST_F(MetaDataRecoveryManagerTest, UnconfirmedMigrationRecoveryRequiresCompletePayload)
+{
+    const std::string key = "unconfirmed-migration";
+    AddObject(key, 7, 1024);
+    std::shared_ptr<SafeObjType> entry;
+    DS_ASSERT_OK(objectTable_->Get(key, entry));
+    (*entry)->stateInfo.SetPrimaryCopy(false);
+    (*entry)->stateInfo.SetMigrationUnconfirmed(true);
+    (*entry)->stateInfo.SetNeedToDelete(true);
+    ObjectMetaPb meta;
+    EXPECT_FALSE(manager_->FillRecoveredMeta(key, meta));
+    auto *object = SafeObjType::GetDerived<ObjCacheShmUnit>(*entry);
+    ASSERT_NE(object, nullptr);
+    object->SetShmUnit(std::make_shared<ShmUnit>());
+    object->stateInfo.SetIncompleted(true);
+    EXPECT_FALSE(manager_->FillRecoveredMeta(key, meta));
+    object->stateInfo.SetIncompleted(false);
+    object->stateInfo.SetCacheInvalid(true);
+    EXPECT_FALSE(manager_->FillRecoveredMeta(key, meta));
+    object->stateInfo.SetCacheInvalid(false);
+    ASSERT_TRUE(manager_->FillRecoveredMeta(key, meta));
+    EXPECT_FALSE(meta.config().is_replica());
+    EXPECT_EQ(meta.primary_address(), localAddress_.ToString());
+    EXPECT_EQ(meta.data_size(), 1024U);
+    EXPECT_EQ(meta.version(), 7U);
+    EXPECT_TRUE(object->stateInfo.IsMigrationUnconfirmed());
+    EXPECT_TRUE(object->stateInfo.IsNeedToDelete());
+    EXPECT_FALSE(object->stateInfo.IsPrimaryCopy());
+    object->stateInfo.SetMigrationExpired(true);
+    EXPECT_FALSE(manager_->FillRecoveredMeta(key, meta));
+}
+
 ObjectMetaPb BuildRecoverMeta(const std::string &objectKey, WriteMode writeMode,
                               const std::string &primaryAddress = "127.0.0.1:18500")
 {

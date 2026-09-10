@@ -41,6 +41,7 @@
 #include "datasystem/common/inject/inject_point.h"
 #include "datasystem/common/kvstore/coordination_keys.h"
 #include "datasystem/common/object_cache/safe_table.h"
+#include "datasystem/common/parallel/parallel_for.h"
 #include "datasystem/common/rdma/fast_transport_manager_wrapper.h"
 #include "datasystem/common/rpc/rpc_message.h"
 #include "datasystem/common/shared_memory/allocator.h"
@@ -75,9 +76,11 @@ using namespace datasystem::object_cache;
 DS_DECLARE_string(health_check_path);
 DS_DECLARE_bool(enable_distributed_master);
 DS_DECLARE_bool(enable_leaving_intercept);
+DS_DECLARE_bool(enable_metadata_recovery);
 DS_DECLARE_bool(enable_reconciliation);
 DS_DECLARE_bool(enable_transport_fallback);
 DS_DECLARE_bool(enable_worker_worker_batch_get);
+DS_DECLARE_string(data_migrate_urma_transport_mode);
 DS_DECLARE_uint32(arena_per_tenant);
 DS_DECLARE_int32(oc_worker_worker_parallel_min);
 
@@ -147,6 +150,10 @@ public:
     using CreateMetaHandler = std::function<Status(master::CreateMetaReqPb &, master::CreateMetaRspPb &)>;
     using QueryMetaHandler = std::function<Status(int, master::QueryMetaRspPb &)>;
     using RemoveMetaHandler = std::function<Status(master::RemoveMetaReqPb &, master::RemoveMetaRspPb &)>;
+    using PushMetaHandler =
+        std::function<Status(master::PushMetaToMasterReqPb &, master::PushMetaToMasterRspPb &)>;
+    using CheckLocationHandler =
+        std::function<Status(master::CheckObjectDataLocationReqPb &, master::CheckObjectDataLocationRspPb &)>;
 
     explicit FakeWorkerMasterOCApi(const HostPort &localAddr) : WorkerLocalMasterOCApi(nullptr, localAddr, nullptr)
     {
@@ -272,6 +279,18 @@ public:
         return pureQueryMetaStatus_;
     }
 
+    Status PushMetadataToMaster(master::PushMetaToMasterReqPb &req,
+                                master::PushMetaToMasterRspPb &rsp) override
+    {
+        return pushMetaHandler_ == nullptr ? Status::OK() : pushMetaHandler_(req, rsp);
+    }
+
+    Status CheckObjectDataLocation(master::CheckObjectDataLocationReqPb &req,
+                                   master::CheckObjectDataLocationRspPb &rsp) override
+    {
+        return checkLocationHandler_ == nullptr ? Status::OK() : checkLocationHandler_(req, rsp);
+    }
+
     void SetResponse(const master::GIncreaseRspPb &response)
     {
         response_ = response;
@@ -366,6 +385,9 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         removeMetaHandler_ = std::move(handler);
     }
+
+    PushMetaHandler pushMetaHandler_;
+    CheckLocationHandler checkLocationHandler_;
 
     int CreateMetaCallCount() const
     {
@@ -3313,9 +3335,376 @@ TEST_F(WorkerOcServiceImplTest, RebuildRefForMatchedObjectsShouldCollectRetryIds
     EXPECT_THAT(retryIds.recoverAppRefFailedIds, UnorderedElementsAre("obj1", "obj3"));
 }
 
+TEST_F(WorkerOcServiceImplTest, DeferredGetCleanupRechecksMigrationState)
+{
+    impl_->deleteProc_ = deleteProc_;
+    for (const auto &key : { "confirmed-copy", "unconfirmed-copy", "expired-copy", "transient-copy", "new-version" }) {
+        AddObject(key);
+        std::shared_ptr<SafeObjType> entry;
+        DS_ASSERT_OK(objectTable_->Get(key, entry));
+        DS_ASSERT_OK(entry->WLock());
+        (*entry)->stateInfo.SetPrimaryCopy(false);
+        (*entry)->stateInfo.SetNeedToDelete(true);
+        const uint64_t queuedVersion = (*entry)->GetCreateTime();
+        // The queued Get captured needDelete=true before this same-version migration update.
+        if (std::string(key) == "confirmed-copy") {
+            (*entry)->stateInfo.SetNeedToDelete(false);
+            (*entry)->stateInfo.SetPrimaryCopy(true);
+        } else if (std::string(key) == "unconfirmed-copy") {
+            (*entry)->stateInfo.SetMigrationUnconfirmed(true);
+        } else if (std::string(key) == "expired-copy") {
+            (*entry)->stateInfo.SetMigrationExpired(true);
+        } else if (std::string(key) == "new-version") {
+            (*entry)->SetCreateTime(queuedVersion + 1);
+        }
+        entry->WUnlock();
+        DS_ASSERT_OK(
+            impl_->DeleteObject(key, queuedVersion, WorkerOCServiceImpl::DeleteEligibility::DEFERRED_GET_CLEANUP));
+        if (std::string(key) == "transient-copy") {
+            EXPECT_EQ(objectTable_->Contains(key).GetCode(), K_NOT_FOUND);
+        } else {
+            EXPECT_TRUE(objectTable_->Contains(key).IsOk()) << key;
+        }
+    }
+    // Explicit deletion keeps its existing semantics; only deferred Get cleanup is conditional.
+    DS_ASSERT_OK(impl_->DeleteObject("confirmed-copy", 1));
+    EXPECT_EQ(objectTable_->Contains("confirmed-copy").GetCode(), K_NOT_FOUND);
+    DS_ASSERT_OK(impl_->DeleteObject("unconfirmed-copy", 1));
+    EXPECT_EQ(objectTable_->Contains("unconfirmed-copy").GetCode(), K_NOT_FOUND);
+    DS_ASSERT_OK(impl_->DeleteObject("expired-copy", 1));
+    EXPECT_EQ(objectTable_->Contains("expired-copy").GetCode(), K_NOT_FOUND);
+}
+
+TEST_F(WorkerOcServiceImplTest, TopologyCleanupRetainsUnconfirmedAndFencesOrdinaryDeletion)
+{
+    Parallel::InitParallelThreadPool(1);
+    const bool oldMetadataRecovery = FLAGS_enable_metadata_recovery;
+    Raii restoreFlag([oldMetadataRecovery]() { FLAGS_enable_metadata_recovery = oldMetadataRecovery; });
+    FLAGS_enable_metadata_recovery = false;
+    const std::string ordinaryObject = "ordinary-stale-copy";
+    const std::string markerRaceObject = "marker-race-copy";
+    const std::string versionRaceObject = "version-race-copy";
+    const std::string identityRaceObject = "identity-race-copy";
+    const std::string unconfirmedObject = "unconfirmed-migration-copy";
+    const std::string secondUnconfirmedObject = "second-unconfirmed-migration-copy";
+    AddObject(ordinaryObject);
+    AddReadableObject(markerRaceObject);
+    AddObject(versionRaceObject);
+    AddObject(identityRaceObject);
+    AddReadableObject(unconfirmedObject);
+    AddReadableObject(secondUnconfirmedObject);
+    std::unordered_map<std::string, std::shared_ptr<SafeObjType>> entries;
+    for (const auto &objectKey : { markerRaceObject, versionRaceObject, identityRaceObject, unconfirmedObject,
+                                   secondUnconfirmedObject }) {
+        DS_ASSERT_OK(objectTable_->Get(objectKey, entries[objectKey]));
+        placement_.SetOwner(objectKey, localAddress_);
+    }
+    for (const auto &objectKey : { unconfirmedObject, secondUnconfirmedObject }) {
+        DS_ASSERT_OK(entries[objectKey]->WLock());
+        (*entries[objectKey])->stateInfo.SetPrimaryCopy(false);
+        (*entries[objectKey])->stateInfo.SetNeedToDelete(true);
+        (*entries[objectKey])->stateInfo.SetMigrationUnconfirmed(true);
+        entries[objectKey]->WUnlock();
+    }
+    placement_.SetOwner(ordinaryObject, localAddress_);
+    DS_ASSERT_OK(topologyRuntime_.StartWithActiveLocalMember(localAddress_));
+
+    auto api = std::make_shared<FakeWorkerMasterOCApi>(localAddress_);
+    size_t pushMetaCalls = 0;
+    api->pushMetaHandler_ = [&](master::PushMetaToMasterReqPb &, master::PushMetaToMasterRspPb &) {
+        ++pushMetaCalls;
+        return Status(K_RUNTIME_ERROR, "metadata recovery must remain disabled");
+    };
+    std::unordered_set<std::string> checkedObjects;
+    api->checkLocationHandler_ = [&](master::CheckObjectDataLocationReqPb &req,
+                                     master::CheckObjectDataLocationRspPb &rsp) {
+        for (const auto &objectVersion : req.object_versions()) {
+            const auto &objectKey = objectVersion.object_key();
+            checkedObjects.emplace(objectKey);
+            if (objectKey == markerRaceObject) {
+                RETURN_IF_NOT_OK(entries[objectKey]->WLock());
+                (*entries[objectKey])->stateInfo.SetPrimaryCopy(false);
+                (*entries[objectKey])->stateInfo.SetNeedToDelete(true);
+                (*entries[objectKey])->stateInfo.SetMigrationUnconfirmed(true);
+                entries[objectKey]->WUnlock();
+            } else if (objectKey == versionRaceObject) {
+                RETURN_IF_NOT_OK(entries[objectKey]->WLock());
+                (*entries[objectKey])->SetCreateTime((*entries[objectKey])->GetCreateTime() + 1);
+                entries[objectKey]->WUnlock();
+            } else if (objectKey == identityRaceObject) {
+                auto replacement = std::make_unique<ObjCacheShmUnit>();
+                replacement->SetDataSize(1024);
+                replacement->SetCreateTime(objectVersion.version());
+                replacement->SetLifeState(ObjectLifeState::OBJECT_SEALED);
+                replacement->stateInfo.SetDataFormat(DataFormat::BINARY);
+                replacement->stateInfo.SetPrimaryCopy(true);
+                RETURN_IF_NOT_OK(entries[objectKey]->WLock());
+                entries[objectKey]->SetRealObject(std::move(replacement));
+                entries[objectKey]->WUnlock();
+            }
+            rsp.add_need_clear_object_keys(objectKey);
+        }
+        return Status::OK();
+    };
+    auto apiManager = std::make_shared<FakeWorkerMasterApiManager>(localAddress_, metadataRoute_);
+    apiManager->SetApi(api);
+    MetaDataRecoveryManager recovery(
+        localAddress_, objectTable_, { [](const HostPort &) { return Status::OK(); } }, apiManager, metadataRoute_);
+    dataClearImpl_ = std::make_shared<WorkerOcServiceClearDataFlow>(
+        objectTable_, globalRefTable_, apiManager, gRefProc_, deleteProc_, &recovery, metadataRoute_, *endpointPolicy_,
+        localAddress_.ToString());
+
+    ClearDataRetryIds retryIds;
+    dataClearImpl_->ClearTopologyFailureMatchedObjects(
+        { ordinaryObject, markerRaceObject, versionRaceObject, identityRaceObject, unconfirmedObject,
+          secondUnconfirmedObject },
+        retryIds);
+    EXPECT_EQ(objectTable_->Contains(ordinaryObject).GetCode(), K_NOT_FOUND);
+    EXPECT_TRUE(objectTable_->Contains(markerRaceObject).IsOk());
+    EXPECT_TRUE(objectTable_->Contains(versionRaceObject).IsOk());
+    EXPECT_TRUE(objectTable_->Contains(identityRaceObject).IsOk());
+    EXPECT_TRUE(objectTable_->Contains(unconfirmedObject).IsOk());
+    EXPECT_TRUE(objectTable_->Contains(secondUnconfirmedObject).IsOk());
+    EXPECT_TRUE((*entries[markerRaceObject])->stateInfo.IsMigrationUnconfirmed());
+    EXPECT_EQ((*entries[versionRaceObject])->GetCreateTime(), 2U);
+    for (const auto &objectKey : { unconfirmedObject, secondUnconfirmedObject }) {
+        EXPECT_TRUE((*entries[objectKey])->stateInfo.IsMigrationUnconfirmed());
+        EXPECT_FALSE((*entries[objectKey])->stateInfo.IsPrimaryCopy());
+        EXPECT_TRUE((*entries[objectKey])->stateInfo.IsNeedToDelete());
+    }
+    EXPECT_THAT(checkedObjects,
+                UnorderedElementsAre(ordinaryObject, markerRaceObject, versionRaceObject, identityRaceObject));
+    EXPECT_EQ(pushMetaCalls, 0U);
+    EXPECT_TRUE(retryIds.Empty());
+
+    ClearDataRetryIds repeatedCleanupRetryIds;
+    dataClearImpl_->ClearTopologyFailureMatchedObjects({ unconfirmedObject }, repeatedCleanupRetryIds);
+    EXPECT_EQ(pushMetaCalls, 0U);
+    EXPECT_TRUE((*entries[unconfirmedObject])->stateInfo.IsMigrationUnconfirmed());
+    EXPECT_TRUE(repeatedCleanupRetryIds.Empty());
+    dataClearImpl_.reset();
+}
+
+TEST_F(WorkerOcServiceImplTest, TopologyCleanupOrdinaryObjectsRespectMetadataRecoveryAndSnapshotFence)
+{
+    Parallel::InitParallelThreadPool(1);
+    const bool oldMetadataRecovery = FLAGS_enable_metadata_recovery;
+    Raii restoreFlag([oldMetadataRecovery]() { FLAGS_enable_metadata_recovery = oldMetadataRecovery; });
+    FLAGS_enable_metadata_recovery = true;
+    const std::string recoveredObject = "ordinary-recovered-copy";
+    const std::string changedObject = "ordinary-changed-during-recovery";
+    AddReadableObject(recoveredObject);
+    AddReadableObject(changedObject);
+    std::unordered_map<std::string, std::shared_ptr<SafeObjType>> entries;
+    for (const auto &objectKey : { recoveredObject, changedObject }) {
+        DS_ASSERT_OK(objectTable_->Get(objectKey, entries[objectKey]));
+        placement_.SetOwner(objectKey, localAddress_);
+    }
+    DS_ASSERT_OK(topologyRuntime_.StartWithActiveLocalMember(localAddress_));
+
+    auto api = std::make_shared<FakeWorkerMasterOCApi>(localAddress_);
+    api->checkLocationHandler_ = [](master::CheckObjectDataLocationReqPb &req,
+                                    master::CheckObjectDataLocationRspPb &rsp) {
+        for (const auto &object : req.object_versions()) {
+            rsp.add_need_clear_object_keys(object.object_key());
+        }
+        return Status::OK();
+    };
+    size_t pushMetaCalls = 0;
+    api->pushMetaHandler_ = [&](master::PushMetaToMasterReqPb &req, master::PushMetaToMasterRspPb &) {
+        ++pushMetaCalls;
+        EXPECT_EQ(req.metas_size(), 1);
+        if (req.metas(0).object_key() != changedObject) {
+            EXPECT_EQ(req.metas(0).object_key(), recoveredObject);
+            return Status::OK();
+        }
+        auto &entry = entries.at(changedObject);
+        RETURN_IF_NOT_OK(entry->WLock());
+        (*entry)->SetCreateTime((*entry)->GetCreateTime() + 1);
+        entry->WUnlock();
+        return Status(K_RPC_UNAVAILABLE, "metadata recovery unavailable");
+    };
+    auto apiManager = std::make_shared<FakeWorkerMasterApiManager>(localAddress_, metadataRoute_);
+    apiManager->SetApi(api);
+    MetaDataRecoveryManager recovery(
+        localAddress_, objectTable_, { [](const HostPort &) { return Status::OK(); } }, apiManager, metadataRoute_);
+    dataClearImpl_ = std::make_shared<WorkerOcServiceClearDataFlow>(
+        objectTable_, globalRefTable_, apiManager, gRefProc_, deleteProc_, &recovery, metadataRoute_, *endpointPolicy_,
+        localAddress_.ToString());
+
+    ClearDataRetryIds recoveredRetryIds;
+    dataClearImpl_->ClearTopologyFailureMatchedObjects({ recoveredObject }, recoveredRetryIds);
+    EXPECT_EQ(pushMetaCalls, 1U);
+    EXPECT_TRUE(objectTable_->Contains(recoveredObject).IsOk());
+    EXPECT_TRUE((*entries[recoveredObject])->IsShmUnitExistsAndComplete());
+    EXPECT_TRUE(recoveredRetryIds.Empty());
+
+    ClearDataRetryIds failedRetryIds;
+    dataClearImpl_->ClearTopologyFailureMatchedObjects({ changedObject }, failedRetryIds);
+    EXPECT_EQ(pushMetaCalls, 2U);
+    EXPECT_TRUE(objectTable_->Contains(changedObject).IsOk());
+    EXPECT_EQ((*entries[changedObject])->GetCreateTime(), 2U);
+    EXPECT_TRUE(failedRetryIds.Empty());
+    dataClearImpl_.reset();
+}
+
+TEST_F(WorkerOcServiceImplTest, UnconfirmedRecoveryFailureEntersTopologyRetry)
+{
+    Parallel::InitParallelThreadPool(1);
+    const bool oldMetadataRecovery = FLAGS_enable_metadata_recovery;
+    Raii restoreFlag([oldMetadataRecovery]() { FLAGS_enable_metadata_recovery = oldMetadataRecovery; });
+    FLAGS_enable_metadata_recovery = true;
+    const std::string objectKey = "unconfirmed-recovery-retry";
+    AddReadableObject(objectKey);
+    std::shared_ptr<SafeObjType> entry;
+    DS_ASSERT_OK(objectTable_->Get(objectKey, entry));
+    DS_ASSERT_OK(entry->WLock());
+    (*entry)->stateInfo.SetPrimaryCopy(false);
+    (*entry)->stateInfo.SetNeedToDelete(true);
+    (*entry)->stateInfo.SetMigrationUnconfirmed(true);
+    entry->WUnlock();
+    placement_.SetOwner(objectKey, localAddress_);
+    DS_ASSERT_OK(topologyRuntime_.StartWithActiveLocalMember(localAddress_));
+
+    auto api = std::make_shared<FakeWorkerMasterOCApi>(localAddress_);
+    size_t pushMetaCalls = 0;
+    api->pushMetaHandler_ = [&pushMetaCalls](master::PushMetaToMasterReqPb &, master::PushMetaToMasterRspPb &) {
+        ++pushMetaCalls;
+        return Status(K_RPC_UNAVAILABLE, "metadata recovery unavailable");
+    };
+    auto apiManager = std::make_shared<FakeWorkerMasterApiManager>(localAddress_, metadataRoute_);
+    apiManager->SetApi(api);
+    MetaDataRecoveryManager recovery(localAddress_, objectTable_, { [](const HostPort &) { return Status::OK(); } },
+                                     apiManager, metadataRoute_);
+    dataClearImpl_ = std::make_shared<WorkerOcServiceClearDataFlow>(objectTable_, globalRefTable_, apiManager,
+                                                                    gRefProc_, deleteProc_, &recovery, metadataRoute_,
+                                                                    *endpointPolicy_, localAddress_.ToString());
+
+    ClearDataRetryIds retryIds;
+    dataClearImpl_->ClearTopologyFailureMatchedObjects({ objectKey }, retryIds);
+
+    EXPECT_EQ(pushMetaCalls, 1U);
+    EXPECT_THAT(retryIds.topologyCheckFailedIds, UnorderedElementsAre(objectKey));
+    EXPECT_TRUE(objectTable_->Contains(objectKey).IsOk());
+    EXPECT_TRUE((*entry)->HasCompleteUnconfirmedPayload());
+    dataClearImpl_.reset();
+}
+
+TEST_F(WorkerOcServiceImplTest, ExpiredMigrationSkipsRecoveryAndUsesTopologyCleanup)
+{
+    const bool oldMetadataRecovery = FLAGS_enable_metadata_recovery;
+    Raii restoreFlag([oldMetadataRecovery]() { FLAGS_enable_metadata_recovery = oldMetadataRecovery; });
+    FLAGS_enable_metadata_recovery = true;
+    const std::string objectKey = "expired-migration-cleanup";
+    AddReadableObject(objectKey);
+    std::shared_ptr<SafeObjType> entry;
+    DS_ASSERT_OK(objectTable_->Get(objectKey, entry));
+    DS_ASSERT_OK(entry->WLock());
+    (*entry)->stateInfo.SetNeedToDelete(true);
+    (*entry)->stateInfo.SetMigrationExpired(true);
+    entry->WUnlock();
+    placement_.SetOwner(objectKey, localAddress_);
+    DS_ASSERT_OK(topologyRuntime_.StartWithActiveLocalMember(localAddress_));
+
+    auto api = std::make_shared<FakeWorkerMasterOCApi>(localAddress_);
+    size_t pushMetaCalls = 0;
+    api->pushMetaHandler_ = [&pushMetaCalls](master::PushMetaToMasterReqPb &, master::PushMetaToMasterRspPb &) {
+        ++pushMetaCalls;
+        return Status::OK();
+    };
+    api->checkLocationHandler_ = [&objectKey](master::CheckObjectDataLocationReqPb &,
+                                              master::CheckObjectDataLocationRspPb &rsp) {
+        rsp.add_need_clear_object_keys(objectKey);
+        return Status::OK();
+    };
+    auto apiManager = std::make_shared<FakeWorkerMasterApiManager>(localAddress_, metadataRoute_);
+    apiManager->SetApi(api);
+    MetaDataRecoveryManager recovery(localAddress_, objectTable_, { [](const HostPort &) { return Status::OK(); } },
+                                     apiManager, metadataRoute_);
+    dataClearImpl_ = std::make_shared<WorkerOcServiceClearDataFlow>(objectTable_, globalRefTable_, apiManager,
+                                                                    gRefProc_, deleteProc_, &recovery, metadataRoute_,
+                                                                    *endpointPolicy_, localAddress_.ToString());
+
+    ClearDataRetryIds retryIds;
+    dataClearImpl_->ClearTopologyFailureMatchedObjects({ objectKey }, retryIds);
+
+    EXPECT_EQ(pushMetaCalls, 0U);
+    EXPECT_TRUE(retryIds.Empty());
+    EXPECT_EQ(objectTable_->Contains(objectKey).GetCode(), K_NOT_FOUND);
+    dataClearImpl_.reset();
+}
+
+TEST_F(WorkerOcServiceImplTest, TopologyCleanupSnapshotsAreBoundedByMasterBatch)
+{
+    const bool oldMetadataRecovery = FLAGS_enable_metadata_recovery;
+    Raii restoreFlag([oldMetadataRecovery]() { FLAGS_enable_metadata_recovery = oldMetadataRecovery; });
+    FLAGS_enable_metadata_recovery = false;
+    constexpr size_t objectCount = 501;
+    std::vector<std::string> objectKeys;
+    objectKeys.reserve(objectCount);
+    for (size_t i = 0; i < objectCount; ++i) {
+        objectKeys.emplace_back("bounded-topology-cleanup-" + std::to_string(i));
+        AddObject(objectKeys.back());
+        placement_.SetOwner(objectKeys.back(), localAddress_);
+    }
+    std::shared_ptr<SafeObjType> lastEntry;
+    DS_ASSERT_OK(objectTable_->Get(objectKeys.back(), lastEntry));
+    DS_ASSERT_OK(topologyRuntime_.StartWithActiveLocalMember(localAddress_));
+
+    auto api = std::make_shared<FakeWorkerMasterOCApi>(localAddress_);
+    std::vector<size_t> requestSizes;
+    api->checkLocationHandler_ = [&](master::CheckObjectDataLocationReqPb &req,
+                                     master::CheckObjectDataLocationRspPb &rsp) {
+        requestSizes.emplace_back(req.object_versions_size());
+        if (requestSizes.size() == 1) {
+            RETURN_IF_NOT_OK(lastEntry->WLock());
+            (*lastEntry)->SetCreateTime((*lastEntry)->GetCreateTime() + 1);
+            lastEntry->WUnlock();
+        }
+        for (const auto &object : req.object_versions()) {
+            rsp.add_need_clear_object_keys(object.object_key());
+        }
+        return Status::OK();
+    };
+    auto apiManager = std::make_shared<FakeWorkerMasterApiManager>(localAddress_, metadataRoute_);
+    apiManager->SetApi(api);
+    dataClearImpl_ = std::make_shared<WorkerOcServiceClearDataFlow>(objectTable_, globalRefTable_, apiManager,
+                                                                    gRefProc_, deleteProc_, nullptr, metadataRoute_,
+                                                                    *endpointPolicy_, localAddress_.ToString());
+
+    ClearDataRetryIds retryIds;
+    dataClearImpl_->ClearTopologyFailureMatchedObjects(objectKeys, retryIds);
+
+    EXPECT_THAT(requestSizes, ElementsAre(500U, 1U));
+    EXPECT_TRUE(retryIds.Empty());
+    EXPECT_EQ(objectTable_->Contains(objectKeys.back()).GetCode(), K_NOT_FOUND);
+    dataClearImpl_.reset();
+}
+
+TEST_F(WorkerOcServiceImplTest, TopologyCleanupSnapshotDoesNotDeleteReinsertedKey)
+{
+    const std::string key = "reinserted-during-cleanup";
+    AddObject(key);
+    std::vector<std::string> ordinary;
+    std::vector<std::string> unconfirmed;
+    WorkerOcServiceClearDataFlow::TopologyCleanupSnapshots snapshots;
+    dataClearImpl_->PartitionTopologyCleanupObjects({ key }, ordinary, unconfirmed, snapshots);
+    ASSERT_EQ(snapshots.size(), 1U);
+    std::weak_ptr<SafeObjType> oldEntry = snapshots.at(key).entry;
+    DS_ASSERT_OK(objectTable_->Erase(key));
+    AddObject(key);
+    EXPECT_FALSE(oldEntry.expired());
+    dataClearImpl_->ClearTopologyObjects(ordinary, snapshots);
+    EXPECT_TRUE(objectTable_->Contains(key).IsOk());
+    snapshots.clear();
+    EXPECT_TRUE(oldEntry.expired());
+}
+
 TEST_F(WorkerOcServiceImplTest, ClearDataRetryImplShouldRouteFailedIdsToRetryStages)
 {
     using ClearMatchedObjectsMethod =
+        void (WorkerOcServiceClearDataFlow::*)(const std::vector<std::string> &, ClearDataRetryIds &);
+    using ClearTopologyObjectsMethod =
         void (WorkerOcServiceClearDataFlow::*)(const std::vector<std::string> &, ClearDataRetryIds &);
     using RetryIncreaseMasterRefMethod =
         void (WorkerOcServiceClearDataFlow::*)(const std::vector<std::string> &, ClearDataRetryIds &);
@@ -3323,6 +3712,7 @@ TEST_F(WorkerOcServiceImplTest, ClearDataRetryImplShouldRouteFailedIdsToRetrySta
         void (WorkerOcServiceClearDataFlow::*)(const std::vector<std::string> &, ClearDataRetryIds &);
 
     std::vector<std::string> clearObjIds;
+    std::vector<std::string> topologyObjIds;
     std::vector<std::string> increaseObjIds;
     std::vector<std::string> recoverObjIds;
     BINEXPECT_CALL((ClearMatchedObjectsMethod) & WorkerOcServiceClearDataFlow::ClearMatchedObjects, (_, _))
@@ -3330,6 +3720,12 @@ TEST_F(WorkerOcServiceImplTest, ClearDataRetryImplShouldRouteFailedIdsToRetrySta
                                         ClearDataRetryIds &retryIds) {
             clearObjIds = objIds;
             retryIds.clearFailedIds.emplace("clear-next");
+        }));
+    BINEXPECT_CALL(
+        (ClearTopologyObjectsMethod) & WorkerOcServiceClearDataFlow::ClearTopologyFailureMatchedObjects, (_, _))
+        .WillOnce(Invoke([&topologyObjIds](const std::vector<std::string> &objIds, ClearDataRetryIds &retryIds) {
+            topologyObjIds = objIds;
+            retryIds.topologyCheckFailedIds.emplace("topology-next");
         }));
     BINEXPECT_CALL((RetryIncreaseMasterRefMethod) & WorkerOcServiceClearDataFlow::RetryIncreaseMasterRef, (_, _))
         .WillOnce(Invoke([&increaseObjIds](const std::vector<std::string> &objIds,
@@ -3348,6 +3744,7 @@ TEST_F(WorkerOcServiceImplTest, ClearDataRetryImplShouldRouteFailedIdsToRetrySta
 
     ClearDataRetryIds retryIds;
     retryIds.clearFailedIds = { "clear-1", "clear-2" };
+    retryIds.topologyCheckFailedIds = { "topology-1" };
     retryIds.increaseFailedIds = { "increase-1" };
     retryIds.recoverAppRefFailedIds = { "recover-1", "recover-2" };
 
@@ -3356,9 +3753,11 @@ TEST_F(WorkerOcServiceImplTest, ClearDataRetryImplShouldRouteFailedIdsToRetrySta
     dataClearImpl_->ClearDataRetryImpl(req, retryIds, nextRetryIds);
 
     EXPECT_THAT(clearObjIds, UnorderedElementsAre("clear-1", "clear-2"));
+    EXPECT_THAT(topologyObjIds, UnorderedElementsAre("topology-1"));
     EXPECT_THAT(increaseObjIds, UnorderedElementsAre("increase-1"));
     EXPECT_THAT(recoverObjIds, UnorderedElementsAre("recover-1", "recover-2"));
     EXPECT_THAT(nextRetryIds.clearFailedIds, UnorderedElementsAre("clear-next"));
+    EXPECT_THAT(nextRetryIds.topologyCheckFailedIds, UnorderedElementsAre("topology-next"));
     EXPECT_THAT(nextRetryIds.increaseFailedIds, UnorderedElementsAre("increase-next"));
     EXPECT_THAT(nextRetryIds.recoverAppRefFailedIds, UnorderedElementsAre("recover-next"));
 }
