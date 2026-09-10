@@ -45,6 +45,8 @@ from deploy_common import (
     start_procmon,
     start_service,
     start_service_standalone,
+    stop_service,
+    stop_service_standalone,
     upload_launcher,
     upload_procmon,
 )
@@ -376,14 +378,17 @@ class TestStartServiceStandaloneTiming(unittest.TestCase):
         return {'name': 'p1', 'ip': '10.0.0.1'}
 
     @patch('deploy_common.upload_launcher')
+    @patch('deploy_common.kubectl_exec_raw')
     @patch('deploy_common.subprocess.run')
     def test_launcher_path_records_elapsed_and_invokes_python(self, mock_run,
+                                                               mock_raw,
                                                                mock_upload):
         # upload_launcher succeeds; launcher prints "PID ELAPSED" on stdout.
         mock_upload.return_value = '/tmp/standalone_launcher.py'
         mock_run.return_value = MagicMock(returncode=0,
                                           stdout='1234 0.52\n',
                                           stderr='')
+        mock_raw.return_value = '1234\n'
         pod = self._pod()
         ok = start_service_standalone(
             pod, 'default', 'worker_test', '/tmp/ds', '/tmp/cfg.json',
@@ -405,9 +410,10 @@ class TestStartServiceStandaloneTiming(unittest.TestCase):
         self.assertNotIn('nohup', ' '.join(called_cmd))
 
     @patch('deploy_common.upload_launcher')
+    @patch('deploy_common.kubectl_exec_raw')
     @patch('deploy_common.subprocess.run')
     def test_launcher_passes_ready_file_when_config_has_ready_check_path(
-            self, mock_run, mock_upload):
+            self, mock_run, mock_raw, mock_upload):
         # When the worker config has ready_check_path, the launcher command
         # must include --ready-file <path> so the launcher polls for the
         # authoritative readiness file (worker_oc_server.cpp:2911-2933)
@@ -416,6 +422,7 @@ class TestStartServiceStandaloneTiming(unittest.TestCase):
         mock_run.return_value = MagicMock(returncode=0,
                                           stdout='1234 0.52\n',
                                           stderr='')
+        mock_raw.return_value = '1234\n'
         pod = self._pod()
         config = {
             'worker_address': {'value': '10.0.0.1:31501'},
@@ -432,9 +439,10 @@ class TestStartServiceStandaloneTiming(unittest.TestCase):
         self.assertIn('/tmp/ds/probe/ready', called_cmd)
 
     @patch('deploy_common.upload_launcher')
+    @patch('deploy_common.kubectl_exec_raw')
     @patch('deploy_common.subprocess.run')
     def test_launcher_omits_ready_file_when_config_has_no_ready_check_path(
-            self, mock_run, mock_upload):
+            self, mock_run, mock_raw, mock_upload):
         # When the worker config has no ready_check_path (coordinator or
         # worker with the flag unset), the launcher command must NOT
         # include --ready-file; it falls back to --port polling.
@@ -442,6 +450,7 @@ class TestStartServiceStandaloneTiming(unittest.TestCase):
         mock_run.return_value = MagicMock(returncode=0,
                                           stdout='1234 0.52\n',
                                           stderr='')
+        mock_raw.return_value = '1234\n'
         pod = self._pod()
         config = {'coordinator_address': {'value': '10.0.0.1:31511'}}
         ok = start_service_standalone(
@@ -485,6 +494,115 @@ class TestStartServiceStandaloneTiming(unittest.TestCase):
         called_cmd = ' '.join(mock_run.call_args[0][0])
         self.assertIn('nohup', called_cmd)
         self.assertIn('worker_test', called_cmd)
+
+
+class TestStopServiceStandalone(unittest.TestCase):
+    """stop_service_standalone: SIGTERM + pgrep verify. Returns True when
+    the process is gone (was running and exited, or was already absent).
+    Returns False only when the process refuses to exit after SIGTERM.
+    Replaces the prior ``pkill || true`` + unconditional ``return True``
+    that always printed OK even when the process was still running."""
+
+    def _pod(self):
+        return {'name': 'p1', 'ip': '10.0.0.1'}
+
+    @patch('deploy_common.kubectl_exec_raw')
+    @patch('deploy_common.subprocess.run')
+    @patch('deploy_common.time.sleep')
+    def test_process_exits_after_sigterm(self, mock_sleep, mock_run, mock_raw):
+        # pkill sends SIGTERM; pgrep confirms process is gone -> stopped.
+        mock_raw.return_value = ''
+        ok = stop_service_standalone(self._pod(), 'default', 'worker_test',
+                                     timeout=10)
+        self.assertTrue(ok)
+
+    @patch('deploy_common.kubectl_exec_raw')
+    @patch('deploy_common.subprocess.run')
+    @patch('deploy_common.time.sleep')
+    def test_process_already_absent(self, mock_sleep, mock_run, mock_raw):
+        # pkill finds no process (rc=1) but pgrep also finds nothing ->
+        # idempotent stop, returns True (not a failure to stop something
+        # that is already stopped).
+        mock_raw.return_value = ''
+        ok = stop_service_standalone(self._pod(), 'default', 'worker_test',
+                                     timeout=10)
+        self.assertTrue(ok)
+
+    @patch('deploy_common.kubectl_exec_raw')
+    @patch('deploy_common.subprocess.run')
+    @patch('deploy_common.time.sleep')
+    def test_process_refuses_to_exit(self, mock_sleep, mock_run, mock_raw):
+        # SIGTERM sent but process still alive after 3s grace period ->
+        # FAILED, return False. This is the regression guard: the old code
+        # unconditionally returned True here.
+        mock_raw.return_value = '1234\n'
+        ok = stop_service_standalone(self._pod(), 'default', 'worker_test',
+                                     timeout=10)
+        self.assertFalse(ok)
+
+    @patch('deploy_common.kubectl_exec_raw')
+    @patch('deploy_common.subprocess.run')
+    @patch('deploy_common.time.sleep')
+    def test_no_or_true_in_pkill_command(self, mock_sleep, mock_run, mock_raw):
+        # The old code used `pkill ... || true` which masked the pkill rc.
+        # The new code must NOT have `|| true` so pkill's rc is visible
+        # (though we rely on pgrep, not pkill rc, for the final verdict).
+        mock_raw.return_value = ''
+        stop_service_standalone(self._pod(), 'default', 'worker_test',
+                                timeout=10)
+        pkill_cmd = mock_run.call_args[0][0]
+        cmd_str = ' '.join(pkill_cmd)
+        self.assertNotIn('|| true', cmd_str,
+                         'pkill must not be masked with || true')
+
+
+class TestStartServiceStandaloneCrashDetect(unittest.TestCase):
+    """start_service_standalone: post-launch pgrep verify catches a process
+    that crashes immediately after the launcher reports readiness. Without
+    this check, "started" is printed for a process that is already gone."""
+
+    def _pod(self):
+        return {'name': 'p1', 'ip': '10.0.0.1'}
+
+    @patch('deploy_common.upload_launcher')
+    @patch('deploy_common.kubectl_exec_raw')
+    @patch('deploy_common.subprocess.run')
+    def test_crash_detected_when_pgid_gone(self, mock_run, mock_raw, mock_upload):
+        # Launcher returns a PID (1234) + elapsed, but the post-launch
+        # pgrep finds nothing (process crashed right after readiness) ->
+        # FAILED, return False. This is the false-positive regression guard.
+        mock_upload.return_value = '/tmp/standalone_launcher.py'
+        mock_run.return_value = MagicMock(returncode=0,
+                                          stdout='1234 0.52\n',
+                                          stderr='')
+        mock_raw.return_value = ''
+        pod = self._pod()
+        ok = start_service_standalone(
+            pod, 'default', 'worker_test', '/tmp/ds', '/tmp/cfg.json',
+            'jf:9999', 'predictor', '', config=None,
+            enable_procmon=False, port=31501, process_name='worker_test',
+            timeout=10)
+        self.assertFalse(ok)
+
+    @patch('deploy_common.upload_launcher')
+    @patch('deploy_common.kubectl_exec_raw')
+    @patch('deploy_common.subprocess.run')
+    def test_started_when_process_survives(self, mock_run, mock_raw, mock_upload):
+        # Launcher returns PID + elapsed, post-launch pgrep confirms the
+        # PID is still alive -> started, return True. This is the happy path
+        # that must still work after the crash-detect addition.
+        mock_upload.return_value = '/tmp/standalone_launcher.py'
+        mock_run.return_value = MagicMock(returncode=0,
+                                          stdout='1234 0.52\n',
+                                          stderr='')
+        mock_raw.return_value = '1234\n'
+        pod = self._pod()
+        ok = start_service_standalone(
+            pod, 'default', 'worker_test', '/tmp/ds', '/tmp/cfg.json',
+            'jf:9999', 'predictor', '', config=None,
+            enable_procmon=False, port=31501, process_name='worker_test',
+            timeout=10)
+        self.assertTrue(ok)
 
 
 class TestExtractReadyCheckPath(unittest.TestCase):
@@ -775,48 +893,57 @@ class TestStartService(unittest.TestCase):
     def _pod(self):
         return {'name': 'p1', 'ip': '10.0.0.1'}
 
+    def _exec_ok(self, process_count='1'):
+        """Mock kubectl_exec: dscli start rc=0 + check_process sees N procs.
+
+        start_service now does a post-launch check_process (pgrep) before
+        declaring success; the mock must return a stdout that check_process
+        can parse as a process count (>0 = alive). The first call is the
+        dscli start command, the second is the check_process ``ps aux``.
+        """
+        return MagicMock(returncode=0, stdout=process_count, stderr='')
+
     @patch('deploy_common.kubectl_exec')
     @patch('deploy_common.kubectl_cp_to')
     def test_worker_uses_f_flag(self, mock_cp, mock_exec):
-        mock_exec.return_value = MagicMock(returncode=0)
+        mock_exec.return_value = self._exec_ok()
         ok = start_service(self._pod(), 'default',
                            {'worker_address': {'value': '10.0.0.1:31501'}},
                            '/tmp/worker.config', 31501, 'datasystem_worker',
                            enable_procmon=False, timeout=10)
         self.assertTrue(ok)
-        self.assertEqual(mock_exec.call_count, 1)
-        self.assertEqual(mock_exec.call_args[0][2],
+        # First kubectl_exec call is the dscli start command.
+        self.assertEqual(mock_exec.call_args_list[0][0][2],
                          'dscli start -f /tmp/worker.config')
 
     @patch('deploy_common.kubectl_exec')
     @patch('deploy_common.kubectl_cp_to')
     def test_coordinator_uses_C_flag(self, mock_cp, mock_exec):
-        mock_exec.return_value = MagicMock(returncode=0)
+        mock_exec.return_value = self._exec_ok()
         ok = start_service(self._pod(), 'default',
                            {'coordinator_address': {'value': '10.0.0.1:31511'}},
                            '/tmp/coordinator.config', 31511,
                            'datasystem_coordinator',
                            enable_procmon=False, timeout=10)
         self.assertTrue(ok)
-        self.assertEqual(mock_exec.call_count, 1)
-        self.assertEqual(mock_exec.call_args[0][2],
+        self.assertEqual(mock_exec.call_args_list[0][0][2],
                          'dscli start -C /tmp/coordinator.config')
 
     @patch('deploy_common.kubectl_exec')
     @patch('deploy_common.kubectl_cp_to')
     def test_numactl_opts_appended_for_worker(self, mock_cp, mock_exec):
-        mock_exec.return_value = MagicMock(returncode=0)
+        mock_exec.return_value = self._exec_ok()
         start_service(self._pod(), 'default',
                       {'worker_address': {'value': '10.0.0.1:31501'}},
                       '/tmp/worker.config', 31501, 'datasystem_worker',
                       enable_procmon=False, numactl_opts='-N 0', timeout=10)
-        self.assertEqual(mock_exec.call_args[0][2],
+        self.assertEqual(mock_exec.call_args_list[0][0][2],
                          'dscli start -f /tmp/worker.config -N 0')
 
     @patch('deploy_common.kubectl_exec')
     @patch('deploy_common.kubectl_cp_to')
     def test_jemalloc_prof_conf_appended_for_worker(self, mock_cp, mock_exec):
-        mock_exec.return_value = MagicMock(returncode=0)
+        mock_exec.return_value = self._exec_ok()
         start_service(self._pod(), 'default',
                       {'worker_address': {'value': '192.0.2.1:31501'}},
                       '/tmp/worker.config', 31501, 'datasystem_worker',
@@ -824,14 +951,14 @@ class TestStartService(unittest.TestCase):
                       jemalloc_prof_conf='prof_final:true,lg_prof_sample:20',
                       timeout=10)
         self.assertEqual(
-            mock_exec.call_args[0][2],
+            mock_exec.call_args_list[0][0][2],
             'dscli start -f /tmp/worker.config '
             '--jemalloc_prof_conf prof_final:true,lg_prof_sample:20')
 
     @patch('deploy_common.kubectl_exec')
     @patch('deploy_common.kubectl_cp_to')
     def test_jemalloc_prof_conf_is_shell_quoted(self, mock_cp, mock_exec):
-        mock_exec.return_value = MagicMock(returncode=0)
+        mock_exec.return_value = self._exec_ok()
         start_service(self._pod(), 'default',
                       {'worker_address': {'value': '192.0.2.1:31501'}},
                       '/tmp/worker.config', 31501, 'datasystem_worker',
@@ -839,20 +966,20 @@ class TestStartService(unittest.TestCase):
                       jemalloc_prof_conf='prof_prefix:/tmp/heap profiles/worker',
                       timeout=10)
         self.assertEqual(
-            mock_exec.call_args[0][2],
+            mock_exec.call_args_list[0][0][2],
             "dscli start -f /tmp/worker.config "
             "--jemalloc_prof_conf 'prof_prefix:/tmp/heap profiles/worker'")
 
     @patch('deploy_common.kubectl_exec')
     @patch('deploy_common.kubectl_cp_to')
     def test_coordinator_ignores_jemalloc_prof_conf(self, mock_cp, mock_exec):
-        mock_exec.return_value = MagicMock(returncode=0)
+        mock_exec.return_value = self._exec_ok()
         start_service(self._pod(), 'default',
                       {'coordinator_address': {'value': '192.0.2.1:31511'}},
                       '/tmp/coordinator.config', 31511,
                       'datasystem_coordinator', enable_procmon=False,
                       jemalloc_prof_conf='prof_final:true', timeout=10)
-        self.assertEqual(mock_exec.call_args[0][2],
+        self.assertEqual(mock_exec.call_args_list[0][0][2],
                          'dscli start -C /tmp/coordinator.config')
 
     @patch('deploy_common.kubectl_exec')
@@ -861,14 +988,28 @@ class TestStartService(unittest.TestCase):
         # numactl is worker-only; coordinator path passes numactl_opts=None,
         # so even if a caller mistakenly passed opts they must not be
         # appended to a coordinator's dscli start -C command.
-        mock_exec.return_value = MagicMock(returncode=0)
+        mock_exec.return_value = self._exec_ok()
         start_service(self._pod(), 'default',
                       {'coordinator_address': {'value': '10.0.0.1:31511'}},
                       '/tmp/coordinator.config', 31511,
                       'datasystem_coordinator',
                       enable_procmon=False, numactl_opts='-N 0', timeout=10)
-        self.assertEqual(mock_exec.call_args[0][2],
+        self.assertEqual(mock_exec.call_args_list[0][0][2],
                          'dscli start -C /tmp/coordinator.config')
+
+    @patch('deploy_common.kubectl_exec')
+    @patch('deploy_common.kubectl_cp_to')
+    def test_start_fails_when_process_crashes_immediately(self, mock_cp, mock_exec):
+        # Post-launch verify: dscli start returns 0 (readiness passed), but
+        # check_process sees 0 alive processes (binary crashed right after
+        # readiness). start_service must return False and print FAILED, not
+        # "started". This is the regression guard for the false-positive.
+        mock_exec.return_value = MagicMock(returncode=0, stdout='0', stderr='')
+        ok = start_service(self._pod(), 'default',
+                           {'worker_address': {'value': '10.0.0.1:31501'}},
+                           '/tmp/worker.config', 31501, 'datasystem_worker',
+                           enable_procmon=False, timeout=10)
+        self.assertFalse(ok)
 
 
 class TestStartProcmon(unittest.TestCase):

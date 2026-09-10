@@ -559,6 +559,17 @@ def start_service(pod, namespace, config, remote_config, port, process_name,
             kubectl_exec(pod_name, namespace, cmd, timeout=timeout)
         finally:
             pod['_start_elapsed'] = time.monotonic() - t_start
+        # Post-launch verify: dscli start returns 0 when the binary signals
+        # readiness, but the process may crash immediately after (segfault,
+        # bad config, missing .so). check_process confirms it is still alive
+        # before declaring success; without this, "started" is printed for a
+        # process that is already gone, and the operator sees a green deploy
+        # that is actually red.
+        _, status, _ = check_process(pod, namespace, process_name, timeout=timeout)
+        if status != 'alive':
+            log_info(f'  {pod_name} ({pod_ip}) -> FAILED: process exited '
+                     f'immediately after dscli start (status={status})')
+            return False
         log_info(f'  {pod_name} ({pod_ip}) -> started')
 
         if enable_procmon:
@@ -1354,6 +1365,18 @@ def start_service_standalone(pod, namespace, binary_name, remote_dir, config_pat
     if not pid:
         log_info(f'  {name} ({pod_ip}) -> FAILED: process not found')
         return False
+    # Post-launch verify: the launcher / nohup path reported a PID, but the
+    # process may have crashed immediately after the readiness signal
+    # (segfault, bad config, missing .so). A quick pgrep confirms the PID
+    # is still alive before declaring success; without this, "started" is
+    # printed for a process that is already gone, and the operator sees a
+    # green deploy that is actually red.
+    verify = kubectl_exec_raw({'name': name}, namespace,
+                              f'pgrep -f {binary_name}', timeout=10)
+    if not verify or not verify.strip():
+        log_info(f'  {name} ({pod_ip}) -> FAILED: process exited immediately '
+                 f'after launch (pid={pid} no longer found)')
+        return False
     log_info(f'  {name} ({pod_ip}) -> started (pid={pid})')
     # Attach procmon (same logic as start_service dscli path)
     if enable_procmon:
@@ -1518,13 +1541,26 @@ def _launch_via_nohup(name, namespace, binary_name, remote_dir, log_path,
 
 
 def stop_service_standalone(pod, namespace, process_name, timeout=DEFAULT_TIMEOUT):
-    """Stop a standalone test binary via SIGTERM."""
+    """Stop a standalone test binary via SIGTERM.
+
+    Returns True if the process is gone after SIGTERM (whether it was
+    running and exited, or was already absent). Returns False only if
+    SIGTERM was sent but the process refused to exit within the grace
+    period (verified via ``pgrep``). ``pkill`` rc=1 (no match) is treated
+    as success -- stopping an already-stopped process is idempotent.
+    """
     name = pod['name']
-    r = subprocess.run(['kubectl', 'exec', '-n', namespace, name, '--', 'bash', '-c',
-                        f'pkill -TERM -f {process_name} 2>/dev/null || true'],
-                       capture_output=True, text=True, timeout=timeout)
-    import time
+    pod_ip = pod.get('ip', '')
+    subprocess.run(['kubectl', 'exec', '-n', namespace, name, '--', 'bash', '-c',
+                    f'pkill -TERM -f {process_name} 2>/dev/null'],
+                   capture_output=True, text=True, timeout=timeout)
     time.sleep(3)
+    verify = kubectl_exec_raw({'name': name}, namespace,
+                              f'pgrep -f {process_name}', timeout=10)
+    if verify and verify.strip():
+        log_info(f'  {name} ({pod_ip}) -> FAILED: still running after SIGTERM')
+        return False
+    log_info(f'  {name} ({pod_ip}) -> stopped')
     return True
 
 
