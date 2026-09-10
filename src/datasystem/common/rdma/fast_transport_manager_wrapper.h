@@ -87,6 +87,13 @@ void SetClientUbNumaConfig(bool affinityEnabled, uint32_t rrType, uint32_t srcCh
                            const std::string &configSource);
 
 /**
+ * @brief Resolve the client process's own address for fast transport identity.
+ * @return HostPort built from POD_IP (injected by K8s deploy scripts) with port 0, or an empty
+ *         HostPort when POD_IP is absent.
+ */
+HostPort GetClientFastTransportLocalAddr();
+
+/**
  * @brief Initialize Fast Transport Manager.
  * @param[in] hostport Local address for device lookup and identity. When empty (default),
  *            only local URMA resources are initialized without binding to a specific address.

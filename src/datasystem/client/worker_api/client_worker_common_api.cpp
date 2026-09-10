@@ -1130,7 +1130,7 @@ Status ClientWorkerRemoteCommonApi::FastTransportHandshake(int32_t timeoutMs, ui
     // PostRegisterClient has already requested UB runtime when either this endpoint uses UB or this client may
     // connect cross-node. Keeping the request there is required because transport arenas can be initialized before
     // this deferred handshake when local cache is disabled.
-    Status initRc = InitializeFastTransportManager();
+    Status initRc = InitializeFastTransportManager(GetClientFastTransportLocalAddr());
     if (initRc.IsError()) {
         if (!IsShmEnable()) {
             return initRc;

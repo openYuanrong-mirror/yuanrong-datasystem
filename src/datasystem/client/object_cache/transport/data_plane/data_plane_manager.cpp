@@ -85,7 +85,7 @@ Status InitClientUbRuntime(uint64_t fastTransportMemSize, bool enablePipelineH2D
     static Status initStatus;
     SetClientFastTransportMode(FastTransportMode::UB, fastTransportMemSize, enablePipelineH2D);
     std::call_once(initOnce, []() {
-        initStatus = InitializeFastTransportManager();
+        initStatus = InitializeFastTransportManager(GetClientFastTransportLocalAddr());
         if (initStatus.IsError()) {
             initStatus.AppendMsg("Fast transport init failed");
         }
