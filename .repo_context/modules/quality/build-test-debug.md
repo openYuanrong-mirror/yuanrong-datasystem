@@ -490,6 +490,24 @@ Backed by `tests/kvtest/deploy_coordinator.py`, `deploy_worker.py`, `deploy_comm
   Covered by `test_deploy_common.py` (`TestCmdCollectShared::test_forwards_max_workers_from_args`,
   `TestCollectLogsFromPodTarStream`) and `test_deploy_client.py` (`TestDoCollect`: single-phase /
   summary-timeout-caps-retries / node-slice).
+- start/stop false-positive fix: `deploy_worker.py deploy` / `start` printed "started" and stop printed "OK"
+  even when the process had crashed immediately after launch (standalone) or was never running (stop). Three
+  fixes in `deploy_common.py`:
+  - `stop_service_standalone`: replaced `pkill ... || true` + unconditional `return True` with SIGTERM +
+    `pgrep` verify after 3s grace period. Returns False if the process is still alive; returns True if gone
+    (whether it was running and exited, or was already absent — idempotent stop). The `|| true` mask is
+    removed so pkill's rc is visible (though the final verdict is pgrep, not pkill rc).
+  - `start_service_standalone`: added a post-launch `pgrep -f {binary_name}` verify after the launcher /
+    nohup path reports a PID. If the PID is gone (process crashed right after readiness), prints FAILED and
+    returns False instead of the false "started (pid=...)".
+  - `start_service` (dscli): added a post-launch `check_process` (ps aux | grep) verify after `dscli start`
+    returns 0. If the process count is 0 (crashed right after dscli readiness), prints FAILED and returns
+    False instead of the false "started".
+  The non-standalone (dscli) path was already correct for `stop_service` (kubectl_exec check=True raises
+  CalledProcessError on dscli stop non-zero). The standalone `stop_service_standalone` bug existed since
+  its introduction (`83e794791`). Covered by `test_deploy_common.py` (`TestStopServiceStandalone`:
+  process-exits / already-absent / refuses-to-exit / no-or-true-in-pkill; `TestStartServiceStandaloneCrashDetect`:
+  crash-detected / started-when-survives; `TestStartService::test_start_fails_when_process_crashes_immediately`).
 - `deploy_jf.py` is the JF mock pod lifecycle CLI (deploy/start/stop/check/clean/collect). It is
   self-contained (uses its own `_kubectl_exec`, not the shared `deploy_common` primitives) because the JF
   mock is a single Python script (`mock_jf_server.py`) with no whl, no dscli, and no per-pod config file.
