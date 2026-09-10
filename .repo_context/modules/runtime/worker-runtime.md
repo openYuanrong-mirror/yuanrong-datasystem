@@ -441,6 +441,13 @@
   - topology routing distinguishes a real redirect from a ScaleOut transfer barrier. Structured callers receive
     `moving=true`; legacy boolean callers receive `true` with an empty target address so they defer the operation instead
     of redirecting back to the committed source or mutating metadata while migration is in flight.
+  - the worker OBJECT_COUNT resource metric reports the live `objectTable` entry count; the `WORKER_OBJECT_COUNT`
+    and `WORKER_ALLOCATED_MEMORY_SIZE` kv_metrics gauges are refreshed inside the same ResMetricCollector handlers
+    (OBJECT_COUNT / OBJECT_SIZE) each scan, so when the collector is initialized both export channels carry one
+    collection snapshot per scan (the kv_metrics Tick may lag one scan) and no per-RPC gauge refresh exists on
+    service entrypoints; registering with monitoring disabled at startup leaves the handlers dormant until restart.
+    After a migration rollback, rolled back pre-existing entries are removed from the object table after their
+    data cleanup is attempted, whether the staged copy was a memory-resident husk or a disk husk.
 - Useful files during debugging:
   - `src/datasystem/worker/worker_main.cpp`
   - `src/datasystem/worker/data_worker.cpp`

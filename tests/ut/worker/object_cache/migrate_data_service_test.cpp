@@ -60,6 +60,7 @@
 #include "datasystem/protos/worker_object.pb.h"
 #include "datasystem/cluster/routing/placement_facade.h"
 #include "datasystem/utils/status.h"
+#include "datasystem/worker/object_cache/async_send_manager.h"
 #include "datasystem/worker/object_cache/obj_cache_shm_unit.h"
 #include "datasystem/worker/object_cache/object_endpoint_policy.h"
 #include "datasystem/worker/object_cache/service/service_execution_policy.h"
@@ -284,6 +285,11 @@ public:
     void SetEvictionManager(std::shared_ptr<WorkerOcEvictionManager> manager)
     {
         evictionManager_ = std::move(manager);
+    }
+
+    void SetAsyncSendManager(std::shared_ptr<AsyncSendManager> manager)
+    {
+        asyncSendManager_ = std::move(manager);
     }
 };
 
@@ -2792,5 +2798,211 @@ TEST_F(NotifyRemoteGetMigrationTest, ReportUnattemptedObjectsSpillRoutesToSkippe
     EXPECT_EQ(failedSet.count("not_attempted"), 0u)
         << "unattempted key must NOT be routed to failed_object_keys when is_spill=true";
 }
+
+namespace {
+void MockQueryMasterMetadataVersion(const std::string &objectKey, uint64_t version, uint64_t dataSize,
+                                    WriteMode writeMode = WriteMode::NONE_L2_CACHE)
+{
+    BINEXPECT_CALL(&WorkerOcServiceMigrateImpl::QueryMasterMetadata, (_, _, _))
+        .Times(1)
+        .WillOnce(Invoke([objectKey, version, dataSize,
+                          writeMode](const std::unordered_set<std::string> &keys, QueryMetaMap &metas,
+                                     std::unordered_set<std::string> &) {
+            EXPECT_THAT(keys, Contains(objectKey));
+            master::QueryMetaInfoPb queryMeta;
+            queryMeta.mutable_meta()->set_object_key(objectKey);
+            queryMeta.mutable_meta()->set_version(version);
+            queryMeta.mutable_meta()->set_data_size(dataSize);
+            queryMeta.mutable_meta()->mutable_config()->set_write_mode(static_cast<uint32_t>(writeMode));
+            metas.emplace(objectKey, std::move(queryMeta));
+            return Status::OK();
+        }));
+}
+
+MigrateDataReqPb MakeSingleObjectMigrateReq(const std::string &objectKey, uint64_t version, uint64_t dataSize,
+                                            MigrateType type)
+{
+    MigrateDataReqPb req;
+    req.set_type(type);
+    req.set_worker_addr("127.0.0.1:18889");
+    auto *info = req.add_objects();
+    info->set_object_key(objectKey);
+    info->set_version(version);
+    info->set_data_size(dataSize);
+    info->add_part_index(0);
+    return req;
+}
+
+std::vector<RpcMessage> MakeSinglePayload(uint64_t dataSize)
+{
+    std::vector<RpcMessage> payloads(1);
+    payloads[0].CopyString(std::string(dataSize, 'x'));
+    return payloads;
+}
+}  // namespace
+
+TEST_F(MigrateDataServiceTest, RollbackExpiredExistingReplicaMustNotLeaveStaleEntry)
+{
+    EnableHeatEviction();
+    const std::string objectKey = "tcp-rollback-stale-existing-replica";
+    const uint64_t dataSize = 1;
+    DS_ASSERT_OK(CreateObject(objectKey, dataSize, WriteMode::NONE_L2_CACHE, false));
+    evictionManager_->Add(objectKey);
+    SetMemoryAvailable(true);
+    const uint64_t version = 2;
+    MockQueryMasterMetadataVersion(objectKey, version, dataSize);
+    BINEXPECT_CALL(&WorkerOcServiceMigrateImpl::ReplacePrimaryImpl, (_, _, _, _))
+        .Times(1)
+        .WillOnce(Invoke([objectKey](const std::string &, const ObjectInfoMap &needSendMasterIds,
+                                     const MigrateType &, PrimarySwitchOutcome &outcome) {
+            EXPECT_FALSE(needSendMasterIds.at(objectKey).second)
+                << "a pre-existing replica entry must be classified as needDel=false";
+            outcome.expiredIds.insert(objectKey);
+            return Status::OK();
+        }));
+
+    MigrateDataReqPb req = MakeSingleObjectMigrateReq(objectKey, version, dataSize, MigrateType::SPILL);
+    MigrateDataRspPb rsp;
+    DS_ASSERT_OK(impl_->MigrateData(req, rsp, MakeSinglePayload(dataSize)));
+    // Legacy wire contract: expired ids are reported as success_ids unless the request type is
+    // REBALANCE_KEEP_LOCAL; the expired classification is only observable via the rollback behavior.
+    ASSERT_EQ(rsp.success_ids_size(), 1);
+    EXPECT_EQ(rsp.success_ids(0), objectKey);
+
+    std::shared_ptr<SafeObjType> entry;
+    EXPECT_EQ(objectTable_->Get(objectKey, entry).GetCode(), K_NOT_FOUND)
+        << "a rolled back existing replica entry must be removed from the object table";
+}
+
+TEST_F(MigrateDataServiceTest, RollbackExpiredAndFailedOutcomeIsIdempotent)
+{
+    EnableHeatEviction();
+    const std::string objectKey = "tcp-rollback-expired-and-failed";
+    const uint64_t dataSize = 1;
+    DS_ASSERT_OK(CreateObject(objectKey, dataSize, WriteMode::NONE_L2_CACHE, false));
+    evictionManager_->Add(objectKey);
+    SetMemoryAvailable(true);
+    const uint64_t version = 2;
+    MockQueryMasterMetadataVersion(objectKey, version, dataSize);
+    BINEXPECT_CALL(&WorkerOcServiceMigrateImpl::ReplacePrimaryImpl, (_, _, _, _))
+        .Times(1)
+        .WillOnce(Invoke([objectKey](const std::string &, const ObjectInfoMap &, const MigrateType &,
+                                     PrimarySwitchOutcome &outcome) {
+            outcome.expiredIds.insert(objectKey);
+            outcome.failedIds.insert(objectKey);
+            return Status::OK();
+        }));
+
+    MigrateDataReqPb req = MakeSingleObjectMigrateReq(objectKey, version, dataSize, MigrateType::SPILL);
+    MigrateDataRspPb rsp;
+    DS_ASSERT_OK(impl_->MigrateData(req, rsp, MakeSinglePayload(dataSize)));
+    std::shared_ptr<SafeObjType> entry;
+    EXPECT_EQ(objectTable_->Get(objectKey, entry).GetCode(), K_NOT_FOUND)
+        << "a key reported as both expired and failed must be rolled back twice without crashing";
+}
+
+TEST_F(MigrateDataServiceTest, RollbackWriteBackEntryRemovesAsyncSendTask)
+{
+    EnableHeatEviction();
+    const std::string objectKey = "tcp-rollback-write-back";
+    const uint64_t dataSize = 1;
+    DS_ASSERT_OK(CreateObject(objectKey, dataSize, WriteMode::WRITE_BACK_L2_CACHE, false));
+    evictionManager_->Add(objectKey);
+    auto asyncSendManager = std::make_shared<AsyncSendManager>(nullptr, evictionManager_);
+    impl_->SetAsyncSendManager(asyncSendManager);
+    SetMemoryAvailable(true);
+    const uint64_t version = 2;
+    MockQueryMasterMetadataVersion(objectKey, version, dataSize, WriteMode::WRITE_BACK_L2_CACHE);
+    BINEXPECT_CALL(&AsyncSendManager::Add, (_, _, _))
+        .Times(1)
+        .WillOnce(Return(Status::OK()));
+    BINEXPECT_CALL(&AsyncSendManager::Remove, (_))
+        .Times(1)
+        .WillOnce(Invoke([objectKey](const std::string &removedKey) {
+            EXPECT_EQ(removedKey, objectKey);
+        }));
+    BINEXPECT_CALL(&WorkerOcServiceMigrateImpl::ReplacePrimaryImpl, (_, _, _, _))
+        .Times(1)
+        .WillOnce(Invoke([objectKey](const std::string &, const ObjectInfoMap &needSendMasterIds,
+                                     const MigrateType &, PrimarySwitchOutcome &outcome) {
+            EXPECT_FALSE(needSendMasterIds.at(objectKey).second)
+                << "a pre-existing write-back replica entry must be classified as needDel=false";
+            outcome.expiredIds.insert(objectKey);
+            return Status::OK();
+        }));
+
+    MigrateDataReqPb req = MakeSingleObjectMigrateReq(objectKey, version, dataSize, MigrateType::SPILL);
+    MigrateDataRspPb rsp;
+    DS_ASSERT_OK(impl_->MigrateData(req, rsp, MakeSinglePayload(dataSize)));
+    std::shared_ptr<SafeObjType> entry;
+    EXPECT_EQ(objectTable_->Get(objectKey, entry).GetCode(), K_NOT_FOUND)
+        << "a rolled back write-back entry must be erased and dequeued from the async send manager";
+}
+
+TEST_F(MigrateDataServiceTest, RollbackExpiredSpilledReplicaEntryIsErasedWithStaleData)
+{
+    const std::string objectKey = "tcp-rollback-spilled-replica";
+    const uint64_t dataSize = 1;
+    DS_ASSERT_OK(CreateObject(objectKey, dataSize, WriteMode::NONE_L2_CACHE, false));
+    std::shared_ptr<SafeObjType> entry;
+    DS_ASSERT_OK(objectTable_->Get(objectKey, entry));
+    (*entry)->SetShmUnit(nullptr);
+    (*entry)->stateInfo.SetSpillState(true);
+    SetMemoryAvailable(false);
+    SetSpillAvailable(true);
+    const uint64_t version = 2;
+    MockQueryMasterMetadataVersion(objectKey, version, dataSize);
+    BINEXPECT_CALL(&WorkerOcServiceMigrateImpl::ReplacePrimaryImpl, (_, _, _, _))
+        .Times(1)
+        .WillOnce(Invoke([objectKey](const std::string &, const ObjectInfoMap &needSendMasterIds,
+                                     const MigrateType &, PrimarySwitchOutcome &outcome) {
+            EXPECT_FALSE(needSendMasterIds.at(objectKey).second)
+                << "a pre-existing spilled replica entry must be classified as needDel=false";
+            outcome.expiredIds.insert(objectKey);
+            return Status::OK();
+        }));
+
+    MigrateDataReqPb req = MakeSingleObjectMigrateReq(objectKey, version, dataSize, MigrateType::SCALE_DOWN);
+    MigrateDataRspPb rsp;
+    DS_ASSERT_OK(impl_->MigrateData(req, rsp, MakeSinglePayload(dataSize)));
+    // Legacy wire contract: expired ids are reported as success_ids unless the request type is
+    // REBALANCE_KEEP_LOCAL; the expired classification is only observable via the rollback behavior.
+    ASSERT_EQ(rsp.success_ids_size(), 1);
+    EXPECT_EQ(rsp.success_ids(0), objectKey);
+
+    EXPECT_EQ(objectTable_->Get(objectKey, entry).GetCode(), K_NOT_FOUND)
+        << "a rolled back spilled replica entry whose disk data was deleted must be removed from the object table";
+}
+
+TEST_F(MigrateDataServiceTest, RollbackExpiredNewCreatedEntryIsErased)
+{
+    EnableHeatEviction();
+    const std::string objectKey = "tcp-rollback-new-created";
+    const uint64_t dataSize = 1;
+    SetMemoryAvailable(true);
+    MockQueryMasterMetadataHit(objectKey);
+    BINEXPECT_CALL(&WorkerOcServiceMigrateImpl::ReplacePrimaryImpl, (_, _, _, _))
+        .Times(1)
+        .WillOnce(Invoke([objectKey](const std::string &, const ObjectInfoMap &needSendMasterIds,
+                                     const MigrateType &, PrimarySwitchOutcome &outcome) {
+            EXPECT_TRUE(needSendMasterIds.at(objectKey).second)
+                << "a freshly created target entry must be classified as needDel=true";
+            outcome.expiredIds.insert(objectKey);
+            return Status::OK();
+        }));
+
+    MigrateDataReqPb req = MakeSingleObjectMigrateReq(objectKey, 1, dataSize, MigrateType::SPILL);
+    MigrateDataRspPb rsp;
+    DS_ASSERT_OK(impl_->MigrateData(req, rsp, MakeSinglePayload(dataSize)));
+    // Legacy wire contract: expired ids are reported as success_ids unless the request type is
+    // REBALANCE_KEEP_LOCAL; the expired classification is only observable via the rollback behavior.
+    ASSERT_EQ(rsp.success_ids_size(), 1);
+    EXPECT_EQ(rsp.success_ids(0), objectKey);
+
+    std::shared_ptr<SafeObjType> entry;
+    EXPECT_EQ(objectTable_->Get(objectKey, entry).GetCode(), K_NOT_FOUND)
+        << "a rolled back newly created entry must be erased from the object table";
+}
+
 }  // namespace ut
 }  // namespace datasystem

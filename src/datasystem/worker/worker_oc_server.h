@@ -537,6 +537,21 @@ private:
     void RegisteringWorkerCallbackFunc();
 
     /**
+     * @brief Registers common worker resource collect handlers (spill, memory, thread pools, clients).
+     */
+    void RegisteringWorkerCommonCallbackFunc();
+
+    /**
+     * @brief Registers object cache collect handlers and mirrors the live count and size into kv_metrics gauges.
+     */
+    void RegisteringObjectCacheCallbackFunc();
+
+    /**
+     * @brief Registers stream cache collect handlers.
+     */
+    void RegisteringStreamCacheCallbackFunc();
+
+    /**
      * @brief Registers callback functions for master metrics.
      */
     void RegisteringMasterCallbackFunc();
