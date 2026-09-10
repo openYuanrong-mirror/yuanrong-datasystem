@@ -21,6 +21,7 @@
 #define DATASYSTEM_CLUSTER_ALGORITHM_BALANCED_RING_H
 
 #include <cstdint>
+#include <cstddef>
 #include <map>
 #include <set>
 #include <unordered_set>
