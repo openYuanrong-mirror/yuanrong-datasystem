@@ -139,6 +139,7 @@ void ShmMmapTableEntry::PinHostMemory()
               << ", attemptedCount: " << pinResult.attemptedFragmentCount
               << ", successCount: " << pinResult.successCount << ", failedCount: " << failedCount
               << ", retryCount: " << pinResult.retryCount
+              << ", stoppedByClientExit: " << pinResult.stoppedByClientExit
               << ", registrationEnabled: true, completed: true, elapsedUs: " << elapsedUs.count();
 }
 
@@ -148,11 +149,23 @@ ShmMmapTableEntry::PinResult ShmMmapTableEntry::PinHostMemoryFragments()
     size_t remainingRetryCount = HOST_MEMORY_PIN_MAX_RETRY_COUNT;
     const size_t fragmentCount = GetPinFragmentCount();
     for (size_t i = 0; i < fragmentCount; ++i) {
+        if (IsClientExiting()) {
+            result.stoppedByClientExit = true;
+            break;
+        }
         if (i > 0) {
             std::this_thread::sleep_for(HOST_MEMORY_FRAGMENT_INTERVAL);
+            if (IsClientExiting()) {
+                result.stoppedByClientExit = true;
+                break;
+            }
         }
         ++result.attemptedFragmentCount;
         while (!PinHostMemoryFragment(i)) {
+            if (IsClientExiting()) {
+                result.stoppedByClientExit = true;
+                return result;
+            }
             if (remainingRetryCount == 0) {
                 const auto fragment = GetPinFragment(i);
                 LOG(ERROR) << "[CudaHostMemory] Worker shared memory pin stopped after retries were exhausted, "
@@ -170,6 +183,11 @@ ShmMmapTableEntry::PinResult ShmMmapTableEntry::PinHostMemoryFragments()
         ++result.successCount;
     }
     return result;
+}
+
+bool ShmMmapTableEntry::IsClientExiting() const
+{
+    return clientExiting_ != nullptr && clientExiting_->load(std::memory_order_acquire);
 }
 
 bool ShmMmapTableEntry::PinHostMemoryFragment(size_t fragmentIndex)

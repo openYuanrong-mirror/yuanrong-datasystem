@@ -209,7 +209,8 @@ function(add_ds_ut_executable TARGET_NAME)
 endfunction()
 
 add_ds_ut_executable(cuda_host_memory_test client/cuda_host_memory_test.cpp)
-target_link_libraries(cuda_host_memory_test PRIVATE GTest::gtest GTest::gtest_main common_cuda_host_memory)
+target_link_libraries(cuda_host_memory_test PRIVATE GTest::gtest GTest::gtest_main common_cuda_host_memory
+                                                   client_mmap_static)
 
 add_ds_ut_executable(ds_ut
         ${DS_TEST_UT_SRCS}
