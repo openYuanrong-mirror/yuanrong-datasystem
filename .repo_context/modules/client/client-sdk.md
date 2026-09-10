@@ -130,9 +130,11 @@
     latch rather than the SDK's initially bound Worker lock id. Transport selection/admission, session, fd-channel,
     auth, legacy reference state, and the mmap manager/table use bthread mutex/RWLock/condition-variable primitives
     because these paths can be entered from brpc/bthread execution contexts.
-  - Non-embedded shared-memory mmap entries submit CUDA host-memory registration to one client-wide serial background
-    worker. All entries owned by that client also share one operation mutex, so whole-mapping registration and
-    destructor-driven unregistration cannot overlap. An mmap is usable immediately: KV `Create`/`MCreate` and both
+  - Non-embedded shared-memory mmap entries submit CUDA host-memory registration to one client-wide serial pin worker.
+    Their last-reference deleter submits unregistration, unmapping, and final entry destruction to a separate
+    client-wide serial unmap worker, so the thread releasing the entry does not wait for fragmented unregistration.
+    Both workers share one operation mutex, so whole-mapping registration and unregistration cannot overlap, although
+    the two queues do not provide global FIFO ordering. An mmap is usable immediately: KV `Create`/`MCreate` and both
     Buffer-returning `Get` variants expose the Worker SHM directly without waiting for registration or allocating a
     temporary Host buffer. Registration and unregistration divide each Worker mapping into fixed 64 MiB fragments
     (with a smaller tail fragment when needed) and wait 5 ms between fragments during normal Worker cleanup, including
