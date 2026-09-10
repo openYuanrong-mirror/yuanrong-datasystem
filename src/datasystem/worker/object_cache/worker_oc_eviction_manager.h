@@ -173,6 +173,16 @@ public:
     void Evict(uint64_t needSize = 0, CacheType cacheType = CacheType::MEMORY);
 
     /**
+     * @brief Estimates the pre-trigger margin: the average cached object size (>= 1 MiB).
+     *
+     * The background patrol reserves room for the next incoming object, the same quantity the
+     * foreground allocation check already counts via usage + needSize, instead of requiring
+     * operators to tune a fixed margin.
+     * @return margin in bytes, never below 1 MiB.
+     */
+    uint64_t EstimatePretriggerMarginBytes();
+
+    /**
      * @brief Touch an object on a cache hit (Get memory hit). Dispatches to the active
      *        eviction strategy (clock: refill curCounter; heat: add size-normalized heat + lastAccess).
      * @param[in] objectKey The hit object key.
