@@ -139,9 +139,9 @@ inline bool ShouldLogFirstAndEveryN(uint32_t n, std::atomic<uint64_t> &counter)
 // Basic Logging Macros Impl
 // Undefine brpc/butil logging macros to prevent redefinition warnings when both
 // datasystem log.h and brpc butil/logging.h are included in the same TU.
-// brpc's butil/logging.h (pulled in via <brpc/channel.h> etc.) defines LOG, VLOG,
-// CHECK, DLOG and friends with different semantics. Our definitions below take
-// precedence; the #undef ensures no -Werror macro-redefinition under cmake.
+// brpc's butil/logging.h (pulled in via <brpc/channel.h> or bthread headers) defines
+// LOG, VLOG, CHECK, DLOG and friends with different semantics. Datasystem LOG macros
+// take precedence, while an existing streamable butil CHECK family must be preserved.
 #ifdef LOG
 #undef LOG
 #endif
@@ -175,6 +175,7 @@ inline bool ShouldLogFirstAndEveryN(uint32_t n, std::atomic<uint64_t> &counter)
 #ifdef VLOG_IS_ON
 #undef VLOG_IS_ON
 #endif
+#ifndef BUTIL_LOGGING_H_
 #ifdef CHECK
 #undef CHECK
 #endif
@@ -195,6 +196,7 @@ inline bool ShouldLogFirstAndEveryN(uint32_t n, std::atomic<uint64_t> &counter)
 #endif
 #ifdef CHECK_GE
 #undef CHECK_GE
+#endif
 #endif
 #ifdef DLOG
 #undef DLOG
@@ -291,6 +293,7 @@ inline bool ShouldLogFirstAndEveryN(uint32_t n, std::atomic<uint64_t> &counter)
     LOG(INFO)
 
 // Assertion Macros
+#ifndef BUTIL_LOGGING_H_
 #define DS_CHECK_OP(op, val1, val2)                                                                                  \
     do {                                                                                                             \
         if (!((val1)op(val2))) {                                                                                     \
@@ -306,6 +309,7 @@ inline bool ShouldLogFirstAndEveryN(uint32_t n, std::atomic<uint64_t> &counter)
 #define CHECK_GE(a, b) DS_CHECK_OP(>=, a, b)
 
 #define CHECK(condition) LOG_IF(FATAL, !(condition)) << "Check failed: " #condition " "
+#endif
 
 #define CHECK_NOTNULL(ptr)                                   \
     do {                                                     \

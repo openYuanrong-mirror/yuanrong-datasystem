@@ -276,6 +276,7 @@ ds_cc_library(
         "worker_self_port_health.h",
     ],
     deps = [
+        "//src/datasystem/cluster:remote_ub_port_health_verifier",
         "//src/datasystem/cluster:cluster_topology_scope",
         "//src/datasystem/worker:metadata_route_resolver",
         "//src/datasystem/worker/object_cache:object_endpoint_policy",

@@ -20,10 +20,11 @@
 
 #include <cstddef>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
+
+#include <bthread/mutex.h>
 
 #include "datasystem/client/object_cache/routing/ub_routing_health.h"
 #include "datasystem/common/object_cache/peer_ub_admission.h"
@@ -54,18 +55,20 @@ private:
     struct WorkerState;
     struct State;
 
+    void LogRoutingChange(const State &previous, const State &current, const HostPort &worker,
+                          const char *source) const;
+
     void ReconcileTopologyMemberLocked(const std::shared_ptr<const State> &current,
                                        const HostPort &worker,
                                        const ::datasystem::MembershipPb &member,
                                        State &next, WorkerState &workers) const;
     ApplyResult ApplySummaryInternal(const UbHealthSummary &summary,
                                      const std::string &expectedIncarnation,
-                                     bool verified);
+                                     bool verified, const char *source);
     bool ResolveExpectedIncarnationLocked(const State &current, const HostPort &worker,
                                           const std::string &fallback, std::string &expected) const;
-    void LogAdmissionChange(const UbHealthSummary &summary, const UbHealthSummary &accepted, bool unavailable) const;
 
-    mutable std::mutex writeMutex_;
+    mutable bthread::Mutex writeMutex_;
     std::shared_ptr<const State> state_;
 };
 

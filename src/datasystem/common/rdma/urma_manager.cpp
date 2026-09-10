@@ -234,7 +234,7 @@ Status UrmaManager::Stop()
 {
     std::shared_ptr<UbPortHealthMonitor> portHealthMonitor;
     {
-        std::lock_guard<std::mutex> lock(clientPortHealthMutex_);
+        std::lock_guard<bthread::Mutex> lock(clientPortHealthMutex_);
         portHealthStopping_ = true;
         portHealthMonitor = std::atomic_exchange_explicit(
             &clientPortHealthMonitor_, std::shared_ptr<UbPortHealthMonitor>{}, std::memory_order_acq_rel);
@@ -370,7 +370,7 @@ Status UrmaManager::InitClientPortHealthMonitor()
 
 Status UrmaManager::GetOrCreatePortHealthMonitor(std::shared_ptr<UbPortHealthMonitor> &monitor)
 {
-    std::lock_guard<std::mutex> lock(clientPortHealthMutex_);
+    std::lock_guard<bthread::Mutex> lock(clientPortHealthMutex_);
     CHECK_FAIL_RETURN_STATUS(!portHealthStopping_, K_SHUTTING_DOWN, "URMA port health monitor is stopping");
     auto current = std::atomic_load_explicit(&clientPortHealthMonitor_, std::memory_order_acquire);
     if (current != nullptr) {

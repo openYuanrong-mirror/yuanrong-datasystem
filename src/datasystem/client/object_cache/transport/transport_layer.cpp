@@ -217,9 +217,16 @@ struct TransportLayer::LocalUbSenderState final : public UrmaLateCompletionObser
         inFlightGate.fetch_or(IN_FLIGHT_CLOSING, std::memory_order_acq_rel);
     }
 
-    void AdmitOperation()
+    bool TryAdmitOperation()
     {
-        inFlightGate.fetch_add(1, std::memory_order_relaxed);
+        uint64_t current = inFlightGate.load(std::memory_order_acquire);
+        while ((current & IN_FLIGHT_CLOSING) == 0) {
+            if (inFlightGate.compare_exchange_weak(current, current + 1, std::memory_order_acq_rel,
+                                                   std::memory_order_acquire)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     bool CompleteOperation()
@@ -281,13 +288,12 @@ struct TransportLayer::LocalUbSenderState final : public UrmaLateCompletionObser
         }
     }
 
-    mutable std::shared_mutex mutex;
     std::weak_ptr<bthread::Mutex> reconcileMutex;
     std::weak_ptr<bthread::ConditionVariable> reconcileCv;
     std::weak_ptr<ThreadPool> lateCompletionPool;
     std::weak_ptr<UbHealthFilter> healthFilter;
-    std::mutex inFlightDrainMutex;
-    std::condition_variable inFlightCv;
+    bthread::Mutex inFlightDrainMutex;
+    bthread::ConditionVariable inFlightCv;
     std::atomic<uint64_t> inFlightGate{ 0 };
 };
 
@@ -297,7 +303,7 @@ TransportLayer::LocalUbSenderOperation::~LocalUbSenderOperation()
         return;
     }
     if (state->CompleteOperation()) {
-        std::lock_guard<std::mutex> lock(state->inFlightDrainMutex);
+        std::lock_guard<bthread::Mutex> lock(state->inFlightDrainMutex);
         state->inFlightCv.notify_all();
     }
 }
@@ -514,10 +520,8 @@ Status TransportLayer::AcquireLocalUbSenderAdmission(TransportHint hint, LocalUb
     if (hint != TransportHint::UB_CANDIDATE) {
         return Status::OK();
     }
-    std::shared_lock<std::shared_mutex> admission(localUbSenderState_->mutex);
-    CHECK_FAIL_RETURN_STATUS(!localUbSenderState_->IsShuttingDown(), K_SHUTTING_DOWN,
+    CHECK_FAIL_RETURN_STATUS(localUbSenderState_->TryAdmitOperation(), K_SHUTTING_DOWN,
                              "TransportLayer is shutting down");
-    localUbSenderState_->AdmitOperation();
     operation.state = localUbSenderState_.get();
     return Status::OK();
 }
@@ -565,11 +569,8 @@ bool TransportLayer::ReportLocalUbSenderFailure(const LocalUbSenderFailureView &
     if (UbFailureClassifier().Classify(outcome) != UbFailureClass::PORT_UNAVAILABLE_ERROR4) {
         return false;
     }
-    {
-        std::shared_lock<std::shared_mutex> lock(localUbSenderState_->mutex);
-        if (localUbSenderState_->IsShuttingDown()) {
-            return false;
-        }
+    if (localUbSenderState_->IsShuttingDown()) {
+        return false;
     }
     TriggerClientLocalUbPortHealthQuery();
     return true;
@@ -1491,15 +1492,12 @@ void TransportLayer::ReconcileLoop()
 void TransportLayer::Shutdown()
 {
     std::lock_guard<bthread::Mutex> shutdownLock(shutdownMutex_);
+    localUbSenderState_->CloseAdmission();
     {
-        std::lock_guard<std::shared_mutex> admission(localUbSenderState_->mutex);
-        localUbSenderState_->CloseAdmission();
-    }
-    {
-        std::unique_lock<std::mutex> lock(localUbSenderState_->inFlightDrainMutex);
-        localUbSenderState_->inFlightCv.wait(lock, [this] {
-            return localUbSenderState_->InFlightOperationCount() == 0;
-        });
+        std::unique_lock<bthread::Mutex> lock(localUbSenderState_->inFlightDrainMutex);
+        while (localUbSenderState_->InFlightOperationCount() != 0) {
+            localUbSenderState_->inFlightCv.wait(lock);
+        }
     }
     Thread reconcileThread;
     {

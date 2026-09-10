@@ -24,6 +24,12 @@
 #include <gtest/gtest.h>
 
 #include "datasystem/cluster/ub_health/remote_ub_port_health_verifier.h"
+#include "datasystem/common/flags/common_flags.h"
+#include "datasystem/common/object_cache/ub_port_health.h"
+#include "datasystem/common/util/raii.h"
+
+DS_DECLARE_bool(alsologtostderr);
+
 namespace datasystem::cluster {
 namespace {
 const HostPort WORKER("127.0.0.1", 18480);
@@ -48,8 +54,56 @@ UbHealthSummary SummaryFor(const HostPort &worker, const std::string &incarnatio
     return summary;
 }
 
+size_t CountOccurrences(const std::string &text, const std::string &needle)
+{
+    size_t count = 0;
+    for (size_t position = 0; (position = text.find(needle, position)) != std::string::npos;
+         position += needle.size()) {
+        ++count;
+    }
+    return count;
+}
 }  // namespace
 
+TEST(RemoteUbPortHealthVerifierTest, LogsOnlyChangedResponsesAndRetryStatus)
+{
+    const bool oldAlsoLogToStderr = FLAGS_alsologtostderr;
+    Raii restoreFlag([oldAlsoLogToStderr] { FLAGS_alsologtostderr = oldAlsoLogToStderr; });
+    FLAGS_alsologtostderr = true;
+    RemoteUbPortHealthVerifier verifier;
+
+    testing::internal::CaptureStderr();
+    ASSERT_TRUE(verifier.RequestVerification(WORKER, INCARNATION, 0));
+    auto ticket = verifier.TryBeginDue(0);
+    ASSERT_TRUE(ticket.has_value());
+    EXPECT_TRUE(verifier.Complete(*ticket, Summary(4, 4, 1), Status::OK(), 1).evidenceAccepted);
+
+    ticket = verifier.TryBeginDue(1'001);
+    ASSERT_TRUE(ticket.has_value());
+    EXPECT_TRUE(verifier.Complete(*ticket, Summary(4, 4, 1), Status::OK(), 1'002).evidenceAccepted);
+
+    ticket = verifier.TryBeginDue(2'002);
+    ASSERT_TRUE(ticket.has_value());
+    EXPECT_TRUE(verifier.Complete(*ticket, std::nullopt,
+                                  Status(K_RPC_DEADLINE_EXCEEDED, "timeout"), 2'003).retryScheduled);
+    ticket = verifier.TryBeginDue(3'003);
+    ASSERT_TRUE(ticket.has_value());
+    EXPECT_TRUE(verifier.Complete(*ticket, std::nullopt,
+                                  Status(K_RPC_DEADLINE_EXCEEDED, "timeout"), 3'004).retryScheduled);
+
+    ticket = verifier.TryBeginDue(4'004);
+    ASSERT_TRUE(ticket.has_value());
+    EXPECT_TRUE(verifier.Complete(*ticket, Summary(4, 3, 2), Status::OK(), 4'005).evidenceAccepted);
+    const auto logs = testing::internal::GetCapturedStderr();
+
+    EXPECT_EQ(CountOccurrences(logs, "UB_PORT_QUERY action=response"), 2u) << logs;
+    EXPECT_EQ(CountOccurrences(logs, "UB_PORT_QUERY action=retry"), 1u) << logs;
+    EXPECT_NE(logs.find("decision=ISOLATE source=query_response"), std::string::npos) << logs;
+    EXPECT_NE(logs.find("decision=RECOVER source=query_response"), std::string::npos) << logs;
+    EXPECT_NE(logs.find("incarnation_prefix=" + FormatUbHealthIncarnationPrefix(INCARNATION)),
+              std::string::npos) << logs;
+    EXPECT_NE(logs.find("next_retry_ms=1000"), std::string::npos) << logs;
+}
 TEST(RemoteUbPortHealthVerifierTest, ClientModeQueriesEverySecondUntilAnyPortRecovers)
 {
     RemoteUbPortHealthVerifier verifier;

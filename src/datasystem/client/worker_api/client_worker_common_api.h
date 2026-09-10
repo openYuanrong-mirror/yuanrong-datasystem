@@ -40,6 +40,8 @@
 #include "datasystem/common/log/log.h"
 #include "datasystem/common/util/locks.h"
 
+#include <bthread/mutex.h>
+
 #include "datasystem/common/heartbeat_type.h"
 #include "datasystem/common/object_cache/ub_health_summary_codec.h"
 #include "datasystem/common/token/client_access_token.h"
@@ -278,7 +280,7 @@ protected:
     void DispatchUbHealthSummaryCallback(const UbHealthSummary &summary, const char *context);
 
     int64_t heartBeatTimeoutMs_{ 0 };
-    std::mutex ubHealthSummaryCallbackMutex_;
+    bthread::Mutex ubHealthSummaryCallbackMutex_;
     UbHealthSummaryApplyHook ubHealthSummaryCallback_;
 
 private:

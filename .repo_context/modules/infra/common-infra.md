@@ -246,6 +246,15 @@ MADV_HUGEPAGE)` to the shared-memory memfd mapping after `mmap` succeeds when th
     Shutdown prevents monitor recreation, joins outstanding queries/callbacks, clears published snapshot/admission
     state, and then tears down the URMA context. Restart collects fresh facts while preserving the previous health epoch
     fence. Shared Monitor startup still schedules the initial query needed by the routing health view.
+    UB health synchronization reachable from brpc/bthread callbacks uses bthread-compatible primitives: Monitor and
+    callback-drain mutex/CV pairs migrate together, registry/verifier/filter state retains one bthread write mutex,
+    and `PeerUbAdmission` plus `UbHealthSummaryCache` retain read/write semantics with `bthread::RWLock`. Client sender
+    admission linearizes its closing bit and active count through one CAS state word; only the bthread mutex/CV drain
+    pair remains. Data-plane health callbacks acquire a counted lease under their lifecycle mutex, execute summary
+    merge, verifier updates, hooks, and wakeups outside that mutex. Detach waits until every acquired lease exits.
+    Other Provider/RPC and admission critical-section optimizations remain separate from this synchronization change.
+    `UbHealthLeaseSync` keeps its `std::mutex`/`std::condition_variable` pair because only its dedicated native `Thread`
+    owns that wait loop; changing its state machine is outside this synchronization commit.
     Pending refresh retains last-confirmed local admission. Query failures never invent all-down facts and pending
     refresh retries remain rate-limited. `ReadSummaryForQuery` reads cached facts and requests coalesced refresh
     without waiting for Provider; stale/in-flight replies are pending. `WorkerRouter`'s frozen DTO is declared in
@@ -271,6 +280,16 @@ MADV_HUGEPAGE)` to the shared-memory memfd mapping after `mmap` succeeds when th
     release after unlock.
     The private client admission observer is declared in `common/rdma/client_port_health_admission_observer.h`;
     moving this header does not change the atomic gate layout or observer lifetime.
+    Native URMA port identity is the chip/die/port tuple. The provider sorts and validates these tuples before
+    assigning process-local ordinal indexes; chip-local repeated port indexes are not duplicate physical ports.
+    Routing transitions log only published before/after snapshots outside the writer lock, with hex-encoded identity
+    prefixes. Batched observations log each worker's final published change, not unpublished intermediate values.
+    Worker RemoteGet (single and batch) checks requester self admission before creating the remote RPC/receive path.
+    Worker peer and migration paths reuse the same verifier type and a bounded shared query pool. Lease summaries
+    carry only aggregate worker health, not a peer matrix; query results retain endpoint/incarnation/epoch fencing.
+    Worker dispatch also refills on each completion without a batch future barrier. Callback leases pin the service
+    across business work and active queries without holding the lifecycle mutex. Detach rejects new leases and drains
+    existing users before service destruction; queued queries then return shutting-down without accessing the service.
     `tests/ut/common/rdma/ub_port_health_test.cpp` covers monitor state and lifecycle branches;
     `tests/ut/common/rdma/urma_port_status_provider_test.cpp` covers the mock ABI-to-provider path; and the mock-only
     Client CQE-4 case in `tests/st/client/object_cache/urma_object_client_test.cpp` covers asynchronous query, Host Get

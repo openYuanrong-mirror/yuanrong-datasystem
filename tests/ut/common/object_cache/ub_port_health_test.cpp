@@ -18,18 +18,22 @@
 
 #include "tests/support/fake_ub_port_status_provider.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <future>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "datasystem/common/flags/common_flags.h"
 #include "datasystem/common/object_cache/ub_port_health.h"
 #include "datasystem/common/util/raii.h"
+#include "datasystem/common/util/uuid_generator.h"
 
 DS_DECLARE_bool(alsologtostderr);
 
@@ -69,6 +73,25 @@ private:
     std::vector<UbPortHealthSummary> summaries_;
 };
 
+class ThrowOnceUbPortStatusProvider : public IUbPortStatusProvider {
+public:
+    Status QueryPortStatus(std::vector<UbPortStatus> &portStatus) override
+    {
+        if (calls_.fetch_add(1, std::memory_order_acq_rel) == 0) {
+            throw std::runtime_error("provider failure");
+        }
+        portStatus = { { 0, UbPortState::GOOD } };
+        return Status::OK();
+    }
+
+    size_t Calls() const
+    {
+        return calls_.load(std::memory_order_acquire);
+    }
+
+private:
+    std::atomic<size_t> calls_{ 0 };
+};
 }  // namespace
 
 TEST(UbPortHealthTest, AnyHealthyPortRecoversIsolation)
@@ -79,6 +102,18 @@ TEST(UbPortHealthTest, AnyHealthyPortRecoversIsolation)
 
     auto degraded = Summary(4, 3, 2);
     EXPECT_TRUE(ShouldRecoverFromUbIsolation(degraded));
+}
+
+TEST(UbPortHealthTest, IncarnationLogPrefixUsesOnePrintableFormat)
+{
+    std::string uuidBytes(UUID_SIZE, '\0');
+    for (size_t i = 0; i < uuidBytes.size(); ++i) {
+        uuidBytes[i] = static_cast<char>(i);
+    }
+    const auto uuidPrefix = FormatUbHealthIncarnationPrefix(uuidBytes);
+    EXPECT_EQ(uuidPrefix, "00010203-040");
+
+    EXPECT_EQ(FormatUbHealthIncarnationPrefix("worker-incarnation"), "776f726b6572");
 }
 
 TEST(UbPortHealthTest, MonitorPublishesNormalizedImmutableSnapshot)
@@ -169,5 +204,23 @@ TEST(UbPortHealthTest, MonitorStopWaitsForInFlightProviderQuery)
     EXPECT_EQ(monitor->EnsureFresh(std::chrono::milliseconds(0)).GetCode(), K_NOT_READY);
 }
 
+TEST(UbPortHealthTest, ProviderExceptionClearsInFlightAndAllowsNextQuery)
+{
+    auto provider = std::make_shared<ThrowOnceUbPortStatusProvider>();
+    auto monitor = UbPortHealthMonitor::CreateForTest(provider, std::chrono::milliseconds(1));
+    ASSERT_TRUE(monitor->Start().IsOk());
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (provider->Calls() < 2 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    ASSERT_GE(provider->Calls(), 2u);
+    ASSERT_TRUE(monitor->EnsureFresh(std::chrono::hours(1)).IsOk());
+    auto snapshot = monitor->GetSnapshot();
+    ASSERT_NE(snapshot, nullptr);
+    EXPECT_TRUE(snapshot->valid);
+    EXPECT_FALSE(snapshot->verificationPending);
+    EXPECT_EQ(snapshot->badPortCount, 0u);
+    monitor->Stop();
+}
 }  // namespace ut
 }  // namespace datasystem

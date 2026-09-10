@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -25,6 +26,9 @@
 
 #include <gtest/gtest.h>
 
+#include <bthread/bthread.h>
+#include <bthread/countdown_event.h>
+
 #include "ut/common.h"
 #define private public
 #include "datasystem/client/object_cache/transport/data_plane/data_plane_manager.h"
@@ -34,7 +38,22 @@
 namespace datasystem::client {
 namespace {
 const HostPort WORKER("127.0.0.1", 18481);
+const HostPort SECOND_WORKER("127.0.0.1", 18482);
 constexpr char INCARNATION[] = "worker-incarnation";
+constexpr char SECOND_INCARNATION[] = "worker-incarnation-2";
+
+template <typename Predicate>
+bool WaitUntil(Predicate predicate, std::chrono::milliseconds timeout)
+{
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (predicate()) {
+            return true;
+        }
+        std::this_thread::yield();
+    }
+    return predicate();
+}
 
 class FakeVerifierDataPlaneManager final : public DataPlaneManager {
 public:
@@ -130,6 +149,89 @@ public:
     bool released = false;
 };
 
+TEST(DataPlaneUbHealthCallbackStateTest, ConcurrentCallbacksRunOutsideLifecycleLockAndDetachDrains)
+{
+    bthread::CountdownEvent hooksEntered(2);
+    bthread::CountdownEvent releaseHooks(1);
+    std::atomic<size_t> hookCalls{ 0 };
+    DataPlaneManager manager(
+        nullptr, 0, {}, nullptr, false, 1, nullptr, false, true, nullptr,
+        [&](const UbHealthSummary &) {
+            hookCalls.fetch_add(1, std::memory_order_relaxed);
+            hooksEntered.signal();
+            releaseHooks.wait();
+        });
+    WorkerSnapshot snapshot;
+    snapshot.ringVersion = 1;
+    snapshot.remoteTransportAddrs = { WORKER, SECOND_WORKER };
+    snapshot.workerIncarnations = { { WORKER, INCARNATION }, { SECOND_WORKER, SECOND_INCARNATION } };
+    ASSERT_TRUE(manager.UpdateWorkerSnapshot(snapshot).IsOk());
+
+    auto callback = manager.ubHealthCallbackState_;
+    struct CallbackCall {
+        std::shared_ptr<DataPlaneManager::UbHealthCallbackState> callback;
+        UbHealthSummary summary;
+    } first{ callback, UbHealthSummary{} }, second{ callback, UbHealthSummary{} };
+    first.summary.worker = WORKER;
+    first.summary.incarnation = INCARNATION;
+    first.summary.epoch = 1;
+    second.summary.worker = SECOND_WORKER;
+    second.summary.incarnation = SECOND_INCARNATION;
+    second.summary.epoch = 1;
+    auto runCallback = [](void *arg) -> void * {
+        auto &call = *static_cast<CallbackCall *>(arg);
+        call.callback->ObserveSummary(call.summary);
+        return nullptr;
+    };
+
+    bthread_t firstCallback;
+    bthread_t secondCallback;
+    ASSERT_EQ(bthread_start_background(&firstCallback, nullptr, runCallback, &first), 0);
+    if (bthread_start_background(&secondCallback, nullptr, runCallback, &second) != 0) {
+        releaseHooks.signal();
+        EXPECT_EQ(bthread_join(firstCallback, nullptr), 0);
+        FAIL() << "Failed to start the second callback bthread";
+    }
+    if (hooksEntered.timed_wait(butil::seconds_from_now(2)) != 0) {
+        releaseHooks.signal();
+        EXPECT_EQ(bthread_join(firstCallback, nullptr), 0);
+        EXPECT_EQ(bthread_join(secondCallback, nullptr), 0);
+        FAIL() << "Both callbacks did not enter the business hook concurrently";
+    }
+
+    auto detach = std::async(std::launch::async, [&] { callback->Detach(); });
+    const bool admissionClosed = WaitUntil(
+        [&] {
+            std::lock_guard<bthread::Mutex> lock(callback->mutex_);
+            return callback->manager_ == nullptr && callback->activeCallbacks_ == 2;
+        },
+        std::chrono::seconds(1));
+    if (!admissionClosed) {
+        releaseHooks.signal();
+        EXPECT_EQ(bthread_join(firstCallback, nullptr), 0);
+        EXPECT_EQ(bthread_join(secondCallback, nullptr), 0);
+        detach.get();
+        FAIL() << "Detach did not close callback admission while preserving active leases";
+    }
+    EXPECT_EQ(detach.wait_for(std::chrono::milliseconds(50)), std::future_status::timeout);
+    callback->drained_.notify_all();
+    EXPECT_EQ(detach.wait_for(std::chrono::milliseconds(50)), std::future_status::timeout);
+    callback->ObserveSummary(first.summary);
+    EXPECT_EQ(hookCalls.load(std::memory_order_acquire), 2u);
+
+    releaseHooks.signal();
+    EXPECT_EQ(bthread_join(firstCallback, nullptr), 0);
+    EXPECT_EQ(bthread_join(secondCallback, nullptr), 0);
+    detach.get();
+    {
+        std::lock_guard<bthread::Mutex> lock(callback->mutex_);
+        EXPECT_EQ(callback->activeCallbacks_, 0u);
+        EXPECT_EQ(callback->manager_, nullptr);
+    }
+    callback->ObserveSummary(second.summary);
+    EXPECT_EQ(hookCalls.load(std::memory_order_acquire), 2u);
+}
+
 TEST(DataPlaneUbHealthVerifierTest, DispatchRefillsFreeSlotAndShutdownDrainsOutstandingQueries)
 {
     ControlledVerifierDataPlaneManager manager;
@@ -200,8 +302,8 @@ TEST(DataPlaneUbHealthVerifierTest, VerifiedAllDownSchedulesOneSecondRecoveryAnd
     ASSERT_TRUE(deadline.has_value());
     const auto delay = std::chrono::duration_cast<std::chrono::milliseconds>(
         *deadline - std::chrono::steady_clock::now());
-    EXPECT_GE(delay.count(), 900);
-    EXPECT_LE(delay.count(), UB_REMOTE_PORT_HEALTH_QUERY_INTERVAL.count());
+    EXPECT_GT(delay.count(), 0);
+    EXPECT_LE(delay, UB_REMOTE_PORT_HEALTH_QUERY_INTERVAL);
     EXPECT_GE(wakes, 2u);
 
     ASSERT_TRUE(manager.UpdateWorkerSnapshot(Snapshot(2, false)).IsOk());

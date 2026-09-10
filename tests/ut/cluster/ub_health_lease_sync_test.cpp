@@ -3,6 +3,8 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  */
 
+#include <algorithm>
+
 #include <gtest/gtest.h>
 
 #include "datasystem/cluster/ub_health/ub_health_lease_sync.h"
@@ -21,6 +23,14 @@ std::string Encode(const UbHealthSummary &summary)
     UbHealthSummaryPb pb;
     EncodeUbHealthSummary(summary, pb);
     return pb.SerializeAsString();
+}
+
+const UbHealthSummary *FindSummary(const std::vector<UbHealthSummary> &summaries,
+                                   const HostPort &worker)
+{
+    auto iter = std::find_if(summaries.begin(), summaries.end(),
+                             [&worker](const auto &summary) { return summary.worker == worker; });
+    return iter == summaries.end() ? nullptr : &*iter;
 }
 }  // namespace
 
@@ -98,4 +108,85 @@ TEST(UbHealthLeaseSyncTest, LeaseExpiryDropsGlobalObservationButPreservesLocalEv
     EXPECT_TRUE(admission.CheckReadSource(GLOBAL_PEER).IsOk());
     EXPECT_EQ(admission.CheckReadSource(LOCAL_PEER).GetCode(), K_URMA_DATA_WORKER_UNAVAILABLE);
 }
+TEST(UbHealthLeaseSyncTest, SameIncarnationHealthEpochNeverMovesBackward)
+{
+    FakeCoordinationBackend backend;
+    std::vector<UbHealthSummary> consumed;
+    UbHealthSummary peer;
+    peer.worker = GLOBAL_PEER;
+    peer.incarnation = "global-1";
+    peer.writable = false;
+    peer.epoch = 5;
+    peer.portHealth = UbPortHealthSummary{ true, 4, 4, 5, false };
+    backend.PutBytes(TABLE, GLOBAL_PEER.ToString(), Encode(peer));
+    UbHealthLeaseSync::Config config{
+        TABLE,
+        SELF,
+        [](std::string &incarnation) {
+            incarnation = "self-1";
+            return Status::OK();
+        },
+        [] { return UbHealthSummary{}; },
+        [&consumed](const auto &snapshot) { consumed = snapshot; }
+    };
+    UbHealthLeaseSync sync(backend, std::move(config));
+    ASSERT_TRUE(sync.SyncOnce().IsOk());
+
+    auto staleRecovery = peer;
+    staleRecovery.writable = true;
+    staleRecovery.epoch = 6;
+    staleRecovery.portHealth = UbPortHealthSummary{ true, 4, 3, 4, false };
+    backend.PutBytes(TABLE, GLOBAL_PEER.ToString(), Encode(staleRecovery));
+    ASSERT_TRUE(sync.SyncOnce().IsOk());
+    auto observed = FindSummary(consumed, GLOBAL_PEER);
+    ASSERT_NE(observed, nullptr);
+    EXPECT_EQ(observed->epoch, 6u);
+    EXPECT_EQ(observed->portHealth->badPortCount, 4u);
+
+    auto currentRecovery = staleRecovery;
+    currentRecovery.portHealth->healthEpoch = 6;
+    backend.PutBytes(TABLE, GLOBAL_PEER.ToString(), Encode(currentRecovery));
+    ASSERT_TRUE(sync.SyncOnce().IsOk());
+    observed = FindSummary(consumed, GLOBAL_PEER);
+    ASSERT_NE(observed, nullptr);
+    EXPECT_EQ(observed->epoch, 6u);
+    EXPECT_EQ(observed->portHealth->badPortCount, 3u);
+}
+
+TEST(UbHealthLeaseSyncTest, NewPortHealthSurvivesOlderAdmissionEpoch)
+{
+    FakeCoordinationBackend backend;
+    std::vector<UbHealthSummary> consumed;
+    UbHealthSummary peer;
+    peer.worker = GLOBAL_PEER;
+    peer.incarnation = "global-1";
+    peer.epoch = 8;
+    peer.portHealth = UbPortHealthSummary{ true, 4, 0, 2, false };
+    backend.PutBytes(TABLE, GLOBAL_PEER.ToString(), Encode(peer));
+    UbHealthLeaseSync sync(
+        backend,
+        { TABLE,
+          SELF,
+          [](std::string &incarnation) {
+              incarnation = "self-1";
+              return Status::OK();
+          },
+          [] { return UbHealthSummary{}; },
+          [&consumed](const auto &snapshot) { consumed = snapshot; } });
+    ASSERT_TRUE(sync.SyncOnce().IsOk());
+
+    auto newerPortHealth = peer;
+    newerPortHealth.epoch = 7;
+    newerPortHealth.portHealth = UbPortHealthSummary{ true, 4, 4, 3, false };
+    backend.PutBytes(TABLE, GLOBAL_PEER.ToString(), Encode(newerPortHealth));
+    ASSERT_TRUE(sync.SyncOnce().IsOk());
+
+    auto observed = FindSummary(consumed, GLOBAL_PEER);
+    ASSERT_NE(observed, nullptr);
+    EXPECT_EQ(observed->epoch, 8u);
+    ASSERT_TRUE(observed->portHealth.has_value());
+    EXPECT_EQ(observed->portHealth->healthEpoch, 3u);
+    EXPECT_EQ(observed->portHealth->badPortCount, 4u);
+}
+
 }  // namespace datasystem::cluster

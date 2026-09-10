@@ -152,6 +152,94 @@ using namespace datasystem::master;
 using namespace datasystem::worker;
 namespace datasystem {
 namespace object_cache {
+WorkerOCServiceImpl::UbHealthCallbackState::UbHealthCallbackState(WorkerOCServiceImpl *service) : service_(service)
+{
+}
+
+void WorkerOCServiceImpl::UbHealthCallbackState::Detach()
+{
+    std::unique_lock<bthread::Mutex> lock(mutex_);
+    service_ = nullptr;
+    while (activeCallbacks_ != 0) {
+        drained_.wait(lock);
+    }
+}
+
+WorkerOCServiceImpl::UbHealthCallbackState::Lease WorkerOCServiceImpl::UbHealthCallbackState::Acquire()
+{
+    std::lock_guard<bthread::Mutex> lock(mutex_);
+    if (service_ != nullptr) {
+        ++activeCallbacks_;
+    }
+    return Lease(this, service_);
+}
+
+WorkerOCServiceImpl::UbHealthCallbackState::Lease::~Lease()
+{
+    if (service_ != nullptr) {
+        std::lock_guard<bthread::Mutex> lock(owner_->mutex_);
+        if (--owner_->activeCallbacks_ == 0) {
+            owner_->drained_.notify_all();
+        }
+    }
+}
+
+void WorkerOCServiceImpl::UbHealthCallbackState::RequestVerification(const HostPort &peer)
+{
+    auto lease = Acquire();
+    if (lease) {
+        lease.service_->RequestPeerUbPortHealthVerification(peer);
+    }
+}
+
+void WorkerOCServiceImpl::UbHealthCallbackState::ObserveSummary(const UbHealthSummary &summary)
+{
+    auto lease = Acquire();
+    if (lease) {
+        lease.service_->ObservePeerUbHealthSummary(summary);
+    }
+}
+
+bool WorkerOCServiceImpl::UbHealthCallbackState::ApplyVerifiedPortHealth(
+    const cluster::RemoteUbQueryTicket &ticket, const UbPortHealthSummary &summary)
+{
+    auto lease = Acquire();
+    if (!lease) {
+        return false;
+    }
+    cluster::MemberEndpoint current;
+    if (lease.service_->membership_.ResolveByAddress(ticket.peer.ToString(), current).IsError()
+        || current.identity.id != ticket.incarnation) {
+        return false;
+    }
+    return lease.service_->ubAdmission_->ApplyPortHealth(
+        ticket.peer, summary, UbPortHealthEvidenceSource::QUERY_RESPONSE);
+}
+
+void WorkerOCServiceImpl::UbHealthCallbackState::ScheduleVerification()
+{
+    auto lease = Acquire();
+    if (lease) {
+        lease.service_->SchedulePeerUbPortHealthVerification();
+    }
+}
+
+bool WorkerOCServiceImpl::UbHealthCallbackState::IsAttached() const
+{
+    std::lock_guard<bthread::Mutex> lock(mutex_);
+    return service_ != nullptr;
+}
+
+Status WorkerOCServiceImpl::UbHealthCallbackState::QueryPortHealth(
+    const cluster::RemoteUbQueryTicket &ticket, UbHealthSummary &summary)
+{
+    auto lease = Acquire();
+    CHECK_FAIL_RETURN_STATUS(lease && lease.service_->getProc_ != nullptr, K_SHUTTING_DOWN,
+                             "Worker UB health query owner is detached");
+    return lease.service_->getProc_->QueryPeerUbPortHealth(
+        ticket.peer, ticket.incarnation, static_cast<int32_t>(UB_REMOTE_PORT_HEALTH_QUERY_INTERVAL.count()), summary);
+}
+
 namespace {
 constexpr char CLUSTER_TOPOLOGY_SCHEMA_VERSION[] = "2";
 constexpr char TOPOLOGY_READINESS_PROBE_KEY[] = "topology-readiness-probe";
@@ -214,6 +302,170 @@ void AttachPublishedSelfUbHealth(const WorkerOCServiceImpl &service, Response &r
     if (summary != nullptr) {
         rsp.mutable_ub_health_summary()->CopyFrom(*summary);
     }
+}
+
+void CompletePeerUbPortHealthVerification(
+    const std::shared_ptr<cluster::RemoteUbPortHealthVerifier> &verifier,
+    const std::shared_ptr<WorkerOCServiceImpl::UbHealthCallbackState> &callbackState,
+    const cluster::RemoteUbQueryTicket &ticket) noexcept
+{
+    UbHealthSummary summary;
+    Status rc;
+    try {
+        rc = callbackState->QueryPortHealth(ticket, summary);
+    } catch (const std::exception &error) {
+        rc = Status(K_RUNTIME_ERROR, error.what());
+    } catch (...) {
+        rc = Status(K_RUNTIME_ERROR, "Worker UB port-health query threw");
+    }
+    std::optional<UbHealthSummary> response;
+    if (rc.IsOk()) {
+        response = summary;
+    }
+    auto completion = verifier->Complete(
+        ticket, response, rc, static_cast<uint64_t>(GetSteadyClockTimeStampMs()));
+    if (completion.evidenceAccepted && response.has_value() && response->portHealth.has_value()) {
+        try {
+            (void)callbackState->ApplyVerifiedPortHealth(ticket, *response->portHealth);
+        } catch (const std::exception &error) {
+            LOG(ERROR) << "Failed to apply verified Worker UB port-health response: " << error.what();
+        } catch (...) {
+            LOG(ERROR) << "Failed to apply verified Worker UB port-health response";
+        }
+    }
+}
+
+struct PeerUbPortHealthVerificationContext {
+    std::shared_ptr<cluster::RemoteUbPortHealthVerifier> verifier;
+    std::shared_ptr<std::atomic<bool>> scheduled;
+    std::shared_ptr<PeerUbAdmission> admission;
+    std::weak_ptr<ThreadPool> queryPool;
+    std::shared_ptr<WorkerOCServiceImpl::UbHealthCallbackState> callbackState;
+    std::shared_ptr<std::atomic<size_t>> inFlight;
+};
+
+std::vector<cluster::RemoteUbQueryTicket> CollectDuePeerUbPortHealthQueries(
+    const PeerUbPortHealthVerificationContext &context)
+{
+    std::vector<cluster::RemoteUbQueryTicket> tickets;
+    tickets.reserve(cluster::REMOTE_UB_PORT_HEALTH_MAX_CONCURRENT_QUERIES);
+    const auto queryStartMs = static_cast<uint64_t>(GetSteadyClockTimeStampMs());
+    constexpr auto maxQueries = cluster::REMOTE_UB_PORT_HEALTH_MAX_CONCURRENT_QUERIES;
+    while (tickets.size() < maxQueries && context.inFlight->load(std::memory_order_acquire) < maxQueries) {
+        auto ticket = context.verifier->TryBeginDue(queryStartMs);
+        if (!ticket.has_value()) {
+            break;
+        }
+        tickets.emplace_back(std::move(*ticket));
+        context.inFlight->fetch_add(1, std::memory_order_acq_rel);
+    }
+    return tickets;
+}
+
+void DispatchPeerUbPortHealthQueries(const PeerUbPortHealthVerificationContext &context,
+                                     const std::vector<cluster::RemoteUbQueryTicket> &tickets)
+{
+    for (const auto &ticket : tickets) {
+        std::shared_ptr<std::atomic<bool>> unclaimed;
+        try {
+            auto queryPool = context.queryPool.lock();
+            if (queryPool == nullptr) {
+                context.inFlight->fetch_sub(1, std::memory_order_acq_rel);
+                (void)context.verifier->Complete(
+                    ticket, std::nullopt, Status(K_SHUTTING_DOWN, "Worker UB port-health query pool is closed"),
+                    static_cast<uint64_t>(GetSteadyClockTimeStampMs()));
+                continue;
+            }
+            unclaimed = std::make_shared<std::atomic<bool>>(true);
+            INJECT_POINT_NO_RETURN("WorkerOCServiceImpl.DispatchUbPortHealthQuery", [] {
+                throw std::runtime_error("Injected query dispatch failure");
+            });
+            (void)queryPool->Submit([verifier = context.verifier,
+                                     callbackState = context.callbackState, inFlight = context.inFlight,
+                                     ticket, unclaimed] {
+                if (unclaimed->exchange(false)) {
+                    CompletePeerUbPortHealthVerification(verifier, callbackState, ticket);
+                    inFlight->fetch_sub(1, std::memory_order_acq_rel);
+                    callbackState->ScheduleVerification();
+                }
+            });
+        } catch (const std::exception &error) {
+            if (unclaimed != nullptr && !unclaimed->exchange(false)) {
+                continue;
+            }
+            context.inFlight->fetch_sub(1, std::memory_order_acq_rel);
+            LOG(ERROR) << "Failed to dispatch Worker UB port-health query: " << error.what();
+            (void)context.verifier->Complete(
+                ticket, std::nullopt, Status(K_RUNTIME_ERROR, error.what()),
+                static_cast<uint64_t>(GetSteadyClockTimeStampMs()));
+        } catch (...) {
+            if (unclaimed != nullptr && !unclaimed->exchange(false)) {
+                continue;
+            }
+            context.inFlight->fetch_sub(1, std::memory_order_acq_rel);
+            LOG(ERROR) << "Failed to dispatch Worker UB port-health query";
+            (void)context.verifier->Complete(
+                ticket, std::nullopt, Status(K_RUNTIME_ERROR, "Failed to dispatch Worker UB port-health query"),
+                static_cast<uint64_t>(GetSteadyClockTimeStampMs()));
+        }
+    }
+}
+
+bool PrepareNextPeerUbPortHealthQuery(const PeerUbPortHealthVerificationContext &context)
+{
+    context.scheduled->store(false, std::memory_order_release);
+    if (context.inFlight->load(std::memory_order_acquire) >=
+        cluster::REMOTE_UB_PORT_HEALTH_MAX_CONCURRENT_QUERIES) {
+        return false;
+    }
+    auto next = context.verifier->NextQueryDeadlineMs();
+    const auto nowMs = static_cast<uint64_t>(GetSteadyClockTimeStampMs());
+    bool expected = false;
+    if (!next.has_value()) {
+        return false;
+    }
+    if (*next <= nowMs) {
+        return context.scheduled->compare_exchange_strong(expected, true);
+    }
+    std::weak_ptr<WorkerOCServiceImpl::UbHealthCallbackState> weakCallbackState(context.callbackState);
+    TimerQueue::TimerImpl timer;
+    auto rc = TimerQueue::GetInstance()->AddTimer(
+        *next - nowMs,
+        [weakCallbackState] {
+            if (auto state = weakCallbackState.lock()) {
+                state->ScheduleVerification();
+            }
+        },
+        timer);
+    LOG_IF_ERROR(rc, "Failed to schedule delayed Worker UB port health verification");
+    if (rc.IsOk() || !context.scheduled->compare_exchange_strong(expected, true)) {
+        return false;
+    }
+    const auto retryDelayMs = std::min<uint64_t>(
+        *next - nowMs, static_cast<uint64_t>(UB_REMOTE_PORT_HEALTH_QUERY_INTERVAL.count()));
+    std::this_thread::sleep_for(std::chrono::milliseconds(retryDelayMs));
+    return true;
+}
+
+void RunPeerUbPortHealthVerification(const PeerUbPortHealthVerificationContext &context)
+{
+    if (context.verifier == nullptr || context.scheduled == nullptr ||
+        context.admission == nullptr || context.queryPool.expired() || context.callbackState == nullptr) {
+        if (context.scheduled != nullptr) {
+            context.scheduled->store(false, std::memory_order_release);
+        }
+        return;
+    }
+    while (context.callbackState->IsAttached()) {
+        auto tickets = CollectDuePeerUbPortHealthQueries(context);
+        if (!tickets.empty()) {
+            DispatchPeerUbPortHealthQueries(context, tickets);
+        }
+        if (!PrepareNextPeerUbPortHealthQuery(context)) {
+            return;
+        }
+    }
+    context.scheduled->store(false, std::memory_order_release);
 }
 
 }  // namespace
@@ -364,10 +616,19 @@ WorkerOCServiceImpl::WorkerOCServiceImpl(HostPort serverAddr, HostPort masterAdd
     // Identify the local Worker so its own lease echo cannot fence recovery of a directly
     // observed local UB failure.
     ubAdmission_->SetSelfWorker(localAddress_);
+    ubHealthCallbackState_ = std::make_shared<UbHealthCallbackState>(this);
 }
 
 WorkerOCServiceImpl::~WorkerOCServiceImpl()
 {
+    if (ubHealthCallbackState_ != nullptr) {
+        ubHealthCallbackState_->Detach();
+    }
+    remoteUbPortHealthQueryPool_.reset();
+    ubAdmission_->SetRemotePortHealthVerificationTrigger({});
+    if (getProc_ != nullptr) {
+        getProc_->SetRemoteUbHealthSummaryObserver({});
+    }
     LOG(INFO) << "WorkerOCServiceImpl exit";
     selfPortHealth_->Stop();
     StopTopologyHealthCoordinator();
@@ -459,6 +720,7 @@ void WorkerOCServiceImpl::InitServiceImpl()
     getProc_ =
         std::make_shared<WorkerOcServiceGetImpl>(param, etcdStore_, memCpyThreadPool_, threadPool_,
                                                  akSkManager_, localAddress_, migrateRateController_, ubAdmission_);
+    ConfigurePeerUbHealthCallbacks();
     queryAndGetProc_ =
         std::make_shared<WorkerQueryAndGetImpl>(getProc_, memoryRefTable_, akSkManager_, localAddress_, ubAdmission_);
     if (auto provider = std::atomic_load(&selfUbHealthSummaryProvider_)) {
@@ -478,6 +740,23 @@ void WorkerOCServiceImpl::InitServiceImpl()
     expireProc_ = std::make_shared<WorkerOcServiceExpireImpl>(param, akSkManager_);
     initOk_.set_value(Status::OK());
     setValue_ = true;
+}
+
+void WorkerOCServiceImpl::ConfigurePeerUbHealthCallbacks()
+{
+    auto callbackState = ubHealthCallbackState_;
+    ubAdmission_->SetRemotePortHealthVerificationTrigger(
+        [callbackState](const HostPort &peer) { callbackState->RequestVerification(peer); });
+    getProc_->SetRemoteUbHealthSummaryObserver(
+        [callbackState](const UbHealthSummary &summary) { callbackState->ObserveSummary(summary); });
+}
+
+void WorkerOCServiceImpl::ConfigureDataMigrator(DataMigrator &migrator)
+{
+    migrator.SetUbAdmission(ubAdmission_.get());
+    auto callbackState = ubHealthCallbackState_;
+    migrator.SetUbHealthSummaryObserver(
+        [callbackState](const UbHealthSummary &summary) { callbackState->ObserveSummary(summary); });
 }
 
 Status WorkerOCServiceImpl::Init()
@@ -1072,6 +1351,7 @@ Status WorkerOCServiceImpl::MigrateData(const MigrateDataReqPb &req, MigrateData
                                         std::vector<RpcMessage> payloads)
 {
     ScopedRequestContext ctx;
+    Raii attachHealth([this, &rsp] { AttachPublishedSelfUbHealth(*this, rsp); });
     RETURN_IF_NOT_OK_PRINT_ERROR_MSG(akSkManager_->VerifySignatureAndTimestamp(req), "AK/SK failed.");
     return gMigrateProc_->MigrateData(req, rsp, std::move(payloads));
 }
@@ -1079,6 +1359,7 @@ Status WorkerOCServiceImpl::MigrateData(const MigrateDataReqPb &req, MigrateData
 Status WorkerOCServiceImpl::MigrateDataDirect(const MigrateDataDirectReqPb &req, MigrateDataDirectRspPb &rsp)
 {
     ScopedRequestContext ctx;
+    Raii attachHealth([this, &rsp] { AttachPublishedSelfUbHealth(*this, rsp); });
     RETURN_IF_NOT_OK_PRINT_ERROR_MSG(akSkManager_->VerifySignatureAndTimestamp(req), "AK/SK failed.");
     return gMigrateProc_->MigrateDataDirect(req, rsp);
 }
@@ -1106,7 +1387,7 @@ Status WorkerOCServiceImpl::MigrateData(const std::vector<std::string> &objectKe
 {
     DataMigrator migrator(MigrateType::SCALE_DOWN, metadataRoute_, membership_, endpointPolicy_,
                           exitRequested_, localAddress_, akSkManager_, objectTable_, taskId);
-    migrator.SetUbAdmission(ubAdmission_.get());
+    ConfigureDataMigrator(migrator);
     migrator.Init();
     return migrator.Migrate(objectKeys, {});
 }
@@ -1118,7 +1399,7 @@ Status WorkerOCServiceImpl::MigrateData(const std::vector<std::string> &objectKe
     DataMigrator migrator(MigrateType::SCALE_DOWN, metadataRoute_, membership_, endpointPolicy_,
                           exitRequested_, localAddress_, akSkManager_, objectTable_, taskId,
                           DataMigrator::UNLIMITED_RETRY_COUNT, deadline, &cancellation);
-    migrator.SetUbAdmission(ubAdmission_.get());
+    ConfigureDataMigrator(migrator);
     migrator.Init();
     return migrator.Migrate(objectKeys, {});
 }
@@ -1128,7 +1409,7 @@ Status WorkerOCServiceImpl::MigrateL2CacheData(const std::vector<std::string> &n
 {
     DataMigrator migrator(MigrateType::SCALE_DOWN, metadataRoute_, membership_, endpointPolicy_,
                           exitRequested_, localAddress_, akSkManager_, objectTable_, taskId);
-    migrator.SetUbAdmission(ubAdmission_.get());
+    ConfigureDataMigrator(migrator);
     migrator.Init();
     return migrator.MigrateL2CacheBySlot(needMigrateL2CacheIds);
 }
@@ -1141,7 +1422,7 @@ Status WorkerOCServiceImpl::MigrateL2CacheData(const std::vector<std::string> &n
     DataMigrator migrator(MigrateType::SCALE_DOWN, metadataRoute_, membership_, endpointPolicy_,
                           exitRequested_, localAddress_, akSkManager_, objectTable_, taskId,
                           DataMigrator::UNLIMITED_RETRY_COUNT, deadline, &cancellation);
-    migrator.SetUbAdmission(ubAdmission_.get());
+    ConfigureDataMigrator(migrator);
     migrator.Init();
     return migrator.MigrateL2CacheBySlot(needMigrateL2CacheIds);
 }
@@ -3274,7 +3555,7 @@ struct WorkerOCServiceImpl::PublishedSelfUbHealth {
 
 UbHealthSummary WorkerOCServiceImpl::BuildSelfUbHealthSummary() const
 {
-    std::lock_guard<std::mutex> lock(selfUbHealthPublicationMutex_);
+    std::lock_guard<bthread::Mutex> lock(selfUbHealthPublicationMutex_);
     auto summary = ubAdmission_->BuildSelfHealthSummary(localAddress_);
     summary.worker = localAddress_;
     if (selfPortHealth_ != nullptr) {
@@ -3357,6 +3638,105 @@ Status WorkerOCServiceImpl::QuerySelfUbPortHealth(const QueryUbPortHealthReqPb &
 void WorkerOCServiceImpl::ReplaceGlobalUbHealthSummaries(const std::vector<UbHealthSummary> &summaries)
 {
     ubAdmission_->ReplaceGlobalSummaries(summaries);
+    std::shared_ptr<const cluster::TopologySnapshot> topology;
+    if (membership_.GetSnapshot(topology).IsOk() && topology != nullptr) {
+        const auto activeMembers = topology->ActiveMembers();
+        std::unordered_map<HostPort, std::string> incarnations;
+        incarnations.reserve(activeMembers.size());
+        for (const auto *member : activeMembers) {
+            HostPort worker;
+            if (worker.ParseString(member->identity.address).IsOk()) {
+                incarnations.emplace(std::move(worker), member->identity.id);
+            }
+        }
+        std::unordered_set<HostPort> workers;
+        workers.reserve(incarnations.size());
+        for (const auto &[worker, incarnation] : incarnations) {
+            (void)incarnation;
+            workers.emplace(worker);
+        }
+        ubAdmission_->ReconcileRemotePortHealthCapabilities(incarnations);
+        observedPeerUbHealthSummaries_.ReconcileWorkers(workers);
+        remoteUbPortHealthVerifier_->ReconcileTopology(incarnations);
+    }
+    for (const auto &summary : summaries) {
+        ObservePeerUbHealthSummary(summary, false);
+    }
+}
+
+void WorkerOCServiceImpl::RequestPeerUbPortHealthVerification(const HostPort &peer)
+{
+    cluster::MemberEndpoint endpoint;
+    if (membership_.ResolveByAddress(peer.ToString(), endpoint).IsError()
+        || endpoint.identity.id.empty()) {
+        return;
+    }
+    if (remoteUbPortHealthVerifier_->RequestVerification(
+        peer, endpoint.identity.id,
+        static_cast<uint64_t>(GetSteadyClockTimeStampMs()))) {
+        SchedulePeerUbPortHealthVerification();
+    }
+}
+
+void WorkerOCServiceImpl::ObservePeerUbHealthSummary(const UbHealthSummary &summary, bool allowNewQuery)
+{
+    if (summary.worker == localAddress_) {
+        return;
+    }
+    cluster::MemberEndpoint current;
+    UbHealthSummary accepted;
+    if (membership_.ResolveByAddress(summary.worker.ToString(), current).IsError()
+        || current.identity.id != summary.incarnation
+        || !observedPeerUbHealthSummaries_.Apply(summary, current.identity.id, accepted)) {
+        return;
+    }
+    if (!accepted.portHealth.has_value()) {
+        return;
+    }
+    ubAdmission_->SetRemotePortHealthCapability(accepted.worker, true, accepted.incarnation);
+    const bool hinted = remoteUbPortHealthVerifier_->NotifySummaryHint(
+        accepted, static_cast<uint64_t>(GetSteadyClockTimeStampMs()));
+    if (allowNewQuery && ShouldIsolateForUbPortHealth(*accepted.portHealth)) {
+        RequestPeerUbPortHealthVerification(accepted.worker);
+        if (hinted) {
+            SchedulePeerUbPortHealthVerification();
+        }
+        return;
+    }
+    if (hinted) {
+        SchedulePeerUbPortHealthVerification();
+    }
+}
+
+void WorkerOCServiceImpl::SchedulePeerUbPortHealthVerification()
+{
+    bool expected = false;
+    if (remoteUbPortHealthQueryPool_ == nullptr || getProc_ == nullptr
+        || !remoteUbQueryTaskScheduled_->compare_exchange_strong(expected, true)) {
+        return;
+    }
+    PeerUbPortHealthVerificationContext context{ remoteUbPortHealthVerifier_, remoteUbQueryTaskScheduled_,
+                                                 ubAdmission_, remoteUbPortHealthQueryPool_, ubHealthCallbackState_,
+                                                 remoteUbQueriesInFlight_ };
+    std::shared_ptr<std::atomic<bool>> unclaimed;
+    try {
+        unclaimed = std::make_shared<std::atomic<bool>>(true);
+        (void)remoteUbPortHealthQueryPool_->Submit([context, unclaimed] {
+            if (unclaimed->exchange(false)) {
+                RunPeerUbPortHealthVerification(context);
+            }
+        });
+    } catch (const std::exception &error) {
+        if (unclaimed == nullptr || unclaimed->exchange(false)) {
+            context.scheduled->store(false, std::memory_order_release);
+        }
+        LOG(ERROR) << "Failed to schedule Worker UB port health verification: " << error.what();
+    } catch (...) {
+        if (unclaimed == nullptr || unclaimed->exchange(false)) {
+            context.scheduled->store(false, std::memory_order_release);
+        }
+        LOG(ERROR) << "Failed to schedule Worker UB port health verification";
+    }
 }
 
 Status WorkerOCServiceImpl::DeleteDevObjects(const DeleteAllCopyReqPb &req, DeleteAllCopyRspPb &resp)
@@ -3386,6 +3766,7 @@ void WorkerOCServiceImpl::InitShmRefForClient(const ClientKey &clientId, bool su
 Status WorkerOCServiceImpl::NotifyRemoteGet(const NotifyRemoteGetReqPb &req, NotifyRemoteGetRspPb &rsp)
 {
     ScopedRequestContext ctx;
+    Raii attachHealth([this, &rsp] { AttachPublishedSelfUbHealth(*this, rsp); });
     RETURN_IF_NOT_OK(gMigrateProc_->ValidateRebalancePolicyFence(
         req.has_rebalance_policy_fence(), req.target_eviction_policy(), req.target_eviction_policy_epoch()));
     RETURN_IF_NOT_OK(gMigrateProc_->AcquireIncomingMigrationAdmission(!FLAGS_enable_transport_fallback));

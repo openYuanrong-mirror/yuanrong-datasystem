@@ -24,6 +24,8 @@
 #include <mutex>
 #include <vector>
 
+#include <bthread/mutex.h>
+
 #include "datasystem/client/object_cache/transport/rpc/set_request_builder.h"
 #include "datasystem/common/ak_sk/signature.h"
 #include "datasystem/common/object_cache/object_base.h"
@@ -192,7 +194,7 @@ private:
     std::shared_ptr<WorkerOCService_BrpcGenericStub> controlStub_;
     std::shared_ptr<WorkerWorkerTransportService_BrpcGenericStub> transportStub_;
     std::shared_ptr<WorkerWorkerOCService_BrpcGenericStub> dataStub_;
-    std::mutex ubHealthSummaryMutex_;
+    bthread::Mutex ubHealthSummaryMutex_;
     std::shared_ptr<const UbHealthSummary> lastUbHealthSummary_;
     UbHealthSummaryApplyHook ubHealthSummaryCallback_;
     std::atomic<bool> alive_{ false };

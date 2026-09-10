@@ -32,9 +32,13 @@ namespace datasystem {
 
 constexpr uint64_t UB_PORT_HEALTH_UNKNOWN_EPOCH = 0;
 constexpr uint64_t UB_PORT_HEALTH_FIRST_EPOCH = 1;
+constexpr size_t UB_HEALTH_INCARNATION_LOG_PREFIX_LENGTH = 12;
 constexpr std::chrono::milliseconds UB_PORT_HEALTH_PROVIDER_QUERY_INTERVAL{ 1'000 };
 constexpr std::chrono::milliseconds UB_REMOTE_PORT_HEALTH_QUERY_INTERVAL{ 1'000 };
 constexpr std::chrono::milliseconds UB_PORT_HEALTH_REFRESH_WAIT_TIMEOUT{ 1'000 };
+
+std::string FormatUbHealthIncarnationPrefix(const uint8_t *incarnation, size_t size);
+std::string FormatUbHealthIncarnationPrefix(const std::string &incarnation);
 
 enum class UbPortState : uint8_t { UNKNOWN = 0, GOOD = 1, BAD = 2 };
 

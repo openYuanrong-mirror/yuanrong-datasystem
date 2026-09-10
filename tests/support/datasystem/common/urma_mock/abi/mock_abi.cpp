@@ -303,7 +303,7 @@ urma_status_t ds_urma_mock_user_ctl(urma_context_t *ctx, urma_user_ctl_in_t *in,
 
     int64_t totalPortCount = K_DEFAULT_PORT_COUNT;
     int64_t badPortCount = 0;
-    bool injectDuplicateIndex = false;
+    bool injectDuplicateIdentity = false;
     bool injectInvalidCount = false;
     bool injectShortOutput = false;
     bool injectUnknownState = false;
@@ -312,8 +312,8 @@ urma_status_t ds_urma_mock_user_ctl(urma_context_t *ctx, urma_user_ctl_in_t *in,
         totalPortCount = total;
         badPortCount = bad;
     });
-    INJECT_POINT_NO_RETURN("UrmaMock.QueryPortStatus.duplicate", [&injectDuplicateIndex] {
-        injectDuplicateIndex = true;
+    INJECT_POINT_NO_RETURN("UrmaMock.QueryPortStatus.duplicate", [&injectDuplicateIdentity] {
+        injectDuplicateIdentity = true;
     });
     INJECT_POINT_NO_RETURN("UrmaMock.QueryPortStatus.invalidCount", [&injectInvalidCount] {
         injectInvalidCount = true;
@@ -344,7 +344,9 @@ urma_status_t ds_urma_mock_user_ctl(urma_context_t *ctx, urma_user_ctl_in_t *in,
                                                ? BONDP_PORT_STATUS_BAD
                                                : BONDP_PORT_STATUS_GOOD;
     }
-    if (injectDuplicateIndex && statusOut->port_count > 1) {
+    if (injectDuplicateIdentity && statusOut->port_count > 1) {
+        statusOut->port_status[1].chip_id = statusOut->port_status[0].chip_id;
+        statusOut->port_status[1].die_id = statusOut->port_status[0].die_id;
         statusOut->port_status[1].port_idx = statusOut->port_status[0].port_idx;
     }
     if (injectUnknownState && statusOut->port_count != 0) {
@@ -686,17 +688,25 @@ void ds_urma_mock_put_rjetty(urma_rjetty_t *rjetty)
 
 urma_status_t ds_urma_mock_modify_jetty(urma_jetty_t *jetty, urma_jetty_attr_t *attr)
 {
-    (void)attr;
-    (void)ShouldReturnFromStatusInject("urma.ModifyJettyToError");
     auto &tables = datasystem::urma_mock::Tables();
+    std::shared_ptr<datasystem::urma_mock::MockJetty> mockJetty;
     {
         std::lock_guard<std::mutex> lock(tables.mu);
-        auto it = tables.jetty.find(jetty);
-        if (it != tables.jetty.end()) {
-            return URMA_SUCCESS;
+        mockJetty = datasystem::urma_mock::FindMockObject(tables.jetty, jetty);
+    }
+    if (mockJetty == nullptr) {
+        return URMA_E_INVALID;
+    }
+    if (attr != nullptr && (attr->mask & JETTY_STATE) != 0 && attr->state == URMA_JETTY_STATE_ERROR) {
+        auto *sendJfc = mockJetty->GetSendJfc();
+        if (sendJfc != nullptr) {
+            datasystem::urma_mock::MockCr flush;
+            flush.status = static_cast<urma_status_t>(URMA_CR_WR_FLUSH_ERR_DONE);
+            flush.localId = static_cast<uint32_t>(mockJetty->GetId());
+            sendJfc->PushCr(flush);
         }
     }
-    return URMA_E_INVALID;
+    return URMA_SUCCESS;
 }
 
 // --- jfr import legacy ABI (3) ---

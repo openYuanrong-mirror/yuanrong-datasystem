@@ -21,10 +21,11 @@
 #define DATASYSTEM_MIGRATE_DATA_MIGRATE_TRANSPORT_H
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
-#include <optional>
+#include "datasystem/common/object_cache/ub_health_summary_codec.h"
 #include "datasystem/worker/object_cache/data_migrator/basic/base_data_unit.h"
 #include "datasystem/worker/object_cache/data_migrator/basic/migrate_progress.h"
 #include "datasystem/worker/object_cache/worker_worker_oc_api.h"
@@ -67,6 +68,7 @@ public:
         std::unordered_set<ImmutableString> skipKeys;
         uint64_t limitRate{ 0 };
         std::optional<ProviderUbFailureDetailPb> ubFailureDetail;
+        std::optional<UbHealthSummary> ubHealthSummary;
     };
 
     /**
@@ -78,6 +80,19 @@ public:
     virtual Status MigrateDataToRemote(const Request &req, Response &rsp) = 0;
 
 protected:
+    template <typename ResponsePb>
+    void CollectUbHealthSummary(const ResponsePb &responsePb, const Request &request, Response &response) const
+    {
+        if (!responsePb.has_ub_health_summary() || request.api == nullptr) {
+            return;
+        }
+        UbHealthSummary summary;
+        if (DecodeUbHealthSummary(responsePb.ub_health_summary(), summary).IsOk()
+            && summary.worker == request.api->GetHostPort()) {
+            response.ubHealthSummary = std::move(summary);
+        }
+    }
+
     int64_t CalcMigrateDataDirectTimeoutMs(uint64_t totalDataBytes)
     {
         constexpr int64_t maxTimeoutMs = 180'000;

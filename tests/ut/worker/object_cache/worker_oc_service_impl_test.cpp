@@ -23,6 +23,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <sys/stat.h>
 #include <thread>
@@ -785,7 +786,7 @@ public:
         DS_ASSERT_OK(objectTable_->Insert(objectKey, std::move(obj)));
     }
 
-    static void SetUnavailableSummary(PeerUbAdmission *admission, const HostPort &peer)
+    static void SetVerifiedUnavailablePorts(PeerUbAdmission *admission, const HostPort &peer)
     {
         ASSERT_NE(admission, nullptr);
         UbHealthSummary summary;
@@ -797,6 +798,11 @@ public:
         summary.reason = UbFailureClass::PORT_UNAVAILABLE_ERROR4;
         summary.lastStatusCode = StatusCode::K_URMA_ERROR;
         admission->ReplaceGlobalSummaries({ summary });
+        DS_ASSERT_OK(admission->CheckWriteTarget(peer, UbOperationKind::WORKER_REMOTE_GET_WRITEBACK));
+        const UbPortHealthSummary ports{ true, 4, 4, 1, false };
+        ASSERT_TRUE(admission->ApplyPortHealth(peer, ports, UbPortHealthEvidenceSource::QUERY_RESPONSE));
+        ASSERT_EQ(admission->CheckWriteTarget(peer, UbOperationKind::WORKER_REMOTE_GET_WRITEBACK).GetCode(),
+                  K_URMA_WORKER_UNAVAILABLE);
     }
 
     static GetObjectRemoteReqPb MakeUrmaRemoteGetRequest(const std::string &objectKey, uint64_t dataSize,
@@ -1110,6 +1116,32 @@ TEST_F(WorkerOcServiceImplTest, MigrationUbAdmissionUsesExistingTcpFallback)
               K_URMA_WORKER_UNAVAILABLE);
 }
 
+TEST_F(WorkerOcServiceImplTest, MigrationHealthSummaryUsesDedicatedObserver)
+{
+    DataMigrator migrator(MigrateType::SCALE_DOWN, metadataRoute_, topologyRuntime_.Engine()->Membership(),
+                          *endpointPolicy_, &exitRequested_, localAddress_, nullptr, objectTable_);
+    MigrateDataHandler::MigrateResult result;
+    result.ubHealthSummary = UbHealthSummary{};
+    result.ubHealthSummary->worker = HostPort("127.0.0.1", 18482);
+    result.ubHealthSummary->incarnation = "worker-incarnation";
+    size_t observations = 0;
+    migrator.SetUbHealthSummaryObserver([&](const UbHealthSummary &summary) {
+        ++observations;
+        EXPECT_EQ(summary.worker, result.ubHealthSummary->worker);
+        EXPECT_EQ(summary.incarnation, result.ubHealthSummary->incarnation);
+    });
+
+    migrator.ObserveUbHealthSummary(result);
+    EXPECT_EQ(observations, 1u);
+    result.ubHealthSummary.reset();
+    migrator.ObserveUbHealthSummary(result);
+    EXPECT_EQ(observations, 1u);
+
+    result.ubHealthSummary = UbHealthSummary{};
+    migrator.SetUbHealthSummaryObserver([](const UbHealthSummary &) { throw std::runtime_error("observer failure"); });
+    EXPECT_NO_THROW(migrator.ObserveUbHealthSummary(result));
+}
+
 TEST_F(WorkerOcServiceImplTest, RemoteGetL2MissDoesNotLeaveEmptyEntry)
 {
     const std::string objectKey = "remote-get-l2-missing-key";
@@ -1131,7 +1163,7 @@ TEST_F(WorkerOcRemoteGetAdmissionTest, BlockingRemoteGetAdmissionFailureFallsBac
     const std::string objectKey = "blocked-remote-get-fallback";
     const HostPort requester("192.0.2.30", 18481);
     AddTransferableObject(objectKey, dataSize);
-    SetUnavailableSummary(impl_->GetUbAdmission(), requester);
+    SetVerifiedUnavailablePorts(impl_->GetUbAdmission(), requester);
     const bool savedFallback = FLAGS_enable_transport_fallback;
     Raii restoreFallback([savedFallback] { FLAGS_enable_transport_fallback = savedFallback; });
     FLAGS_enable_transport_fallback = true;
@@ -1163,7 +1195,7 @@ TEST_F(WorkerOcRemoteGetAdmissionTest, BlockingRemoteGetAdmissionFailureReturnsU
     const std::string objectKey = "blocked-remote-get-no-fallback";
     const HostPort requester("192.0.2.31", 18481);
     AddTransferableObject(objectKey, dataSize);
-    SetUnavailableSummary(impl_->GetUbAdmission(), requester);
+    SetVerifiedUnavailablePorts(impl_->GetUbAdmission(), requester);
     const bool savedFallback = FLAGS_enable_transport_fallback;
     Raii restoreFallback([savedFallback] { FLAGS_enable_transport_fallback = savedFallback; });
     FLAGS_enable_transport_fallback = false;
@@ -1191,7 +1223,7 @@ TEST_F(WorkerOcRemoteGetAdmissionTest, BatchAdmissionPinsRequestToTcpBeforeLaneA
     constexpr uint64_t dataSize = 16;
     constexpr size_t objectCount = 3;
     const HostPort requester("192.0.2.32", 18481);
-    SetUnavailableSummary(impl_->GetUbAdmission(), requester);
+    SetVerifiedUnavailablePorts(impl_->GetUbAdmission(), requester);
     BatchGetObjectRemoteReqPb req;
     req.set_allow_aggregate_gather(true);
     req.set_aggregate_gather_metadata_size(impl_->GetMetadataSize());
@@ -1239,7 +1271,7 @@ TEST_F(WorkerOcRemoteGetAdmissionTest, BatchAdmissionPinsRequestToTcpBeforeLaneA
 TEST_F(WorkerOcServiceImplTest, BatchAdmissionFailsBeforeLaneWhenFallbackDisabled)
 {
     const HostPort requester("192.0.2.33", 18481);
-    SetUnavailableSummary(impl_->GetUbAdmission(), requester);
+    SetVerifiedUnavailablePorts(impl_->GetUbAdmission(), requester);
     BatchGetObjectRemoteReqPb req;
     req.add_requests()->CopyFrom(MakeUrmaRemoteGetRequest("blocked-batch-no-fallback", 16, requester));
     const bool savedFallback = FLAGS_enable_transport_fallback;

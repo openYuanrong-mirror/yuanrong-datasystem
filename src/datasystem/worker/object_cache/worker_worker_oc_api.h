@@ -70,6 +70,9 @@ public:
      * @return Status of the call.
      */
     virtual Status NotifyRemoteGet(NotifyRemoteGetReqPb &req, NotifyRemoteGetRspPb &rsp) = 0;
+
+    virtual Status QueryUbPortHealth(const std::string &expectedWorkerIncarnation,
+                                     int32_t timeoutMs, QueryUbPortHealthRspPb &rsp) = 0;
 };
 
 class WorkerLocalWorkerOCApi : public WorkerWorkerOCApi {
@@ -121,6 +124,9 @@ public:
         (void)rsp;
         RETURN_STATUS(K_RUNTIME_ERROR, "Not supported in local version");
     }
+
+    Status QueryUbPortHealth(const std::string &expectedWorkerIncarnation,
+                             int32_t timeoutMs, QueryUbPortHealthRspPb &rsp) override;
 
 private:
     WorkerWorkerOCServiceImpl *service_;
@@ -228,6 +234,9 @@ public:
     Status MigrateDataDirect(MigrateDataDirectReqPb &req, MigrateDataDirectRspPb &rsp);
 
     Status NotifyRemoteGet(NotifyRemoteGetReqPb &req, NotifyRemoteGetRspPb &rsp) override;
+
+    Status QueryUbPortHealth(const std::string &expectedWorkerIncarnation,
+                             int32_t timeoutMs, QueryUbPortHealthRspPb &rsp) override;
 
 private:
     // The HostPort of the remote worker node.

@@ -47,6 +47,7 @@
 #include "datasystem/common/util/net_util.h"
 #include "datasystem/common/util/thread_pool.h"
 
+#include <bthread/condition_variable.h>
 #include <bthread/mutex.h>
 #include <bthread/rwlock.h>
 
@@ -66,13 +67,26 @@ private:
         void Detach();
         void ObserveSummary(const UbHealthSummary &summary);
 
-    private:
-        void FinishObservation();
+      private:
+        class Lease {
+        public:
+            Lease(UbHealthCallbackState *owner, DataPlaneManager *manager) : owner_(owner), manager_(manager) {}
+            ~Lease();
+            Lease(const Lease &) = delete;
+            Lease &operator=(const Lease &) = delete;
+            explicit operator bool() const { return manager_ != nullptr; }
 
-        std::mutex mutex_;
-        std::condition_variable drained_;
+        private:
+            friend class UbHealthCallbackState;
+            UbHealthCallbackState *owner_;
+            DataPlaneManager *manager_;
+        };
+
+        Lease Acquire();
+        bthread::Mutex mutex_;
+        bthread::ConditionVariable drained_;
+        size_t activeCallbacks_ = 0;
         DataPlaneManager *manager_;
-        size_t activeObservers_{ 0 };
     };
 
 public:

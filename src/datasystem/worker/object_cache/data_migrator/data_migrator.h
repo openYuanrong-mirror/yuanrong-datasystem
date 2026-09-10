@@ -98,6 +98,15 @@ public:
     }
 
     /**
+     * @brief Observe the health summary attached to a migration response.
+     * @param[in] observer Callback owned by the Worker service lifecycle.
+     */
+    void SetUbHealthSummaryObserver(UbHealthSummaryApplyHook observer)
+    {
+        ubHealthSummaryObserver_ = std::move(observer);
+    }
+
+    /**
      * @brief Migrate objects to remote nodes.
      * @param[in] objectKeys Object keys to migrate.
      * @param[in] objectSizes Object sizes mapping.
@@ -156,6 +165,8 @@ public:
 
 private:
     using SlotMigrateFuture = std::pair<uint32_t, std::future<MigrateDataHandler::MigrateResult>>;
+
+    void ObserveUbHealthSummary(const MigrateDataHandler::MigrateResult &result) const;
 
     /**
      * @brief Log migration progress periodically.
@@ -358,6 +369,7 @@ private:
     std::chrono::steady_clock::time_point deadline_;
     const cluster::CancellationToken *cancellation_{ nullptr };
     PeerUbAdmission *ubAdmission_{ nullptr };
+    UbHealthSummaryApplyHook ubHealthSummaryObserver_;
 
     std::unique_ptr<ThreadPool> threadPool_;
 

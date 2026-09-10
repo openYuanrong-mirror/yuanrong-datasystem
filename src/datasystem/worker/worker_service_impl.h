@@ -21,11 +21,12 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <set>
 #include <shared_mutex>
 #include <unordered_map>
+
+#include <bthread/mutex.h>
 
 #include "datasystem/common/ak_sk/ak_sk_manager.h"
 #include "datasystem/common/eventloop/event_loop.h"
@@ -212,7 +213,7 @@ private:
     std::string workerUuid_;
     const cluster::MembershipEndpointView &membership_;  // Read-only view owned by WorkerOCServer's Engine.
     const std::atomic<bool> &localExiting_;             // WorkerOCServer-owned local admission gate.
-    mutable std::mutex ubHealthSummaryProviderMutex_;
+    mutable bthread::Mutex ubHealthSummaryProviderMutex_;
     UbHealthSummaryProvider ubHealthSummaryProvider_;
 
     SharedMutex mutex_;                           // for unboundedUnixSockFds_

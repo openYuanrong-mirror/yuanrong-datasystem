@@ -27,7 +27,11 @@
 #include "datasystem/common/object_cache/ub_health_summary_codec.h"
 #include "datasystem/common/object_cache/urma_fallback_tcp_limiter.h"
 #include "datasystem/common/rpc/brpc_status_util.h"
+#include "datasystem/common/flags/flags.h"
 #include "datasystem/common/util/raii.h"
+
+DS_DECLARE_bool(enable_urma);
+DS_DECLARE_bool(enable_transport_fallback);
 #define private public
 #include "datasystem/worker/object_cache/service/worker_oc_service_get_impl.h"
 #include "datasystem/worker/object_cache/worker_worker_oc_service_impl.h"
@@ -71,6 +75,68 @@ Status CheckRemoteReadAdmission(WorkerOcServiceGetImpl &impl, const HostPort &wo
     return impl.CheckRemoteReadAdmission(worker.ToString(), fallback, useFastTransport);
 }
 }  // namespace
+
+TEST(WorkerOcServiceGetUbAdmissionTest, RequesterAllDownHonorsTcpFallbackPolicyUntilPartialRecovery)
+{
+    const bool previousUrma = FLAGS_enable_urma;
+    const bool previousFallback = FLAGS_enable_transport_fallback;
+    Raii restore([previousUrma, previousFallback] {
+        FLAGS_enable_urma = previousUrma;
+        FLAGS_enable_transport_fallback = previousFallback;
+    });
+    FLAGS_enable_urma = true;
+    auto admission = std::make_shared<PeerUbAdmission>(UbPortHealthVerificationMode::VERIFIED_PORT_HEALTH);
+    admission->SetSelfWorker(LOCAL_WORKER);
+    WorkerRequestManager requestManager;
+    auto param = BuildGetParam(requestManager, std::make_shared<ObjectTable>());
+    WorkerOcServiceGetImpl getImpl(param, nullptr, nullptr, nullptr, nullptr, LOCAL_WORKER, nullptr, admission);
+    ASSERT_TRUE(admission->ApplyPortHealth(
+        LOCAL_WORKER, UbPortHealthSummary{ true, 4, 4, 1, false }, UbPortHealthEvidenceSource::PASSIVE_SUMMARY));
+    FLAGS_enable_transport_fallback = true;
+    bool useFastTransport = true;
+    EXPECT_TRUE(CheckRemoteReadAdmission(getImpl, DATA_WORKER, WorkerOcServiceGetImpl::ReadTransportFallback::ALLOWED,
+                                         useFastTransport)
+                    .IsOk());
+    FLAGS_enable_transport_fallback = false;
+    const auto isolatedCode = IsUrmaEnabled() ? K_URMA_WORKER_UNAVAILABLE : K_OK;
+    constexpr size_t blockedRequests = 32;
+    for (size_t i = 0; i < blockedRequests; ++i) {
+        useFastTransport = true;
+        EXPECT_EQ(CheckRemoteReadAdmission(getImpl, DATA_WORKER,
+                                           WorkerOcServiceGetImpl::ReadTransportFallback::FORBIDDEN, useFastTransport)
+                      .GetCode(),
+                  isolatedCode);
+    }
+    ASSERT_TRUE(admission->ApplyPortHealth(
+        LOCAL_WORKER, UbPortHealthSummary{ true, 4, 3, 2, false }, UbPortHealthEvidenceSource::PASSIVE_SUMMARY));
+    useFastTransport = true;
+    EXPECT_TRUE(CheckRemoteReadAdmission(getImpl, DATA_WORKER, WorkerOcServiceGetImpl::ReadTransportFallback::FORBIDDEN,
+                                         useFastTransport)
+                    .IsOk());
+    EXPECT_TRUE(useFastTransport);
+}
+
+TEST(WorkerOcServiceGetUbAdmissionTest, ProviderCqe9RequestsRequesterSelfVerification)
+{
+    auto admission = std::make_shared<PeerUbAdmission>(UbPortHealthVerificationMode::VERIFIED_PORT_HEALTH);
+    admission->SetSelfWorker(LOCAL_WORKER);
+    uint32_t selfQueries = 0;
+    admission->SetSelfPortHealthRefreshTrigger([&selfQueries] { ++selfQueries; });
+    WorkerRequestManager requestManager;
+    auto param = BuildGetParam(requestManager, std::make_shared<ObjectTable>());
+    WorkerOcServiceGetImpl getImpl(param, nullptr, nullptr, nullptr, nullptr, LOCAL_WORKER, nullptr, admission);
+    GetObjectRemoteRspPb response;
+    FillProviderUbFailureDetail(Status(K_URMA_ERROR, "requester ACK timeout"), LOCAL_WORKER.ToString(),
+                                DATA_WORKER.ToString(), std::nullopt, URMA_REMOTE_ACK_TIMEOUT_STATUS,
+                                *response.mutable_provider_ub_failure_detail());
+
+    getImpl.ReportRemoteReadOutcome(DATA_WORKER.ToString(), response, "worker_get");
+
+    EXPECT_EQ(selfQueries, 1u);
+    ASSERT_TRUE(admission->GetState(LOCAL_WORKER).has_value());
+    EXPECT_EQ(admission->GetState(LOCAL_WORKER)->state, UbAdmissionState::SUSPECT);
+    EXPECT_FALSE(admission->GetState(DATA_WORKER).has_value());
+}
 
 TEST(WorkerOcServiceGetUbAdmissionTest, UnavailableDataWorkerReadSourceUsesConfiguredFallback)
 {
@@ -350,6 +416,32 @@ TEST(WorkerOcServiceGetUbAdmissionTest, ExplicitRemoteGetDetailMarksProviderUnav
                                        useFastTransport)
                   .GetCode(),
               K_URMA_DATA_WORKER_UNAVAILABLE);
+}
+
+TEST(WorkerOcServiceGetUbAdmissionTest, HealthyRemoteGetSidecarsNotifyWithoutFailureDetail)
+{
+    auto admission = std::make_shared<PeerUbAdmission>();
+    WorkerRequestManager requestManager;
+    auto param = BuildGetParam(requestManager, std::make_shared<ObjectTable>());
+    WorkerOcServiceGetImpl getImpl(param, nullptr, nullptr, nullptr, nullptr, LOCAL_WORKER, nullptr, admission);
+    std::vector<UbHealthSummary> observed;
+    getImpl.SetRemoteUbHealthSummaryObserver(
+        [&observed](const UbHealthSummary &summary) { observed.emplace_back(summary); });
+    UbHealthSummary summary;
+    summary.worker = DATA_WORKER;
+    summary.incarnation = "data-worker-incarnation";
+    summary.portHealth = UbPortHealthSummary{ true, 4, 0, 1, false };
+    GetObjectRemoteRspPb single;
+    EncodeUbHealthSummary(summary, *single.mutable_ub_health_summary());
+    BatchGetObjectRemoteRspPb batch;
+    EncodeUbHealthSummary(summary, *batch.mutable_ub_health_summary());
+
+    getImpl.ReportRemoteReadOutcome(DATA_WORKER.ToString(), single, "remote_get_response");
+    getImpl.ReportRemoteReadOutcome(DATA_WORKER.ToString(), batch, "batch_remote_get_response");
+
+    ASSERT_EQ(observed.size(), 2u);
+    EXPECT_EQ(observed.front().worker, DATA_WORKER);
+    EXPECT_FALSE(admission->GetState(DATA_WORKER).has_value());
 }
 
 TEST(WorkerOcServiceGetUbAdmissionTest, SingleRemoteGetErrorResponseFormsObservationBeforeReturningFailure)

@@ -92,11 +92,9 @@ Status ApplyHeartbeatUbHealthSummary(const HeartbeatRspPb &rsp, const HostPort &
     // The process start id carried by HeartbeatRspPb is intentionally a different identity domain. The topology-aware
     // consumer performs the authoritative membership-incarnation fence; this cache only rejects stale epochs from the
     // same UB health incarnation before notifying that consumer.
-    if (cache.Apply(summary, summary.incarnation) && hook) {
-        auto accepted = cache.Get(summary.worker);
-        if (accepted.has_value()) {
-            hook(*accepted);
-        }
+    UbHealthSummary accepted;
+    if (cache.Apply(summary, summary.incarnation, accepted) && hook) {
+        hook(accepted);
     }
     return Status::OK();
 }

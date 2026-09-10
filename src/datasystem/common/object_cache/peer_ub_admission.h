@@ -32,6 +32,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include <bthread/rwlock.h>
+
 #include "datasystem/common/object_cache/ub_failure_classifier.h"
 #include "datasystem/common/object_cache/ub_port_health.h"
 #include "datasystem/common/rdma/fast_transport_base.h"
@@ -164,12 +166,14 @@ public:
     ~UbHealthSummaryCache() = default;
 
     bool Apply(const UbHealthSummary &summary, const std::string &expectedIncarnation);
+    bool Apply(const UbHealthSummary &summary, const std::string &expectedIncarnation,
+               UbHealthSummary &accepted);
     std::optional<UbHealthSummary> Get(const HostPort &worker) const;
     void ReconcileWorkers(const std::unordered_set<HostPort> &workers);
     size_t Size() const;
 
 private:
-    mutable std::shared_mutex mutex_;
+    mutable bthread::RWLock mutex_;
     Snapshot state_;
 };
 
@@ -277,7 +281,7 @@ private:
     uint64_t GetOrCreatePeerCompletionGenerationLocked(const HostPort &peer);
     void AdvancePeerCompletionGenerationLocked(const HostPort &peer);
 
-    mutable std::shared_mutex mutex_;
+    mutable bthread::RWLock mutex_;
     std::unordered_map<HostPort, UbPathState> states_;
     std::unordered_map<HostPort, UbHealthSummary> globalSummaries_;
     std::unordered_map<HostPort, std::string> latestGlobalIncarnations_;

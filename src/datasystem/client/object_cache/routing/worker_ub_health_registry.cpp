@@ -25,20 +25,26 @@
 
 namespace datasystem::client {
 namespace {
-bool SameRoutingWorkers(const std::unordered_map<HostPort, WorkerUbPortHealth> &lhs,
-                        const std::unordered_map<HostPort, WorkerUbPortHealth> &rhs)
+struct RoutingHealthChange {
+    HostPort worker;
+    std::string incarnationPrefix;
+    const char *source;
+    UbPortHealthSummary previous;
+    UbPortHealthSummary current;
+    bool previouslyWritable;
+    bool currentlyWritable;
+};
+
+void LogRoutingHealthChange(const RoutingHealthChange &change)
 {
-    if (lhs.size() != rhs.size()) {
-        return false;
-    }
-    for (const auto &[worker, health] : lhs) {
-        auto other = rhs.find(worker);
-        if (other == rhs.end() || health.incarnation != other->second.incarnation
-            || !IsSameUbPortHealth(health.portHealth, other->second.portHealth)) {
-            return false;
-        }
-    }
-    return true;
+    LOG(INFO) << "UB_ROUTING_HEALTH action=updated peer=" << change.worker.ToString()
+              << " source=" << change.source << " incarnation_prefix=" << change.incarnationPrefix
+              << " old_valid=" << change.previous.valid << " old_bad=" << change.previous.badPortCount
+              << " old_total=" << change.previous.totalPortCount << " new_valid=" << change.current.valid
+              << " new_bad=" << change.current.badPortCount << " new_total=" << change.current.totalPortCount
+              << " health_epoch=" << change.current.healthEpoch
+              << " old_writable=" << change.previouslyWritable
+              << " writable=" << change.currentlyWritable << " routing_visible=true";
 }
 
 bool IsRoutableMember(::datasystem::MembershipPb::StatePb state)
@@ -84,8 +90,9 @@ WorkerUbHealthRegistry::WorkerUbHealthRegistry() : state_(std::make_shared<const
 
 void WorkerUbHealthRegistry::ReconcileTopology(const ::datasystem::ClusterTopologyPb &topology)
 {
-    std::lock_guard<std::mutex> lock(writeMutex_);
-    auto current = std::atomic_load(&state_);
+    std::shared_ptr<const State> current;
+    std::lock_guard<bthread::Mutex> lock(writeMutex_);
+    current = std::atomic_load(&state_);
     auto incarnations = std::make_shared<State::Incarnations>();
     incarnations->reserve(topology.members_size());
     std::unordered_set<HostPort> workers;
@@ -115,11 +122,6 @@ void WorkerUbHealthRegistry::ReconcileTopology(const ::datasystem::ClusterTopolo
         ReconcileTopologyMemberLocked(current, worker, *member, *next, *workerState);
     }
     workerState->health.ReconcileWorkers(workers);
-    if (current->workers->health.Size() == workerState->health.Size()
-        && current->workers->verifiedUnavailable == workerState->verifiedUnavailable
-        && SameRoutingWorkers(current->routing.workers, next->routing.workers)) {
-        return;
-    }
     next->incarnations = std::move(incarnations);
     next->workers = std::move(workerState);
     std::atomic_store(&state_, std::shared_ptr<const State>(std::move(next)));
@@ -151,20 +153,22 @@ void WorkerUbHealthRegistry::ReconcileTopologyMemberLocked(
 
 bool WorkerUbHealthRegistry::ApplySummary(const UbHealthSummary &summary, const std::string &expectedIncarnation)
 {
-    return ApplySummaryInternal(summary, expectedIncarnation, false) == ApplyResult::UPDATED;
+    return ApplySummaryInternal(summary, expectedIncarnation, false, "rpc_response") == ApplyResult::UPDATED;
 }
 
 bool WorkerUbHealthRegistry::ApplyVerifiedSummary(const UbHealthSummary &summary,
                                                   const std::string &expectedIncarnation)
 {
-    return ApplySummaryInternal(summary, expectedIncarnation, true) != ApplyResult::REJECTED;
+    return ApplySummaryInternal(summary, expectedIncarnation, true, "query_response") != ApplyResult::REJECTED;
 }
 
 WorkerUbHealthRegistry::ApplyResult WorkerUbHealthRegistry::ApplySummaryInternal(
-    const UbHealthSummary &summary, const std::string &expectedIncarnation, bool verified)
+    const UbHealthSummary &summary, const std::string &expectedIncarnation, bool verified,
+    const char *source)
 {
-    std::unique_lock<std::mutex> lock(writeMutex_);
-    auto current = std::atomic_load(&state_);
+    std::shared_ptr<const State> current;
+    std::unique_lock<bthread::Mutex> lock(writeMutex_);
+    current = std::atomic_load(&state_);
     std::string expected;
     if (!ResolveExpectedIncarnationLocked(*current, summary.worker, expectedIncarnation, expected)) {
         return ApplyResult::REJECTED;
@@ -199,12 +203,9 @@ WorkerUbHealthRegistry::ApplyResult WorkerUbHealthRegistry::ApplySummaryInternal
         workers->verifiedUnavailable[summary.worker] = summary.incarnation;
     }
     next->workers = std::move(workers);
-    std::atomic_store(&state_, std::shared_ptr<const State>(std::move(next)));
-    const bool admissionChanged = unavailable.has_value() && *unavailable != currentlyVerified;
+    std::atomic_store(&state_, std::shared_ptr<const State>(next));
     lock.unlock();
-    if (admissionChanged) {
-        LogAdmissionChange(summary, accepted, *unavailable);
-    }
+    LogRoutingChange(*current, *next, summary.worker, source);
     return evidenceAccepted ? ApplyResult::UPDATED : ApplyResult::REJECTED;
 }
 
@@ -224,27 +225,38 @@ bool WorkerUbHealthRegistry::ResolveExpectedIncarnationLocked(const State &curre
     return true;
 }
 
-void WorkerUbHealthRegistry::LogAdmissionChange(const UbHealthSummary &summary, const UbHealthSummary &accepted,
-                                                bool unavailable) const
+void WorkerUbHealthRegistry::LogRoutingChange(const State &previous, const State &current,
+                                              const HostPort &worker, const char *source) const
 {
-    if (accepted.portHealth.has_value()) {
-        LOG(INFO) << "UB_PORT_HEALTH action=" << (unavailable ? "isolate" : "recover")
-                  << " peer=" << summary.worker.ToString() << " incarnation=" << summary.incarnation
-                  << " source=query_response health_epoch=" << accepted.portHealth->healthEpoch
-                  << " bad=" << accepted.portHealth->badPortCount
-                  << " total=" << accepted.portHealth->totalPortCount;
+    auto before = previous.routing.workers.find(worker);
+    auto after = current.routing.workers.find(worker);
+    if (after == current.routing.workers.end()) {
         return;
     }
-    LOG(INFO) << "UB_PORT_HEALTH action=" << (unavailable ? "isolate" : "recover")
-              << " peer=" << summary.worker.ToString() << " incarnation=" << summary.incarnation
-              << " source=query_response legacy_summary=true";
+    UbPortHealthSummary oldPortHealth;
+    bool wasUnavailable = false;
+    if (before != previous.routing.workers.end()) {
+        oldPortHealth = before->second.portHealth;
+        auto oldMarked = previous.workers->verifiedUnavailable.find(worker);
+        wasUnavailable = oldMarked != previous.workers->verifiedUnavailable.end()
+                         && oldMarked->second == before->second.incarnation;
+    }
+    auto newMarked = current.workers->verifiedUnavailable.find(worker);
+    const bool isUnavailable = newMarked != current.workers->verifiedUnavailable.end()
+                               && newMarked->second == after->second.incarnation;
+    if (before != previous.routing.workers.end()
+        && IsSameUbPortHealth(oldPortHealth, after->second.portHealth) && wasUnavailable == isUnavailable) {
+        return;
+    }
+    LogRoutingHealthChange({ worker, FormatUbHealthIncarnationPrefix(after->second.incarnation), source,
+                             oldPortHealth, after->second.portHealth, !wasUnavailable, !isUnavailable });
 }
 
 bool WorkerUbHealthRegistry::ApplyLocalClientPortHealth(const UbPortHealthSummary &portHealth)
 {
     // Keep the retired snapshot alive until the publication lock has been released.
     std::shared_ptr<const State> current;
-    std::lock_guard<std::mutex> lock(writeMutex_);
+    std::lock_guard<bthread::Mutex> lock(writeMutex_);
     current = std::atomic_load(&state_);
     std::optional<UbPortHealthSummary> merged;
     if (!MergeUbPortHealth(current->routing.localClient, portHealth, merged)

@@ -111,6 +111,7 @@ Status TcpMigrateTransport::MigrateDataToRemote(const Request &req, Response &rs
     MigrateDataRspPb rspPb;
     rspPb.Clear();
     Status rc = req.api->MigrateData(reqPb, payloads, rspPb);
+    CollectUbHealthSummary(rspPb, req, rsp);
     if (rc.IsOk()) {
         ProcessMigrateRsp(rspPb, req, rsp);
     }

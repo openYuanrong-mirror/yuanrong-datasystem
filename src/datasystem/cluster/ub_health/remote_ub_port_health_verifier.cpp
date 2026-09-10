@@ -26,18 +26,12 @@
 
 namespace datasystem::cluster {
 namespace {
-constexpr size_t UB_INCARNATION_LOG_PREFIX_LENGTH = 12;
 
 bool IsUsableQuerySummary(const RemoteUbQueryTicket &ticket, const UbHealthSummary &summary)
 {
     return summary.worker == ticket.peer && summary.incarnation == ticket.incarnation
            && summary.portHealth.has_value() && HasKnownUbPortHealth(*summary.portHealth)
            && !summary.portHealth->verificationPending;
-}
-
-std::string IncarnationLogPrefix(const std::string &incarnation)
-{
-    return incarnation.substr(0, std::min(incarnation.size(), UB_INCARNATION_LOG_PREFIX_LENGTH));
 }
 
 bool IsStaleOrConflicting(const std::optional<UbPortHealthSummary> &current,
@@ -75,7 +69,7 @@ Status ValidateQueryCompletion(const RemoteUbQueryTicket &ticket,
 void LogQueryRetry(const RemoteUbQueryTicket &ticket, const Status &status, uint64_t nextRetryMs)
 {
     LOG(WARNING) << "UB_PORT_QUERY action=retry peer=" << ticket.peer.ToString()
-                 << " incarnation_prefix=" << IncarnationLogPrefix(ticket.incarnation)
+                 << " incarnation_prefix=" << FormatUbHealthIncarnationPrefix(ticket.incarnation)
                  << " status_code=" << status.GetCode() << " status=" << status
                  << " next_retry_ms=" << nextRetryMs;
 }
@@ -84,7 +78,7 @@ void LogQueryResponse(const RemoteUbQueryTicket &ticket, const UbPortHealthSumma
                       const char *decision)
 {
     LOG(INFO) << "UB_PORT_QUERY action=response peer=" << ticket.peer.ToString()
-              << " incarnation_prefix=" << IncarnationLogPrefix(ticket.incarnation)
+              << " incarnation_prefix=" << FormatUbHealthIncarnationPrefix(ticket.incarnation)
               << " health_epoch=" << portHealth.healthEpoch << " bad=" << portHealth.badPortCount
               << " total=" << portHealth.totalPortCount << " decision=" << decision
               << " source=query_response";
@@ -106,7 +100,7 @@ bool RemoteUbPortHealthVerifier::RequestVerification(const HostPort &peer, const
     if (peer.Empty() || incarnation.empty()) {
         return false;
     }
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<bthread::Mutex> lock(mutex_);
     auto [iter, inserted] = peers_.try_emplace(peer);
     if (inserted) {
         iter->second.incarnation = incarnation;
@@ -142,7 +136,7 @@ bool RemoteUbPortHealthVerifier::RequestVerification(const HostPort &peer, const
 
 std::optional<RemoteUbQueryTicket> RemoteUbPortHealthVerifier::TryBeginDue(uint64_t nowMs)
 {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<bthread::Mutex> lock(mutex_);
     auto selected = peers_.end();
     for (auto iter = peers_.begin(); iter != peers_.end(); ++iter) {
         if (iter->second.inFlight || iter->second.nextQueryMs > nowMs) {
@@ -234,7 +228,7 @@ RemoteUbQueryCompletion RemoteUbPortHealthVerifier::Complete(
     const RemoteUbQueryTicket &ticket, const std::optional<UbHealthSummary> &summary,
     const Status &queryStatus, uint64_t nowMs)
 {
-    std::unique_lock<std::mutex> lock(mutex_);
+    std::unique_lock<bthread::Mutex> lock(mutex_);
     auto iter = peers_.find(ticket.peer);
     if (iter == peers_.end() || iter->second.incarnation != ticket.incarnation
         || !MatchesUbProbe(iter->second.inFlight, iter->second.generation, ticket.generation)) {
@@ -285,7 +279,7 @@ bool RemoteUbPortHealthVerifier::NotifySummaryHint(const UbHealthSummary &summar
     if (!summary.portHealth.has_value() || !HasKnownUbPortHealth(*summary.portHealth)) {
         return false;
     }
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<bthread::Mutex> lock(mutex_);
     auto iter = peers_.find(summary.worker);
     if (iter == peers_.end() || iter->second.incarnation != summary.incarnation
         || (iter->second.lastPortHealth.has_value()
@@ -307,7 +301,7 @@ bool RemoteUbPortHealthVerifier::NotifySummaryHint(const UbHealthSummary &summar
 void RemoteUbPortHealthVerifier::ReconcileTopology(
     const std::unordered_map<HostPort, std::string> &incarnations)
 {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<bthread::Mutex> lock(mutex_);
     for (auto iter = peers_.begin(); iter != peers_.end();) {
         auto current = incarnations.find(iter->first);
         iter = current == incarnations.end() || current->second != iter->second.incarnation
@@ -318,7 +312,7 @@ void RemoteUbPortHealthVerifier::ReconcileTopology(
 
 std::optional<uint64_t> RemoteUbPortHealthVerifier::NextQueryDeadlineMs() const
 {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<bthread::Mutex> lock(mutex_);
     return NextUbProbeDeadline(peers_, [](const auto &entry) -> std::optional<uint64_t> {
         const auto &state = entry.second;
         return !state.inFlight && state.nextQueryMs != std::numeric_limits<uint64_t>::max()

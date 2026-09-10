@@ -264,6 +264,9 @@ Status MigrateDataHandler::SpyOnRemoteRemainBytesByRpc(CacheType type)
     ApplyRebalancePolicyFence(req);
     MigrateDataRspPb rsp;
     Status s = MigrateDataToRemoteRetry(remoteApi_, req, {}, rsp);
+    if (rsp.has_ub_health_summary()) {
+        CaptureRemoteUbHealth(rsp.ub_health_summary());
+    }
     if (s.IsError()) {
         LOG(WARNING) << FormatString(
             "[Migrate Data] Spy on remote node %s remain bytes but meets error, local node: %s, status: %s",
@@ -577,6 +580,9 @@ void MigrateDataHandler::HandleMigrationTransportResponse(const Status &status, 
     if (response.ubFailureDetail.has_value()) {
         ubFailureDetail_ = std::move(response.ubFailureDetail);
     }
+    if (response.ubHealthSummary.has_value()) {
+        ubHealthSummary_ = std::move(response.ubHealthSummary);
+    }
     if (status.IsError()) {
         LOG(ERROR) << FormatString("[Migrate Data] Send %ld objects[%ld bytes] data to %s failed, error message: %s",
                                    datas_.size(), currBatchSize_, remoteApi_->Address(), status.ToString());
@@ -615,6 +621,18 @@ Status MigrateDataHandler::MigrateDataToRemoteRetry(const std::shared_ptr<Worker
     return status;
 }
 
+bool MigrateDataHandler::WaitForBusyHealRetry(uint64_t sleepMs) const
+{
+    const uint64_t actualSleep = RandomData().GetRandomUint64(
+        sleepMs, std::min(sleepMs * BUSY_HEAL_BACKOFF_FACTOR, BUSY_HEAL_MAX_SLEEP_MS));
+    for (uint64_t slept = 0;
+         slept < actualSleep && (stoppingPtr_ == nullptr || !stoppingPtr_->load(std::memory_order_relaxed));
+         slept += BUSY_HEAL_CANCEL_POLL_MS) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(BUSY_HEAL_CANCEL_POLL_MS));
+    }
+    return stoppingPtr_ == nullptr || !stoppingPtr_->load(std::memory_order_relaxed);
+}
+
 Status MigrateDataHandler::SelfHealBusyRate(uint64_t requiredSize)
 {
     if (selfHealAttempted_) {
@@ -635,17 +653,13 @@ Status MigrateDataHandler::SelfHealBusyRate(uint64_t requiredSize)
            && static_cast<uint64_t>(GetSteadyClockTimeStampMs()) < deadline
            && (stoppingPtr_ == nullptr || !stoppingPtr_->load(std::memory_order_relaxed))) {
         INJECT_POINT_NO_RETURN("MigrateDataHandler.SelfHealBusyRate.probe");
-        uint64_t actualSleep = RandomData().GetRandomUint64(
-            sleepMs, std::min(sleepMs * BUSY_HEAL_BACKOFF_FACTOR, BUSY_HEAL_MAX_SLEEP_MS));
-        for (uint64_t slept = 0;
-             slept < actualSleep && (stoppingPtr_ == nullptr || !stoppingPtr_->load(std::memory_order_relaxed));
-             slept += BUSY_HEAL_CANCEL_POLL_MS) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(BUSY_HEAL_CANCEL_POLL_MS));
-        }
-        if (stoppingPtr_ != nullptr && stoppingPtr_->load(std::memory_order_relaxed)) {
+        if (!WaitForBusyHealRetry(sleepMs)) {
             break;
         }
         lastErr = remoteApi_->MigrateDataProbe(req, rsp, BUSY_HEAL_PROBE_TIMEOUT_MS);
+        if (rsp.has_ub_health_summary()) {
+            CaptureRemoteUbHealth(rsp.ub_health_summary());
+        }
         if (lastErr.IsOk()) {
             rate = rsp.limit_rate();
             limiter_.UpdateRate(rate);
@@ -705,6 +719,14 @@ Status MigrateDataHandler::BuildHealResult(bool recovered, uint64_t rate, int pr
     return Status::OK();
 }
 
+void MigrateDataHandler::CaptureRemoteUbHealth(const UbHealthSummaryPb &encoded)
+{
+    UbHealthSummary summary;
+    if (DecodeUbHealthSummary(encoded, summary).IsOk() && summary.worker == remoteApi_->GetHostPort()) {
+        ubHealthSummary_ = std::move(summary);
+    }
+}
+
 Status MigrateDataHandler::TryUpdateRate(uint64_t rate)
 {
     if (rate != 0) {
@@ -734,6 +756,7 @@ MigrateDataHandler::MigrateResult MigrateDataHandler::ConstructResult(Status sta
              .skipIds = skipIds_,
              .strategy = strategy_,
              .ubFailureDetail = ubFailureDetail_,
+             .ubHealthSummary = ubHealthSummary_,
              .targetRemainBytes = lastRemainBytes_ };
 }
 

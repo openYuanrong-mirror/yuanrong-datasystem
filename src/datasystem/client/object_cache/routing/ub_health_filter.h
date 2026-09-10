@@ -15,6 +15,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include <bthread/mutex.h>
+
 #include "datasystem/client/object_cache/routing/i_worker_filter.h"
 #include "datasystem/client/object_cache/routing/worker_ub_health_registry.h"
 #include "datasystem/common/object_cache/peer_ub_admission.h"
@@ -83,7 +85,7 @@ private:
     std::shared_ptr<PeerUbAdmission> writeTargetAdmission_;
     // Trusted incarnation updates and Provider failure reports serialize through this mutex so a restart
     // cannot clear evidence learned for the newly published process generation.
-    mutable std::mutex incarnationMutex_;
+    mutable bthread::Mutex incarnationMutex_;
     std::unordered_map<HostPort, std::string> trustedIncarnations_;
     // An empty value means the failure was observed before a trusted incarnation was available.
     std::unordered_map<HostPort, std::string> localObservationIncarnations_;

@@ -28,6 +28,8 @@
 #include <unordered_map>
 #include <tbb/concurrent_hash_map.h>
 
+#include <bthread/mutex.h>
+
 #include "datasystem/common/rdma/urma_async_event_handler.h"
 #include "datasystem/common/rdma/urma_dlopen_util.h"
 
@@ -976,7 +978,7 @@ private:
     // Polling thread
     std::unique_ptr<Thread> serverEventThread_{ nullptr };
     std::unique_ptr<std::thread> perfThread_{ nullptr };
-    mutable std::mutex clientPortHealthMutex_;
+    mutable bthread::Mutex clientPortHealthMutex_;
     bool portHealthStopping_{ false };
     std::shared_ptr<UbPortHealthMonitor> clientPortHealthMonitor_;
     std::atomic<uint64_t> clientPortHealthAdmissionState_{ 0 };

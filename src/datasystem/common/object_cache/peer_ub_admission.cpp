@@ -26,18 +26,11 @@
 
 #include "datasystem/common/inject/inject_point.h"
 #include "datasystem/common/log/log.h"
-#include "datasystem/common/util/format.h"
 #include "datasystem/common/util/timer.h"
 #include "datasystem/common/util/uuid_generator.h"
 
 namespace datasystem {
 namespace {
-
-constexpr size_t UB_HEALTH_INCARNATION_LOG_PREFIX_LENGTH = 12;
-constexpr size_t HEX_CHAR_COUNT_PER_BYTE = 2;
-constexpr size_t HEX_HIGH_NIBBLE_SHIFT = 4;
-constexpr uint8_t HEX_LOW_NIBBLE_MASK = 0x0f;
-constexpr char HEX_DIGITS[] = "0123456789abcdef";
 
 enum class GlobalSummaryTransition {
     QUARANTINE_APPLIED,
@@ -135,23 +128,33 @@ void InvokeRemoteVerificationTrigger(
 struct PortHealthApplyResult {
     bool applied = false;
     bool isolated = false;
+    bool isolatedTransition = false;
     bool recovered = false;
+    UbAdmissionState previousState = UbAdmissionState::AVAILABLE;
     std::optional<uint32_t> previousBadPortCount;
 };
 
 void LogPortHealthApply(const HostPort &subject, const UbPortHealthSummary &summary,
                         UbPortHealthEvidenceSource source, const PortHealthApplyResult &result)
 {
-    if (result.recovered) {
-        LOG(INFO) << "UB_PORT_ADMISSION action=recovered peer=" << subject.ToString()
-                  << " previous_bad="
+    const char *sourceName = source == UbPortHealthEvidenceSource::QUERY_RESPONSE ? "query_response"
+                                                                                   : "local_snapshot";
+    if (result.isolatedTransition) {
+        LOG(WARNING) << "UB admission marked peer UNAVAILABLE, peer=" << subject.ToString()
+                     << ", previous_state=" << static_cast<int>(result.previousState)
+                     << ", state=" << static_cast<int>(UbAdmissionState::UNAVAILABLE)
+                     << ", bad=" << summary.badPortCount << ", total=" << summary.totalPortCount
+                     << ", health_epoch=" << summary.healthEpoch << ", source=" << sourceName;
+    } else if (result.recovered) {
+        LOG(INFO) << "UB admission marked peer AVAILABLE, peer=" << subject.ToString()
+                  << ", previous_state=" << static_cast<int>(result.previousState)
+                  << ", state=" << static_cast<int>(UbAdmissionState::AVAILABLE)
+                  << ", previous_bad="
                   << (result.previousBadPortCount.has_value()
                           ? std::to_string(*result.previousBadPortCount)
                           : "unknown")
-                  << " bad=" << summary.badPortCount << " total=" << summary.totalPortCount
-                  << " health_epoch=" << summary.healthEpoch
-                  << " source=" << (source == UbPortHealthEvidenceSource::QUERY_RESPONSE ? "query_response"
-                                                                                           : "local_snapshot");
+                  << ", bad=" << summary.badPortCount << ", total=" << summary.totalPortCount
+                  << ", health_epoch=" << summary.healthEpoch << ", source=" << sourceName;
     } else if (result.applied) {
         LOG(INFO) << "UB admission applied port health, peer=" << subject.ToString()
                   << ", state=" << static_cast<int>(result.isolated ? UbAdmissionState::UNAVAILABLE
@@ -170,30 +173,6 @@ GlobalSummaryChange CaptureGlobalSummaryChange(GlobalSummaryTransition transitio
                                 summary.writable, summary.state, summary.reason, summary.lastStatusCode };
 }
 
-std::array<char, UB_HEALTH_INCARNATION_LOG_PREFIX_LENGTH + 1> FormatIncarnationPrefix(
-    const GlobalSummaryChange &change)
-{
-    std::array<char, UB_HEALTH_INCARNATION_LOG_PREFIX_LENGTH + 1> prefix{};
-    if (change.incarnationSize == UUID_SIZE) {
-        std::array<char, UUID_STRING_BUFFER_SIZE> printableUuid{};
-        const auto rc = BytesUuidToString(change.incarnationBytes.data(), change.incarnationBytes.size(),
-                                          printableUuid.data(), printableUuid.size());
-        if (rc.IsOk()) {
-            std::copy_n(printableUuid.begin(), UB_HEALTH_INCARNATION_LOG_PREFIX_LENGTH, prefix.begin());
-            return prefix;
-        }
-    }
-
-    const auto bytesToEncode =
-        std::min(change.incarnationSize, (prefix.size() - 1) / HEX_CHAR_COUNT_PER_BYTE);
-    for (size_t i = 0; i < bytesToEncode; ++i) {
-        const auto outputOffset = i * HEX_CHAR_COUNT_PER_BYTE;
-        prefix[outputOffset] = HEX_DIGITS[change.incarnationBytes[i] >> HEX_HIGH_NIBBLE_SHIFT];
-        prefix[outputOffset + 1] = HEX_DIGITS[change.incarnationBytes[i] & HEX_LOW_NIBBLE_MASK];
-    }
-    return prefix;
-}
-
 }  // namespace
 
 Status PeerUbAdmission::CheckWriteTarget(const HostPort &peer, UbOperationKind op) const
@@ -201,7 +180,7 @@ Status PeerUbAdmission::CheckWriteTarget(const HostPort &peer, UbOperationKind o
     (void)op;
     bool blocked;
     {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
+        bthread::RWLockRdGuard lock(mutex_);
         auto it = states_.find(peer);
         blocked = !IsGlobalWritableLocked(peer) || (it != states_.end() && ShouldBlock(it->second));
     }
@@ -216,7 +195,7 @@ Status PeerUbAdmission::CheckReadSource(const HostPort &peer) const
 {
     bool blocked;
     {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
+        bthread::RWLockRdGuard lock(mutex_);
         auto it = states_.find(peer);
         blocked = !IsGlobalWritableLocked(peer) || (it != states_.end() && ShouldBlock(it->second));
     }
@@ -240,7 +219,7 @@ void PeerUbAdmission::EnableVerifiedPortHealth()
 
 void PeerUbAdmission::SetSelfPortHealthRefreshTrigger(std::function<void()> trigger)
 {
-    std::lock_guard<std::shared_mutex> lock(mutex_);
+    bthread::RWLockWrGuard lock(mutex_);
     selfPortHealthRefreshTrigger_ = std::move(trigger);
 }
 
@@ -255,7 +234,7 @@ void PeerUbAdmission::SetRemotePortHealthCapability(const HostPort &peer, bool e
     if (peer.Empty()) {
         return;
     }
-    std::lock_guard<std::shared_mutex> lock(mutex_);
+    bthread::RWLockWrGuard lock(mutex_);
     if (enabled) {
         const auto current = remotePortHealthPeers_.find(peer);
         const bool changed = current == remotePortHealthPeers_.end() || current->second != incarnation;
@@ -273,7 +252,7 @@ void PeerUbAdmission::SetRemotePortHealthCapability(const HostPort &peer, bool e
 void PeerUbAdmission::ReconcileRemotePortHealthCapabilities(
     const std::unordered_map<HostPort, std::string> &incarnations)
 {
-    std::lock_guard<std::shared_mutex> lock(mutex_);
+    bthread::RWLockWrGuard lock(mutex_);
     for (auto iter = remotePortHealthPeers_.begin(); iter != remotePortHealthPeers_.end();) {
         auto current = incarnations.find(iter->first);
         iter = current == incarnations.end()
@@ -335,7 +314,7 @@ bool PeerUbAdmission::PrepareOutcomeTransition(
     UbAdmissionState &nextState, std::function<void()> &selfPortHealthRefreshTrigger,
     std::shared_ptr<const RemotePortHealthVerificationTrigger> &remoteVerificationTrigger)
 {
-    std::lock_guard<std::shared_mutex> lock(mutex_);
+    bthread::RWLockWrGuard lock(mutex_);
     if (fence.has_value() && !IsLateCompletionFenceCurrentLocked(outcome.peer, *fence)) {
         return false;
     }
@@ -382,11 +361,12 @@ bool PeerUbAdmission::ApplyPortHealth(const HostPort &subject, const UbPortHealt
     }
     PortHealthApplyResult result;
     {
-        std::lock_guard<std::shared_mutex> lock(mutex_);
+        bthread::RWLockWrGuard lock(mutex_);
         auto &state = states_[subject];
         const auto nextState = summary.badPortCount == summary.totalPortCount ? UbAdmissionState::UNAVAILABLE
                                                                                : UbAdmissionState::AVAILABLE;
         const auto previousState = state.state;
+        result.previousState = previousState;
         if (state.portHealth.has_value()) {
             result.previousBadPortCount = state.portHealth->badPortCount;
         }
@@ -413,6 +393,8 @@ bool PeerUbAdmission::ApplyPortHealth(const HostPort &subject, const UbPortHealt
         }
         result.isolated = nextState == UbAdmissionState::UNAVAILABLE;
         result.applied = ApplyPortHealthFactLocked(subject, state, summary, nextState);
+        result.isolatedTransition = result.applied && previousState != UbAdmissionState::UNAVAILABLE
+                                    && nextState == UbAdmissionState::UNAVAILABLE;
         result.recovered = result.applied && previousState == UbAdmissionState::UNAVAILABLE
                            && nextState == UbAdmissionState::AVAILABLE;
     }
@@ -475,7 +457,7 @@ void PeerUbAdmission::ReplaceGlobalSummaries(const std::vector<UbHealthSummary> 
     stats.input = summaries.size();
     const HostPort receiver = self_;
     {
-        std::lock_guard<std::shared_mutex> lock(mutex_);
+        bthread::RWLockWrGuard lock(mutex_);
         const auto nowMs = GetSteadyClockTimeStampMs();
         std::unordered_map<HostPort, UbHealthSummary> replacement;
         replacement.reserve(summaries.size());
@@ -565,7 +547,8 @@ void PeerUbAdmission::ReplaceGlobalSummaries(const std::vector<UbHealthSummary> 
 
     const auto receiverForLog = receiver.Empty() ? std::string("unknown") : receiver.ToString();
     for (const auto &change : changes) {
-        const auto incarnationPrefix = FormatIncarnationPrefix(change);
+        const auto incarnationPrefix =
+            FormatUbHealthIncarnationPrefix(change.incarnationBytes.data(), change.incarnationSize);
         LOG(INFO) << "UB_HEALTH_SUMMARY action=global_summary_applied receiver=" << receiverForLog
                   << " target=" << change.worker
                   << " transition=" << GlobalSummaryTransitionName(change.transition)
@@ -586,7 +569,7 @@ void PeerUbAdmission::InitializeVerification(const HostPort &peer, uint64_t nowM
     if (peer.Empty()) {
         return;
     }
-    std::lock_guard<std::shared_mutex> lock(mutex_);
+    bthread::RWLockWrGuard lock(mutex_);
     auto &state = states_[peer];
     state.state = UbAdmissionState::SUSPECT;
     state.lastStatus = Status(K_NOT_READY, "UB data plane requires verification probe");
@@ -599,7 +582,7 @@ void PeerUbAdmission::InitializeVerification(const HostPort &peer, uint64_t nowM
 
 std::optional<UbProbeToken> PeerUbAdmission::TryBeginProbe(const HostPort &peer, uint64_t nowMs)
 {
-    std::lock_guard<std::shared_mutex> lock(mutex_);
+    bthread::RWLockWrGuard lock(mutex_);
     auto iter = states_.find(peer);
     if (iter == states_.end()) {
         return std::nullopt;
@@ -623,7 +606,7 @@ std::optional<UbProbeToken> PeerUbAdmission::TryBeginProbe(const HostPort &peer,
 
 bool PeerUbAdmission::CancelProbe(const UbProbeToken &token, uint64_t nowMs)
 {
-    std::lock_guard<std::shared_mutex> lock(mutex_);
+    bthread::RWLockWrGuard lock(mutex_);
     auto iter = states_.find(token.peer);
     if (iter == states_.end()
         || (iter->second.state != UbAdmissionState::PROBING
@@ -650,7 +633,7 @@ bool PeerUbAdmission::CompleteProbe(const UbProbeToken &token, const Status &sta
     std::shared_ptr<const RemotePortHealthVerificationTrigger> verifier;
     std::function<void()> refreshSelf;
     {
-        std::lock_guard<std::shared_mutex> lock(mutex_);
+        bthread::RWLockWrGuard lock(mutex_);
         verifier = token.peer == self_ ? nullptr : std::atomic_load(&remotePortHealthVerificationTrigger_);
         if (token.peer == self_ && UsesVerifiedPortHealth()) {
             refreshSelf = selfPortHealthRefreshTrigger_;
@@ -676,7 +659,7 @@ bool PeerUbAdmission::CompleteProbe(const UbProbeToken &token, const Status &sta
     StatusCode previousStatusCode = K_OK;
     UbFailureClass previousFailureClass = UbFailureClass::SUCCESS;
     {
-        std::lock_guard<std::shared_mutex> lock(mutex_);
+        bthread::RWLockWrGuard lock(mutex_);
         auto iter = states_.find(token.peer);
         if (iter == states_.end()
             || (iter->second.state != UbAdmissionState::PROBING
@@ -731,7 +714,7 @@ bool PeerUbAdmission::CompleteProbe(const UbProbeToken &token, const Status &sta
 
 std::optional<HostPort> PeerUbAdmission::NextProbeCandidate(uint64_t nowMs) const
 {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
+    bthread::RWLockRdGuard lock(mutex_);
     for (const auto &[peer, state] : states_) {
         if (IsPortHealthManagedState(peer, state)) {
             continue;
@@ -749,7 +732,7 @@ std::optional<HostPort> PeerUbAdmission::NextProbeCandidate(uint64_t nowMs) cons
 
 std::optional<uint64_t> PeerUbAdmission::NextProbeDeadlineMs() const
 {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
+    bthread::RWLockRdGuard lock(mutex_);
     return NextUbProbeDeadline(states_, [this](const auto &entry) -> std::optional<uint64_t> {
         const auto &[peer, state] = entry;
         const bool recoverable = state.state == UbAdmissionState::UNAVAILABLE
@@ -764,7 +747,7 @@ std::optional<uint64_t> PeerUbAdmission::NextProbeDeadlineMs() const
 void PeerUbAdmission::ReconcileTopologyWorkers(const std::unordered_set<HostPort> &workers, uint64_t nowMs,
                                                uint64_t cleanupGraceMs)
 {
-    std::lock_guard<std::shared_mutex> lock(mutex_);
+    bthread::RWLockWrGuard lock(mutex_);
     topologyInitialized_ = true;
     topologyWorkers_ = workers;
     for (const auto &worker : workers) {
@@ -812,7 +795,7 @@ void PeerUbAdmission::ReconcileTopologyWorkers(const std::unordered_set<HostPort
 
 void PeerUbAdmission::PruneExpiredTopologyState(uint64_t nowMs)
 {
-    std::lock_guard<std::shared_mutex> lock(mutex_);
+    bthread::RWLockWrGuard lock(mutex_);
     if (nextTombstoneExpiryMs_ != 0 && nowMs >= nextTombstoneExpiryMs_) {
         PruneTombstonesLocked(nowMs);
     }
@@ -820,7 +803,7 @@ void PeerUbAdmission::PruneExpiredTopologyState(uint64_t nowMs)
 
 UbHealthSummary PeerUbAdmission::BuildSelfHealthSummary(const HostPort &self) const
 {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
+    bthread::RWLockRdGuard lock(mutex_);
     UbHealthSummary summary;
     summary.worker = self;
     auto it = states_.find(self);
@@ -841,14 +824,14 @@ UbHealthSummary PeerUbAdmission::BuildSelfHealthSummary(const HostPort &self) co
 
 std::optional<UbPathState> PeerUbAdmission::GetState(const HostPort &peer) const
 {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
+    bthread::RWLockRdGuard lock(mutex_);
     auto it = states_.find(peer);
     return it == states_.end() ? std::nullopt : std::optional<UbPathState>{ it->second };
 }
 
 PeerUbAdmissionStats PeerUbAdmission::GetStats() const
 {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
+    bthread::RWLockRdGuard lock(mutex_);
     return PeerUbAdmissionStats{ states_.size(), globalSummaries_.size(), latestGlobalIncarnations_.size(),
                                  retiredGlobalIncarnations_.size(), departedWorkers_.size(),
                                  replayTombstones_.size(), peerCompletionGenerations_.size() };
@@ -856,7 +839,7 @@ PeerUbAdmissionStats PeerUbAdmission::GetStats() const
 
 void PeerUbAdmission::ClearLocalState(const HostPort &peer)
 {
-    std::lock_guard<std::shared_mutex> lock(mutex_);
+    bthread::RWLockWrGuard lock(mutex_);
     states_.erase(peer);
     AdvancePeerCompletionGenerationLocked(peer);
     if (peer == self_) {
@@ -922,7 +905,7 @@ std::optional<UrmaLateCompletionContext> PeerUbAdmission::BuildLateCompletionCon
         | operationValue;
     uint64_t peerToken = 0;
     if (remotePeer.has_value() && !remotePeer->Empty()) {
-        std::lock_guard<std::shared_mutex> lock(mutex_);
+        bthread::RWLockWrGuard lock(mutex_);
         peerToken = GetOrCreatePeerCompletionGenerationLocked(*remotePeer);
     }
     return UrmaLateCompletionContext{ observer, ownerToken, peerToken };
@@ -945,7 +928,7 @@ void PeerUbAdmission::OnLateUrmaCompletion(const UrmaLateCompletion &completion,
         HostPort attributedPeer;
         LateCompletionFence fence{ LateCompletionScope::LOCAL_SENDER, generation };
         if (localSenderFailure) {
-            std::shared_lock<std::shared_mutex> lock(mutex_);
+            bthread::RWLockRdGuard lock(mutex_);
             if (self_.Empty()) {
                 return;
             }
@@ -1066,25 +1049,38 @@ bool UbHealthSummaryCache::Snapshot::Apply(const UbHealthSummary &summary, const
 
 bool UbHealthSummaryCache::Apply(const UbHealthSummary &summary, const std::string &expectedIncarnation)
 {
+    UbHealthSummary accepted;
+    return Apply(summary, expectedIncarnation, accepted);
+}
+
+bool UbHealthSummaryCache::Apply(const UbHealthSummary &summary, const std::string &expectedIncarnation,
+                                 UbHealthSummary &accepted)
+{
     if (summary.worker.Empty() || summary.incarnation.empty() || summary.incarnation != expectedIncarnation) {
         return false;
     }
     {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
+        bthread::RWLockRdGuard lock(mutex_);
         const auto *current = state_.Find(summary.worker);
         if (current != nullptr && IsSameUbHealthSummary(*current, summary)) {
             return false;
         }
     }
-    std::lock_guard<std::shared_mutex> lock(mutex_);
+    bthread::RWLockWrGuard lock(mutex_);
     const auto *current = state_.Find(summary.worker);
     // Standalone cache admission updates require a newer epoch; passive Registry/RPC observations do not.
+    bool applied;
     if (current != nullptr && current->incarnation == summary.incarnation && current->epoch == summary.epoch) {
         auto retainedAdmission = *current;
         retainedAdmission.portHealth = summary.portHealth;
-        return state_.Apply(retainedAdmission, expectedIncarnation);
+        applied = state_.Apply(retainedAdmission, expectedIncarnation);
+    } else {
+        applied = state_.Apply(summary, expectedIncarnation);
     }
-    return state_.Apply(summary, expectedIncarnation);
+    if (applied) {
+        accepted = *state_.Find(summary.worker);
+    }
+    return applied;
 }
 
 void UbHealthSummaryCache::Snapshot::ReconcileWorkers(const std::unordered_set<HostPort> &workers)
@@ -1099,20 +1095,20 @@ void UbHealthSummaryCache::Snapshot::ReconcileWorkers(const std::unordered_set<H
 
 void UbHealthSummaryCache::ReconcileWorkers(const std::unordered_set<HostPort> &workers)
 {
-    std::lock_guard<std::shared_mutex> lock(mutex_);
+    bthread::RWLockWrGuard lock(mutex_);
     state_.ReconcileWorkers(workers);
 }
 
 std::optional<UbHealthSummary> UbHealthSummaryCache::Get(const HostPort &worker) const
 {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
+    bthread::RWLockRdGuard lock(mutex_);
     const auto *summary = state_.Find(worker);
     return summary == nullptr ? std::nullopt : std::optional<UbHealthSummary>{ *summary };
 }
 
 size_t UbHealthSummaryCache::Size() const
 {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
+    bthread::RWLockRdGuard lock(mutex_);
     return state_.Size();
 }
 

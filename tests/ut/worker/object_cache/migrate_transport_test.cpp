@@ -39,6 +39,16 @@ namespace datasystem {
 namespace ut {
 
 namespace {
+class InspectableMigrateTransport final : public MigrateTransport {
+public:
+    using MigrateTransport::CollectUbHealthSummary;
+
+    Status MigrateDataToRemote(const Request &, Response &) override
+    {
+        return Status::OK();
+    }
+};
+
 MigrateTransport::Request MakeEmptyRequest()
 {
     MigrateTransport::Request req;
@@ -47,6 +57,34 @@ MigrateTransport::Request MakeEmptyRequest()
     return req;
 }
 }  // namespace
+
+TEST(MigrateTransportTest, CollectsOnlyMatchingAggregateHealthSidecar)
+{
+    const HostPort remote("127.0.0.1", 18889);
+    auto req = MakeEmptyRequest();
+    req.api = std::make_shared<WorkerRemoteWorkerOCApi>(remote, HostPort("127.0.0.1", 18888), nullptr);
+    UbHealthSummary summary;
+    summary.worker = remote;
+    summary.incarnation = "remote-incarnation";
+    summary.portHealth = UbPortHealthSummary{ true, 4, 1, 3, false };
+    MigrateDataRspPb encoded;
+    EncodeUbHealthSummary(summary, *encoded.mutable_ub_health_summary());
+    InspectableMigrateTransport transport;
+    MigrateTransport::Response response;
+
+    transport.CollectUbHealthSummary(encoded, req, response);
+
+    ASSERT_TRUE(response.ubHealthSummary.has_value());
+    EXPECT_EQ(response.ubHealthSummary->worker, remote);
+    ASSERT_TRUE(response.ubHealthSummary->portHealth.has_value());
+    EXPECT_EQ(response.ubHealthSummary->portHealth->badPortCount, 1u);
+
+    summary.worker = HostPort("127.0.0.1", 19999);
+    EncodeUbHealthSummary(summary, *encoded.mutable_ub_health_summary());
+    response.ubHealthSummary.reset();
+    transport.CollectUbHealthSummary(encoded, req, response);
+    EXPECT_FALSE(response.ubHealthSummary.has_value());
+}
 
 TEST(FastMigrateTransport2Test, ProcessMigrateResponsePopulatesSkipKeys)
 {
