@@ -8,10 +8,12 @@ lookup by port, remote log_dir reading, and pod discovery.
 """
 
 import base64
+import io
 import json
 import os
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -23,6 +25,8 @@ from deploy_common import (
     build_install_bundle,
     check_process,
     clean_pod,
+    cmd_clean_impl,
+    cmd_clean_logs_shared,
     cmd_clean_shared,
     cmd_collect_impl,
     cmd_collect_shared,
@@ -700,6 +704,30 @@ class TestGetPods(unittest.TestCase):
         self.assertEqual([p['name'] for p in pods],
                          ['coordinator-a', 'worker-a'])
 
+    @patch('deploy_common.subprocess.check_output')
+    def test_extracts_node_and_host_ip_for_deploy_client(self, mock_co):
+        # deploy_client.cmd_gen_config reads pod['node'] (spec.nodeName) to
+        # spread writer/reader instances across physical nodes, and
+        # pod['host_ip'] (status.hostIP) to inject HOST_IP env. These fields
+        # must be present on every returned pod so client does not KeyError;
+        # worker/coordinator/jf callers ignore them. Absent fields fall back
+        # to '' so a pod missing status.hostIP (rare) does not break discovery.
+        mock_co.return_value = json.dumps({
+            'items': [
+                {'metadata': {'name': 'worker-a'},
+                 'spec': {'nodeName': 'node-1'},
+                 'status': {'podIP': '10.0.0.1', 'hostIP': '192.168.1.1'}},
+                {'metadata': {'name': 'worker-b'},
+                 'spec': {'nodeName': 'node-2'},
+                 'status': {'podIP': '10.0.0.2', 'hostIP': '192.168.1.2'}},
+            ]
+        })
+        pods = get_pods('default', ['worker-'])
+        self.assertEqual(pods[0]['node'], 'node-1')
+        self.assertEqual(pods[0]['host_ip'], '192.168.1.1')
+        self.assertEqual(pods[1]['node'], 'node-2')
+        self.assertEqual(pods[1]['host_ip'], '192.168.1.2')
+
 
 class TestFindDefaultWhl(unittest.TestCase):
     @patch('deploy_common.glob.glob')
@@ -1100,6 +1128,106 @@ class TestCollectLogsFromPod(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class TestCollectLogsFromPodTarStream(unittest.TestCase):
+    """collect_logs_from_pod tar-stream path: one ``tar czf - {files}`` via
+    ``kubectl exec`` replaces the prior ``N_files + 5`` per-file ``base64``
+    round-trips. Covers the primary path, the base64 fallback (container
+    without tar), and that the tar stream carries stdout.log when
+    remote_dir exists."""
+
+    def _pod(self):
+        return {'name': 'p1', 'ip': '10.0.0.1'}
+
+    def _tar_bytes(self, files):
+        """Build a tar.gz from {name: content} and return its bytes."""
+        import io
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode='w:gz') as tar:
+            for name, content in files.items():
+                data = content if isinstance(content, bytes) else content.encode()
+                info = tarfile.TarInfo(name=name)
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+        return buf.getvalue()
+
+    @patch('deploy_common.kubectl_exec')
+    @patch('deploy_common.subprocess.run')
+    @patch('deploy_common._collect_stagger_delay', return_value=0)
+    def test_tar_stream_primary_path(self, mock_stagger, mock_run, mock_exec):
+        # Primary path: kubectl exec tar czf - | local tar extract.
+        # The kubectl_exec mocks handle ls -d / ls / base64 (fallback should
+        # NOT be hit). subprocess.run mocks the tar stream download.
+        log_content = b'worker log line\n'
+        tar_bytes = self._tar_bytes({'worker.log': log_content})
+
+        def _exec_resp(*args, **kwargs):
+            cmd = args[2]
+            if cmd.startswith('ls -d '):
+                return MagicMock(returncode=0)
+            if cmd.startswith('ls '):
+                return MagicMock(returncode=0, stdout='/var/log/ds/worker.log')
+            return MagicMock(returncode=0, stdout='')
+        mock_exec.side_effect = _exec_resp
+
+        # subprocess.run is called by _collect_via_tar_stream for the tar
+        # download; return the tar bytes as stdout.
+        mock_run.return_value = MagicMock(returncode=0, stdout=tar_bytes)
+
+        tmp = tempfile.mkdtemp()
+        try:
+            ok = collect_logs_from_pod(self._pod(), 'default', '/var/log/ds',
+                                       tmp, remote_config_dir='/tmp',
+                                       remote_dir=None, timeout=10)
+            self.assertTrue(ok)
+            local_file = os.path.join(tmp, 'p1', 'worker.log')
+            self.assertTrue(os.path.exists(local_file),
+                           'tar stream must extract worker.log locally')
+            with open(local_file, 'rb') as f:
+                self.assertEqual(f.read(), log_content)
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    @patch('deploy_common.kubectl_exec')
+    @patch('deploy_common.subprocess.run')
+    @patch('deploy_common._collect_stagger_delay', return_value=0)
+    def test_falls_back_to_base64_when_tar_fails(self, mock_stagger, mock_run, mock_exec):
+        # If the tar stream fails (container without tar, or broken stdout),
+        # collect must degrade to per-file base64 so it still works on any
+        # image. This is the "minimal image" resilience path.
+        log_content = b'fallback log\n'
+
+        def _exec_resp(*args, **kwargs):
+            cmd = args[2]
+            if cmd.startswith('ls -d '):
+                return MagicMock(returncode=0)
+            if cmd.startswith('ls '):
+                return MagicMock(returncode=0, stdout='/var/log/ds/worker.log')
+            if cmd.startswith('base64 '):
+                return MagicMock(returncode=0,
+                                  stdout=base64.b64encode(log_content).decode())
+            return MagicMock(returncode=0, stdout='')
+        mock_exec.side_effect = _exec_resp
+
+        # Tar stream returns failure (no tar in container).
+        mock_run.return_value = MagicMock(returncode=1, stdout=b'')
+
+        tmp = tempfile.mkdtemp()
+        try:
+            ok = collect_logs_from_pod(self._pod(), 'default', '/var/log/ds',
+                                       tmp, remote_config_dir='/tmp',
+                                       remote_dir=None, timeout=10)
+            self.assertTrue(ok)
+            local_file = os.path.join(tmp, 'p1', 'worker.log')
+            self.assertTrue(os.path.exists(local_file),
+                           'base64 fallback must extract worker.log')
+            with open(local_file, 'rb') as f:
+                self.assertEqual(f.read(), log_content)
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 class TestCmdCollectShared(unittest.TestCase):
     """cmd_collect_shared forwards args.remote_dir to cmd_collect_impl so
     standalone-mode collects pick up stdout.log; missing attr defaults to
@@ -1137,6 +1265,37 @@ class TestCmdCollectShared(unittest.TestCase):
         self.assertEqual(rc, 0)
         kwargs = mock_impl.call_args[1]
         self.assertIsNone(kwargs['remote_dir'])
+
+    @patch('deploy_common.cmd_collect_impl', return_value=0)
+    def test_forwards_max_workers_from_args(self, mock_impl):
+        # --max-workers bounds the pool on large clusters; the shared helper
+        # must forward args.max_workers to cmd_collect_impl so the pool is
+        # actually bounded. A regression here would silently leave collect
+        # unbounded even when the operator passed --max-workers.
+        args = SimpleNamespace(namespace='default',
+                               remote_config='/tmp/worker.config',
+                               output='out',
+                               remote_dir='/tmp/ds_worker',
+                               max_workers=50)
+        pods = [{'name': 'p1', 'ip': '10.0.0.1'}]
+        rc = cmd_collect_shared(args, pods, 'worker logs', timeout=10)
+        self.assertEqual(rc, 0)
+        kwargs = mock_impl.call_args[1]
+        self.assertEqual(kwargs['max_workers'], 50)
+
+    @patch('deploy_common.cmd_collect_impl', return_value=0)
+    def test_missing_max_workers_attr_defaults_to_none(self, mock_impl):
+        # Older callers (or test stubs) without max_workers must not crash;
+        # getattr falls back to None so the pool stays unbounded (back compat).
+        args = SimpleNamespace(namespace='default',
+                               remote_config='/tmp/worker.config',
+                               output='out',
+                               remote_dir='/tmp/ds_worker')
+        pods = [{'name': 'p1', 'ip': '10.0.0.1'}]
+        rc = cmd_collect_shared(args, pods, 'worker logs', timeout=10)
+        self.assertEqual(rc, 0)
+        kwargs = mock_impl.call_args[1]
+        self.assertIsNone(kwargs['max_workers'])
 
 
 class TestCleanPod(unittest.TestCase):
@@ -1261,6 +1420,184 @@ class TestCmdCleanShared(unittest.TestCase):
         self.assertEqual(rc, 0)
         kwargs = mock_impl.call_args[1]
         self.assertIsNone(kwargs['remote_dir'])
+
+
+class TestCleanPodKeepBinary(unittest.TestCase):
+    """clean_pod(keep_binary=True): the clean-logs path. Same kill + log_dir +
+    resource_monitor.csv cleanup as clean, but in standalone mode the
+    remote_dir is preserved and only {remote_dir}/stdout.log is removed --
+    the binary and lib/ .so stay so a re-deploy skips the 100M+ upload.
+    stdout.log must still be deleted explicitly because the standalone
+    binary appends to it across runs."""
+
+    def _pod(self):
+        return {'name': 'p1', 'ip': '10.0.0.1'}
+
+    @patch('deploy_common.kill_process')
+    @patch('deploy_common.kubectl_exec')
+    def test_non_standalone_is_no_op_on_remote_dir(self, mock_exec, mock_kill):
+        # remote_dir=None + keep_binary=True (dscli-mode clean-logs): behaves
+        # identically to clean -- log_dir + resource_monitor.csv only. The
+        # keep_binary flag has nothing to preserve because clean never touched
+        # the package-prefix install path either.
+        clean_pod(self._pod(), 'default', '/var/log/ds', '/tmp',
+                  'datasystem_worker', remote_dir=None, timeout=10,
+                  keep_binary=True)
+        cmds = [c[0][2] for c in mock_exec.call_args_list]
+        self.assertIn('rm -rf /var/log/ds', cmds)
+        self.assertIn('rm -f /tmp/resource_monitor.csv', cmds)
+        self.assertFalse(any(c.startswith('rm -f /tmp/ds_worker') for c in cmds))
+        self.assertFalse(any(c.startswith('rm -rf /tmp/ds_worker') for c in cmds))
+
+    @patch('deploy_common.kill_process')
+    @patch('deploy_common.kubectl_exec')
+    def test_standalone_removes_only_stdout_log(self, mock_exec, mock_kill):
+        # remote_dir set + keep_binary=True: rm -f {remote_dir}/stdout.log
+        # is issued, rm -rf {remote_dir} is NOT. Binary + lib/ are preserved.
+        clean_pod(self._pod(), 'default', '/var/log/ds', '/tmp',
+                  'worker_test', remote_dir='/tmp/ds_worker', timeout=10,
+                  keep_binary=True)
+        cmds = [c[0][2] for c in mock_exec.call_args_list]
+        self.assertIn('rm -rf /var/log/ds', cmds)
+        self.assertIn('rm -f /tmp/resource_monitor.csv', cmds)
+        self.assertIn('rm -f /tmp/ds_worker/stdout.log', cmds)
+        # The whole remote_dir must NOT be removed -- that would drop the
+        # binary + lib/ and defeat the purpose of clean-logs.
+        self.assertNotIn('rm -rf /tmp/ds_worker', cmds)
+        # kill target is still the standalone binary name (clean-logs must
+        # kill the process; leaving it running while deleting its stdout.log
+        # would be a confusing state).
+        mock_kill.assert_called_once_with(
+            self._pod(), 'default', 'worker_test', timeout=10)
+
+    @patch('deploy_common.kill_process')
+    @patch('deploy_common.kubectl_exec')
+    def test_standalone_stdout_log_cleanup_runs_after_log_dir(self, mock_exec, mock_kill):
+        # Order matters: stdout.log removal must come after log_dir +
+        # resource_monitor.csv (same ordering as clean's remote_dir removal)
+        # so a still-running binary does not see its files disappear
+        # mid-shutdown.
+        clean_pod(self._pod(), 'default', '/var/log/ds', '/tmp',
+                  'coordinator_test', remote_dir='/tmp/ds_coordinator',
+                  timeout=10, keep_binary=True)
+        cmds = [c[0][2] for c in mock_exec.call_args_list]
+        self.assertLess(cmds.index('rm -rf /var/log/ds'),
+                        cmds.index('rm -f /tmp/ds_coordinator/stdout.log'))
+        self.assertLess(cmds.index('rm -f /tmp/resource_monitor.csv'),
+                        cmds.index('rm -f /tmp/ds_coordinator/stdout.log'))
+
+    @patch('deploy_common.kill_process')
+    @patch('deploy_common.kubectl_exec')
+    def test_standalone_without_log_dir_still_cleans_stdout_log(self, mock_exec, mock_kill):
+        # A config without log_dir must still remove stdout.log in standalone
+        # clean-logs mode (stdout.log accumulates across deploys and would
+        # stack otherwise). log_dir is skipped via the `if log_dir:` guard.
+        clean_pod(self._pod(), 'default', None, '/tmp',
+                  'worker_test', remote_dir='/tmp/ds_worker', timeout=10,
+                  keep_binary=True)
+        cmds = [c[0][2] for c in mock_exec.call_args_list]
+        self.assertNotIn('rm -rf None', cmds)
+        self.assertIn('rm -f /tmp/resource_monitor.csv', cmds)
+        self.assertIn('rm -f /tmp/ds_worker/stdout.log', cmds)
+
+
+class TestCmdCleanImplKeepBinary(unittest.TestCase):
+    """cmd_clean_impl(keep_binary=True) forwards keep_binary through to each
+    per-pod clean_pod call so the clean-logs pipeline preserves the binary."""
+
+    @patch('deploy_common.clean_pod', return_value=True)
+    @patch('deploy_common.read_remote_log_dir',
+           return_value=('/var/log/ds', {}))
+    def test_keep_binary_forwarded_to_clean_pod(self, mock_read, mock_clean):
+        pods = [{'name': 'p1', 'ip': '10.0.0.1'}]
+        cmd_clean_impl(pods, 'default', '/tmp/worker.config',
+                       'worker_test', 'worker logs',
+                       remote_dir='/tmp/ds_worker', timeout=10,
+                       keep_binary=True)
+        # clean_pod must receive keep_binary=True so it issues
+        # rm -f stdout.log instead of rm -rf remote_dir.
+        _, kwargs = mock_clean.call_args
+        self.assertTrue(kwargs['keep_binary'])
+        self.assertEqual(kwargs['remote_dir'], '/tmp/ds_worker')
+
+    @patch('deploy_common.clean_pod', return_value=True)
+    @patch('deploy_common.read_remote_log_dir',
+           return_value=('/var/log/ds', {}))
+    def test_default_keep_binary_is_false(self, mock_read, mock_clean):
+        # clean (not clean-logs) must default keep_binary=False so it still
+        # does rm -rf remote_dir -- a regression here would silently turn
+        # clean into clean-logs and stack stale binaries.
+        pods = [{'name': 'p1', 'ip': '10.0.0.1'}]
+        cmd_clean_impl(pods, 'default', '/tmp/worker.config',
+                       'worker_test', 'worker logs',
+                       remote_dir='/tmp/ds_worker', timeout=10)
+        _, kwargs = mock_clean.call_args
+        self.assertFalse(kwargs['keep_binary'])
+
+
+class TestCmdCleanLogsShared(unittest.TestCase):
+    """cmd_clean_logs_shared mirrors cmd_clean_shared but forces
+    keep_binary=True at the impl layer. Process selection + --standalone /
+    --remote-dir semantics are identical to clean."""
+
+    def _args(self, **overrides):
+        defaults = dict(namespace='default',
+                        remote_config='/tmp/worker.config',
+                        standalone=False,
+                        remote_dir='/tmp/ds_worker')
+        defaults.update(overrides)
+        return SimpleNamespace(**defaults)
+
+    @patch('deploy_common.cmd_clean_impl', return_value=0)
+    def test_non_standalone_skips_remote_dir_but_forces_keep_binary(self, mock_impl):
+        # Non-standalone: kill datasystem_worker, remote_dir=None (dscli mode
+        # has nothing in remote_dir to preserve). keep_binary=True is still
+        # forwarded -- it is a no-op when remote_dir is None, but pinning it
+        # keeps the contract explicit and robust if a future caller sets
+        # remote_dir in dscli mode.
+        args = self._args(standalone=False)
+        pods = [{'name': 'p1', 'ip': '10.0.0.1'}]
+        rc = cmd_clean_logs_shared(args, pods, 'datasystem_worker',
+                                   'worker_test', 'worker logs', timeout=10)
+        self.assertEqual(rc, 0)
+        pos = mock_impl.call_args[0]
+        kwargs = mock_impl.call_args[1]
+        self.assertEqual(pos[3], 'datasystem_worker')
+        self.assertIsNone(kwargs['remote_dir'])
+        self.assertTrue(kwargs['keep_binary'])
+        self.assertEqual(kwargs['timeout'], 10)
+
+    @patch('deploy_common.cmd_clean_impl', return_value=0)
+    def test_standalone_uses_test_binary_and_forces_keep_binary(self, mock_impl):
+        # Standalone: kill worker_test, pass remote_dir through, and force
+        # keep_binary=True so the impl removes only stdout.log and preserves
+        # the binary + lib/.
+        args = self._args(standalone=True)
+        pods = [{'name': 'p1', 'ip': '10.0.0.1'}]
+        rc = cmd_clean_logs_shared(args, pods, 'datasystem_worker',
+                                   'worker_test', 'worker logs', timeout=10)
+        self.assertEqual(rc, 0)
+        pos = mock_impl.call_args[0]
+        kwargs = mock_impl.call_args[1]
+        self.assertEqual(pos[3], 'worker_test')
+        self.assertEqual(kwargs['remote_dir'], '/tmp/ds_worker')
+        self.assertTrue(kwargs['keep_binary'])
+
+    @patch('deploy_common.cmd_clean_impl', return_value=0)
+    def test_standalone_without_remote_dir_attr_tolerates_missing(self, mock_impl):
+        # getattr fallback: a caller without --remote-dir must not crash with
+        # AttributeError; remote_dir becomes None and clean-logs degrades to
+        # log_dir + resource_monitor.csv only (same tolerance as clean).
+        args = SimpleNamespace(namespace='default',
+                               remote_config='/tmp/worker.config',
+                               standalone=True)
+        pods = [{'name': 'p1', 'ip': '10.0.0.1'}]
+        rc = cmd_clean_logs_shared(args, pods, 'datasystem_worker',
+                                   'worker_test', 'worker logs', timeout=10)
+        self.assertEqual(rc, 0)
+        kwargs = mock_impl.call_args[1]
+        self.assertIsNone(kwargs['remote_dir'])
+        self.assertTrue(kwargs['keep_binary'])
 
 
 if __name__ == '__main__':

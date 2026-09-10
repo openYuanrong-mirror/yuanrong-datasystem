@@ -24,6 +24,7 @@ from deploy_coordinator import (
     PROCESS_NAME,
     PROCESS_NAME_STANDALONE,
     cmd_clean,
+    cmd_clean_logs,
     cmd_deploy,
     cmd_kill,
     cmd_start,
@@ -384,6 +385,41 @@ class TestCmdWiring(unittest.TestCase):
                                remote_dir='/tmp/ds_coordinator',
                                timeout=10)
         rc = cmd_clean(args, [self._pod()])
+        self.assertEqual(rc, 0)
+        mock_shared.assert_called_once_with(
+            args, [self._pod()], PROCESS_NAME, PROCESS_NAME_STANDALONE,
+            'coordinator logs', 10)
+
+    @patch('deploy_coordinator.cmd_clean_logs_shared', return_value=0)
+    def test_cmd_clean_logs_uses_coordinator_process(self, mock_shared):
+        # clean-logs mirrors clean's call shape but delegates to
+        # cmd_clean_logs_shared (which forces keep_binary=True at the impl
+        # layer). standalone=False: helper picks PROCESS_NAME
+        # (datasystem_coordinator) and skips remote_dir; keep_binary is a
+        # no-op in dscli mode (clean never touched the package prefix).
+        args = SimpleNamespace(namespace='default',
+                               remote_config='/tmp/coordinator.config',
+                               standalone=False,
+                               remote_dir='/tmp/ds_coordinator',
+                               timeout=10)
+        rc = cmd_clean_logs(args, [self._pod()])
+        self.assertEqual(rc, 0)
+        mock_shared.assert_called_once_with(
+            args, [self._pod()], PROCESS_NAME, PROCESS_NAME_STANDALONE,
+            'coordinator logs', 10)
+
+    @patch('deploy_coordinator.cmd_clean_logs_shared', return_value=0)
+    def test_cmd_clean_logs_standalone_passes_coordinator_test_process(self, mock_shared):
+        # clean-logs --standalone: helper switches to PROCESS_NAME_STANDALONE
+        # (coordinator_test) and forwards remote_dir + keep_binary=True so the
+        # impl removes only {remote_dir}/stdout.log and preserves the binary
+        # + lib/. cmd_clean_logs itself is role-agnostic about the switch.
+        args = SimpleNamespace(namespace='default',
+                               remote_config='/tmp/coordinator.config',
+                               standalone=True,
+                               remote_dir='/tmp/ds_coordinator',
+                               timeout=10)
+        rc = cmd_clean_logs(args, [self._pod()])
         self.assertEqual(rc, 0)
         mock_shared.assert_called_once_with(
             args, [self._pod()], PROCESS_NAME, PROCESS_NAME_STANDALONE,

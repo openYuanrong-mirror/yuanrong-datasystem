@@ -25,6 +25,7 @@ from deploy_worker import (
     PROCESS_NAME,
     PROCESS_NAME_STANDALONE,
     cmd_clean,
+    cmd_clean_logs,
     cmd_deploy,
     cmd_install,
     cmd_start,
@@ -293,6 +294,45 @@ class TestCmdClean(unittest.TestCase):
                                remote_dir='/tmp/ds_worker',
                                timeout=10)
         rc = cmd_clean(args, [self._pod()])
+        self.assertEqual(rc, 0)
+        mock_shared.assert_called_once_with(
+            args, [self._pod()], PROCESS_NAME, PROCESS_NAME_STANDALONE,
+            'worker logs', 10)
+
+
+class TestCmdCleanLogs(unittest.TestCase):
+    """cmd_clean_logs forwards both process names + the label to the
+    clean-logs shared helper (cmd_clean_logs_shared, not cmd_clean_shared);
+    the helper forces keep_binary=True at the impl layer. Call shape mirrors
+    cmd_clean exactly so the worker role stays in lockstep with the
+    coordinator role's clean-logs wiring."""
+
+    def _pod(self):
+        return {'name': 'p1', 'ip': '10.0.0.1'}
+
+    @patch('deploy_worker.cmd_clean_logs_shared', return_value=0)
+    def test_non_standalone_calls_clean_logs_shared(self, mock_shared):
+        args = SimpleNamespace(namespace='default',
+                               remote_config='/tmp/worker.config',
+                               standalone=False,
+                               remote_dir='/tmp/ds_worker',
+                               timeout=10)
+        rc = cmd_clean_logs(args, [self._pod()])
+        self.assertEqual(rc, 0)
+        mock_shared.assert_called_once_with(
+            args, [self._pod()], PROCESS_NAME, PROCESS_NAME_STANDALONE,
+            'worker logs', 10)
+
+    @patch('deploy_worker.cmd_clean_logs_shared', return_value=0)
+    def test_standalone_calls_clean_logs_shared(self, mock_shared):
+        # Same call shape as non-standalone; the helper picks worker_test from
+        # args.standalone=True and forwards remote_dir + keep_binary=True.
+        args = SimpleNamespace(namespace='default',
+                               remote_config='/tmp/worker.config',
+                               standalone=True,
+                               remote_dir='/tmp/ds_worker',
+                               timeout=10)
+        rc = cmd_clean_logs(args, [self._pod()])
         self.assertEqual(rc, 0)
         mock_shared.assert_called_once_with(
             args, [self._pod()], PROCESS_NAME, PROCESS_NAME_STANDALONE,

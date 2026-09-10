@@ -14,33 +14,19 @@ import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from deploy_common import log_error, log_info, normalize_jemalloc_prof_conf, setup_logging
+from deploy_common import (
+    _print_timings,
+    get_pods,
+    log_error,
+    log_info,
+    normalize_jemalloc_prof_conf,
+    setup_logging,
+)
 
 
 _GRACEFUL_STOP_TIMEOUT = 120
 _SUMMARY_TIMEOUT = 60
 _POLL_INTERVAL = 2
-
-
-def _print_timings(action, timings):
-    """Print per-pod duration stats for an action.
-
-    ``timings`` is a list of ``(target, elapsed_seconds, succeeded)``
-    tuples populated from worker threads (list.append is GIL-atomic in
-    CPython, so concurrent appends from the thread pool are safe).
-    """
-    if not timings:
-        return
-    log_info(f'\n{action} per-pod timings:')
-    for target, elapsed, ok in sorted(timings, key=lambda x: x[0]):
-        log_info(f'  {target:<40} {elapsed:7.2f}s  {"OK" if ok else "FAIL"}')
-    elapsed_all = [t for _, t, _ in timings]
-    ok_count = sum(1 for _, _, ok in timings if ok)
-    fail_count = len(timings) - ok_count
-    log_info(f'  min={min(elapsed_all):.2f}s  max={max(elapsed_all):.2f}s  '
-             f'avg={sum(elapsed_all) / len(elapsed_all):.2f}s  '
-             f'total={sum(elapsed_all):.2f}s  '
-             f'(succeeded={ok_count}, failed={fail_count})')
 
 
 class Deployer:
@@ -255,8 +241,43 @@ class Deployer:
         log_info(f'  {target} -> {len(files)} {file_label}')
 
         if transport == 'kubectl':
-            # kubectl cp requires tar inside container; use cat instead
+            # Stream all files in one kubectl exec (tar czf - | local tar xf -).
+            # Previously this was per-file `kubectl exec cat {file}` (N kubectl
+            # processes per node); on 500+ nodes that was 500*N API server
+            # round-trips. The tar stream is binary-safe and gzip-compressed,
+            # matching the SSH path's efficiency. Falls back to per-file cat
+            # if the container lacks tar (rare; install already relies on tar
+            # via kubectl cp, so this fallback is almost never hit).
             ns = self._namespace(node)
+            iid = node['instance_id']
+            tar_suffix = file_label.replace(' ', '_')
+            tar_local = f'/tmp/collect_{tar_suffix}_{iid}.tar.gz'
+            file_list = ' '.join(shlex.quote(f) for f in files)
+            try:
+                r = subprocess.run(
+                    ['kubectl', 'exec', target, '-n', ns, '--', 'sh', '-c',
+                     f'tar czf - {file_list} 2>/dev/null'],
+                    capture_output=True, timeout=120)
+                if r.returncode == 0 and r.stdout:
+                    import io
+                    with tarfile.open(fileobj=io.BytesIO(r.stdout), mode='r:gz') as tar:
+                        for member in tar.getmembers():
+                            # Map remote path to local path (preserve subpath).
+                            local_path = self._local_path_for(
+                                member.name, local_dir, remote_dir)
+                            if member.isdir():
+                                os.makedirs(local_path, exist_ok=True)
+                            elif member.isfile():
+                                tar.extract(member, path=os.path.dirname(local_path))
+                                # extractall uses member.name; rename to local_path.
+                                extracted = os.path.join(os.path.dirname(local_path), member.name)
+                                if os.path.exists(extracted) and extracted != local_path:
+                                    os.rename(extracted, local_path)
+                    return
+            except Exception as e:
+                log_info(f'    {target} -> tar stream failed: {e}; falling back to cat')
+
+            # Fallback: per-file cat (for containers without tar).
             for remote_path in files:
                 local_path = self._local_path_for(remote_path, local_dir, remote_dir)
                 cmd = ['kubectl', 'exec', target, '-n', ns, '--', 'cat', remote_path]
@@ -264,8 +285,6 @@ class Deployer:
                     with open(local_path, 'wb') as f:
                         subprocess.run(cmd, stdout=f, check=True, timeout=120)
                 except Exception as e:
-                    # Use the full remote_path (not basename) so failures of
-                    # same-named files in different dirs are distinguishable.
                     log_info(f'    {remote_path} -> {local_path} FAILED: {e}')
         elif transport == 'localhost':
             for remote_path in files:
@@ -1030,88 +1049,177 @@ class Deployer:
         ok = sum(1 for r in results if r)
         log_info(f'\nClean result: {ok}/{len(results)}')
 
-    def do_collect(self, sdk_log_dir='/root/.datasystem/logs', output_dir='collected'):
+    def do_clean_logs(self):
+        """Kill processes and remove run-time output, but keep the binary + lib.
+
+        Mirrors ``do_clean`` except the install-phase artifacts (the kvtest
+        binary, ``lib/`` .so, ``procmon.py``, ``standalone_launcher.py``)
+        are preserved so a re-deploy skips the ~100MB upload on 2000+ node
+        clusters. Removes only the per-run products: ``config_*.json``,
+        ``run.log``, ``metrics_*/`` output dirs, ``resource_monitor.csv``,
+        and the SDK log dir ``/root/.datasystem/logs/``. ``config_*.json`` is
+        regenerated by ``start`` so deleting it is safe; ``run.log`` and the
+        ``metrics_*/`` dirs are appended/recreated per run, so leaving them
+        would stack stale output across runs.
+        """
+        results = []
+
+        def clean_logs_node(node):
+            target = self._exec_target(node)
+            log_info(f'Cleaning logs on {target}...')
+            try:
+                # Step 1: Kill processes (same two-phase kill as do_clean: a
+                # graceful TERM first, then -9 for survivors -- a still-running
+                # binary would otherwise keep writing to the files we're about
+                # to delete and race the rm).
+                self.run_on(node,
+                            "for p in $(pgrep -x kvtest 2>/dev/null); do "
+                            "kill $p 2>/dev/null; done; "
+                            "for p in $(pgrep -x procmon.py 2>/dev/null); do "
+                            "kill $p 2>/dev/null; done",
+                            check=False, timeout=15)
+                time.sleep(1)
+
+                # Step 2: Force kill remaining
+                self.run_on(node,
+                            "for p in $(pgrep -x kvtest 2>/dev/null); do "
+                            "kill -9 $p 2>/dev/null; done; "
+                            "for p in $(pgrep -x procmon.py 2>/dev/null); do "
+                            "kill -9 $p 2>/dev/null; done",
+                            check=False, timeout=15)
+                time.sleep(1)
+
+                # Step 3: Remove run-time products only (preserve binary +
+                # lib/ + procmon.py + standalone_launcher.py installed by
+                # install_node). config_*.json is per-instance and regenerated
+                # by start_node; run.log + metrics_*/ + resource_monitor.csv
+                # are run output that would stack across runs if left.
+                self.run_on(
+                    node,
+                    f'rm -rf {self.remote_work_dir}/config_*.json '
+                    f'{self.remote_work_dir}/run.log '
+                    f'{self.remote_work_dir}/metrics_* '
+                    f'{self.remote_work_dir}/resource_monitor.csv '
+                    f'/root/.datasystem/logs/',
+                    check=False, timeout=15)
+
+                # Verify install artifacts survived (the whole point of
+                # clean-logs vs clean). A missing binary means install never
+                # ran or was wiped -- flag it so the operator doesn't hit a
+                # confusing "start FAILED: kvtest binary not found" on the
+                # next run.
+                verify = self.run_on(
+                    node, f'test -x {self.remote_work_dir}/kvtest',
+                    check=False, timeout=10)
+                if verify.returncode == 0:
+                    log_info(f'  {target} -> OK (binary preserved)')
+                else:
+                    log_info(f'  {target} -> WARNING: kvtest binary missing; '
+                             f'run install before next start')
+                return True
+            except Exception as e:
+                log_info(f'  {target} -> FAILED ({e})')
+                return False
+
+        with ThreadPoolExecutor(max_workers=len(self.nodes) or 1) as pool:
+            futures = [pool.submit(clean_logs_node, n) for n in self.nodes]
+            for future in as_completed(futures):
+                results.append(future.result())
+
+        ok = sum(1 for r in results if r)
+        log_info(f'\nClean-logs result: {ok}/{len(results)}')
+
+    def do_collect(self, sdk_log_dir='/root/.datasystem/logs', output_dir='collected',
+                   summary_timeout=5, max_workers=None, node_slice=None):
+        """Collect output files and SDK logs from all nodes.
+
+        Single-phase pipeline: each node triggers its own /summary then
+        immediately collects its files, all in one bounded ThreadPoolExecutor.
+        This eliminates the prior two-phase design where Phase 1 (summary)
+        blocked on the slowest node for up to ``summary_timeout`` seconds
+        before Phase 2 (collect) could start -- on 2000 nodes one unreachable
+        node stalled all 1999 others.
+
+        ``summary_timeout`` (default 5s, overridable via --summary-timeout)
+        caps per-node summary retries. The /summary endpoint is synchronous
+        (returns HTTP 200 only after ``run_summary.txt`` is written), so
+        ``rc=0`` means the file is ready; a dead/unreachable node exhausts
+        its own timeout and collects whatever files are available.
+
+        ``max_workers`` bounds the pool (default ``len(nodes)`` = unbounded).
+        On large clusters a bounded pool avoids overloading the local fork
+        budget and (for kubectl transport) the API server's TLS+impersonation
+        connections.
+
+        ``node_slice`` (``(offset, count)`` or ``None``) limits collect to
+        a deterministic slice of nodes (sorted by ``host:instance_id``) so
+        a 2000-node collect can be manually batched.
+        """
         collect_dir = output_dir
         results = []
 
-        # Phase 1: trigger summary generation on running instances.
-        # The /summary endpoint is synchronous — WriteSummary runs inline
-        # and returns HTTP 200 only after run_summary.txt is written to
-        # disk. So curl rc=0 means the summary file is ready. Retry per
-        # node until success or timeout; if the process is dead or the
-        # port unreachable, exhaust the timeout and collect whatever
-        # files are available.
-        log_info('Triggering summary generation...')
+        nodes = self.nodes
+        if node_slice is not None:
+            offset, count = node_slice
+            if offset < 0:
+                offset = 0
+            nodes = nodes[offset:offset + count] if count is not None else nodes[offset:]
+            if not nodes:
+                log_info('No nodes in the requested slice; nothing to collect.')
+                return
 
-        def trigger_summary(node):
-            port = node.get('port', self.listen_port)
-            url = f'http://localhost:{port}/summary'
-            deadline = time.monotonic() + _SUMMARY_TIMEOUT
-            while time.monotonic() < deadline:
-                r = self.run_on(node, f'curl -sf -X POST {url} --max-time 3',
-                                check=False, timeout=10)
-                if r.returncode == 0:
-                    return True
-                time.sleep(_POLL_INTERVAL)
-            return False
-
-        with ThreadPoolExecutor(max_workers=len(self.nodes) or 1) as pool:
-            futures = {pool.submit(trigger_summary, n): n for n in self.nodes}
-            for f in as_completed(futures):
-                node = futures[f]
-                target = self._exec_target(node)
-                if f.result():
-                    log_info(f'  {target} -> summary OK')
-                else:
-                    log_info(f'  {target} -> summary timeout, collecting available files')
-
-        # Phase 2: collect kvtest output files and SDK logs
-        def collect_all(node, local_dir):
-            self.collect_files(node, local_dir)
-            self.collect_sdk_logs(node, local_dir, sdk_log_dir)
-
-        self._collect_from_all_nodes(
-            collect_dir,
-            collect_all,
-            file_label='files',
-            result_label='Collect result'
-        )
-
-    def _collect_from_all_nodes(self, collect_dir, collect_fn, file_label='files', result_label='Collect result'):
-        """Collect files from all nodes (internal helper)."""
-        results = []
+        workers = max_workers or (len(nodes) or 1)
+        log_info(f'Collecting from {len(nodes)} node(s) with max_workers={workers}...')
 
         def collect_node(node):
             instance_id = node['instance_id']
             target = self._exec_target(node)
             local_dir = os.path.join(collect_dir, f'{target}_{instance_id}')
-            log_info(f'Collecting {file_label} from {target} (instance_id={instance_id})...')
+            log_info(f'Collecting from {target} (instance_id={instance_id})...')
+
+            # Per-node summary trigger (synchronous /summary endpoint).
+            # Returns True if rc=0 (file ready), False on timeout.
+            port = node.get('port', self.listen_port)
+            url = f'http://localhost:{port}/summary'
+            deadline = time.monotonic() + summary_timeout
+            summary_ok = False
+            while time.monotonic() < deadline:
+                r = self.run_on(node, f'curl -sf -X POST {url} --max-time 3',
+                                check=False, timeout=10)
+                if r.returncode == 0:
+                    summary_ok = True
+                    break
+                time.sleep(_POLL_INTERVAL)
+            if summary_ok:
+                log_info(f'  {target} -> summary OK')
+            else:
+                log_info(f'  {target} -> summary timeout, collecting available files')
+
+            # Immediately collect this node's files (no global barrier).
             try:
-                collect_fn(node, local_dir)
+                self.collect_files(node, local_dir)
+                self.collect_sdk_logs(node, local_dir, sdk_log_dir)
                 if not os.path.isdir(local_dir):
                     return 'empty'
-                # Files may now land in subdirs (metrics_*/run.log etc.),
-                # so walk recursively instead of only counting top-level files.
-                count = sum(len(files) for _, _, files in os.walk(local_dir))
-                if count == 0:
-                    log_info(f'  {target} -> 0 {file_label}')
+                count_files = sum(len(f) for _, _, f in os.walk(local_dir))
+                if count_files == 0:
+                    log_info(f'  {target} -> 0 files')
                     return 'empty'
-                log_info(f'  {target} -> {count} {file_label} collected to {local_dir}/')
+                log_info(f'  {target} -> {count_files} files collected to {local_dir}/')
                 return 'ok'
             except Exception as e:
                 log_info(f'  {target} -> FAILED ({e})')
                 return 'fail'
 
-        with ThreadPoolExecutor(max_workers=len(self.nodes) or 1) as pool:
-            futures = [pool.submit(collect_node, n) for n in self.nodes]
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(collect_node, n) for n in nodes]
             for future in as_completed(futures):
                 results.append(future.result())
 
         ok = sum(1 for r in results if r == 'ok')
         empty = sum(1 for r in results if r == 'empty')
         fail = sum(1 for r in results if r == 'fail')
-        total = len(results)
-        log_info(f'\n{result_label}: {ok} collected, {empty} empty, {fail} failed / {total} total -> {collect_dir}/')
+        log_info(f'\nCollect result: {ok} ok / {empty} empty / {fail} fail / {len(results)} total')
 
     def do_run(self, duration):
         """Wait duration then auto stop + collect."""
@@ -1139,7 +1247,7 @@ class Deployer:
         elapsed = int(time.time() - start)
         log_info(f'\n--- Run finished ({elapsed}s elapsed) ---')
         self.do_stop()
-        self.do_collect()
+        self.do_collect(summary_timeout=5)
 
 
 def parse_duration(s):
@@ -1155,56 +1263,6 @@ def parse_duration(s):
 
 
 # --- gen-config ---
-
-def _get_pods(namespace, prefixes):
-    """Get running pods matching any of the given name prefixes.
-
-    OR semantics: a pod is selected if its name starts with any prefix.
-    Dedup by name (a pod matching multiple prefixes is still added once).
-    The final list is sorted by name globally so instance_id assignment is
-    deterministic regardless of the order prefixes were passed on the CLI.
-    A WARNING is printed for each prefix that matched zero pods.
-    """
-    try:
-        out = subprocess.check_output(
-            ['kubectl', 'get', 'pods', '-n', namespace, '-o', 'json',
-             '--field-selector=status.phase=Running'],
-            text=True, timeout=30)
-    except FileNotFoundError:
-        log_error('ERROR: kubectl not found')
-        sys.exit(1)
-    except subprocess.CalledProcessError as e:
-        log_error(f'ERROR: kubectl failed: {e.stderr}')
-        sys.exit(1)
-
-    prefixes = list(prefixes or [])
-    data = json.loads(out)
-    pods = []
-    seen = set()
-    for item in data.get('items', []):
-        name = item['metadata']['name']
-        if not any(name.startswith(p) for p in prefixes):
-            continue
-        pod_ip = item.get('status', {}).get('podIP', '')
-        if not pod_ip:
-            continue
-        if name in seen:
-            continue
-        seen.add(name)
-        node_name = item.get('spec', {}).get('nodeName', '')
-        # status.hostIP is the k8s node's InternalIP (set by the kubelet);
-        # fall back to '' if absent (rare; logged by the caller when used
-        # as HOST_IP). This is the node IP, not the hostname — using nodeName
-        # (hostname) for HOST_IP would break coordinator/etcd registration.
-        host_ip = item.get('status', {}).get('hostIP', '')
-        pods.append({'name': name, 'ip': pod_ip, 'node': node_name,
-                     'host_ip': host_ip})
-    pods.sort(key=lambda p: p['name'])
-    for p in prefixes:
-        if not any(pod['name'].startswith(p) for pod in pods):
-            log_error(f'WARNING: prefix "{p}" matched 0 pods')
-    return pods
-
 
 def _parse_pipeline(s):
     return [op.strip() for op in s.split(',') if op.strip()] if s else []
@@ -1407,7 +1465,7 @@ def cmd_gen_config(args):
     # --- Node discovery ---
     if args.prefixes:
         # Pod discovery via kubectl (all modes)
-        pods = _get_pods(args.namespace, args.prefixes)
+        pods = get_pods(args.namespace, args.prefixes)
         if not pods:
             log_error(f'No running pods found matching prefixes {args.prefixes} '
                       f'in namespace "{args.namespace}"')
@@ -1706,9 +1764,32 @@ def main():
                    help='Local output directory (default: collected)')
     p.add_argument('--sdk-log-dir', default='/root/.datasystem/logs',
                    help='SDK log directory on remote nodes (default: /root/.datasystem/logs)')
+    p.add_argument('--summary-timeout', type=int, default=5,
+                   help='Per-node summary-trigger timeout in seconds (default: 5). '
+                        'The /summary endpoint is synchronous (returns 200 only after '
+                        'run_summary.txt is written); each node retries POST /summary '
+                        'until rc=0 or this timeout. Lower values start collecting '
+                        'sooner when a node is unreachable.')
+    p.add_argument('--count', type=int, default=None,
+                   help='Limit collect to N nodes (sorted by host:instance_id). '
+                        'Pair with --offset to manually batch large clusters.')
+    p.add_argument('--offset', type=int, default=0,
+                   help='Skip the first N nodes before applying --count (default: 0).')
+    p.add_argument('--max-workers', type=int, default=None,
+                   help='Max concurrent nodes for collect (default: all). On large '
+                        'clusters (500+ nodes) an unbounded pool overloads the local '
+                        'fork budget and (for kubectl) the API server.')
 
     # clean
     p = sub.add_parser('clean', help='Kill processes and remove remote work dirs', parents=[shared])
+    p.add_argument('deploy_json')
+    p.add_argument('config_template', nargs='?', default='config/config.json.example')
+
+    # clean-logs: same scope as clean but preserves the binary + lib + scripts
+    p = sub.add_parser('clean-logs',
+                       help='Kill processes and remove run-time output, but keep '
+                            'standalone binary + lib + procmon + launcher',
+                       parents=[shared])
     p.add_argument('deploy_json')
     p.add_argument('config_template', nargs='?', default='config/config.json.example')
 
@@ -1762,9 +1843,18 @@ def main():
     elif args.command == 'stop':
         deployer.do_stop()
     elif args.command == 'collect':
-        deployer.do_collect(args.sdk_log_dir, args.output)
+        node_slice = None
+        if getattr(args, 'count', None) is not None or getattr(args, 'offset', 0) > 0:
+            node_slice = (getattr(args, 'offset', 0), getattr(args, 'count', None))
+        deployer.do_collect(
+            args.sdk_log_dir, args.output,
+            summary_timeout=getattr(args, 'summary_timeout', 5),
+            max_workers=getattr(args, 'max_workers', None),
+            node_slice=node_slice)
     elif args.command == 'clean':
         deployer.do_clean()
+    elif args.command == 'clean-logs':
+        deployer.do_clean_logs()
 
 
 if __name__ == '__main__':
