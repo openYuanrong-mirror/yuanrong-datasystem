@@ -44,13 +44,12 @@ constexpr char kRemoveSubmissionExceptionMarker[] = "Coordinator membership Remo
 constexpr char kOperationCompletionErrorMarker[] = "Coordinator membership asynchronous operation failed";
 constexpr char kUnsafeOverTargetMarker[] =
     "Coordinator membership over-target configuration has no safe removal target";
-constexpr char K_COORDINATOR_MEMBERSHIP_TRACE_PREFIX[] = "CoordinatorMembership;";
 
 std::string GetCoordinatorMembershipTraceId()
 {
     auto traceId = Trace::Instance().GetTraceID();
     if (traceId.empty()) {
-        traceId = std::string(K_COORDINATOR_MEMBERSHIP_TRACE_PREFIX) + GetStringUuid();
+        traceId = Trace::GenerateComponentTraceId("CoordinatorMembership");
     }
     return traceId;
 }

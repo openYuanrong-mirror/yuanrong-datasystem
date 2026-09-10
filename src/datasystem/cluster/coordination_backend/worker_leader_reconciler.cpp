@@ -343,7 +343,7 @@ void WorkerLeaderReconciler::RunEnsureLoop(CoordinatorLeaderIdentity identity)
     size_t retryAttempt = 0;
     EnsureWork work{ std::move(identity), false, false };
     while (!stopping_.load(std::memory_order_acquire)) {
-        TraceGuard traceGuard = Trace::Instance().SetTraceNewID("LeaderReconciler;" + GetStringUuid());
+        TraceGuard traceGuard = Trace::Instance().SetTraceNewID(Trace::GenerateComponentTraceId("LeaderReconciler"));
         if (!TakePendingEnsure(work)) {
             break;
         }
