@@ -1335,9 +1335,11 @@ Status DsCoordinationBackend::PrepareNodeStateMutation(MemberLifecycleState stat
             mutation.required = false;
             return Status::OK();
         }
-        CHECK_FAIL_RETURN_STATUS(!IsKeepAliveTimeout(), K_NOT_READY,
-                                 "The key written to the cluster table must be bound to a lease");
         mutation.startedFrom = GetMembershipIncarnationLocked();
+        CHECK_FAIL_RETURN_STATUS(!mutation.startedFrom.coordinatorId.empty()
+                                     && mutation.startedFrom.modRevision != COORDINATOR_NO_MOD_REVISION_CHECK
+                                     && keepAliveTtlMs_ > 0,
+                                 K_NOT_READY, "membership incarnation is not established");
         std::lock_guard<std::mutex> lock(keepAliveMutex_);
         mutation.value = keepAliveValue_;
         mutation.value.lifecycleState = state;
@@ -1365,6 +1367,7 @@ Status DsCoordinationBackend::CommitNodeStateMutation(const MembershipMutation &
                                        || mutation.value.lifecycleState == MemberLifecycleState::EXITING;
             if (sameProcess && allowedByExit) {
                 keepAliveValue_ = mutation.value;
+                keepAliveTimeout_ = false;
                 successEpoch = ++membershipSuccessEpoch_;
             } else {
                 retry = true;

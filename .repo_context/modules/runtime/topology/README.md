@@ -48,6 +48,12 @@
   returns `K_TRY_AGAIN`. Positive sub-millisecond deadline remainder is rounded up so a caller's final 1 ms budget still
   reaches the Coordinator. A successful old-generation response may advance the local revision fence but cannot replace
   a newer process timestamp; it is retried with the current payload within that same attempt/deadline budget.
+  Lifecycle publication requires a nonempty Coordinator identity, an established modification revision and a positive
+  TTL, not a successful most-recent KeepAlive RPC. Its fenced Put can renew an existing membership after a transient
+  renewal failure; missing or replaced memberships still fail the server-side fence. Only a successful current-payload
+  commit clears the local renewal-failure flag. This rule is specific to Coordinator membership writes, not ETCD lease
+  writes or sidecar TTL keys. `DsCoordinationBackendSessionTest` covers READY after renewal failure, missing/replaced
+  memberships, changed Coordinator identity, unestablished membership and failed READY writes.
   Membership deletion explicitly carries both captured fields; proxy implementations that do not support the paired
   fence fail closed instead of degrading to a revision-only delete. Recreation treats either field changing as a new
   remote incarnation whose process timestamp must still match. Because Coordinator Ensure cannot use the ordinary

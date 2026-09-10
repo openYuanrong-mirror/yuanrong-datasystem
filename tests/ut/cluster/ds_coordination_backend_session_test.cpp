@@ -103,6 +103,9 @@ public:
         }
         lastExpectedCoordinatorId_ = expectedCoordinatorId;
         lastExpectedModRevision_ = expectedModRevision;
+        if (!expectedCoordinatorId.empty() && expectedCoordinatorId != putCoordinatorId_) {
+            return Status(K_TRY_AGAIN, "membership Coordinator changed");
+        }
         if (expectedModRevision != COORDINATOR_NO_MOD_REVISION_CHECK && expectedModRevision != putRevision_) {
             return Status(K_TRY_AGAIN, "membership incarnation changed");
         }
@@ -1425,6 +1428,85 @@ TEST(DsCoordinationBackendSessionTest, RecoveringLeaderInitialLeaseUsesReconcile
     ASSERT_TRUE(backend.UpdateNodeState(MemberLifecycleState::READY).IsOk());
     EXPECT_EQ(proxy.LastExpectedModRevision(), 17);
     EXPECT_TRUE(backend.ShutdownEventSources().IsOk());
+}
+
+TEST(DsCoordinationBackendSessionTest, ReadyPublicationRenewsMembershipAfterKeepAliveRpcFailure)
+{
+    DeterministicCoordinatorProxy proxy;
+    proxy.SetKeepAliveStatus(Status(K_RPC_UNAVAILABLE, "injected renewal failure"));
+    DsCoordinationBackend backend(&proxy, WATCHER_ADDRESS);
+    ASSERT_TRUE(backend.InitKeepAlive("/datasystem/c/cluster", WATCHER_ADDRESS, false, true).IsOk());
+    for (int retry = 0; retry < 100 && !backend.IsKeepAliveTimeout(); ++retry) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_TRUE(backend.IsKeepAliveTimeout());
+    ASSERT_TRUE(backend.ShutdownEventSources().IsOk());
+    ASSERT_TRUE(backend.IsFirstKeepAliveSent());
+    const auto putCalls = proxy.PutCalls();
+
+    ASSERT_TRUE(backend.UpdateNodeState(MemberLifecycleState::READY).IsOk());
+    EXPECT_EQ(proxy.PutCalls(), putCalls + 1);
+    EXPECT_EQ(proxy.LastExpectedCoordinatorId(), COORDINATOR_A);
+    EXPECT_EQ(proxy.LastExpectedModRevision(), 1);
+    EXPECT_GT(proxy.LastPutTtlMs(), 0);
+    EXPECT_FALSE(backend.IsKeepAliveTimeout());
+    MembershipValue value;
+    ASSERT_TRUE(MembershipValueCodec::Decode(proxy.LastPutValue(), value).IsOk());
+    EXPECT_EQ(value.lifecycleState, MemberLifecycleState::READY);
+}
+
+TEST(DsCoordinationBackendSessionTest, ReadyPublicationAfterRenewalFailureRejectsMissingOrReplacedMembership)
+{
+    for (const int64_t revision : { 0, 17, 1 }) {
+        DeterministicCoordinatorProxy proxy;
+        proxy.SetKeepAliveStatus(Status(K_RPC_UNAVAILABLE, "injected renewal failure"));
+        DsCoordinationBackend backend(&proxy, WATCHER_ADDRESS);
+        ASSERT_TRUE(backend.InitKeepAlive("/datasystem/c/cluster", WATCHER_ADDRESS, false, true).IsOk());
+        for (int retry = 0; retry < 100 && !backend.IsKeepAliveTimeout(); ++retry) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        ASSERT_TRUE(backend.IsKeepAliveTimeout());
+        ASSERT_TRUE(backend.ShutdownEventSources().IsOk());
+        proxy.SetMembershipRevision(revision);
+        if (revision == 1) {
+            proxy.SetPutCoordinatorId(COORDINATOR_B);
+        }
+        const auto valueBefore = proxy.LastPutValue();
+
+        EXPECT_EQ(backend.UpdateNodeState(MemberLifecycleState::READY).GetCode(), K_TRY_AGAIN);
+        EXPECT_EQ(proxy.LastExpectedCoordinatorId(), COORDINATOR_A);
+        EXPECT_EQ(proxy.LastExpectedModRevision(), 1);
+        EXPECT_EQ(proxy.LastPutValue(), valueBefore);
+        EXPECT_TRUE(backend.IsKeepAliveTimeout());
+    }
+}
+
+TEST(DsCoordinationBackendSessionTest, ReadyPublicationRequiresEstablishedMembership)
+{
+    DeterministicCoordinatorProxy proxy;
+    DsCoordinationBackend backend(&proxy, WATCHER_ADDRESS);
+
+    EXPECT_EQ(backend.UpdateNodeState(MemberLifecycleState::READY).GetCode(), K_NOT_READY);
+    EXPECT_EQ(proxy.PutCalls(), 0U);
+}
+
+TEST(DsCoordinationBackendSessionTest, FailedReadyPublicationDoesNotClearRenewalFailure)
+{
+    DeterministicCoordinatorProxy proxy;
+    proxy.SetKeepAliveStatus(Status(K_RPC_UNAVAILABLE, "injected renewal failure"));
+    DsCoordinationBackend backend(&proxy, WATCHER_ADDRESS);
+    ASSERT_TRUE(backend.InitKeepAlive("/datasystem/c/cluster", WATCHER_ADDRESS, false, true).IsOk());
+    for (int retry = 0; retry < 100 && !backend.IsKeepAliveTimeout(); ++retry) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_TRUE(backend.IsKeepAliveTimeout());
+    ASSERT_TRUE(backend.ShutdownEventSources().IsOk());
+    const auto valueBefore = proxy.LastPutValue();
+    proxy.SetPutStatus(Status(K_RPC_DEADLINE_EXCEEDED, "injected publication failure"));
+
+    EXPECT_EQ(backend.UpdateNodeState(MemberLifecycleState::READY).GetCode(), K_RPC_DEADLINE_EXCEEDED);
+    EXPECT_EQ(proxy.LastPutValue(), valueBefore);
+    EXPECT_TRUE(backend.IsKeepAliveTimeout());
 }
 
 TEST(DsCoordinationBackendSessionTest, EnsuredMembershipClearsEarlierRenewalFailure)
