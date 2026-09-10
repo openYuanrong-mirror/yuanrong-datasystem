@@ -87,6 +87,7 @@ list(FILTER DS_TEST_UT_SRCS EXCLUDE REGEX .*/coordinator/coordinator_server_opti
 list(FILTER DS_TEST_UT_SRCS EXCLUDE REGEX .*/coordinator/topology_control_perf_test\.cpp$)
 list(FILTER DS_TEST_UT_SRCS EXCLUDE REGEX .*/common/coordinator/coordinator_election_manager_test\.cpp$)
 list(FILTER DS_TEST_UT_SRCS EXCLUDE REGEX .*/common/rdma/event_bthread_wait_test\.cpp$)
+list(FILTER DS_TEST_UT_SRCS EXCLUDE REGEX .*/common/rdma/urma_port_status_provider_test\.cpp$)
 list(FILTER DS_TEST_UT_SRCS EXCLUDE REGEX .*/worker/data_worker_options_test\.cpp$)
 list(FILTER DS_TEST_UT_SRCS EXCLUDE REGEX .*/test_main\.cpp$)
 list(FILTER DS_TEST_UT_SRCS EXCLUDE REGEX .*/common/rdma/hixl_plugin_api_test\.cpp$)
@@ -141,9 +142,6 @@ if (NOT BUILD_WITH_RDMA)
     list(FILTER DS_TEST_UT_SRCS EXCLUDE REGEX ".*/rdma/.*\\.cpp$")
     # The port-health monitor uses a fake provider and does not require RDMA hardware.
     list(APPEND DS_TEST_UT_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/common/rdma/ub_port_health_test.cpp")
-    if (BUILD_WITH_URMA_MOCK)
-        list(APPEND DS_TEST_UT_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/common/rdma/urma_port_status_provider_test.cpp")
-    endif()
 endif()
 if (NOT BUILD_WITH_URMA)
     list(FILTER DS_TEST_UT_SRCS EXCLUDE REGEX ".*/client/urma_send_lane_test\\.cpp$")
@@ -238,10 +236,13 @@ if (BUILD_WITH_URMA OR BUILD_WITH_URMA_MOCK)
     add_ds_ut_executable(ds_ut_urma_send_jetty_fault
             client/urma_send_jetty_fault_test.cpp
             $<TARGET_OBJECTS:_ds_ut_main_obj>)
+    add_ds_ut_executable(ds_ut_urma_port_status_provider
+            common/rdma/urma_port_status_provider_test.cpp
+            $<TARGET_OBJECTS:_ds_ut_main_obj>)
 endif()
 if (BUILD_WITH_URMA_MOCK)
         foreach(_urma_ut_target ds_ut_urma_remote_jetty_reuse ds_ut_urma_send_jetty_lifecycle
-                                ds_ut_urma_send_jetty_fault)
+                                ds_ut_urma_send_jetty_fault ds_ut_urma_port_status_provider)
                 target_compile_definitions(${_urma_ut_target} PRIVATE USE_URMA USE_URMA_MOCK)
                 target_link_libraries(${_urma_ut_target} PRIVATE common_urma_mock_obj)
         endforeach()
@@ -383,6 +384,12 @@ if (BUILD_WITH_URMA OR BUILD_WITH_URMA_MOCK)
             ${DS_UT_COMMON_UTIL_EXTRA_LIBS}
             ${DS_UT_HEAVY_LINK_END}
             -Wl,--reduce-memory-overheads)
+    target_link_libraries(ds_ut_urma_port_status_provider PRIVATE
+            ${DS_UT_HEAVY_LINK_START}
+            ${DS_UT_DEPEND_LIBS}
+            ${DS_UT_COMMON_UTIL_EXTRA_LIBS}
+            ${DS_UT_HEAVY_LINK_END}
+            -Wl,--reduce-memory-overheads)
 endif()
 if (BUILD_WITH_URMA)
     target_link_libraries(ds_ut_urma_jetty_gate PRIVATE
@@ -483,6 +490,8 @@ if (BUILD_WITH_URMA OR BUILD_WITH_URMA_MOCK)
     add_datasystem_test(ds_ut_urma_send_jetty_fault
             TEST_ENVIRONMENTS ${TEST_ENVIRONMENT})
     add_datasystem_test(ds_ut_urma_connection_inflight
+            TEST_ENVIRONMENTS ${TEST_ENVIRONMENT})
+    add_datasystem_test(ds_ut_urma_port_status_provider
             TEST_ENVIRONMENTS ${TEST_ENVIRONMENT})
 endif()
 if (BUILD_WITH_URMA)

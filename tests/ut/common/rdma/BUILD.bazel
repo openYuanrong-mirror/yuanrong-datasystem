@@ -4,7 +4,8 @@ load("//bazel:build_defs.bzl", "ds_cc_test")
 
 package(default_visibility = ["//visibility:public"])
 
-URMA_MOCK_COMPATIBLE_WITH = select({
+URMA_COMPATIBLE_WITH = select({
+    "//:enable_urma": [],
     "//:enable_urma_mock": [],
     "//conditions:default": ["@platforms//:incompatible"],
 })
@@ -19,7 +20,7 @@ ds_cc_test(
     name = "ub_port_health_test",
     srcs = ["ub_port_health_test.cpp"],
     deps = [
-        "//src/datasystem/common/rdma:ub_port_health",
+        "//src/datasystem/common/object_cache:ub_port_health",
         "//tests/ut:ut_common",
     ],
 )
@@ -27,12 +28,22 @@ ds_cc_test(
 ds_cc_test(
     name = "urma_port_status_provider_test",
     srcs = ["urma_port_status_provider_test.cpp"],
-    copts = ["-DUSE_URMA_MOCK"],
-    target_compatible_with = URMA_MOCK_COMPATIBLE_WITH,
+    defines = select({
+        "//:enable_urma": ["USE_URMA"],
+        "//:enable_urma_mock": ["USE_URMA", "USE_URMA_MOCK"],
+        "//conditions:default": [],
+    }),
+    target_compatible_with = URMA_COMPATIBLE_WITH,
     deps = [
         "//src/datasystem/common/inject:common_inject",
+        "//src/datasystem/common/object_cache:ub_port_health",
         "//src/datasystem/common/rdma:urma_dlopen_util",
-        "//src/datasystem/common/rdma:urma_manager",
-        "//tests/support/datasystem/common/urma_mock:urma_mock_backend",
-    ],
+    ] + select({
+        "//:enable_urma": ["//src/datasystem/common/rdma:urma_manager"],
+        "//:enable_urma_mock": [
+            "//src/datasystem/common/rdma:urma_manager",
+            "//src/datasystem/common/urma_mock:urma_abi_compat",
+        ],
+        "//conditions:default": [],
+    }),
 )

@@ -10,7 +10,6 @@ set(FAST_TRANSPORT_SRCS "")
 list(APPEND FAST_TRANSPORT_SRCS
     fast_transport_base.cpp
     fast_transport_manager_wrapper.cpp
-    ub_port_health.cpp
 )
 set(URMA_DEPEND_LIBS
     common_rdma_util)
@@ -98,6 +97,7 @@ if (BUILD_WITH_URMA_MOCK)
 endif()
 target_link_libraries(common_rdma
     PRIVATE ${URMA_DEPEND_LIBS} ${RDMA_DEPEND_LIBS} meta_transport_protos_client share_memory_protos_client
+            common_ub_port_health
     PUBLIC ${BRPC_LIBRARIES})
 
 # Propagate HCCS transport availability to source files via compile definition

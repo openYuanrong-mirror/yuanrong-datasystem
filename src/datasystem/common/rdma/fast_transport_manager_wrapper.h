@@ -22,6 +22,7 @@
 #define DATASYSTEM_COMMON_FAST_TRANSPORT_MANAGER_WRAPPER_H
 
 #include "datasystem/common/rdma/rdma_util.h"
+#include "datasystem/common/object_cache/ub_port_health.h"
 #include "datasystem/common/rdma/urma_send_lane.h"
 #ifdef USE_URMA
 #include "datasystem/common/rdma/urma_manager.h"
@@ -37,6 +38,7 @@
 #include "datasystem/protos/meta_transport.pb.h"
 
 namespace datasystem {
+
 bool NeedDelayReleaseShmUnit(const Status &status);
 
 /**
@@ -107,6 +109,13 @@ Status CheckClientLocalUbPortHealth();
 
 /** @brief Request an asynchronous local port query after a client-side CQE 4. */
 void TriggerClientLocalUbPortHealthQuery();
+
+/**
+ * @brief Obtain the single monitor owned by the initialized process-local URMA context.
+ * @param[out] monitor Shared context monitor; reset when unavailable. Callers must not stop it.
+ * @return K_OK, K_NOT_SUPPORTED in a non-URMA build, or K_NOT_READY before runtime initialization.
+ */
+Status GetLocalUbPortHealthMonitor(std::shared_ptr<UbPortHealthMonitor> &monitor);
 
 /**
  * @brief Verify one established worker UB path with a dedicated one-byte URMA WRITE.

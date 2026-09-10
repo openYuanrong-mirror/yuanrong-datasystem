@@ -82,3 +82,13 @@ ds_cc_test(
         "//src/datasystem/common/object_cache:ub_health",
     ],
 )
+
+ds_cc_test(
+    name = "ub_port_health_test",
+    srcs = ["ub_port_health_test.cpp"],
+    deps = [
+        "//tests:ub_port_test_support",
+        "//src/datasystem/common/object_cache:ub_port_health",
+        "//tests/ut:ut_common",
+    ],
+)
