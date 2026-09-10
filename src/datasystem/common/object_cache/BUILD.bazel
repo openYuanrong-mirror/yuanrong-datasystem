@@ -3,6 +3,16 @@ load("//bazel:build_defs.bzl", "ds_cc_library")
 
 package(default_visibility = ["//visibility:public"])
 
+ds_cc_library(
+    name = "ub_port_health",
+    srcs = ["ub_port_health.cpp"],
+    hdrs = ["ub_port_health.h"],
+    deps = [
+        "//include/datasystem/utils:utils_headers",
+        "//src/datasystem/common/log:common_log",
+    ],
+)
+
 # Main common-layer target (no alwayslink, no client deps)
 ds_cc_library(
     name = "common_object_cache",
@@ -16,6 +26,7 @@ ds_cc_library(
             "peer_ub_admission.cpp",
             "ub_failure_classifier.cpp",
             "ub_health_summary_codec.cpp",
+            "ub_port_health.cpp",
         ],
     ),
     hdrs = glob(
@@ -24,6 +35,7 @@ ds_cc_library(
             "peer_ub_admission.h",
             "ub_failure_classifier.h",
             "ub_health_summary_codec.h",
+            "ub_port_health.h",
         ],
     ),
     deps = [
@@ -77,6 +89,7 @@ ds_cc_library(
         "ub_health_summary_codec.h",
     ],
     deps = [
+        ":ub_port_health",
         "//include/datasystem/utils:utils_headers",
         "//src/datasystem/common/inject:common_inject",
         "//src/datasystem/common/log:common_log",

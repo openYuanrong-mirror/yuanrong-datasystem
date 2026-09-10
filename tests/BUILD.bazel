@@ -1,2 +1,10 @@
 # tests/BUILD.bazel
+load("//bazel:build_defs.bzl", "ds_cc_test_library")
 package(default_visibility = ["//visibility:public"])
+
+ds_cc_test_library(
+    name = "ub_port_test_support",
+    hdrs = ["support/fake_ub_port_status_provider.h"],
+    testonly = True,
+    deps = ["//src/datasystem/common/object_cache:ub_port_health"],
+)

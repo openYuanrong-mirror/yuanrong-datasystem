@@ -155,6 +155,16 @@ void TriggerClientLocalUbPortHealthQuery()
 #endif
 }
 
+Status GetLocalUbPortHealthMonitor(std::shared_ptr<UbPortHealthMonitor> &monitor)
+{
+    monitor.reset();
+#ifdef USE_URMA
+    return UrmaManager::Instance().GetOrCreatePortHealthMonitor(monitor);
+#else
+    return Status(K_NOT_SUPPORTED, "URMA port status query is unavailable in this build");
+#endif
+}
+
 Status ProbeUbDataPlane(const UrmaHandshakeRspPb &response, UrmaWriteFailure *failure)
 {
 #ifdef USE_URMA

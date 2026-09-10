@@ -1,3 +1,6 @@
+add_library(common_ub_port_health STATIC ub_port_health.cpp)
+target_link_libraries(common_ub_port_health PUBLIC common_log common_util)
+
 set(COMMON_BUFFER_SRCS
         buffer.cpp
         lock.cpp
@@ -34,6 +37,7 @@ set(COMMON_REF_DEPEND_LIBS
 
 add_library(common_buffer STATIC ${COMMON_BUFFER_SRCS})
 target_link_libraries(common_buffer PRIVATE ${COMMON_BUFFER_DEPEND_LIBS})
+target_link_libraries(common_buffer PUBLIC common_ub_port_health)
 add_dependencies(common_buffer posix_protos)
 
 add_library(common_ref STATIC ${COMMON_REF_SRCS})

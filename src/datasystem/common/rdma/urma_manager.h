@@ -34,7 +34,7 @@
 #include "datasystem/common/flags/flags.h"
 #include "datasystem/common/rdma/fast_transport_base.h"
 #include "datasystem/common/rdma/urma_info.h"
-#include "datasystem/common/rdma/ub_port_health.h"
+#include "datasystem/common/object_cache/ub_port_health.h"
 #include "datasystem/common/rdma/urma_resource.h"
 #include "datasystem/common/rpc/rpc_channel.h"
 #include "datasystem/common/shared_memory/allocator.h"
@@ -131,6 +131,9 @@ public:
     Status Init(const HostPort &hostport);
 
     Status InitClientPortHealthMonitor();
+
+    // The URMA context owns Start/Stop; users share facts and register weak observers without stopping the Monitor.
+    Status GetOrCreatePortHealthMonitor(std::shared_ptr<UbPortHealthMonitor> &monitor);
 
     void TriggerClientPortHealthQuery();
 
@@ -956,9 +959,11 @@ private:
     std::unique_ptr<Thread> serverEventThread_{ nullptr };
     std::unique_ptr<std::thread> perfThread_{ nullptr };
     mutable std::mutex clientPortHealthMutex_;
+    bool portHealthStopping_{ false };
     std::shared_ptr<UbPortHealthMonitor> clientPortHealthMonitor_;
     std::atomic<uint64_t> clientPortHealthAdmissionState_{ 0 };
-    bool clientPortHealthStopping_{ false };
+    // The context Monitor weakly observes this binding and Stop drains it before owner teardown.
+    std::shared_ptr<IUbPortHealthObserver> clientPortHealthAdmissionObserver_;
     UrmaAsyncEventHandler aeHandler_;
     std::unique_ptr<UrmaResource> urmaResource_;
     std::atomic<uint64_t> requestId_{ 0 };

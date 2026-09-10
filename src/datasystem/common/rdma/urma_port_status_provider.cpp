@@ -16,11 +16,12 @@
 
 #include "datasystem/common/rdma/urma_port_status_provider.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <set>
 #include <tuple>
 #include <type_traits>
+#include <utility>
 
 #ifdef USE_URMA_MOCK
 #include "datasystem/common/urma_mock/abi/urma_abi_compat.h"
@@ -34,12 +35,61 @@
 #include "datasystem/common/util/status_helper.h"
 
 namespace datasystem {
+namespace {
+using NativePortKey = std::tuple<uint32_t, uint32_t, uint32_t>;
+
+struct NativePortStatus {
+    NativePortKey key;
+    UbPortState state;
+};
+
+Status DecodePortStatus(const bondp_query_port_status_out_t &statusOut, size_t outputLength,
+                        std::vector<UbPortStatus> &portStatus)
+{
+    constexpr size_t capacity = std::extent_v<decltype(statusOut.port_status)>;
+    static_assert(capacity > 0, "URMA port status output must use a fixed-size port array");
+    CHECK_FAIL_RETURN_STATUS(statusOut.port_count > 0 && statusOut.port_count <= capacity, K_INVALID,
+                             "URMA port status output count is invalid");
+
+    const size_t requiredLength = offsetof(bondp_query_port_status_out_t, port_status) +
+                                  static_cast<size_t>(statusOut.port_count) * sizeof(statusOut.port_status[0]);
+    CHECK_FAIL_RETURN_STATUS(outputLength >= requiredLength, K_INVALID,
+                             "URMA port status output is shorter than its port count");
+
+    std::vector<NativePortStatus> nativePorts;
+    nativePorts.reserve(statusOut.port_count);
+    for (uint32_t i = 0; i < statusOut.port_count; ++i) {
+        const auto &entry = statusOut.port_status[i];
+        UbPortState state = UbPortState::UNKNOWN;
+        if (entry.status == BONDP_PORT_STATUS_GOOD) {
+            state = UbPortState::GOOD;
+        } else if (entry.status == BONDP_PORT_STATUS_BAD) {
+            state = UbPortState::BAD;
+        } else {
+            RETURN_STATUS(K_INVALID, "URMA port status output contains an unknown port state");
+        }
+        nativePorts.emplace_back(NativePortStatus{ { entry.chip_id, entry.die_id, entry.port_idx }, state });
+    }
+
+    std::sort(nativePorts.begin(), nativePorts.end(),
+              [](const NativePortStatus &lhs, const NativePortStatus &rhs) { return lhs.key < rhs.key; });
+    std::vector<UbPortStatus> decoded;
+    decoded.reserve(nativePorts.size());
+    for (size_t i = 0; i < nativePorts.size(); ++i) {
+        CHECK_FAIL_RETURN_STATUS(i == 0 || nativePorts[i - 1].key != nativePorts[i].key, K_INVALID,
+                                 "URMA port status output contains a duplicate port identity");
+        decoded.emplace_back(UbPortStatus{ static_cast<uint32_t>(i), nativePorts[i].state });
+    }
+    portStatus = std::move(decoded);
+    return Status::OK();
+}
+}  // namespace
 
 UrmaPortStatusProvider::UrmaPortStatusProvider(void *urmaContext) : urmaContext_(urmaContext)
 {
 }
 
-Status UrmaPortStatusProvider::QueryPortStatus(UbPortHealthSnapshot &snapshot)
+Status UrmaPortStatusProvider::QueryPortStatus(std::vector<UbPortStatus> &portStatus)
 {
     CHECK_FAIL_RETURN_STATUS(urmaContext_ != nullptr, K_INVALID, "URMA context is null");
 
@@ -52,30 +102,7 @@ Status UrmaPortStatusProvider::QueryPortStatus(UbPortHealthSnapshot &snapshot)
     if (ret != URMA_SUCCESS) {
         RETURN_STATUS(K_URMA_ERROR, FormatString("Failed to query URMA port status, ret = %d", ret));
     }
-
-    constexpr size_t capacity = std::extent_v<decltype(statusOut.port_status)>;
-    CHECK_FAIL_RETURN_STATUS(statusOut.port_count > 0 && statusOut.port_count <= capacity, K_INVALID,
-                             "URMA port status output count is invalid");
-    const size_t requiredLength = offsetof(bondp_query_port_status_out_t, port_status)
-                                  + static_cast<size_t>(statusOut.port_count) * sizeof(statusOut.port_status[0]);
-    CHECK_FAIL_RETURN_STATUS(static_cast<size_t>(out.len) >= requiredLength, K_INVALID,
-                             "URMA port status output is shorter than its port count");
-
-    UbPortHealthSnapshot candidate{ statusOut.port_count, 0 };
-    std::set<std::tuple<uint32_t, uint32_t, uint32_t>> identities;
-    for (uint32_t i = 0; i < statusOut.port_count; ++i) {
-        const auto &port = statusOut.port_status[i];
-        CHECK_FAIL_RETURN_STATUS(identities.emplace(port.chip_id, port.die_id, port.port_idx).second, K_INVALID,
-                                 "URMA port status output contains a duplicate port identity");
-        if (port.status == BONDP_PORT_STATUS_BAD) {
-            ++candidate.badPortCount;
-        } else {
-            CHECK_FAIL_RETURN_STATUS(port.status == BONDP_PORT_STATUS_GOOD, K_INVALID,
-                                     "URMA port status output contains an unknown port state");
-        }
-    }
-    snapshot = candidate;
-    return Status::OK();
+    return DecodePortStatus(statusOut, static_cast<size_t>(out.len), portStatus);
 }
 
 }  // namespace datasystem

@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "datasystem/common/rdma/ub_port_health.h"
+#include "datasystem/common/object_cache/ub_port_health.h"
 
 #include <gtest/gtest.h>
 
@@ -26,6 +26,7 @@
 #include <mutex>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace datasystem {
 namespace {
@@ -42,14 +43,17 @@ bool WaitUntil(Predicate predicate)
 
 class FakePortStatusProvider : public IUbPortStatusProvider {
 public:
-    void SetReply(Status status, UbPortHealthSnapshot snapshot = {})
+    void SetReply(Status status, uint32_t total = 0, uint32_t bad = 0)
     {
         std::lock_guard<std::mutex> lock(mutex_);
         status_ = std::move(status);
-        snapshot_ = snapshot;
+        ports_.clear();
+        for (uint32_t i = 0; i < total; ++i) {
+            ports_.push_back({ i, i < bad ? UbPortState::BAD : UbPortState::GOOD });
+        }
     }
 
-    Status QueryPortStatus(UbPortHealthSnapshot &snapshot) override
+    Status QueryPortStatus(std::vector<UbPortStatus> &ports) override
     {
         std::unique_lock<std::mutex> lock(mutex_);
         ++queryCount_;
@@ -62,7 +66,7 @@ public:
             releaseBlockedQuery_ = false;
         }
         if (status_.IsOk()) {
-            snapshot = snapshot_;
+            ports = ports_;
         }
         cv_.notify_all();
         return status_;
@@ -103,7 +107,7 @@ private:
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     Status status_;
-    UbPortHealthSnapshot snapshot_;
+    std::vector<UbPortStatus> ports_;
     size_t queryCount_{ 0 };
     bool blockNextQuery_{ false };
     bool queryBlocked_{ false };
@@ -113,93 +117,91 @@ private:
 TEST(UbPortHealthMonitorTest, AllPortsBadClosesAdmission)
 {
     auto provider = std::make_shared<FakePortStatusProvider>();
-    provider->SetReply(Status::OK(), { 4, 4 });
-    UbPortHealthMonitor monitor(provider, std::chrono::milliseconds(20));
-    ASSERT_TRUE(monitor.Start().IsOk());
+    provider->SetReply(Status::OK(), 4, 4);
+    auto monitor = UbPortHealthMonitor::CreateForTest(provider, std::chrono::milliseconds(20));
+    ASSERT_TRUE(monitor->Start().IsOk());
 
-    monitor.TriggerQuery();
+    monitor->TriggerRefresh();
 
     ASSERT_TRUE(provider->WaitForQueries(1));
     EXPECT_TRUE(WaitUntil([&monitor] {
-        return monitor.CheckAdmission().GetCode() == K_URMA_WORKER_UNAVAILABLE;
+        return IsLocalUbNodeIsolated(monitor->GetSnapshot());
     }));
 }
 
 TEST(UbPortHealthMonitorTest, PartialPortFailureKeepsAdmissionOpen)
 {
     auto provider = std::make_shared<FakePortStatusProvider>();
-    provider->SetReply(Status::OK(), { 4, 3 });
-    UbPortHealthMonitor monitor(provider, std::chrono::milliseconds(20));
-    ASSERT_TRUE(monitor.Start().IsOk());
+    provider->SetReply(Status::OK(), 4, 3);
+    auto monitor = UbPortHealthMonitor::CreateForTest(provider, std::chrono::milliseconds(20));
+    ASSERT_TRUE(monitor->Start().IsOk());
 
-    monitor.TriggerQuery();
+    monitor->TriggerRefresh();
 
     ASSERT_TRUE(provider->WaitForQueries(1));
-    ASSERT_TRUE(WaitUntil([&monitor] { return monitor.GetSnapshot() != nullptr; }));
-    EXPECT_TRUE(monitor.CheckAdmission().IsOk());
+    ASSERT_TRUE(WaitUntil([&monitor] { return monitor->GetSnapshot() != nullptr; }));
+    EXPECT_FALSE(IsLocalUbNodeIsolated(monitor->GetSnapshot()));
 }
 
 TEST(UbPortHealthMonitorTest, QueryFailureDoesNotCloseAdmission)
 {
     auto provider = std::make_shared<FakePortStatusProvider>();
     provider->SetReply(Status(K_URMA_ERROR, "query failed"));
-    UbPortHealthMonitor monitor(provider, std::chrono::milliseconds(20));
-    ASSERT_TRUE(monitor.Start().IsOk());
+    auto monitor = UbPortHealthMonitor::CreateForTest(provider, std::chrono::milliseconds(200));
+    ASSERT_TRUE(monitor->Start().IsOk());
 
-    monitor.TriggerQuery();
+    monitor->TriggerRefresh();
 
     ASSERT_TRUE(provider->WaitForQueries(1));
-    EXPECT_TRUE(monitor.CheckAdmission().IsOk());
+    EXPECT_FALSE(IsLocalUbNodeIsolated(monitor->GetSnapshot()));
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     EXPECT_EQ(provider->QueryCount(), 1u);
+    ASSERT_TRUE(provider->WaitForQueries(2));
+    EXPECT_FALSE(IsLocalUbNodeIsolated(monitor->GetSnapshot()));
 }
 
 TEST(UbPortHealthMonitorTest, InvalidSnapshotDoesNotCloseAdmission)
 {
     auto provider = std::make_shared<FakePortStatusProvider>();
-    provider->SetReply(Status::OK(), { 0, 0 });
-    UbPortHealthMonitor monitor(provider, std::chrono::milliseconds(20));
-    ASSERT_TRUE(monitor.Start().IsOk());
-
-    monitor.TriggerQuery();
-
+    provider->SetReply(Status::OK(), 0, 0);
+    auto monitor = UbPortHealthMonitor::CreateForTest(provider, std::chrono::milliseconds(20));
+    ASSERT_TRUE(monitor->Start().IsOk());
     ASSERT_TRUE(provider->WaitForQueries(1));
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    EXPECT_TRUE(monitor.CheckAdmission().IsOk());
-    EXPECT_EQ(monitor.GetSnapshot(), nullptr);
-    EXPECT_EQ(provider->QueryCount(), 1u);
+    EXPECT_EQ(monitor->EnsureFresh(std::chrono::seconds(1)).GetCode(), K_INVALID);
+    EXPECT_FALSE(IsLocalUbNodeIsolated(monitor->GetSnapshot()));
+    ASSERT_NE(monitor->GetSnapshot(), nullptr);
+    EXPECT_FALSE(monitor->GetSnapshot()->valid);
+    EXPECT_TRUE(monitor->GetSnapshot()->verificationPending);
 }
 
 TEST(UbPortHealthMonitorTest, QueryFailurePreservesIsolationAndRecoveryPolling)
 {
     auto provider = std::make_shared<FakePortStatusProvider>();
-    provider->SetReply(Status::OK(), { 4, 4 });
-    UbPortHealthMonitor monitor(provider, std::chrono::milliseconds(20));
-    ASSERT_TRUE(monitor.Start().IsOk());
-    monitor.TriggerQuery();
+    provider->SetReply(Status::OK(), 4, 4);
+    auto monitor = UbPortHealthMonitor::CreateForTest(provider, std::chrono::milliseconds(20));
+    ASSERT_TRUE(monitor->Start().IsOk());
     ASSERT_TRUE(provider->WaitForQueries(1));
     ASSERT_TRUE(WaitUntil([&monitor] {
-        return monitor.CheckAdmission().GetCode() == K_URMA_WORKER_UNAVAILABLE;
+        return IsLocalUbNodeIsolated(monitor->GetSnapshot());
     }));
 
     provider->SetReply(Status(K_URMA_ERROR, "query failed"));
 
     ASSERT_TRUE(provider->WaitForQueries(3));
-    EXPECT_EQ(monitor.CheckAdmission().GetCode(), K_URMA_WORKER_UNAVAILABLE);
+    EXPECT_TRUE(IsLocalUbNodeIsolated(monitor->GetSnapshot()));
 }
 
 TEST(UbPortHealthMonitorTest, RepeatedTriggersCoalesceToOnePendingQuery)
 {
     auto provider = std::make_shared<FakePortStatusProvider>();
-    provider->SetReply(Status::OK(), { 4, 3 });
+    provider->SetReply(Status::OK(), 4, 0);
     provider->BlockNextQuery();
-    UbPortHealthMonitor monitor(provider, std::chrono::milliseconds(20));
-    ASSERT_TRUE(monitor.Start().IsOk());
-    monitor.TriggerQuery();
+    auto monitor = UbPortHealthMonitor::CreateForTest(provider, std::chrono::milliseconds(20));
+    ASSERT_TRUE(monitor->Start().IsOk());
     ASSERT_TRUE(provider->WaitForBlockedQuery());
 
     for (size_t i = 0; i < 32; ++i) {
-        monitor.TriggerQuery();
+        monitor->TriggerRefresh();
     }
     provider->ReleaseBlockedQuery();
 
@@ -211,69 +213,72 @@ TEST(UbPortHealthMonitorTest, RepeatedTriggersCoalesceToOnePendingQuery)
 TEST(UbPortHealthMonitorTest, StopWaitsForInFlightQueryAndRestartBeginsOpen)
 {
     auto provider = std::make_shared<FakePortStatusProvider>();
-    provider->SetReply(Status::OK(), { 4, 4 });
+    provider->SetReply(Status::OK(), 4, 4);
     provider->BlockNextQuery();
-    UbPortHealthMonitor monitor(provider, std::chrono::milliseconds(20));
-    ASSERT_TRUE(monitor.Start().IsOk());
-    monitor.TriggerQuery();
+    auto monitor = UbPortHealthMonitor::CreateForTest(provider, std::chrono::milliseconds(20));
+    ASSERT_TRUE(monitor->Start().IsOk());
     ASSERT_TRUE(provider->WaitForBlockedQuery());
 
-    auto stop = std::async(std::launch::async, [&monitor] { monitor.Stop(); });
+    auto stop = std::async(std::launch::async, [&monitor] { monitor->Stop(); });
     EXPECT_EQ(stop.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
     provider->ReleaseBlockedQuery();
     EXPECT_EQ(stop.wait_for(std::chrono::seconds(1)), std::future_status::ready);
-    EXPECT_TRUE(monitor.CheckAdmission().IsOk());
-    EXPECT_EQ(monitor.GetSnapshot(), nullptr);
+    EXPECT_FALSE(IsLocalUbNodeIsolated(monitor->GetSnapshot()));
+    EXPECT_EQ(monitor->GetSnapshot(), nullptr);
 
-    ASSERT_TRUE(monitor.Start().IsOk());
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    EXPECT_EQ(provider->QueryCount(), 1u);
-    monitor.Stop();
+    provider->SetReply(Status::OK(), 4, 0);
+    provider->BlockNextQuery();
+    ASSERT_TRUE(monitor->Start().IsOk());
+    EXPECT_TRUE(provider->WaitForBlockedQuery());
+    EXPECT_FALSE(IsLocalUbNodeIsolated(monitor->GetSnapshot()));
+    provider->ReleaseBlockedQuery();
+    EXPECT_TRUE(monitor->EnsureFresh(std::chrono::seconds(1)).IsOk());
+    EXPECT_EQ(provider->QueryCount(), 2u);
+    monitor->Stop();
 }
 
 TEST(UbPortHealthMonitorTest, StopClearsPublishedIsolation)
 {
     auto provider = std::make_shared<FakePortStatusProvider>();
-    provider->SetReply(Status::OK(), { 4, 4 });
-    UbPortHealthMonitor monitor(provider, std::chrono::milliseconds(20));
-    ASSERT_TRUE(monitor.Start().IsOk());
-    monitor.TriggerQuery();
+    provider->SetReply(Status::OK(), 4, 4);
+    auto monitor = UbPortHealthMonitor::CreateForTest(provider, std::chrono::milliseconds(20));
+    ASSERT_TRUE(monitor->Start().IsOk());
     ASSERT_TRUE(WaitUntil([&monitor] {
-        return monitor.CheckAdmission().GetCode() == K_URMA_WORKER_UNAVAILABLE;
+        return IsLocalUbNodeIsolated(monitor->GetSnapshot());
     }));
 
-    monitor.Stop();
+    monitor->Stop();
 
-    EXPECT_TRUE(monitor.CheckAdmission().IsOk());
-    EXPECT_EQ(monitor.GetSnapshot(), nullptr);
+    EXPECT_FALSE(IsLocalUbNodeIsolated(monitor->GetSnapshot()));
+    EXPECT_EQ(monitor->GetSnapshot(), nullptr);
 }
 
 TEST(UbPortHealthMonitorTest, PartialRecoveryOpensAdmissionAndPollingStopsOnlyWhenAllGood)
 {
     auto provider = std::make_shared<FakePortStatusProvider>();
-    provider->SetReply(Status::OK(), { 4, 4 });
-    UbPortHealthMonitor monitor(provider, std::chrono::milliseconds(20));
-    ASSERT_TRUE(monitor.Start().IsOk());
-    monitor.TriggerQuery();
+    provider->SetReply(Status::OK(), 4, 4);
+    auto monitor = UbPortHealthMonitor::CreateForTest(provider, std::chrono::milliseconds(20));
+    ASSERT_TRUE(monitor->Start().IsOk());
+    monitor->TriggerRefresh();
     ASSERT_TRUE(provider->WaitForQueries(1));
     ASSERT_TRUE(WaitUntil([&monitor] {
-        return monitor.CheckAdmission().GetCode() == K_URMA_WORKER_UNAVAILABLE;
+        return IsLocalUbNodeIsolated(monitor->GetSnapshot());
     }));
 
-    provider->SetReply(Status::OK(), { 4, 3 });
+    provider->SetReply(Status::OK(), 4, 3);
     ASSERT_TRUE(provider->WaitForQueries(2));
     ASSERT_TRUE(WaitUntil([&monitor] {
-        auto snapshot = monitor.GetSnapshot();
-        return snapshot != nullptr && snapshot->badPortCount == 3 && monitor.CheckAdmission().IsOk();
+        auto snapshot = monitor->GetSnapshot();
+        return snapshot != nullptr && snapshot->badPortCount == 3 && !IsLocalUbNodeIsolated(snapshot);
     }));
     const auto partialQueryCount = provider->QueryCount();
     ASSERT_TRUE(provider->WaitForQueries(partialQueryCount + 1));
 
-    provider->SetReply(Status::OK(), { 4, 0 });
+    provider->SetReply(Status::OK(), 4, 0);
     ASSERT_TRUE(provider->WaitForQueries(partialQueryCount + 2));
     ASSERT_TRUE(WaitUntil([&monitor] {
-        auto snapshot = monitor.GetSnapshot();
-        return snapshot != nullptr && snapshot->badPortCount == 0 && monitor.CheckAdmission().IsOk();
+        auto snapshot = monitor->GetSnapshot();
+        return snapshot != nullptr && snapshot->badPortCount == 0 && !IsLocalUbNodeIsolated(snapshot);
     }));
     const auto allGoodQueryCount = provider->QueryCount();
     std::this_thread::sleep_for(std::chrono::milliseconds(50));

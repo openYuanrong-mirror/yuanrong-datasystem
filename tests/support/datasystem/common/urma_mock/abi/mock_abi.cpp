@@ -303,19 +303,39 @@ urma_status_t ds_urma_mock_user_ctl(urma_context_t *ctx, urma_user_ctl_in_t *in,
 
     int64_t totalPortCount = K_DEFAULT_PORT_COUNT;
     int64_t badPortCount = 0;
+    bool injectDuplicateIndex = false;
+    bool injectInvalidCount = false;
+    bool injectShortOutput = false;
+    bool injectUnknownState = false;
 #ifdef WITH_TESTS
     INJECT_POINT_NO_RETURN("UrmaMock.QueryPortStatus", [&totalPortCount, &badPortCount](int64_t total, int64_t bad) {
         totalPortCount = total;
         badPortCount = bad;
     });
+    INJECT_POINT_NO_RETURN("UrmaMock.QueryPortStatus.duplicate", [&injectDuplicateIndex] {
+        injectDuplicateIndex = true;
+    });
+    INJECT_POINT_NO_RETURN("UrmaMock.QueryPortStatus.invalidCount", [&injectInvalidCount] {
+        injectInvalidCount = true;
+    });
+    INJECT_POINT_NO_RETURN("UrmaMock.QueryPortStatus.shortOutput", [&injectShortOutput] {
+        injectShortOutput = true;
+    });
+    INJECT_POINT_NO_RETURN("UrmaMock.QueryPortStatus.unknown", [&injectUnknownState] {
+        injectUnknownState = true;
+    });
 #endif
-    if (totalPortCount <= 0 || badPortCount < 0 || badPortCount > totalPortCount
-        || totalPortCount > BONDP_QUERY_PORT_STATUS_MAX_PORTS) {
+    if (totalPortCount < 0 || badPortCount < 0 || badPortCount > totalPortCount ||
+        totalPortCount > BONDP_QUERY_PORT_STATUS_MAX_PORTS) {
         return URMA_E_INVALID;
     }
 
     auto *statusOut = reinterpret_cast<bondp_query_port_status_out_t *>(out->addr);
-    statusOut->port_count = static_cast<uint32_t>(totalPortCount);
+    statusOut->port_count = injectInvalidCount ? BONDP_QUERY_PORT_STATUS_MAX_PORTS + 1
+                                               : static_cast<uint32_t>(totalPortCount);
+    if (injectInvalidCount) {
+        return URMA_SUCCESS;
+    }
     for (uint32_t i = 0; i < statusOut->port_count; ++i) {
         statusOut->port_status[i].chip_id = i + 1;
         statusOut->port_status[i].die_id = 1;
@@ -324,11 +344,20 @@ urma_status_t ds_urma_mock_user_ctl(urma_context_t *ctx, urma_user_ctl_in_t *in,
                                                ? BONDP_PORT_STATUS_BAD
                                                : BONDP_PORT_STATUS_GOOD;
     }
-    out->len = static_cast<decltype(out->len)>(offsetof(bondp_query_port_status_out_t, port_status)
-                                               + statusOut->port_count * sizeof(statusOut->port_status[0]));
+    if (injectDuplicateIndex && statusOut->port_count > 1) {
+        statusOut->port_status[1].port_idx = statusOut->port_status[0].port_idx;
+    }
+    if (injectUnknownState && statusOut->port_count != 0) {
+        statusOut->port_status[0].status = -1;
+    }
+    const size_t resultSize = offsetof(bondp_query_port_status_out_t, port_status) +
+                              statusOut->port_count * sizeof(statusOut->port_status[0]);
+    out->len = static_cast<decltype(out->len)>(resultSize);
+    if (injectShortOutput && statusOut->port_count != 0) {
+        out->len = static_cast<decltype(out->len)>(resultSize - sizeof(statusOut->port_status[0]));
+    }
     return URMA_SUCCESS;
 }
-
 // --- jfce (2) ---
 
 urma_jfce_t *ds_urma_mock_create_jfce(urma_context_t *context)
