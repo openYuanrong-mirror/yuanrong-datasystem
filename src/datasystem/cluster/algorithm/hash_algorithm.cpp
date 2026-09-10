@@ -14,6 +14,7 @@
 #include <set>
 #include <unordered_set>
 
+#include "datasystem/cluster/algorithm/token_placement.h"
 #include "datasystem/common/util/hash_algorithm.h"
 #include "datasystem/common/util/hash_ring_token.h"
 #include "datasystem/common/util/net_util.h"
@@ -60,36 +61,6 @@ Status ValidateSelectedMembers(const TopologyState &current, const std::vector<M
     return Status::OK();
 }
 
-Status ProbeUniqueToken(const MemberIdentity &identity, uint32_t index, std::unordered_set<uint32_t> &occupied,
-                        uint32_t &token, uint32_t &seed)
-{
-    for (seed = 0; seed < HashAlgorithm::MAX_TOKEN_SEEDS; ++seed) {
-        token = HashAlgorithm::MakeToken(identity.address, index, seed);
-        if (occupied.insert(token).second) {
-            return Status::OK();
-        }
-    }
-    RETURN_STATUS(K_INVALID, "unique cluster token probe budget exhausted");
-}
-
-Status GenerateTokens(const MemberIdentity &identity, uint32_t count, std::unordered_set<uint32_t> &occupied,
-                      std::vector<uint32_t> &tokens, std::vector<TokenSeedOverride> &tokenSeedOverrides)
-{
-    tokens.clear();
-    tokens.reserve(count);
-    tokenSeedOverrides.clear();
-    for (uint32_t index = 0; index < count; ++index) {
-        uint32_t token;
-        uint32_t seed;
-        RETURN_IF_NOT_OK(ProbeUniqueToken(identity, index, occupied, token, seed));
-        tokens.emplace_back(token);
-        if (seed > 0) {
-            tokenSeedOverrides.emplace_back(TokenSeedOverride{ index, seed });
-        }
-    }
-    return Status::OK();
-}
-
 Status BuildOwners(const std::vector<Member> &members, bool includeJoining, const std::set<std::string> &excluded,
                    std::vector<TokenOwner> &owners, bool activeOnly = false)
 {
@@ -117,6 +88,30 @@ const TokenOwner &FindOwner(const std::vector<TokenOwner> &owners, uint32_t toke
     auto iter = std::lower_bound(owners.begin(), owners.end(), token,
                                  [](const auto &owner, uint32_t value) { return owner.token < value; });
     return iter == owners.end() ? owners.front() : *iter;
+}
+
+size_t CountNewJoiners(const std::vector<MemberIdentity> &ordered, const std::vector<Member> &members)
+{
+    return static_cast<size_t>(std::count_if(ordered.begin(), ordered.end(), [&](const auto &identity) {
+        return std::none_of(members.begin(), members.end(), [&](const auto &member) {
+            return member.identity.address == identity.address;
+        });
+    }));
+}
+
+void CollectPlacementOwners(const std::vector<Member> &members, std::vector<PlacementOwner> &owners,
+                            std::unordered_set<uint32_t> &occupied)
+{
+    // memberIndex must be the dense member ordinal; BalancedRing sizes its bookkeeping from the max
+    // index, so deriving it from owners.size() (cumulative token count) would inflate member counts.
+    uint32_t memberIndex = 0;
+    for (const auto &member : members) {
+        occupied.insert(member.tokens.begin(), member.tokens.end());
+        for (uint32_t ringPoint : member.tokens) {
+            owners.push_back(PlacementOwner{ ringPoint, memberIndex });
+        }
+        ++memberIndex;
+    }
 }
 
 Status LocateIndexedOwner(const std::vector<std::pair<uint32_t, const Member *>> &owners, uint32_t token,
@@ -225,10 +220,12 @@ Status HashAlgorithm::AllocateTokens(const std::vector<MemberIdentity> &members,
               [](const auto &left, const auto &right) { return left.address < right.address; });
     std::unordered_set<uint32_t> occupied;
     std::unordered_map<std::string, TokenAllocation> allocated;
+    const bool balanced = static_cast<size_t>(ordered.size()) * tokensPerMember <= BALANCED_PLACEMENT_MAX_RING_TOKENS;
+    TokenPlacement placement({}, occupied, balanced);
     for (const auto &identity : ordered) {
         auto &allocation = allocated[identity.address];
-        RETURN_IF_NOT_OK(GenerateTokens(identity, tokensPerMember, occupied, allocation.tokens,
-                                        allocation.tokenSeedOverrides));
+        RETURN_IF_NOT_OK(placement.SelectTokens(identity, tokensPerMember, allocation.tokens,
+                                                allocation.tokenSeedOverrides));
     }
     allocations = std::move(allocated);
     return Status::OK();
@@ -290,12 +287,17 @@ Status HashAlgorithm::PlanScaleOut(const ScaleOutPlanInput &input, TopologyPlan 
     built.next = input.current;
     built.next.tokensPerMember = input.tokensPerMember;
     std::unordered_set<uint32_t> occupied;
-    for (const auto &member : built.next.members) {
-        occupied.insert(member.tokens.begin(), member.tokens.end());
-    }
+    std::vector<PlacementOwner> owners;
+    CollectPlacementOwners(built.next.members, owners, occupied);
     auto ordered = input.joining;
     std::sort(ordered.begin(), ordered.end(),
               [](const auto &left, const auto &right) { return left.address < right.address; });
+    // Retained JOINING members already carry tokens counted in owners; only new joiners add tokens
+    // when deciding whether this plan stays in the balanced placement range.
+    const size_t newJoinerCount = CountNewJoiners(ordered, built.next.members);
+    const bool balanced = owners.size() + newJoinerCount * input.tokensPerMember
+                              <= BALANCED_PLACEMENT_MAX_RING_TOKENS;
+    TokenPlacement placement(owners, occupied, balanced);
     for (const auto &identity : ordered) {
         auto iter = std::find_if(built.next.members.begin(), built.next.members.end(),
                                  [&](const auto &member) { return member.identity.address == identity.address; });
@@ -308,8 +310,8 @@ Status HashAlgorithm::PlanScaleOut(const ScaleOutPlanInput &input, TopologyPlan 
         CHECK_FAIL_RETURN_STATUS(std::none_of(built.next.members.begin(), built.next.members.end(), idCollision),
                                  K_INVALID, "new ScaleOut member id collides with current topology");
         TokenAllocation allocation;
-        RETURN_IF_NOT_OK(GenerateTokens(identity, input.tokensPerMember, occupied, allocation.tokens,
-                                        allocation.tokenSeedOverrides));
+        RETURN_IF_NOT_OK(placement.SelectTokens(identity, input.tokensPerMember, allocation.tokens,
+                                                allocation.tokenSeedOverrides));
         built.next.members.push_back({ identity, MemberState::JOINING, std::move(allocation.tokens),
                                        std::move(allocation.tokenSeedOverrides) });
     }

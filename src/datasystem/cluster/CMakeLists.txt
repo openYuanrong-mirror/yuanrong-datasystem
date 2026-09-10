@@ -30,6 +30,8 @@ target_link_libraries(cluster_topology_scope PUBLIC common_util)
 add_library(cluster_topology STATIC
         algorithm/algorithm_catalog.cpp
         algorithm/hash_algorithm.cpp
+        algorithm/balanced_ring.cpp
+        algorithm/token_placement.cpp
         control/topology_controller.cpp
         control/topology_controller_runtime.cpp
         control/topology_failure_classifier.cpp

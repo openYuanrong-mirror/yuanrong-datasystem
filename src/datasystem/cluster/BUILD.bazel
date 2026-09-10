@@ -63,6 +63,8 @@ ds_cc_library(
     srcs = [
         "algorithm/algorithm_catalog.cpp",
         "algorithm/hash_algorithm.cpp",
+        "algorithm/balanced_ring.cpp",
+        "algorithm/token_placement.cpp",
         "control/topology_controller.cpp",
         "control/topology_controller_runtime.cpp",
         "control/topology_failure_classifier.cpp",
@@ -87,6 +89,8 @@ ds_cc_library(
     hdrs = [
         "algorithm/algorithm_catalog.h",
         "algorithm/hash_algorithm.h",
+        "algorithm/balanced_ring.h",
+        "algorithm/token_placement.h",
         "algorithm/topology_algorithm.h",
         "control/topology_controller.h",
         "control/topology_controller_runtime.h",
