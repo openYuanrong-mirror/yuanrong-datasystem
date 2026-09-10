@@ -458,5 +458,52 @@ TEST_F(HardDiskExporterTest, KvMetricsLogWritesWrappedSummaryAsPureJsonLines)
     ifs.read(&first, 1);
     EXPECT_EQ(first, '{');
 }
+
+// A failed flush write must not advance fileSize_ nor trigger ChangeLogFile(), otherwise the
+// untouched file gets rotated into an empty archive.
+TEST_F(HardDiskExporterTest, WriteFailureDoesNotRotateIntoEmptyArchive)
+{
+    class ExposedFdExporter : public HardDiskExporter {
+    public:
+        using HardDiskExporter::Init;
+        int &Fd()
+        {
+            return fd_;
+        }
+    };
+
+    auto oldMaxLogSize = FLAGS_max_log_size;
+    Raii restoreFlags([&] { FLAGS_max_log_size = oldMaxLogSize; });
+    FLAGS_max_log_size = 1;
+
+    const std::string filePath = FLAGS_log_dir + "/harddisk_write_fail.log";
+    (void)DeleteFile(filePath);
+
+    ExposedFdExporter exporter;
+    DS_ASSERT_OK(exporter.Init(filePath));
+    // Break the fd so every pwrite fails while fileSize_ keeps receiving nominal bytes.
+    RETRY_ON_EINTR(close(exporter.Fd()));
+    exporter.Fd() = K_INVALID_FD;
+
+    Uri uri(filePath);
+    constexpr size_t kChunkSize = static_cast<size_t>(600) * 1024;  // 600 KB
+    std::string payload(kChunkSize, 'a');
+    const int rounds = 5;
+    for (int i = 0; i < rounds; ++i) {
+        exporter.Send(payload, uri, __LINE__);
+        exporter.Send(payload, uri, __LINE__);
+        exporter.SubmitWriteMessage();
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    // Nominal bytes far exceed max_log_size, but no write ever succeeded: no rotation may
+    // happen and no empty archive may appear. Wait for the flush thread to consume all
+    // submitted buffers before asserting.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    EXPECT_EQ(CountRotatedFiles(filePath), 0u);
+    EXPECT_TRUE(FileExist(filePath));
+
+    (void)DeleteFile(filePath);
+}
 }  // namespace ut
 }  // namespace datasystem

@@ -149,7 +149,12 @@ void MetricsExporter::FlushBufferedMessages()
     std::copy(flushBuffer->begin(), flushBuffer->end(), std::ostream_iterator<std::string>(ss, "\n"));
     std::string message = ss.str();
     // Do not log from the sink path; monitor output must not recurse into logging.
-    (void)WriteFileNoErrorLog(fd_, message.c_str(), message.size(), endPos);
+    // A failed write must not advance fileSize_ or trigger rotation.
+    Status writeStatus = (endPos < 0) ? Status(K_INVALID, "lseek failed, fd: " + std::to_string(fd_))
+                                      : WriteFileNoErrorLog(fd_, message.c_str(), message.size(), endPos);
+    if (writeStatus.IsError()) {
+        return;
+    }
     if (fileSize_ > UINT64_MAX - message.size()) {
         fileSize_ = UINT64_MAX;
     } else {
