@@ -19,12 +19,16 @@
 
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 
 #include "datasystem/cluster/model/topology_snapshot.h"
+#include "datasystem/common/object_cache/peer_ub_admission.h"
 #include "datasystem/protos/object_posix.pb.h"
 #include "datasystem/utils/status.h"
 
 namespace datasystem::object_cache {
+
+using RoutingUbHealthMap = std::unordered_map<std::string, UbHealthSummary>;
 
 /**
  * @brief Build the versioned GetHashRing response from one immutable topology snapshot.
@@ -36,6 +40,11 @@ namespace datasystem::object_cache {
  */
 Status BuildGetHashRingResponse(const cluster::TopologySnapshot &snapshot, uint64_t requestedVersion,
                                 const std::string &masterAddress, GetHashRingRspPb &rsp,
+                                const std::string &requestedHostIdsDigest = "");
+
+Status BuildGetHashRingResponse(const cluster::TopologySnapshot &snapshot, uint64_t requestedVersion,
+                                const std::string &masterAddress, GetHashRingRspPb &rsp,
+                                const RoutingUbHealthMap &healthSummaries,
                                 const std::string &requestedHostIdsDigest = "");
 
 }  // namespace datasystem::object_cache

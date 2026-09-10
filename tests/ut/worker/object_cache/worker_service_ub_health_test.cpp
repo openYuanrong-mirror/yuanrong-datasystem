@@ -54,7 +54,9 @@ TEST(WorkerServiceUbHealthTest, HeartbeatCarriesOneCompleteSelfSummary)
     source.reason = UbFailureClass::PORT_UNAVAILABLE_ERROR4;
     source.lastStatusCode = K_URMA_ERROR;
     source.epoch = 9;
-    service.SetUbHealthSummaryProvider([source] { return std::optional<UbHealthSummary>{ source }; });
+    auto encoded = std::make_shared<UbHealthSummaryPb>();
+    EncodeUbHealthSummary(source, *encoded);
+    service.SetUbHealthSummaryProvider([encoded] { return encoded; });
     HeartbeatRspPb rsp;
 
     service.PopulateUbHealthSummary(rsp);

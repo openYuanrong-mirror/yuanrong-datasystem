@@ -61,6 +61,7 @@
 #include "datasystem/common/object_cache/lock.h"
 #include "datasystem/common/object_cache/object_base.h"
 #include "datasystem/common/object_cache/object_bitmap.h"
+#include "datasystem/common/object_cache/ub_health_summary_codec.h"
 #include "datasystem/common/object_cache/safe_object.h"
 #include "datasystem/common/parallel/parallel_for.h"
 #include "datasystem/common/rpc/rpc_auth_key_manager.h"
@@ -71,7 +72,6 @@
 #include "datasystem/common/string_intern/string_ref.h"
 #include "datasystem/common/util/deadlock_util.h"
 #include "datasystem/common/util/format.h"
-#include "datasystem/common/flags/common_flags.h"
 #include "datasystem/common/util/hash_algorithm.h"
 #include "datasystem/common/util/meta_route_tool.h"
 #include "datasystem/common/util/memory.h"
@@ -206,14 +206,49 @@ Status BuildClusterTopologyPb(const cluster::TopologySnapshot &snapshot, ::datas
 
 }  // namespace
 
+namespace {
+template <typename Response>
+void AttachPublishedSelfUbHealth(const WorkerOCServiceImpl &service, Response &rsp)
+{
+    auto summary = service.GetPublishedSelfUbHealthProto();
+    if (summary != nullptr) {
+        rsp.mutable_ub_health_summary()->CopyFrom(*summary);
+    }
+}
+
+void AppendActiveUbHealthSummaries(const cluster::TopologySnapshot &snapshot,
+                                   const RoutingUbHealthMap &healthSummaries,
+                                   GetHashRingRspPb &rsp)
+{
+    for (const auto *member : snapshot.ActiveMembers()) {
+        auto summary = healthSummaries.find(member->identity.address);
+        if (summary != healthSummaries.end()
+            && summary->second.incarnation == member->identity.id) {
+            EncodeUbHealthSummary(summary->second, *rsp.add_worker_ub_health_summaries());
+        }
+    }
+}
+}  // namespace
+
 Status BuildGetHashRingResponse(const cluster::TopologySnapshot &snapshot, uint64_t requestedVersion,
                                 const std::string &masterAddress, GetHashRingRspPb &rsp,
+                                const std::string &requestedHostIdsDigest)
+{
+    static const RoutingUbHealthMap emptyHealthSummaries;
+    return BuildGetHashRingResponse(snapshot, requestedVersion, masterAddress, rsp, emptyHealthSummaries,
+                                    requestedHostIdsDigest);
+}
+
+Status BuildGetHashRingResponse(const cluster::TopologySnapshot &snapshot, uint64_t requestedVersion,
+                                const std::string &masterAddress, GetHashRingRspPb &rsp,
+                                const RoutingUbHealthMap &healthSummaries,
                                 const std::string &requestedHostIdsDigest)
 {
     rsp.Clear();
     rsp.set_version(snapshot.Version());
     rsp.set_master_address(masterAddress);
     rsp.set_host_ids_digest(snapshot.HostIdsDigest());
+    AppendActiveUbHealthSummaries(snapshot, healthSummaries, rsp);
     if (requestedVersion != 0 && requestedVersion == snapshot.Version()
         && (requestedHostIdsDigest.empty() || requestedHostIdsDigest == snapshot.HostIdsDigest())) {
         rsp.set_hash_ring_changed(false);
@@ -367,6 +402,7 @@ WorkerOCServiceImpl::WorkerOCServiceImpl(HostPort serverAddr, HostPort masterAdd
 WorkerOCServiceImpl::~WorkerOCServiceImpl()
 {
     LOG(INFO) << "WorkerOCServiceImpl exit";
+    selfPortHealth_->Stop();
     StopTopologyHealthCoordinator();
     metadataRpcObserverAlive_->store(false, std::memory_order_release);
     // Ensure that initOk_.set_value() is called to avoid suspension when MasterLocalWorkerOCApi inits.
@@ -458,6 +494,10 @@ void WorkerOCServiceImpl::InitServiceImpl()
                                                  akSkManager_, localAddress_, migrateRateController_, ubAdmission_);
     queryAndGetProc_ =
         std::make_shared<WorkerQueryAndGetImpl>(getProc_, memoryRefTable_, akSkManager_, localAddress_, ubAdmission_);
+    if (auto provider = std::atomic_load(&selfUbHealthSummaryProvider_)) {
+        getProc_->SetUbHealthSummaryProvider(*provider);
+        queryAndGetProc_->SetUbHealthSummaryProvider(*provider);
+    }
 
     deleteProc_ =
         std::make_shared<WorkerOcServiceDeleteImpl>(param, akSkManager_, localAddress_, getProc_);
@@ -632,6 +672,7 @@ std::string WorkerOCServiceImpl::GetHitInfo() const
 Status WorkerOCServiceImpl::Publish(const PublishReqPb &req, PublishRspPb &resp, std::vector<RpcMessage> payloads)
 {
     ScopedRequestContext ctx;
+    Raii attachHealth([this, &resp] { AttachPublishedSelfUbHealth(*this, resp); });
     METRIC_TIMER(metrics::KvMetricId::WORKER_PROCESS_PUBLISH_LATENCY);
     uint64_t payloadBytes = PayloadBytes(payloads);
     int64_t remainingUs = GetRequestContext()->reqTimeoutDuration.CalcRealRemainingTimeUs();
@@ -671,6 +712,7 @@ Status WorkerOCServiceImpl::MultiPublish(const MultiPublishReqPb &req, MultiPubl
                                          std::vector<RpcMessage> payloads)
 {
     ScopedRequestContext ctx;
+    Raii attachHealth([this, &resp] { AttachPublishedSelfUbHealth(*this, resp); });
     METRIC_TIMER(metrics::KvMetricId::WORKER_PROCESS_PUBLISH_LATENCY);
     uint64_t payloadBytes = PayloadBytes(payloads);
     RETURN_IF_NOT_OK(VerifyClientWriteAdmission(req.is_routed()));
@@ -3247,7 +3289,114 @@ Status WorkerOCServiceImpl::GetHashRing(const GetHashRingReqPb &req, GetHashRing
     RETURN_RUNTIME_ERROR_IF_NULL(topologyEngine_);
     std::shared_ptr<const cluster::TopologySnapshot> snapshot;
     RETURN_IF_NOT_OK(membership_.GetSnapshot(snapshot));
-    return BuildGetHashRingResponse(*snapshot, req.version(), FLAGS_master_address, rsp, req.host_ids_digest());
+    auto healthSummaries = std::atomic_load(&routingUbHealthSnapshot_);
+    RETURN_RUNTIME_ERROR_IF_NULL(healthSummaries);
+    return BuildGetHashRingResponse(*snapshot, req.version(), FLAGS_master_address, rsp, *healthSummaries,
+                                    req.host_ids_digest());
+}
+
+struct WorkerOCServiceImpl::PublishedSelfUbHealth {
+    explicit PublishedSelfUbHealth(UbHealthSummary value) : summary(std::move(value))
+    {
+        EncodeUbHealthSummary(summary, encoded);
+    }
+    UbHealthSummary summary;
+    UbHealthSummaryPb encoded;
+};
+
+UbHealthSummary WorkerOCServiceImpl::BuildSelfUbHealthSummary() const
+{
+    std::lock_guard<std::mutex> lock(selfUbHealthPublicationMutex_);
+    auto summary = ubAdmission_->BuildSelfHealthSummary(localAddress_);
+    summary.worker = localAddress_;
+    if (selfPortHealth_ != nullptr) {
+        summary.portHealth = selfPortHealth_->GetSummary();
+    }
+    cluster::MemberEndpoint endpoint;
+    if (membership_.ResolveByAddress(localAddress_.ToString(), endpoint).IsError()
+        || endpoint.identity.id.empty()) {
+        return summary;
+    }
+    summary.incarnation = endpoint.identity.id;
+    auto current = std::atomic_load(&publishedSelfUbHealthSummary_);
+    UbHealthSummary merged;
+    if (!MergeUbHealthSummary(current == nullptr ? nullptr : &current->summary, summary, merged)) {
+        return current == nullptr ? summary : current->summary;
+    }
+    if (current != nullptr && IsSameUbHealthSummary(current->summary, merged)) {
+        return current->summary;
+    }
+    cluster::MemberEndpoint latest;
+    if (membership_.ResolveByAddress(localAddress_.ToString(), latest).IsError()
+        || latest.identity.id != merged.incarnation) {
+        return summary;
+    }
+    std::shared_ptr<const PublishedSelfUbHealth> next = std::make_shared<PublishedSelfUbHealth>(std::move(merged));
+    std::atomic_store(&publishedSelfUbHealthSummary_, next);
+    return next->summary;
+}
+
+std::optional<UbHealthSummary> WorkerOCServiceImpl::GetPublishedSelfUbHealthSummary() const
+{
+    auto summary = std::atomic_load(&publishedSelfUbHealthSummary_);
+    return summary == nullptr ? std::nullopt : std::optional<UbHealthSummary>{ summary->summary };
+}
+
+std::shared_ptr<const UbHealthSummaryPb> WorkerOCServiceImpl::GetPublishedSelfUbHealthProto() const
+{
+    auto summary = std::atomic_load(&publishedSelfUbHealthSummary_);
+    return summary == nullptr ? nullptr : std::shared_ptr<const UbHealthSummaryPb>(summary, &summary->encoded);
+}
+
+void WorkerOCServiceImpl::SetSelfUbHealthSummaryProvider(
+    UbHealthSummaryProvider provider)
+{
+    auto published = provider ? std::make_shared<const UbHealthSummaryProvider>(std::move(provider)) : nullptr;
+    std::atomic_store(&selfUbHealthSummaryProvider_, published);
+    if (getProc_ != nullptr) {
+        getProc_->SetUbHealthSummaryProvider(published == nullptr ? UbHealthSummaryProvider{} : *published);
+    }
+    if (queryAndGetProc_ != nullptr) {
+        queryAndGetProc_->SetUbHealthSummaryProvider(published == nullptr ? UbHealthSummaryProvider{} : *published);
+    }
+}
+
+Status WorkerOCServiceImpl::QuerySelfUbPortHealth(const QueryUbPortHealthReqPb &req,
+                                                  QueryUbPortHealthRspPb &rsp) const
+{
+    cluster::MemberEndpoint before;
+    RETURN_IF_NOT_OK(membership_.ResolveByAddress(localAddress_.ToString(), before));
+    CHECK_FAIL_RETURN_STATUS(!req.expected_worker_incarnation().empty()
+                                 && req.expected_worker_incarnation() == before.identity.id,
+                             K_NOT_READY, "Worker incarnation changed before UB port health query");
+    UbPortHealthSummary portHealth;
+    RETURN_RUNTIME_ERROR_IF_NULL(selfPortHealth_);
+    RETURN_IF_NOT_OK(selfPortHealth_->QueryUbPortHealth(before.identity.id, portHealth));
+
+    cluster::MemberEndpoint after;
+    RETURN_IF_NOT_OK(membership_.ResolveByAddress(localAddress_.ToString(), after));
+    CHECK_FAIL_RETURN_STATUS(after.identity.id == before.identity.id, K_NOT_READY,
+                             "Worker incarnation changed during UB port health query");
+    (void)BuildSelfUbHealthSummary();
+    auto summary = GetPublishedSelfUbHealthSummary();
+    CHECK_FAIL_RETURN_STATUS(summary.has_value() && summary->incarnation == after.identity.id, K_NOT_READY,
+                             "Worker UB port health summary identity changed during query");
+    summary->portHealth = portHealth;
+    EncodeUbHealthSummary(*summary, *rsp.mutable_health_summary());
+    return Status::OK();
+}
+
+void WorkerOCServiceImpl::ReplaceGlobalUbHealthSummaries(const std::vector<UbHealthSummary> &summaries)
+{
+    ubAdmission_->ReplaceGlobalSummaries(summaries);
+    auto published = std::make_shared<RoutingUbHealthMap>();
+    published->reserve(summaries.size());
+    for (auto summary : summaries) {
+        auto endpoint = summary.worker.ToString();
+        published->emplace(std::move(endpoint), std::move(summary));
+    }
+    std::atomic_store(&routingUbHealthSnapshot_,
+                      std::shared_ptr<const RoutingUbHealthMap>(std::move(published)));
 }
 
 Status WorkerOCServiceImpl::DeleteDevObjects(const DeleteAllCopyReqPb &req, DeleteAllCopyRspPb &resp)
@@ -3338,5 +3487,13 @@ Status WorkerOCServiceImpl::NotifyRemoteGet(const NotifyRemoteGetReqPb &req, Not
     }
     return Status::OK();
 }
+
+Status WorkerOCServiceImpl::ConfigureSelfPortHealth(std::shared_ptr<UbPortHealthMonitor> monitor,
+                                                    std::weak_ptr<IUbPortHealthObserver> changeObserver)
+{
+    selfPortHealth_->Attach(ubAdmission_, localAddress_);
+    return selfPortHealth_->Configure(std::move(monitor), std::move(changeObserver));
+}
+
 }  // namespace object_cache
 }  // namespace datasystem

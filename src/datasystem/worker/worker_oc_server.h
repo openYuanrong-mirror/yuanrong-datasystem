@@ -421,6 +421,8 @@ private:
     void CreateObjectCacheWorkerServices(
         const std::shared_ptr<SafeTable<ImmutableString, ObjectInterface>> &objectTable,
         const std::shared_ptr<object_cache::WorkerOcEvictionManager> &evictionManager);
+    /** @brief Bind the Worker self-health monitor to the initialized process-local URMA context. */
+    Status ConfigureWorkerSelfPortHealth();
 
     /**
      * @brief Create rebalance executor and register rebalance task handler.

@@ -47,7 +47,9 @@
 #include "datasystem/common/immutable_string/immutable_string.h"
 #include "datasystem/common/object_cache/object_bitmap.h"
 #include "datasystem/common/object_cache/peer_ub_admission.h"
+#include "datasystem/common/object_cache/ub_health_summary_codec.h"
 #include "datasystem/common/object_cache/object_ref_info.h"
+#include "datasystem/worker/object_cache/worker_self_port_health.h"
 #include "datasystem/protos/object_posix.pb.h"
 #include "datasystem/worker/object_cache/service/worker_oc_service_migrate_impl.h"
 #include "datasystem/common/rpc/rpc_server_stream_base.h"
@@ -59,6 +61,7 @@
 #include "datasystem/common/util/queue/shm_circular_queue.h"
 #include "datasystem/common/util/status_helper.h"
 #include "datasystem/common/util/thread.h"
+#include "datasystem/common/util/thread_pool.h"
 #include "datasystem/common/util/thread_local.h"
 #include "datasystem/common/util/wait_post.h"
 #include "datasystem/protos/master_heartbeat.pb.h"
@@ -113,7 +116,9 @@ class WorkerRemoteWorkerOCApi;
 
 enum LockMode { Read = 0, Write = 1 };
 
-class WorkerOCServiceImpl : public WorkerOCService, public IWorkerOCService {
+class WorkerOCServiceImpl : public WorkerOCService,
+                            public IWorkerOCService,
+                            public IUbPortHealthObserver {
 public:
     using AsyncTasksDoneChecker = std::function<Status(
         const std::string &, std::chrono::steady_clock::time_point, const cluster::CancellationToken &)>;
@@ -593,15 +598,31 @@ public:
      */
     size_t GetMetadataSize() const;
 
-    UbHealthSummary BuildSelfUbHealthSummary() const
+    UbHealthSummary BuildSelfUbHealthSummary() const;
+
+    void OnUbPortHealthChanged(const UbPortHealthSummary &portHealth) override
     {
-        return ubAdmission_->BuildSelfHealthSummary(localAddress_);
+        (void)portHealth;
+        (void)BuildSelfUbHealthSummary();
     }
+
+    std::optional<UbHealthSummary> GetPublishedSelfUbHealthSummary() const;
+    std::shared_ptr<const UbHealthSummaryPb> GetPublishedSelfUbHealthProto() const;
+
+    void SetSelfUbHealthSummaryProvider(UbHealthSummaryProvider provider);
+
+    Status QuerySelfUbPortHealth(const QueryUbPortHealthReqPb &req, QueryUbPortHealthRspPb &rsp) const;
+
+    void ReplaceGlobalUbHealthSummaries(const std::vector<UbHealthSummary> &summaries);
 
     PeerUbAdmission *GetUbAdmission() const
     {
         return ubAdmission_.get();
     }
+
+    /** @brief Enable the worker self port-health monitor and bind it to PeerUbAdmission(self). */
+    Status ConfigureSelfPortHealth(std::shared_ptr<UbPortHealthMonitor> monitor,
+                                   std::weak_ptr<IUbPortHealthObserver> changeObserver = {});
 
     /**
      * @brief Get the worker-to-master object cache api manager.
@@ -1508,7 +1529,20 @@ private:
 
     std::shared_ptr<WorkerQueryAndGetImpl> queryAndGetProc_{ nullptr };
 
+    std::shared_ptr<const UbHealthSummaryProvider> selfUbHealthSummaryProvider_;
+
     std::shared_ptr<PeerUbAdmission> ubAdmission_{ std::make_shared<PeerUbAdmission>() };
+
+    std::shared_ptr<WorkerSelfPortHealth> selfPortHealth_{ std::make_shared<WorkerSelfPortHealth>() };
+
+    struct PublishedSelfUbHealth;
+    // Control-plane publication only; response readers load the immutable snapshot without taking this lock.
+    mutable std::mutex selfUbHealthPublicationMutex_;
+    mutable std::shared_ptr<const PublishedSelfUbHealth> publishedSelfUbHealthSummary_;
+
+    std::shared_ptr<const std::unordered_map<std::string, UbHealthSummary>> routingUbHealthSnapshot_{
+        std::make_shared<const std::unordered_map<std::string, UbHealthSummary>>()
+    };
 
     std::shared_ptr<WorkerOcServiceDeleteImpl> deleteProc_{ nullptr };
 

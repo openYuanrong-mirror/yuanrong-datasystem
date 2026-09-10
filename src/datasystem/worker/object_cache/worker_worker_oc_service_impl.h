@@ -106,6 +106,8 @@ public:
      */
     Status GetPeerHashRing(const GetHashRingReqPb &req, GetHashRingRspPb &rsp) override;
 
+    Status QueryUbPortHealth(const QueryUbPortHealthReqPb &req, QueryUbPortHealthRspPb &rsp) override;
+
     /**
      * @brief Migrate data when scale down happen.
      * @param[in] req Migrate data request.
@@ -142,7 +144,8 @@ public:
     Status NotifyRemoteGet(const NotifyRemoteGetReqPb &req, NotifyRemoteGetRspPb &rsp) override;
 
 private:
-    static Status CheckRemoteGetWriteTarget(PeerUbAdmission *ubAdmission, const HostPort &remotePeer);
+    static Status CheckRemoteGetWriteTarget(PeerUbAdmission *ubAdmission, const HostPort &localWorker,
+                                            const HostPort &remotePeer);
     static void RecordProviderUbWriteFailure(const GetObjectRemoteReqPb &req, const Status &status,
                                              const HostPort &operatorWorker, GetObjectRemoteRspPb &rsp,
                                              const UrmaWriteFailure *failure = nullptr,

@@ -43,6 +43,7 @@
 #include "datasystem/common/metrics/kv_metrics.h"
 #include "datasystem/common/metrics/metrics.h"
 #include "datasystem/common/object_cache/provider_ub_failure_detail.h"
+#include "datasystem/common/object_cache/ub_health_summary_codec.h"
 #include "datasystem/common/parallel/parallel_for.h"
 #include "datasystem/common/perf/perf_manager.h"
 #include "datasystem/common/string_intern/string_ref.h"
@@ -318,8 +319,10 @@ Status WorkerOcServiceGetImpl::Get(std::shared_ptr<ServerUnaryWriterReader<GetRs
     if (traceEnabled) {
         Trace::Instance().AddLatencyTick(LatencyTickKey::WORKER_GET_START);
     }
+    auto healthProvider = std::atomic_load(&ubHealthSummaryProvider_);
     auto request =
-        std::make_shared<GetRequest>(AccessRecorderKey::DS_POSIX_GET, localAddress_.ToString(), ubAdmission_);
+        std::make_shared<GetRequest>(AccessRecorderKey::DS_POSIX_GET, localAddress_, ubAdmission_,
+                                     healthProvider == nullptr ? UbHealthSummaryProvider{} : *healthProvider);
     INJECT_POINT("WorkerOCServiceImpl.Get.Retry",
                  [&serverApi]() { return serverApi->SendStatus(Status(K_TRY_AGAIN, "test get retry")); });
     GetReqPb req;
@@ -4223,5 +4226,6 @@ Status WorkerOcServiceGetImpl::ProbeUbConnectionToPeer(const HostPort &peerAddr,
     RETURN_IF_NOT_OK(constAccessor->second->ExecOnceParrallelExchange(response));
     return ProbeUbDataPlane(response, failure);
 }
+
 }  // namespace object_cache
 }  // namespace datasystem

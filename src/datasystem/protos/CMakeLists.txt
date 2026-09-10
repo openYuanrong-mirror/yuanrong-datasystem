@@ -182,13 +182,13 @@ GEN_GLOBAL_PROTO_LIB_DEPEND(
         SOURCE ${OBJECT_POSIX_SRCS} ${STREAM_POSIX_SRCS}
         DEPEND zmq_proto_lib_depend
         LINK ${PROTOBUF_LIBRARIES} utils_protos p2p_subscribe_protos rpc_option_protos
-             cluster_topology_protos)
+             cluster_topology_protos share_memory_protos)
 GEN_GLOBAL_PROTO_LIB_DEPEND(CLIENT
         NAME posix_protos_client
         SOURCE ${OBJECT_POSIX_SRCS} ${STREAM_POSIX_SRCS}
         DEPEND zmq_proto_lib_depend
         LINK ${PROTOBUF_LIBRARIES} utils_protos_client p2p_subscribe_protos_client
-             rpc_option_protos cluster_topology_protos_client)
+             rpc_option_protos cluster_topology_protos_client share_memory_protos_client)
 
 # Compile the proto file at the second layer, for example, posix proto.
 GENERATE_ZMQ_CPP(zmq_proto_lib_depend WORKER_OBJECT_SRCS WORKER_OBJECT_HDRS ${PROTO_BUILD_DIR} ${PROTO_SRC_DIR} ${PROTO_SRC_DIR}/worker_object.proto)

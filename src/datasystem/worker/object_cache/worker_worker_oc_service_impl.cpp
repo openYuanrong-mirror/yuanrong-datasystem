@@ -36,6 +36,7 @@
 #include "datasystem/common/util/request_context.h"
 #include "datasystem/common/metrics/kv_metrics.h"
 #include "datasystem/common/object_cache/provider_ub_failure_detail.h"
+#include "datasystem/common/object_cache/ub_health_summary_codec.h"
 #include "datasystem/common/object_cache/shm_guard.h"
 #include "datasystem/common/os_transport_pipeline/os_transport_pipeline_worker_api.h"
 #include "datasystem/common/rdma/fast_transport_manager_wrapper.h"
@@ -94,6 +95,18 @@ inline std::ostream &operator<<(std::ostream &os, const GetObjectRemoteReqPb &re
 }
 namespace object_cache {
 namespace {
+template <typename Response>
+void AttachPublishedSelfUbHealth(const std::shared_ptr<WorkerOCServiceImpl> &service, Response &rsp)
+{
+    if (service == nullptr) {
+        return;
+    }
+    auto summary = service->GetPublishedSelfUbHealthProto();
+    if (summary != nullptr) {
+        rsp.mutable_ub_health_summary()->CopyFrom(*summary);
+    }
+}
+
 void MovePayload(std::vector<RpcMessage> &src, std::vector<RpcMessage> &dst)
 {
     dst.insert(dst.end(), std::make_move_iterator(src.begin()), std::make_move_iterator(src.end()));
@@ -222,6 +235,7 @@ Status WorkerWorkerOCServiceImpl::GetObjectRemote(
         RETURN_IF_NOT_OK_EXCEPT(getRc, StatusCode::K_OC_REMOTE_GET_NOT_ENOUGH);
     }
     TryEncodeRemoteGetLatencySummary(config, traceEnabled, rsp);
+    AttachPublishedSelfUbHealth(ocClientWorkerSvc_, rsp);
     pointImpl.RecordAndReset(PerfKey::WORKER_SERVER_GET_REMOTE_WRITE);
     RETURN_IF_NOT_OK_PRINT_ERROR_MSG(serverApi->Write(rsp), "GetObjectRemote write error");
     pointImpl.RecordAndReset(PerfKey::WORKER_SERVER_GET_REMOTE_SENDPAYLOAD);
@@ -247,6 +261,7 @@ Status WorkerWorkerOCServiceImpl::GetObjectRemote(
 Status WorkerWorkerOCServiceImpl::GetObjectRemote(GetObjectRemoteReqPb &req, GetObjectRemoteRspPb &rsp,
                                                   std::vector<RpcMessage> &payload)
 {
+    Raii attachHealth([this, &rsp] { AttachPublishedSelfUbHealth(ocClientWorkerSvc_, rsp); });
     return ProcessSingleGetObjectRemote(req, rsp, payload, nullptr);
 }
 
@@ -291,7 +306,7 @@ Status WorkerWorkerOCServiceImpl::PrepareSingleGetObjectRemoteReq(const GetObjec
 {
     if (IsUrmaEnabled() && req.has_urma_info()) {
         const auto &remoteAddress = req.urma_info().request_address();
-        auto admissionRc = CheckRemoteGetWriteTarget(ocClientWorkerSvc_->GetUbAdmission(),
+        auto admissionRc = CheckRemoteGetWriteTarget(ocClientWorkerSvc_->GetUbAdmission(), localAddress_,
                                                      HostPort(remoteAddress.host(), remoteAddress.port()));
         if (admissionRc.IsError()) {
             if (!FLAGS_enable_transport_fallback) {
@@ -443,7 +458,7 @@ Status WorkerWorkerOCServiceImpl::GatherWrite(uint64_t subIndex, AggregateInfo &
         };
         auto *ubAdmission = ocClientWorkerSvc_->GetUbAdmission();
         const HostPort remotePeer(remoteSegInfo.host, remoteSegInfo.port);
-        rc = CheckRemoteGetWriteTarget(ubAdmission, remotePeer);
+        rc = CheckRemoteGetWriteTarget(ubAdmission, localAddress_, remotePeer);
         if (rc.IsOk()) {
             auto lateCompletionContext =
                 ubAdmission == nullptr
@@ -779,7 +794,7 @@ Status WorkerWorkerOCServiceImpl::WriteViaFastTransport(
             auto *ubAdmission = ocClientWorkerSvc_->GetUbAdmission();
             const auto &remoteAddress = req.urma_info().request_address();
             const HostPort remotePeer(remoteAddress.host(), remoteAddress.port());
-            auto writeTargetRc = CheckRemoteGetWriteTarget(ubAdmission, remotePeer);
+            auto writeTargetRc = CheckRemoteGetWriteTarget(ubAdmission, localAddress_, remotePeer);
             if (writeTargetRc.IsError()) {
                 fastTransportStatus = writeTargetRc;
                 fastTransportName = "UrmaWriteAdmission";
@@ -821,11 +836,14 @@ Status WorkerWorkerOCServiceImpl::WriteViaFastTransport(
 }
 
 Status WorkerWorkerOCServiceImpl::CheckRemoteGetWriteTarget(PeerUbAdmission *ubAdmission,
+                                                            const HostPort &localWorker,
                                                             const HostPort &remotePeer)
 {
     if (ubAdmission == nullptr) {
         return Status::OK();
     }
+    RETURN_IF_NOT_OK(ubAdmission->CheckWriteTarget(localWorker,
+                                                   UbOperationKind::WORKER_REMOTE_GET_WRITEBACK));
     return ubAdmission->CheckWriteTarget(remotePeer, UbOperationKind::WORKER_REMOTE_GET_WRITEBACK);
 }
 
@@ -1022,6 +1040,15 @@ Status WorkerWorkerOCServiceImpl::GetPeerHashRing(const GetHashRingReqPb &req, G
     return ocClientWorkerSvc_->GetHashRing(req, rsp);
 }
 
+Status WorkerWorkerOCServiceImpl::QueryUbPortHealth(const QueryUbPortHealthReqPb &req,
+                                                    QueryUbPortHealthRspPb &rsp)
+{
+    RETURN_RUNTIME_ERROR_IF_NULL(akSkManager_);
+    RETURN_IF_NOT_OK_PRINT_ERROR_MSG(akSkManager_->VerifySignatureAndTimestamp(req), "AK/SK failed.");
+    RETURN_RUNTIME_ERROR_IF_NULL(ocClientWorkerSvc_);
+    return ocClientWorkerSvc_->QuerySelfUbPortHealth(req, rsp);
+}
+
 Status WorkerWorkerOCServiceImpl::MigrateData(const MigrateDataReqPb &req, MigrateDataRspPb &rsp,
                                               std::vector<::datasystem::RpcMessage> payloads)
 {
@@ -1112,6 +1139,7 @@ Status WorkerWorkerOCServiceImpl::BatchGetObjectRemote(
     }
     RETURN_IF_NOT_OK(BatchGetObjectRemoteImpl(req, rsp, payload, batchTransportContext));
     TryEncodeRemoteGetLatencySummary(config, traceEnabled, rsp);
+    AttachPublishedSelfUbHealth(ocClientWorkerSvc_, rsp);
     pointImpl.RecordAndReset(PerfKey::WORKER_SERVER_GET_REMOTE_WRITE);
     RETURN_IF_NOT_OK_PRINT_ERROR_MSG(serverApi->Write(rsp), "GetObjectRemote write error");
     pointImpl.RecordAndReset(PerfKey::WORKER_SERVER_GET_REMOTE_SENDPAYLOAD);
@@ -1135,7 +1163,7 @@ Status WorkerWorkerOCServiceImpl::PrepareBatchGetObjectRemoteReq(BatchGetObjectR
                 continue;
             }
             const auto &remoteAddress = subReq.urma_info().request_address();
-            auto admissionRc = CheckRemoteGetWriteTarget(ocClientWorkerSvc_->GetUbAdmission(),
+            auto admissionRc = CheckRemoteGetWriteTarget(ocClientWorkerSvc_->GetUbAdmission(), localAddress_,
                                                          HostPort(remoteAddress.host(), remoteAddress.port()));
             if (admissionRc.IsError()) {
                 if (!FLAGS_enable_transport_fallback) {

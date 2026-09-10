@@ -56,6 +56,7 @@ message GetObjectRemoteRspPb {
   repeated uint32 latency_phase_us = 20;
   // Stores total dropped tick+phase count. See FormatLatencySummary for breakdown.
   uint32 latency_tick_dropped_count = 21;
+  UbHealthSummaryPb ub_health_summary = 22;
 }
 
 message BatchGetObjectRemoteReqPb {
@@ -80,6 +81,7 @@ message BatchGetObjectRemoteRspPb {
   repeated uint32 latency_phase_us = 20;
   // Stores total dropped tick+phase count. See FormatLatencySummary for breakdown.
   uint32 latency_tick_dropped_count = 21;
+  UbHealthSummaryPb ub_health_summary = 22;
 }
 
 message CheckCoordinatorStateReqPb {
@@ -175,6 +177,7 @@ message MigrateDataRspPb {
   // Objects whose primary-switch request was terminal because the source version had expired. The source must
   // release these stale copies instead of treating them as confirmed migrated replicas.
   repeated string expired_ids = 10;
+  UbHealthSummaryPb ub_health_summary = 11;
 }
 
 message MigrateDataDirectReqPb {
@@ -208,6 +211,7 @@ message MigrateDataDirectRspPb {
   uint64 limit_rate = 3;
   ProviderUbFailureDetailPb provider_ub_failure_detail = 4;
   repeated string skipped_object_keys = 5;
+  UbHealthSummaryPb ub_health_summary = 6;
 }
 
 message NotifyRemoteGetReqPb {
@@ -232,6 +236,7 @@ message NotifyRemoteGetRspPb {
   uint64 limit_rate = 3;
   ProviderUbFailureDetailPb provider_ub_failure_detail = 4;
   repeated string skipped_object_keys = 5;
+  UbHealthSummaryPb ub_health_summary = 6;
 }
 
 message ProviderUbRecoveryProbeReqPb {
@@ -250,6 +255,7 @@ service WorkerWorkerTransportService {
   rpc WorkerWorkerExchangeUrmaConnectInfo(UrmaHandshakeReqPb) returns (UrmaHandshakeRspPb) {}
   // Query this Worker's current UB admission and, only when writable, verify Worker-to-Client UB WRITE recovery.
   rpc ProbeProviderUbRecovery(ProviderUbRecoveryProbeReqPb) returns (ProviderUbRecoveryProbeRspPb) {}
+  rpc QueryUbPortHealth(QueryUbPortHealthReqPb) returns (QueryUbPortHealthRspPb) {}
 }
 
 service WorkerWorkerOCService {
@@ -273,6 +279,7 @@ service WorkerWorkerOCService {
   rpc MigrateDataDirect(MigrateDataDirectReqPb) returns (MigrateDataDirectRspPb) {}
   rpc NotifyRemoteGet(NotifyRemoteGetReqPb) returns (NotifyRemoteGetRspPb) {}
   rpc GetPeerHashRing(GetHashRingReqPb) returns (GetHashRingRspPb) {}
+  rpc QueryUbPortHealth(QueryUbPortHealthReqPb) returns (QueryUbPortHealthRspPb) {}
 }
 
 message UpdateObjectInfoPb {

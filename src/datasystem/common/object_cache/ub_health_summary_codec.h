@@ -8,6 +8,7 @@
 #define DATASYSTEM_COMMON_OBJECT_CACHE_UB_HEALTH_SUMMARY_CODEC_H
 
 #include <functional>
+#include <memory>
 #include <string>
 
 #include "datasystem/common/object_cache/peer_ub_admission.h"
@@ -15,7 +16,10 @@
 
 namespace datasystem {
 using UbHealthSummaryApplyHook = std::function<void(const UbHealthSummary &)>;
+using UbHealthSummaryProvider = std::function<std::shared_ptr<const UbHealthSummaryPb>()>;
 
+void EncodeUbPortHealthSummary(const UbPortHealthSummary &summary, UbPortHealthSummaryPb &pb);
+Status DecodeUbPortHealthSummary(const UbPortHealthSummaryPb &pb, UbPortHealthSummary &summary);
 void EncodeUbHealthSummary(const UbHealthSummary &summary, UbHealthSummaryPb &pb);
 Status DecodeUbHealthSummary(const UbHealthSummaryPb &pb, UbHealthSummary &summary);
 Status ApplyHeartbeatUbHealthSummary(const HeartbeatRspPb &rsp, const HostPort &expectedWorker,

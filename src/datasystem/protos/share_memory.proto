@@ -162,6 +162,18 @@ message HeartbeatReqPb{
     string access_key = 102;
 }
 
+// valid=false is the explicit UNKNOWN state and carries no isolation or recovery evidence. For valid summaries,
+// health_epoch and total_port_count must be positive and bad_port_count must not exceed total_port_count.
+// verification_pending preserves the last confirmed observation while a refresh is outstanding or failed; a pending
+// summary cannot change an existing isolation.
+message UbPortHealthSummaryPb {
+    bool valid = 1;
+    uint32 total_port_count = 2;
+    uint32 bad_port_count = 3;
+    uint64 health_epoch = 4;
+    bool verification_pending = 5;
+}
+
 message UbHealthSummaryPb {
     string worker_address = 1;
     bytes incarnation = 2;
@@ -172,6 +184,23 @@ message UbHealthSummaryPb {
     uint64 epoch = 7;
     uint32 backoff_level = 8;
     uint64 backoff_deadline_ms = 9;
+    // Optional during rolling upgrade. Explicit UNKNOWN and field absence carry no isolation or recovery evidence.
+    UbPortHealthSummaryPb ub_port_health = 10;
+}
+
+// Shared request and response schema for the Client-to-Worker and Worker-to-Worker QueryUbPortHealth RPCs. Service
+// wiring is intentionally owned by the corresponding transport implementations.
+message QueryUbPortHealthReqPb {
+    bytes expected_worker_incarnation = 1;
+
+    // Keep authentication fields at the established high numbers for rolling-compatible signatures.
+    uint64 timestamp = 100;
+    string signature = 101;
+    string access_key = 102;
+}
+
+message QueryUbPortHealthRspPb {
+    UbHealthSummaryPb health_summary = 1;
 }
 
 message HeartbeatRspPb{

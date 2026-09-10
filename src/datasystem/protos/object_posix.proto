@@ -25,6 +25,7 @@ import "datasystem/protos/utils.proto";
 import "datasystem/protos/p2p_subscribe.proto";
 import "datasystem/protos/meta_transport.proto";
 import "datasystem/protos/cluster_topology.proto";
+import "datasystem/protos/share_memory.proto";
 
 option cc_enable_arenas = true;
 
@@ -138,6 +139,7 @@ message PublishReqPb {
 message PublishRspPb {
   repeated uint32 latency_phase_us = 20;
   uint32 latency_tick_dropped_count = 21; // Stores total dropped tick+phase count. See FormatLatencySummary for breakdown.
+  UbHealthSummaryPb ub_health_summary = 22;
 }
 
 message MultiPublishReqPb {
@@ -177,6 +179,7 @@ message MultiPublishRspPb {
   // Request indexes whose objects were confirmed published on the receiving worker by this request.
   // NX-existing objects and objects with uncertain publish results are excluded.
   repeated uint32 local_published_indexes = 3;
+  UbHealthSummaryPb ub_health_summary = 4;
 }
 
 message ProviderUbFailureDetailPb {
@@ -257,6 +260,7 @@ message GetRspPb {
   ProviderUbFailureDetailPb provider_ub_failure_detail = 4;
   repeated uint32 latency_phase_us = 20;
   uint32 latency_tick_dropped_count = 21; // Stores total dropped tick+phase count. See FormatLatencySummary for breakdown.
+  UbHealthSummaryPb ub_health_summary = 22;
 }
 
 message DecreaseReferenceRequest {
@@ -656,6 +660,7 @@ message GetHashRingRspPb {
   bool hash_ring_changed = 4;     // True if hash_ring field is populated.
   map<string, string> host_id_map = 5;  // workerAddr("host:port") -> hostId, valid when hash_ring_changed=true.
   string host_ids_digest = 6;  // SHA256 of the canonical host_id_map; absent on older workers.
+  repeated UbHealthSummaryPb worker_ub_health_summaries = 7;  // ACTIVE Worker health, independent of ring change.
 }
 
 message QueryAndGetTcpDataReqPb {}
@@ -717,10 +722,12 @@ message QueryAndGetResultPb {
   QueryAndGetLocationInfoPb location = 1;
   QueryAndGetDataResultPb data_result = 2;
   ErrorInfoPb status = 3;
+  ProviderUbFailureDetailPb provider_ub_failure_detail = 4;
 }
 
 message QueryAndGetRspPb {
   repeated QueryAndGetResultPb results = 1;
+  UbHealthSummaryPb ub_health_summary = 2;
 }
 
 service WorkerOCService {

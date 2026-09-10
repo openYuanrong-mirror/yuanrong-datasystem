@@ -1149,6 +1149,7 @@ Status WorkerOCServer::CreateWorkerServices()
     if (EnableOCService()) {
         RETURN_IF_NOT_OK(InitEvictionPolicyWorkerStateStore(evictionManager));
         CreateObjectCacheWorkerServices(objectTable, evictionManager);
+        RETURN_IF_NOT_OK(ConfigureWorkerSelfPortHealth());
     }
     if (EnableSCService()) {
         auto scAllocateManager = std::make_shared<stream_cache::WorkerSCAllocateMemory>(evictionManager);
@@ -1166,6 +1167,21 @@ Status WorkerOCServer::CreateWorkerServices()
     return Status::OK();
 }
 
+Status WorkerOCServer::ConfigureWorkerSelfPortHealth()
+{
+#ifdef USE_URMA
+    if (!IsUrmaEnabled() || objCacheClientWorkerSvc_ == nullptr) {
+        return Status::OK();
+    }
+    std::shared_ptr<UbPortHealthMonitor> monitor;
+    RETURN_IF_NOT_OK(GetLocalUbPortHealthMonitor(monitor));
+    std::weak_ptr<IUbPortHealthObserver> observer(objCacheClientWorkerSvc_);
+    return objCacheClientWorkerSvc_->ConfigureSelfPortHealth(std::move(monitor), std::move(observer));
+#else
+    return Status::OK();
+#endif
+}
+
 void WorkerOCServer::CreateObjectCacheWorkerServices(
     const std::shared_ptr<SafeTable<ImmutableString, ObjectInterface>> &objectTable,
     const std::shared_ptr<object_cache::WorkerOcEvictionManager> &evictionManager)
@@ -1181,10 +1197,19 @@ void WorkerOCServer::CreateObjectCacheWorkerServices(
         return metadataManagerHolder_->CleanupLocalMetadataForRejoin(hostPort_.ToString());
     });
     std::weak_ptr<datasystem::object_cache::WorkerOCServiceImpl> weakOcService = objCacheClientWorkerSvc_;
-    workerSvc_->SetUbHealthSummaryProvider([weakOcService]() -> std::optional<UbHealthSummary> {
+    (void)objCacheClientWorkerSvc_->BuildSelfUbHealthSummary();
+    objCacheClientWorkerSvc_->SetSelfUbHealthSummaryProvider(
+        [weakOcService]() -> std::shared_ptr<const UbHealthSummaryPb> {
+            auto service = weakOcService.lock();
+            return service == nullptr ? nullptr : service->GetPublishedSelfUbHealthProto();
+        });
+    workerSvc_->SetUbHealthSummaryProvider([weakOcService]() -> std::shared_ptr<const UbHealthSummaryPb> {
         auto service = weakOcService.lock();
-        return service == nullptr ? std::nullopt
-                                  : std::optional<UbHealthSummary>{ service->BuildSelfUbHealthSummary() };
+        if (service == nullptr) {
+            return nullptr;
+        }
+        (void)service->BuildSelfUbHealthSummary();
+        return service->GetPublishedSelfUbHealthProto();
     });
     CreateRebalanceExecutor(objectTable, evictionManager);
     objCacheClientWorkerSvc_->RegisterAsyncTasksDoneChecker([this](const std::string &,
@@ -1213,7 +1238,7 @@ void WorkerOCServer::CreateObjectCacheWorkerServices(
         std::make_shared<datasystem::object_cache::MasterWorkerOCServiceImpl>(objCacheClientWorkerSvc_, akSkManager_);
     // create WorkerWorkerTransportService
     objCacheWorkerTransSvc_ = std::make_shared<datasystem::object_cache::WorkerWorkerTransportServiceImpl>(
-        objCacheClientWorkerSvc_, hostPort_, topologyEngine_->Membership());
+        objCacheClientWorkerSvc_, hostPort_, topologyEngine_->Membership(), akSkManager_);
 }
 
 void WorkerOCServer::CreateRebalanceExecutor(
@@ -2339,7 +2364,7 @@ Status WorkerOCServer::StartUbHealthLeaseSync()
         [weakService](const std::vector<UbHealthSummary> &summaries) {
             auto service = weakService.lock();
             if (service != nullptr) {
-                service->GetUbAdmission()->ReplaceGlobalSummaries(summaries);
+                service->ReplaceGlobalUbHealthSummaries(summaries);
             }
         }
     };

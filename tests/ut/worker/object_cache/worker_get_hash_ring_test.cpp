@@ -22,6 +22,7 @@
 
 #include "datasystem/cluster/model/topology_snapshot.h"
 #include "datasystem/cluster/model/topology_types.h"
+#include "datasystem/common/object_cache/ub_health_summary_codec.h"
 #include "datasystem/worker/object_cache/get_hash_ring_response.h"
 #include "ut/common.h"
 
@@ -30,6 +31,17 @@ namespace {
 constexpr uint64_t TOPOLOGY_VERSION = 7;
 constexpr char WORKER_A[] = "127.0.0.1:1000";
 constexpr char WORKER_B[] = "127.0.0.1:2000";
+
+UbHealthSummary MakeHealthSummary(const std::string &worker, const std::string &incarnation,
+                                  uint64_t epoch, uint32_t totalPorts, uint32_t badPorts)
+{
+    UbHealthSummary summary;
+    (void)summary.worker.ParseString(worker);
+    summary.incarnation = incarnation;
+    summary.epoch = epoch;
+    summary.portHealth = UbPortHealthSummary{ true, totalPorts, badPorts, epoch, false };
+    return summary;
+}
 
 Status MakeSnapshot(std::shared_ptr<const cluster::TopologySnapshot> &snapshot)
 {
@@ -53,17 +65,29 @@ TEST_F(WorkerGetHashRingTest, MatchingVersionClearsPayload)
 {
     std::shared_ptr<const cluster::TopologySnapshot> snapshot;
     DS_ASSERT_OK(MakeSnapshot(snapshot));
+    const RoutingUbHealthMap healthSummaries{
+        { WORKER_A, MakeHealthSummary(WORKER_A, std::string(16, 'a'), 3, 4, 1) },
+        { WORKER_B, MakeHealthSummary(WORKER_B, std::string(16, 'b'), 3, 4, 4) },
+        { "127.0.0.1:3000", MakeHealthSummary("127.0.0.1:3000", "outside-topology", 1, 4, 4) }
+    };
     GetHashRingRspPb rsp;
     (*rsp.mutable_host_id_map())["stale"] = "stale";
     (*rsp.mutable_hash_ring()->mutable_members())["stale"];
 
-    DS_ASSERT_OK(BuildGetHashRingResponse(*snapshot, TOPOLOGY_VERSION, "127.0.0.1:9000", rsp));
+    DS_ASSERT_OK(BuildGetHashRingResponse(*snapshot, TOPOLOGY_VERSION, "127.0.0.1:9000", rsp,
+                                          healthSummaries));
 
     EXPECT_FALSE(rsp.hash_ring_changed());
     EXPECT_EQ(rsp.version(), TOPOLOGY_VERSION);
     EXPECT_EQ(rsp.master_address(), "127.0.0.1:9000");
     EXPECT_TRUE(rsp.hash_ring().members().empty());
     EXPECT_TRUE(rsp.host_id_map().empty());
+    ASSERT_EQ(rsp.worker_ub_health_summaries_size(), 1);
+    UbHealthSummary decoded;
+    DS_ASSERT_OK(DecodeUbHealthSummary(rsp.worker_ub_health_summaries(0), decoded));
+    EXPECT_EQ(decoded.worker.ToString(), WORKER_A);
+    ASSERT_TRUE(decoded.portHealth.has_value());
+    EXPECT_EQ(decoded.portHealth->badPortCount, 1u);
 }
 
 TEST_F(WorkerGetHashRingTest, DifferentVersionReturnsTopologyAndHostIdMap)

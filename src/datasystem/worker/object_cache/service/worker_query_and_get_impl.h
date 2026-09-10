@@ -19,12 +19,16 @@
 #define DATASYSTEM_WORKER_OBJECT_CACHE_SERVICE_WORKER_QUERY_AND_GET_IMPL_H
 
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "datasystem/common/object_cache/object_ref_info.h"
 #include "datasystem/common/object_cache/peer_ub_admission.h"
+#include "datasystem/common/object_cache/ub_health_summary_codec.h"
 #include "datasystem/common/rpc/rpc_message.h"
 #include "datasystem/common/util/net_util.h"
 #include "datasystem/protos/object_posix.pb.h"
@@ -61,6 +65,12 @@ public:
      */
     Status QueryAndGet(
         std::shared_ptr<ServerUnaryWriterReader<QueryAndGetRspPb, QueryAndGetReqPb>> &serverApi);
+
+    void SetUbHealthSummaryProvider(UbHealthSummaryProvider provider)
+    {
+        std::atomic_store(&ubHealthSummaryProvider_,
+                          provider ? std::make_shared<const UbHealthSummaryProvider>(std::move(provider)) : nullptr);
+    }
 
 private:
     struct QueryStats {
@@ -120,6 +130,7 @@ private:
     std::shared_ptr<AkSkManager> akSkManager_;
     HostPort localAddress_;
     std::shared_ptr<PeerUbAdmission> ubAdmission_;
+    std::shared_ptr<const UbHealthSummaryProvider> ubHealthSummaryProvider_;
 };
 
 }  // namespace object_cache
