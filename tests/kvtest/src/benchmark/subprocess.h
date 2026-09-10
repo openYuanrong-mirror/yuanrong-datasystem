@@ -144,26 +144,27 @@ inline bool SetCloseOnExec(int fd, bool enabled) {
 
 // --- Determine connection type from role + testMode ---
 
-inline bool RoleUsesServiceDiscovery(ChildRole role, TestMode testMode) {
+inline bool RoleUsesServiceDiscovery(ChildRole role, const Config &cfg) {
     switch (role) {
         case ROLE_SET:
-            return testMode == TestMode::SET_LOCAL
-                || testMode == TestMode::GET_LOCAL
-                || testMode == TestMode::GET_REMOTE_CROSS
-                || testMode == TestMode::MIXED_LOCAL_SET_GET
-                || testMode == TestMode::MIXED_LOCAL_SET_CROSS_GET
-                || testMode == TestMode::MSET_LOCAL
-                || testMode == TestMode::MGET_LOCAL
-                || testMode == TestMode::MGET_REMOTE_CROSS;
+            return cfg.testMode == TestMode::SET_LOCAL
+                || cfg.testMode == TestMode::GET_LOCAL
+                || cfg.ShouldUseServiceDiscoveryForRemoteDirect()
+                || cfg.testMode == TestMode::GET_REMOTE_CROSS
+                || cfg.testMode == TestMode::MIXED_LOCAL_SET_GET
+                || cfg.testMode == TestMode::MIXED_LOCAL_SET_CROSS_GET
+                || cfg.testMode == TestMode::MSET_LOCAL
+                || cfg.testMode == TestMode::MGET_LOCAL
+                || cfg.testMode == TestMode::MGET_REMOTE_CROSS;
         case ROLE_GET:
-            return testMode == TestMode::GET_LOCAL
-                || testMode == TestMode::GET_CROSS_NODE
-                || testMode == TestMode::MIXED_LOCAL_SET_GET
-                || testMode == TestMode::MIXED_REMOTE_SET_REMOTE_CROSS_GET
-                || testMode == TestMode::MGET_LOCAL
-                || testMode == TestMode::MGET_CROSS_NODE;
+            return cfg.testMode == TestMode::GET_LOCAL
+                || cfg.testMode == TestMode::GET_CROSS_NODE
+                || cfg.testMode == TestMode::MIXED_LOCAL_SET_GET
+                || cfg.testMode == TestMode::MIXED_REMOTE_SET_REMOTE_CROSS_GET
+                || cfg.testMode == TestMode::MGET_LOCAL
+                || cfg.testMode == TestMode::MGET_CROSS_NODE;
         case ROLE_DEL:
-            return RoleUsesServiceDiscovery(ROLE_SET, testMode);
+            return RoleUsesServiceDiscovery(ROLE_SET, cfg);
     }
     return false;
 }
@@ -182,7 +183,7 @@ inline std::shared_ptr<datasystem::KVClient> CreateClientForRole(
     ChildRole role, const Config &cfg) {
     using namespace datasystem;
 
-    bool useSD = RoleUsesServiceDiscovery(role, cfg.testMode);
+    bool useSD = RoleUsesServiceDiscovery(role, cfg);
     ConnectOptions opts;
     opts.connectTimeoutMs = cfg.connectTimeoutMs;
     opts.enableCrossNodeConnection = cfg.enableCrossNodeConnection;

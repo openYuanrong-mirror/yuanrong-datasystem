@@ -19,7 +19,8 @@ Benchmark 模式用于精确测量 KVClient Set/Get 操作的吞吐和延迟。�
 
 kvtest 内部维护两个 KVClient：
 - **localClient**：通过 ServiceDiscovery（etcd + `HOST_IP`）发现本机 Worker，走 SHM 通道
-- **remoteClient**：通过 `remote_worker.host:port` 直连远端 Worker，走 UB/RPC 网络
+- **remoteClient**：默认通过 `remote_worker.host:port` 直连远端 Worker，走 UB/RPC 网络；
+  `get_remote_direct` 未配置 `remote_worker.host` 时通过 ServiceDiscovery 选择 Worker
 
 不同模式将 Set/Get 操作分配给不同的客户端。
 
@@ -94,7 +95,8 @@ graph LR
     K -->|Get RPC| WB
 ```
 
-remoteClient → Worker B。Set 和 Get 都在同一远端 Worker 上完成，不触发跨节点传输。测量远端 Worker 本地的端到端延迟。
+remoteClient → Worker B。Set 和 Get 复用同一个 KVClient，在同一 Worker 上完成，不触发 Worker 间传输。
+配置 `remote_worker.host` 时固定直连该 Worker；未配置时通过 ServiceDiscovery 选择 Worker。
 
 ### get_remote_cross — 跨节点 Get（Worker B 拉取 Worker A 的数据）
 
@@ -123,7 +125,7 @@ Set 通过 localClient 写入 Worker A，Get 通过 remoteClient 从 Worker B �
 | `set_remote` | remoteClient (RPC) | — | 无 | 任意 |
 | `get_local` | localClient (SHM) | localClient (SHM) | 无 | Worker A 同机 |
 | `get_cross_node` | remoteClient (RPC) | localClient (SHM) | A → B | Worker A 同机 |
-| `get_remote_direct` | remoteClient (RPC) | remoteClient (RPC) | 无 | 任意 |
+| `get_remote_direct` | remoteClient (RPC/SD) | remoteClient (RPC/SD) | 无 | 任意 |
 | `get_remote_cross` | localClient (SHM) | remoteClient (RPC) | B → A | Worker A 同机 |
 | `mixed_local_set_get` | localClient (SD) | localClient (SD) | 无 | Worker A 同机 |
 | `mixed_remote_set_get` | remoteClient (direct) | remoteClient (direct) | 无 | 任意 |
@@ -231,7 +233,7 @@ Benchmark 模式通过 ServiceDiscovery 连接 etcd 发现 Worker。以下参数
 | `round_cleanup_wait_ms` | int | 3000 | `del` 清理后、下一轮开始前的等待时间（毫秒），0 = 不等待；等待不超过剩余运行时长 |
 | `set_api` | string | "string_view" | Set API 路径：`"string_view"` / `"create_buffer"` / `"create_buffer_raw"`（MSet/MGet 模式忽略） |
 | `cleanup_method` | string | "del" | 清理方式：`"del"`（每轮删除）或 `"ttl"`（TTL 过期） |
-| `remote_worker.host` | string | "" | 远端 Worker 地址，见下方说明 |
+| `remote_worker.host` | string | "" | 远端 Worker 地址；`get_remote_direct` 留空时使用 ServiceDiscovery |
 | `remote_worker.port` | int | 31501 | 远端 Worker 端口 |
 | `set_ratio` | float | 0.5 | Set 操作比例 (0.0, 1.0)，仅 mixed 模式。0.7 = 70% 线程做 Set。必须保证至少 1 个 Get 线程 |
 | `mixed_key_strategy` | string | "same_keys" | Key 策略：`"same_keys"` / `"read_prev"` / `"independent"`，仅 mixed 模式。非法值会被拒绝 |
@@ -243,21 +245,24 @@ Benchmark 模式通过 ServiceDiscovery 连接 etcd 发现 Worker。以下参数
 ### remote_worker 说明
 
 `remote_worker` 用于直连指定 Worker，**绕过 ServiceDiscovery**。kvtest 会用 `host:port` 直接创建 KVClient，不经过 etcd 发现。
+`get_remote_direct` 是例外：配置 `remote_worker.host` 时保持固定地址直连；省略时，Set 和 Get 复用通过
+ServiceDiscovery 创建的 KVClient。ServiceDiscovery 的选址遵循 `host_id_env_name` 对应的 Host ID 和 SDK
+默认亲和策略。
 
-**需要 remote_worker 的模式（8 种）：**
+**需要 remote_worker 的模式（7 种）：**
 
 | 模式 | Set 执行方 | Get 执行方 | remote_worker 用途 |
 |------|-----------|-----------|-------------------|
 | `set_remote` | remoteClient（直连） | — | Set 写入远端 Worker |
 | `mset_remote` | remoteClient（直连） | — | MSet 批量写入远端 Worker |
 | `get_cross_node` | remoteClient（直连） | localClient（SD） | Set 写入远端，Get 从本地 Worker 读（触发跨节点拉取） |
-| `get_remote_direct` | remoteClient（直连） | remoteClient（直连） | Set+Get 都在远端 Worker 本地完成 |
 | `get_remote_cross` | localClient（SD） | remoteClient（直连） | Set 写入本地，Get 从远端 Worker 读（触发跨节点拉取） |
 | `mget_cross_node` | remoteClient（直连） | localClient（SD） | MSet 写入远端，MGet 从本地 Worker 读（触发跨节点拉取） |
 | `mget_remote_direct` | remoteClient（直连） | remoteClient（直连） | MSet+MGet 都在远端 Worker 本地完成 |
 | `mget_remote_cross` | localClient（SD） | remoteClient（直连） | MSet 写入本地，MGet 从远端 Worker 读（触发跨节点拉取） |
 
-**不需要 remote_worker 的模式：** `set_local`、`get_local`——只使用 localClient（通过 ServiceDiscovery 发现本机 Worker）。
+**不需要 remote_worker 的模式：** `set_local`、`get_local` 只使用 localClient；`get_remote_direct` 可选择
+省略 `remote_worker.host` 并使用 ServiceDiscovery。
 
 **填写要求：** `host` 必须是 Worker 的实际监听地址（etcd 中注册的地址），不是宿主机外网 IP。可用 `etcdctl get "" --prefix` 查看：
 
@@ -649,4 +654,5 @@ export HOST_IP=192.168.x.x   # 与 etcd 中 key 的 IP 部分一致
 
 **3. kvtest 和 Worker 不在同一台机器上**
 
-`set_local` / `get_local` / `get_cross_node` 模式要求 kvtest 和 Worker 在同一台机器上（走 SHM 通道）。如果不在同一台机器，改用 `set_remote` / `get_remote_direct` 模式，通过 `remote_worker` 直连远端 Worker。
+`set_local` / `get_local` / `get_cross_node` 模式要求 kvtest 和 Worker 在同一台机器上（走 SHM 通道）。如果不在
+同一台机器，改用 `set_remote`，或使用 `get_remote_direct` 通过 `remote_worker` 直连或 ServiceDiscovery 选址。
