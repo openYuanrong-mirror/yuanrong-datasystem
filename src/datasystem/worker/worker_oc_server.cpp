@@ -2505,7 +2505,7 @@ Status WorkerOCServer::InitClusterRuntimeAndServices()
     }
 
     metadataManagerHolder_ = std::make_unique<MetadataManagerHolder>();
-    resourceManager_ = std::make_unique<master::ResourceManager>();
+    resourceManager_ = std::make_unique<master::ResourceManager>(hostPort_.ToString());
 
     RETURN_IF_NOT_OK(InitCoordinationBackend());
 

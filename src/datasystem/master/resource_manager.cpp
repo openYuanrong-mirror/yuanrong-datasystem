@@ -30,6 +30,7 @@
 #include "datasystem/common/log/log.h"
 #include "datasystem/common/object_cache/eviction_policy_common.h"
 #include "datasystem/common/util/hash_algorithm.h"
+#include "datasystem/common/util/rpc_util.h"
 #include "datasystem/common/util/timer.h"
 
 DS_DECLARE_uint32(node_dead_timeout_s);
@@ -40,6 +41,12 @@ namespace {
 constexpr uint32_t FULL_COHORT_PERCENT = 100;
 
 constexpr uint64_t SNAPSHOT_CLEAR_MIN_S = 60;
+
+bool IsDeferredRolloutLoadStatus(const Status &status)
+{
+    return status.GetCode() == K_NOT_READY || status.GetCode() == K_TRY_AGAIN || IsRetryableRpcError(status)
+           || IsNonRetryableRpcError(status);
+}
 
 master::EvictionPolicyWorkerProgressPb BuildEvictionPolicyWorkerProgress(const master::WorkerStat &stat)
 {
@@ -145,7 +152,7 @@ void FillWorkerStat(const NodeInfo &nodeInfo, master::WorkerStat &stat)
 }
 }  // namespace
 
-ResourceManager::ResourceManager()
+ResourceManager::ResourceManager(std::string refreshIdentity) : refreshIdentity_(std::move(refreshIdentity))
 {
     rebalanceScheduler_ = GetRebalanceStrategy() == "heat"
                               ? std::unique_ptr<RebalanceScheduler>(std::make_unique<HeatRebalanceScheduler>())
@@ -175,6 +182,10 @@ void ResourceManager::SetTopologyMembership(const cluster::MembershipEndpointVie
 
 Status ResourceManager::ReportResource(const master::ResourceReportReqPb &req, master::ResourceReportRspPb &rsp)
 {
+    CHECK_FAIL_RETURN_STATUS(
+        evictionPolicyRolloutStoreState_.load(std::memory_order_acquire)
+            != EvictionPolicyRolloutStoreState::LOADING,
+        K_NOT_READY, "Eviction policy rollout is still loading");
     const auto currentTimestamp = GetSteadyClockTimeStampMs();
     const std::string address = req.stat().address();
     CHECK_FAIL_RETURN_STATUS(!address.empty(), K_INVALID, "The address can not be empty");
@@ -278,6 +289,7 @@ Status ResourceManager::SetEvictionPolicyUpdate(const master::EvictionPolicyUpda
     };
     RETURN_IF_NOT_OK(cas(process));
     RETURN_IF_NOT_OK(ApplyEvictionPolicyRollout(committed));
+    evictionPolicyRolloutStoreState_.store(EvictionPolicyRolloutStoreState::READY, std::memory_order_release);
     LOG(INFO) << "Committed eviction policy rollout epoch=" << committed.update().epoch()
               << " target=" << committed.update().target_policy() << " command=" << committed.update().command()
               << " cohort_percent=" << committed.cohort_percent();
@@ -287,6 +299,10 @@ Status ResourceManager::SetEvictionPolicyUpdate(const master::EvictionPolicyUpda
 Status ResourceManager::GetEvictionPolicyUpdateProgress(uint64_t epoch,
                                                         master::GetEvictionPolicyUpdateProgressRspPb &rsp)
 {
+    CHECK_FAIL_RETURN_STATUS(
+        evictionPolicyRolloutStoreState_.load(std::memory_order_acquire)
+            != EvictionPolicyRolloutStoreState::LOADING,
+        K_NOT_READY, "Eviction policy rollout is still loading");
     std::shared_ptr<const master::EvictionPolicyRolloutPb> rollout;
     std::vector<std::pair<std::string, master::EvictionPolicyWorkerProgressPb>> progress;
     {
@@ -342,8 +358,13 @@ Status ResourceManager::InitEvictionPolicyRolloutStore(RolloutLoader loader, Rol
                                  K_INVALID, "Eviction policy rollout store is already initialized");
         evictionPolicyRolloutLoader_ = std::move(loader);
         evictionPolicyRolloutCas_ = std::move(cas);
+        evictionPolicyRolloutStoreState_.store(EvictionPolicyRolloutStoreState::LOADING, std::memory_order_release);
     }
-    RETURN_IF_NOT_OK(RefreshEvictionPolicyRollout());
+    auto rc = RefreshEvictionPolicyRollout();
+    if (rc.IsOk() || !IsDeferredRolloutLoadStatus(rc)) {
+        return rc;
+    }
+    LOG(WARNING) << "Initial eviction policy rollout load deferred: " << rc.ToString();
     return Status::OK();
 }
 
@@ -358,13 +379,16 @@ Status ResourceManager::RefreshEvictionPolicyRollout()
     std::string serialized;
     auto rc = loader(serialized);
     if (rc.GetCode() == K_NOT_FOUND) {
+        evictionPolicyRolloutStoreState_.store(EvictionPolicyRolloutStoreState::READY, std::memory_order_release);
         return Status::OK();
     }
     RETURN_IF_NOT_OK(rc);
     master::EvictionPolicyRolloutPb rollout;
     CHECK_FAIL_RETURN_STATUS(rollout.ParseFromString(serialized), K_INVALID,
                              "Persisted eviction policy rollout is malformed");
-    return ApplyEvictionPolicyRollout(rollout);
+    RETURN_IF_NOT_OK(ApplyEvictionPolicyRollout(rollout));
+    evictionPolicyRolloutStoreState_.store(EvictionPolicyRolloutStoreState::READY, std::memory_order_release);
+    return Status::OK();
 }
 
 Status ResourceManager::ApplyEvictionPolicyRollout(const master::EvictionPolicyRolloutPb &rollout)
@@ -419,6 +443,10 @@ void ResourceManager::WorkerThread()
     int switchClearRatio = 3;
     int64_t intervalMs = WORKER_THREAD_INTERVAL_MS;
     INJECT_POINT_NO_RETURN("ResourceManager.setInterval", [&intervalMs](int64_t interval) { intervalMs = interval; });
+    int64_t nextWaitMs = intervalMs;
+    if (!refreshIdentity_.empty() && intervalMs > 0) {
+        nextWaitMs = static_cast<int64_t>(MurmurHash3_32(refreshIdentity_)) % intervalMs;
+    }
     while (running_) {
         auto refreshStatus = RefreshEvictionPolicyRollout();
         if (refreshStatus.IsError() && refreshStatus.GetCode() != K_NOT_READY) {
@@ -439,7 +467,8 @@ void ResourceManager::WorkerThread()
         if (!running_.load()) {
             break;
         }
-        (void)taskCv_.wait_for(lock, std::chrono::milliseconds(intervalMs), [this]() { return !running_.load(); });
+        (void)taskCv_.wait_for(lock, std::chrono::milliseconds(nextWaitMs), [this]() { return !running_.load(); });
+        nextWaitMs = intervalMs;
     }
 }
 

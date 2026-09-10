@@ -20,6 +20,7 @@
 
 #include "datasystem/master/resource_manager.h"
 
+#include <array>
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -30,6 +31,7 @@
 #include <gtest/gtest.h>
 
 #include "datasystem/common/flags/common_flags.h"
+#include "datasystem/common/inject/inject_point.h"
 #include "datasystem/common/object_cache/eviction_policy_common.h"
 #include "ut/common.h"
 
@@ -120,6 +122,7 @@ public:
 
     void TearDown() override
     {
+        (void)inject::Clear("ResourceManager.setInterval");
         FLAGS_enable_memory_rebalance = oldEnableMemoryRebalance_;
         CommonTest::TearDown();
     }
@@ -149,6 +152,165 @@ TEST_F(ResourceManagerPolicyRolloutTest, PersistBeforePublishingAndRecoverAfterR
     DS_ASSERT_OK(restarted.ReportResource(MakeReport("127.0.0.1:9002"), rsp));
     ASSERT_TRUE(rsp.has_eviction_policy_update());
     EXPECT_EQ(rsp.eviction_policy_update().epoch(), 7);
+}
+
+class ResourceManagerDeferredRolloutTest : public ResourceManagerPolicyRolloutTest,
+                                         public ::testing::WithParamInterface<StatusCode> {};
+
+TEST_P(ResourceManagerDeferredRolloutTest, RecoversPersistedRolloutOnBackgroundRefresh)
+{
+    master::EvictionPolicyRolloutPb rollout;
+    auto *update = rollout.mutable_update();
+    update->set_epoch(8);
+    update->set_target_policy(master::EVICTION_POLICY_HEAT);
+    update->set_migration_batch_size(64);
+    update->set_command(master::EVICTION_POLICY_COMMIT_CONVERT);
+    rollout.set_cohort_percent(100);
+    std::string serialized;
+    ASSERT_TRUE(rollout.SerializeToString(&serialized));
+
+    std::atomic<bool> storeAvailable{ false };
+    DS_ASSERT_OK(inject::Set("ResourceManager.setInterval", "call(20)"));
+    master::ResourceManager manager("127.0.0.1:9008");
+    const auto initialStatus = GetParam();
+    DS_ASSERT_OK(manager.InitEvictionPolicyRolloutStore(
+        [&storeAvailable, &serialized, initialStatus](std::string &value) {
+            if (!storeAvailable.load(std::memory_order_acquire)) {
+                return Status(initialStatus, "injected Coordinator startup read failure");
+            }
+            value = serialized;
+            return Status::OK();
+        },
+        [](const master::ResourceManager::StoreProcessFunction &) { return Status::OK(); }));
+
+    master::ResourceReportRspPb rsp;
+    EXPECT_EQ(manager.ReportResource(MakeReport("127.0.0.1:9008"), rsp).GetCode(), K_NOT_READY);
+    master::GetEvictionPolicyUpdateProgressRspPb progress;
+    EXPECT_EQ(manager.GetEvictionPolicyUpdateProgress(0, progress).GetCode(), K_NOT_READY);
+
+    storeAvailable.store(true, std::memory_order_release);
+    Status reportStatus;
+    for (size_t attempt = 0; attempt < 100; ++attempt) {
+        reportStatus = manager.ReportResource(MakeReport("127.0.0.1:9008"), rsp);
+        if (reportStatus.IsOk()) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    DS_ASSERT_OK(reportStatus);
+    ASSERT_TRUE(rsp.has_eviction_policy_update());
+    EXPECT_EQ(rsp.eviction_policy_update().epoch(), 8);
+    EXPECT_EQ(rsp.eviction_policy_update().target_policy(), master::EVICTION_POLICY_HEAT);
+    DS_ASSERT_OK(manager.GetEvictionPolicyUpdateProgress(8, progress));
+}
+
+TEST_P(ResourceManagerDeferredRolloutTest, RecoversAbsentRolloutOnBackgroundRefresh)
+{
+    std::atomic<bool> storeAvailable{ false };
+    DS_ASSERT_OK(inject::Set("ResourceManager.setInterval", "call(20)"));
+    master::ResourceManager manager("127.0.0.1:9008");
+    const auto initialStatus = GetParam();
+    DS_ASSERT_OK(manager.InitEvictionPolicyRolloutStore(
+        [&storeAvailable, initialStatus](std::string &) {
+            return storeAvailable.load(std::memory_order_acquire)
+                       ? Status(K_NOT_FOUND, "rollout is absent")
+                       : Status(initialStatus, "injected Coordinator startup read failure");
+        },
+        [](const master::ResourceManager::StoreProcessFunction &) { return Status::OK(); }));
+
+    master::ResourceReportRspPb rsp;
+    EXPECT_EQ(manager.ReportResource(MakeReport("127.0.0.1:9008"), rsp).GetCode(), K_NOT_READY);
+    master::GetEvictionPolicyUpdateProgressRspPb progress;
+    EXPECT_EQ(manager.GetEvictionPolicyUpdateProgress(0, progress).GetCode(), K_NOT_READY);
+
+    storeAvailable.store(true, std::memory_order_release);
+    Status reportStatus;
+    for (size_t attempt = 0; attempt < 100; ++attempt) {
+        reportStatus = manager.ReportResource(MakeReport("127.0.0.1:9008"), rsp);
+        if (reportStatus.IsOk()) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    DS_ASSERT_OK(reportStatus);
+    EXPECT_FALSE(rsp.has_eviction_policy_update());
+    EXPECT_EQ(manager.GetEvictionPolicyUpdateProgress(0, progress).GetCode(), K_NOT_FOUND);
+}
+
+INSTANTIATE_TEST_SUITE_P(StartupReadFailures, ResourceManagerDeferredRolloutTest,
+                         ::testing::Values(K_NOT_READY, K_RPC_DEADLINE_EXCEEDED));
+
+TEST_F(ResourceManagerPolicyRolloutTest, DefersSupportedTransientInitialLoadStatuses)
+{
+    constexpr std::array<StatusCode, 8> deferredCodes{
+        K_NOT_READY,
+        K_TRY_AGAIN,
+        K_RPC_CANCELLED,
+        K_RPC_DEADLINE_EXCEEDED,
+        K_RPC_UNAVAILABLE,
+        K_RPC_NETWORK_BLIP,
+        K_URMA_WAIT_TIMEOUT,
+        K_RPC_PEER_DEAD,
+    };
+    for (const auto code : deferredCodes) {
+        SCOPED_TRACE(Status::StatusCodeName(code));
+        master::ResourceManager manager;
+        DS_ASSERT_OK(manager.InitEvictionPolicyRolloutStore(
+            [code](std::string &) { return Status(code, "injected transient load failure"); },
+            [](const master::ResourceManager::StoreProcessFunction &) { return Status::OK(); }));
+
+        master::ResourceReportRspPb rsp;
+        EXPECT_EQ(manager.ReportResource(MakeReport("127.0.0.1:9010"), rsp).GetCode(), K_NOT_READY);
+    }
+}
+
+TEST_F(ResourceManagerPolicyRolloutTest, DeferredLoadStaysNotReadyUntilStoreStateIsConfirmed)
+{
+    std::atomic<StatusCode> loadStatus{ K_RPC_DEADLINE_EXCEEDED };
+    master::ResourceManager manager;
+    DS_ASSERT_OK(manager.InitEvictionPolicyRolloutStore(
+        [&loadStatus](std::string &value) {
+            const auto code = loadStatus.load(std::memory_order_acquire);
+            value = "malformed";
+            return Status(code, "injected rollout read result");
+        },
+        [](const master::ResourceManager::StoreProcessFunction &) { return Status::OK(); }));
+
+    for (const auto code : { K_RPC_DEADLINE_EXCEEDED, K_KVSTORE_ERROR, K_OK }) {
+        SCOPED_TRACE(Status::StatusCodeName(code));
+        loadStatus.store(code, std::memory_order_release);
+        const auto expected = code == K_OK ? K_INVALID : code;
+        EXPECT_EQ(manager.RefreshEvictionPolicyRolloutForTest().GetCode(), expected);
+        master::ResourceReportRspPb rsp;
+        EXPECT_EQ(manager.ReportResource(MakeReport("127.0.0.1:9010"), rsp).GetCode(), K_NOT_READY);
+        master::GetEvictionPolicyUpdateProgressRspPb progress;
+        EXPECT_EQ(manager.GetEvictionPolicyUpdateProgress(0, progress).GetCode(), K_NOT_READY);
+    }
+}
+
+TEST_F(ResourceManagerPolicyRolloutTest, RejectsNonTransientInitialLoadStatus)
+{
+    master::ResourceManager manager;
+    const auto status = manager.InitEvictionPolicyRolloutStore(
+        [](std::string &) { return Status(K_KVSTORE_ERROR, "injected persistent store failure"); },
+        [](const master::ResourceManager::StoreProcessFunction &) { return Status::OK(); });
+
+    EXPECT_EQ(status.GetCode(), K_KVSTORE_ERROR);
+}
+
+TEST_F(ResourceManagerPolicyRolloutTest, RejectsMalformedInitialRollout)
+{
+    master::ResourceManager manager;
+    EXPECT_EQ(
+        manager
+            .InitEvictionPolicyRolloutStore(
+                [](std::string &value) {
+                    value = "malformed";
+                    return Status::OK();
+                },
+                [](const master::ResourceManager::StoreProcessFunction &) { return Status::OK(); })
+            .GetCode(),
+        K_INVALID);
 }
 
 TEST_F(ResourceManagerPolicyRolloutTest, IndependentMasterRefreshesSharedIntent)
