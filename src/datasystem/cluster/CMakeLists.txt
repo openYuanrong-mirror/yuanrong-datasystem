@@ -1,3 +1,8 @@
+add_library(remote_ub_port_health_verifier STATIC
+        ub_health/remote_ub_port_health_verifier.cpp)
+target_include_directories(remote_ub_port_health_verifier PUBLIC ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(remote_ub_port_health_verifier PUBLIC common_buffer common_log)
+
 add_library(cluster_membership_codec STATIC
         membership/membership_value_codec.cpp)
 target_include_directories(cluster_membership_codec PUBLIC ${PROJECT_SOURCE_DIR}/src)

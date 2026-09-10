@@ -21,6 +21,8 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -31,11 +33,14 @@
 #include <vector>
 
 #include "datasystem/common/object_cache/ub_failure_classifier.h"
+#include "datasystem/common/object_cache/ub_port_health.h"
 #include "datasystem/common/rdma/fast_transport_base.h"
 
 namespace datasystem {
 
 enum class UbAdmissionState { AVAILABLE, SUSPECT, UNAVAILABLE, PROBING };
+
+enum class UbPortHealthVerificationMode : uint8_t { LEGACY = 0, VERIFIED_PORT_HEALTH = 1 };
 
 struct UbPathState {
     UbAdmissionState state = UbAdmissionState::AVAILABLE;
@@ -47,6 +52,9 @@ struct UbPathState {
     bool probeInFlight = false;
     std::optional<int> providerStatus;
     std::optional<int> cqeStatus;
+    std::optional<UbPortHealthSummary> portHealth;
+    // True only while a confirmed all-down fact owns node-level isolation.
+    bool portHealthGoverned = false;
 };
 
 struct UbHealthSummary {
@@ -59,12 +67,64 @@ struct UbHealthSummary {
     uint64_t epoch = 0;
     uint32_t backoffLevel = 0;
     uint64_t backoffDeadlineMs = 0;
+    // Absence means an old peer or no observation. A present invalid summary is an explicit UNKNOWN from a new peer.
+    // Neither form alone is isolation or recovery evidence.
+    std::optional<UbPortHealthSummary> portHealth;
 };
+
+inline bool IsSameUbHealthSummary(const UbHealthSummary &lhs, const UbHealthSummary &rhs)
+{
+    return lhs.worker == rhs.worker && lhs.incarnation == rhs.incarnation && lhs.writable == rhs.writable
+           && lhs.state == rhs.state && lhs.reason == rhs.reason && lhs.lastStatusCode == rhs.lastStatusCode
+           && lhs.epoch == rhs.epoch && lhs.backoffLevel == rhs.backoffLevel
+           && lhs.backoffDeadlineMs == rhs.backoffDeadlineMs && IsSameUbPortHealth(lhs.portHealth, rhs.portHealth);
+}
+
+bool MergeUbPortHealth(const std::optional<UbPortHealthSummary> &current,
+                       const std::optional<UbPortHealthSummary> &incoming,
+                       std::optional<UbPortHealthSummary> &merged);
+bool MergeUbHealthSummary(const UbHealthSummary *current, const UbHealthSummary &incoming,
+                          UbHealthSummary &merged);
 
 struct UbProbeToken {
     HostPort peer{ "", -1 };
     uint64_t epoch = 0;
 };
+
+// Callers serialize these scheduling operations with their existing state lock; evidence policy stays with the owner.
+inline bool TryBeginUbProbe(uint64_t nowMs, uint64_t dueMs, bool &inFlight, uint64_t &generation)
+{
+    if (inFlight || nowMs < dueMs) {
+        return false;
+    }
+    inFlight = true;
+    ++generation;
+    return true;
+}
+
+inline bool MatchesUbProbe(bool inFlight, uint64_t generation, uint64_t token)
+{
+    return inFlight && generation == token;
+}
+
+inline uint64_t UbProbeRetryAt(uint64_t nowMs, uint64_t delayMs)
+{
+    return nowMs > std::numeric_limits<uint64_t>::max() - delayMs
+               ? std::numeric_limits<uint64_t>::max() : nowMs + delayMs;
+}
+
+template <typename States, typename Deadline>
+std::optional<uint64_t> NextUbProbeDeadline(const States &states, const Deadline &getDeadline)
+{
+    std::optional<uint64_t> next;
+    for (const auto &entry : states) {
+        auto due = getDeadline(entry);
+        if (due.has_value() && (!next.has_value() || *due < *next)) {
+            next = due;
+        }
+    }
+    return next;
+}
 
 struct PeerUbAdmissionStats {
     size_t localStates = 0;
@@ -78,6 +138,28 @@ struct PeerUbAdmissionStats {
 
 class UbHealthSummaryCache {
 public:
+    // Copyable state for owners that already publish immutable snapshots. Mutation is serialized by the owner.
+    class Snapshot {
+    public:
+        ~Snapshot() = default;
+
+        bool Prepare(const UbHealthSummary &summary, const std::string &expectedIncarnation,
+                     UbHealthSummary &accepted) const;
+        bool Apply(const UbHealthSummary &summary, const std::string &expectedIncarnation);
+        const UbHealthSummary *Find(const HostPort &worker) const;
+        void Retire(const HostPort &worker, const std::string &incarnation);
+        void ReconcileWorkers(const std::unordered_set<HostPort> &workers);
+        size_t Size() const
+        {
+            return summaries_.size();
+        }
+
+    private:
+        static constexpr size_t MAX_RETIRED_INCARNATIONS_PER_WORKER = 8;
+        std::unordered_map<HostPort, UbHealthSummary> summaries_;
+        std::unordered_map<HostPort, std::unordered_set<std::string>> retiredIncarnations_;
+    };
+
     UbHealthSummaryCache() = default;
     ~UbHealthSummaryCache() = default;
 
@@ -87,23 +169,50 @@ public:
     size_t Size() const;
 
 private:
-    static constexpr size_t MAX_RETIRED_INCARNATIONS_PER_WORKER = 8;
-
     mutable std::shared_mutex mutex_;
-    std::unordered_map<HostPort, UbHealthSummary> summaries_;
-    std::unordered_map<HostPort, std::unordered_set<std::string>> retiredIncarnations_;
+    Snapshot state_;
 };
 
 class PeerUbAdmission : public UrmaLateCompletionObserver,
                         public std::enable_shared_from_this<PeerUbAdmission> {
 public:
-    PeerUbAdmission() = default;
+    using RemotePortHealthVerificationTrigger = std::function<void(const HostPort &)>;
+    using RemotePortHealthSummaryObserver = std::function<void(const UbHealthSummary &)>;
+
+    explicit PeerUbAdmission(
+        UbPortHealthVerificationMode verificationMode = UbPortHealthVerificationMode::LEGACY)
+        : verificationMode_(verificationMode)
+    {
+    }
     ~PeerUbAdmission() override = default;
 
     Status CheckWriteTarget(const HostPort &peer, UbOperationKind op) const;
     Status CheckReadSource(const HostPort &peer) const;
     void ReportOutcome(const UbOpOutcome &outcome);
+
+    void SetRemotePortHealthCapability(const HostPort &peer, bool enabled,
+                                       const std::string &incarnation = {});
+    void ReconcileRemotePortHealthCapabilities(
+        const std::unordered_map<HostPort, std::string> &incarnations);
+    void SetRemotePortHealthVerificationTrigger(RemotePortHealthVerificationTrigger trigger);
+    void SetRemotePortHealthSummaryObserver(RemotePortHealthSummaryObserver observer);
+    void ObserveRemotePortHealthSummary(const UbHealthSummary &summary);
+
+    /**
+     * Apply one valid aggregate port-health fact. Self admission accepts local monitor facts; remote admission accepts
+     * only QUERY_RESPONSE evidence. UNKNOWN and invalid inputs are ignored; pending self observations update the
+     * published health view without changing admission, and remote PASSIVE_SUMMARY inputs never change admission.
+     * Query callers must fence remote responses by the expected Worker incarnation before invoking this method.
+     * @return true when a newer port-health fact was accepted.
+     */
+    bool ApplyPortHealth(const HostPort &subject, const UbPortHealthSummary &summary,
+                         UbPortHealthEvidenceSource source);
+
     void SetSelfWorker(const HostPort &self);
+    /** Enable E4/E9 port verification after a usable Provider has been bound. This transition is one-way. */
+    void EnableVerifiedPortHealth();
+    /** Install the non-blocking self E4 refresh hook. The callback is invoked outside the admission lock. */
+    void SetSelfPortHealthRefreshTrigger(std::function<void()> trigger);
     void ReplaceGlobalSummaries(const std::vector<UbHealthSummary> &summaries);
     void InitializeVerification(const HostPort &peer, uint64_t nowMs);
     std::optional<UbProbeToken> TryBeginProbe(const HostPort &peer, uint64_t nowMs);
@@ -152,9 +261,22 @@ private:
     void RetireWorkerLocked(const HostPort &worker, uint64_t nowMs, uint64_t tombstoneTtlMs);
     void PruneTombstonesLocked(uint64_t nowMs);
     void ReportOutcomeImpl(const UbOpOutcome &outcome, std::optional<LateCompletionFence> fence);
+    bool PrepareOutcomeTransition(
+        const UbOpOutcome &outcome, UbFailureClass failureClass,
+        const std::optional<LateCompletionFence> &fence, bool &changed,
+        UbAdmissionState &nextState, std::function<void()> &selfPortHealthRefreshTrigger,
+        std::shared_ptr<const RemotePortHealthVerificationTrigger> &remoteVerificationTrigger);
     bool IsLateCompletionFenceCurrentLocked(const HostPort &peer, const LateCompletionFence &fence) const;
     bool UpdatePathStateLocked(const UbOpOutcome &outcome, UbFailureClass failureClass,
                                UbAdmissionState nextState);
+    bool RecordPortVerificationTriggerLocked(const UbOpOutcome &outcome, UbFailureClass failureClass);
+    bool ApplyPortHealthFactLocked(const HostPort &subject, UbPathState &state, const UbPortHealthSummary &summary,
+                                   UbAdmissionState nextState);
+    bool IsApplicablePortHealth(const HostPort &subject, const UbPortHealthSummary &summary,
+                                UbPortHealthEvidenceSource source) const;
+    bool UsesVerifiedPortHealth() const;
+    bool IsPortHealthManagedState(const HostPort &subject, const UbPathState &state) const;
+    bool HasRemotePortHealthCapabilityLocked(const HostPort &peer) const;
     uint64_t GetOrCreatePeerCompletionGenerationLocked(const HostPort &peer);
     void AdvancePeerCompletionGenerationLocked(const HostPort &peer);
 
@@ -170,7 +292,12 @@ private:
     bool topologyInitialized_ = false;
     UbFailureClassifier classifier_;
     HostPort self_;
+    std::atomic<UbPortHealthVerificationMode> verificationMode_;
+    std::function<void()> selfPortHealthRefreshTrigger_;
     std::atomic<uint64_t> lateCompletionGeneration_{ 0 };
+    std::unordered_map<HostPort, std::string> remotePortHealthPeers_;
+    std::shared_ptr<const RemotePortHealthVerificationTrigger> remotePortHealthVerificationTrigger_;
+    std::shared_ptr<const RemotePortHealthSummaryObserver> remotePortHealthSummaryObserver_;
     std::unordered_map<HostPort, uint64_t> peerCompletionGenerations_;
     uint64_t nextPeerCompletionGeneration_{ 0 };
 };

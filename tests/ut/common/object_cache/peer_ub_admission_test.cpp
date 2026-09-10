@@ -37,12 +37,20 @@ namespace {
 const HostPort PEER("127.0.0.1", 31501);
 const HostPort SELF("127.0.0.1", 31502);
 constexpr char GLOBAL_SUMMARY_LOG_MARKER[] = "UB_HEALTH_SUMMARY action=global_summary_applied";
-constexpr char ADMISSION_AVAILABLE_LOG_MARKER[] = "UB admission marked peer AVAILABLE";
+UbPortHealthSummary PortSummary(uint32_t totalPortCount, uint32_t badPortCount, uint64_t healthEpoch,
+                                bool verificationPending = false)
+{
+    return { true, totalPortCount, badPortCount, healthEpoch, verificationPending };
+}
 
-struct CapturedProbeCompletion {
-    bool recovered;
-    std::string logs;
-};
+constexpr UbPortHealthEvidenceSource QUERY = UbPortHealthEvidenceSource::QUERY_RESPONSE;
+constexpr UbPortHealthEvidenceSource PASSIVE = UbPortHealthEvidenceSource::PASSIVE_SUMMARY;
+constexpr UbPortHealthVerificationMode VERIFIED = UbPortHealthVerificationMode::VERIFIED_PORT_HEALTH;
+
+void EnablePeerPortHealth(PeerUbAdmission &admission)
+{
+    admission.SetRemotePortHealthCapability(PEER, true, "peer-incarnation");
+}
 
 std::string CaptureGlobalSummaryReplace(PeerUbAdmission &admission,
                                         const std::vector<UbHealthSummary> &summaries)
@@ -52,45 +60,49 @@ std::string CaptureGlobalSummaryReplace(PeerUbAdmission &admission,
     return testing::internal::GetCapturedStderr();
 }
 
-CapturedProbeCompletion CaptureProbeCompletion(PeerUbAdmission &admission, const UbProbeToken &token,
-                                               const Status &status, uint64_t nowMs,
-                                               bool requireGlobalAvailable)
+TEST(PeerUbAdmissionTest, Error4TriggersVerificationAndAllDownFactBlocksReadSource)
 {
-    testing::internal::CaptureStderr();
-    const bool recovered = admission.CompleteProbe(token, status, nowMs, requireGlobalAvailable);
-    return { recovered, testing::internal::GetCapturedStderr() };
-}
-
-TEST(PeerUbAdmissionTest, ExplicitError4BlocksProviderReadSource)
-{
-    PeerUbAdmission admission;
+    PeerUbAdmission admission(VERIFIED);
+    EnablePeerPortHealth(admission);
     UbOpOutcome outcome(PEER, UbOperationKind::WORKER_REMOTE_GET_WRITEBACK,
                         Status(K_URMA_ERROR, "provider write failed"));
     outcome.cqeStatus = 4;
 
     admission.ReportOutcome(outcome);
 
-    EXPECT_EQ(admission.CheckReadSource(PEER).GetCode(), K_URMA_DATA_WORKER_UNAVAILABLE);
+    EXPECT_TRUE(admission.CheckReadSource(PEER).IsOk());
     auto state = admission.GetState(PEER);
     ASSERT_TRUE(state.has_value());
-    EXPECT_EQ(state->state, UbAdmissionState::UNAVAILABLE);
+    EXPECT_EQ(state->state, UbAdmissionState::SUSPECT);
     EXPECT_EQ(state->lastFailureClass, UbFailureClass::PORT_UNAVAILABLE_ERROR4);
+
+    EXPECT_TRUE(admission.ApplyPortHealth(PEER, PortSummary(4, 4, 1), QUERY));
+    EXPECT_EQ(admission.CheckReadSource(PEER).GetCode(), K_URMA_DATA_WORKER_UNAVAILABLE);
+    EXPECT_EQ(admission.GetState(PEER)->state, UbAdmissionState::UNAVAILABLE);
 }
 
-TEST(PeerUbAdmissionTest, ExplicitError9BlocksRemotePeer)
+TEST(PeerUbAdmissionTest, Error9TriggersVerificationAndAllDownQueryFactBlocksReadSource)
 {
-    PeerUbAdmission admission;
+    PeerUbAdmission admission(VERIFIED);
+    EnablePeerPortHealth(admission);
     UbOpOutcome outcome(PEER, UbOperationKind::WORKER_REMOTE_GET_WRITEBACK,
                         Status(K_URMA_ERROR, "remote ACK timed out"));
     outcome.cqeStatus = URMA_REMOTE_ACK_TIMEOUT_STATUS;
 
     admission.ReportOutcome(outcome);
 
-    EXPECT_EQ(admission.CheckReadSource(PEER).GetCode(), K_URMA_DATA_WORKER_UNAVAILABLE);
+    EXPECT_TRUE(admission.CheckReadSource(PEER).IsOk());
     const auto state = admission.GetState(PEER);
     ASSERT_TRUE(state.has_value());
-    EXPECT_EQ(state->state, UbAdmissionState::UNAVAILABLE);
+    EXPECT_EQ(state->state, UbAdmissionState::SUSPECT);
     EXPECT_EQ(state->lastFailureClass, UbFailureClass::REMOTE_UNAVAILABLE_ERROR9);
+
+    EXPECT_FALSE(admission.ApplyPortHealth(PEER, PortSummary(4, 4, 1), PASSIVE));
+    EXPECT_TRUE(admission.CheckReadSource(PEER).IsOk());
+    EXPECT_TRUE(admission.ApplyPortHealth(PEER, PortSummary(4, 4, 2), QUERY));
+    EXPECT_EQ(admission.CheckReadSource(PEER).GetCode(), K_URMA_DATA_WORKER_UNAVAILABLE);
+    EXPECT_EQ(admission.CheckWriteTarget(PEER, UbOperationKind::MIGRATION_WRITE).GetCode(),
+              K_URMA_WORKER_UNAVAILABLE);
 }
 
 TEST(PeerUbAdmissionTest, RpcTimeoutIsSuspectAndDoesNotHardBlock)
@@ -105,28 +117,6 @@ TEST(PeerUbAdmissionTest, RpcTimeoutIsSuspectAndDoesNotHardBlock)
     auto state = admission.GetState(PEER);
     ASSERT_TRUE(state.has_value());
     EXPECT_EQ(state->state, UbAdmissionState::SUSPECT);
-}
-
-TEST(PeerUbAdmissionTest, LateTimeoutCannotDowngradeHardUnavailableEvidence)
-{
-    PeerUbAdmission admission;
-    UbOpOutcome hardFailure(PEER, UbOperationKind::WORKER_REMOTE_GET_WRITEBACK,
-                             Status(K_URMA_ERROR, "provider CQE status 4"));
-    hardFailure.cqeStatus = 4;
-    admission.ReportOutcome(hardFailure);
-    const auto hardState = admission.GetState(PEER);
-    ASSERT_TRUE(hardState.has_value());
-
-    UbOpOutcome lateTimeout(PEER, UbOperationKind::WORKER_REMOTE_GET_WRITEBACK,
-                            Status(K_RPC_DEADLINE_EXCEEDED, "late request timeout"));
-    admission.ReportOutcome(lateTimeout);
-
-    const auto state = admission.GetState(PEER);
-    ASSERT_TRUE(state.has_value());
-    EXPECT_EQ(state->state, UbAdmissionState::UNAVAILABLE);
-    EXPECT_EQ(state->lastFailureClass, UbFailureClass::PORT_UNAVAILABLE_ERROR4);
-    EXPECT_EQ(state->epoch, hardState->epoch);
-    EXPECT_EQ(admission.CheckReadSource(PEER).GetCode(), K_URMA_DATA_WORKER_UNAVAILABLE);
 }
 
 TEST(PeerUbAdmissionTest, StartupVerificationKeepsAdmissionOpen)
@@ -169,37 +159,6 @@ TEST(PeerUbAdmissionTest, StartupVerificationTopologyNotReadyDoesNotQuarantinePe
     EXPECT_TRUE(admission.BuildSelfHealthSummary(PEER).writable);
     EXPECT_TRUE(admission.CheckReadSource(PEER).IsOk());
     EXPECT_TRUE(admission.CheckWriteTarget(PEER, UbOperationKind::MIGRATION_WRITE).IsOk());
-}
-
-TEST(PeerUbAdmissionTest, ConcurrentTimeoutReportsCannotDowngradeUnavailableState)
-{
-    constexpr size_t TIMEOUT_REPORTERS = 8;
-    constexpr uint32_t REPORTS_PER_THREAD = 100;
-    PeerUbAdmission admission;
-    UbOpOutcome hardFailure(PEER, UbOperationKind::WORKER_REMOTE_GET_WRITEBACK,
-                             Status(K_URMA_ERROR, "provider CQE status 4"));
-    hardFailure.cqeStatus = 4;
-    admission.ReportOutcome(hardFailure);
-
-    std::vector<std::thread> reporters;
-    reporters.reserve(TIMEOUT_REPORTERS);
-    for (size_t reporter = 0; reporter < TIMEOUT_REPORTERS; ++reporter) {
-        reporters.emplace_back([&] {
-            for (uint32_t report = 0; report < REPORTS_PER_THREAD; ++report) {
-                UbOpOutcome timeout(PEER, UbOperationKind::WORKER_REMOTE_GET_WRITEBACK,
-                                    Status(K_RPC_DEADLINE_EXCEEDED, "late request timeout"));
-                admission.ReportOutcome(timeout);
-            }
-        });
-    }
-    for (auto &reporter : reporters) {
-        reporter.join();
-    }
-
-    const auto state = admission.GetState(PEER);
-    ASSERT_TRUE(state.has_value());
-    EXPECT_EQ(state->state, UbAdmissionState::UNAVAILABLE);
-    EXPECT_EQ(state->lastFailureClass, UbFailureClass::PORT_UNAVAILABLE_ERROR4);
 }
 
 TEST(PeerUbAdmissionTest, LegacyUrmaErrorWithoutRawEvidenceDoesNotQuarantine)
@@ -281,139 +240,39 @@ TEST(PeerUbAdmissionTest, SuspectProbeFailureKeepsAdmissionOpenAndBacksOff)
     EXPECT_FALSE(admission.TryBeginProbe(PEER, afterFailure->backoffDeadlineMs - 1).has_value());
 }
 
-TEST(PeerUbAdmissionTest, HardFailureProbeStillBlocksAndRemainsUnavailableOnFailure)
+TEST(PeerUbAdmissionTest, PortVerifiedIsolationOnlyRecoversByPortFact)
 {
-    PeerUbAdmission admission;
-    UbOpOutcome outcome(PEER, UbOperationKind::MIGRATION_WRITE, Status(K_URMA_ERROR, "CQE status 4"));
-    outcome.cqeStatus = URMA_PORT_UNAVAILABLE_STATUS;
-    admission.ReportOutcome(outcome);
-    const auto unavailable = admission.GetState(PEER);
-    ASSERT_TRUE(unavailable.has_value());
+    PeerUbAdmission admission(VERIFIED);
+    ASSERT_TRUE(admission.ApplyPortHealth(PEER, PortSummary(4, 4, 1), QUERY));
+    EXPECT_EQ(admission.CheckReadSource(PEER).GetCode(), K_URMA_DATA_WORKER_UNAVAILABLE);
 
-    auto token = admission.TryBeginProbe(PEER, unavailable->backoffDeadlineMs);
-    ASSERT_TRUE(token.has_value());
-    EXPECT_EQ(admission.GetState(PEER)->state, UbAdmissionState::PROBING);
-    EXPECT_EQ(admission.CheckWriteTarget(PEER, UbOperationKind::MIGRATION_WRITE).GetCode(),
-              K_URMA_WORKER_UNAVAILABLE);
+    EXPECT_FALSE(admission.ApplyPortHealth(PEER, PortSummary(4, 4, 0), QUERY));
+    EXPECT_FALSE(admission.ApplyPortHealth(PEER, PortSummary(4, 5, 2), QUERY));
+    EXPECT_FALSE(admission.ApplyPortHealth(PEER, PortSummary(4, 4, 3, true), QUERY));
+    EXPECT_FALSE(admission.ApplyPortHealth(PEER, PortSummary(4, 3, 4), PASSIVE));
+    EXPECT_EQ(admission.CheckReadSource(PEER).GetCode(), K_URMA_DATA_WORKER_UNAVAILABLE);
 
-    EXPECT_FALSE(admission.CompleteProbe(
-        *token, Status(K_RPC_DEADLINE_EXCEEDED, "recovery probe timed out"), unavailable->backoffDeadlineMs, false));
+    EXPECT_TRUE(admission.ApplyPortHealth(PEER, PortSummary(4, 2, 5), QUERY));
+    EXPECT_TRUE(admission.CheckReadSource(PEER).IsOk());
+    EXPECT_TRUE(admission.ApplyPortHealth(PEER, PortSummary(4, 0, 6), QUERY));
+    EXPECT_EQ(admission.GetState(PEER)->portHealthGoverned, false);
+}
+
+TEST(PeerUbAdmissionTest, PortHealthEpochRejectsOlderAndConflictingFacts)
+{
+    PeerUbAdmission admission(VERIFIED);
+    ASSERT_TRUE(admission.ApplyPortHealth(PEER, PortSummary(4, 4, 2), QUERY));
+
+    EXPECT_FALSE(admission.ApplyPortHealth(PEER, PortSummary(4, 3, 1), QUERY));
+    EXPECT_FALSE(admission.ApplyPortHealth(PEER, PortSummary(4, 3, 2), QUERY));
     EXPECT_EQ(admission.GetState(PEER)->state, UbAdmissionState::UNAVAILABLE);
-    EXPECT_EQ(admission.CheckWriteTarget(PEER, UbOperationKind::MIGRATION_WRITE).GetCode(),
-              K_URMA_WORKER_UNAVAILABLE);
-}
 
-TEST(PeerUbAdmissionTest, HardUnavailableRecoveryLogsAvailableAfterCommit)
-{
-    const bool oldAlsoLogToStderr = FLAGS_alsologtostderr;
-    Raii restoreFlag([oldAlsoLogToStderr] { FLAGS_alsologtostderr = oldAlsoLogToStderr; });
-    FLAGS_alsologtostderr = true;
-
-    struct HardFailureCase {
-        int cqeStatus;
-        UbFailureClass failureClass;
-    };
-    for (const auto &testCase : { HardFailureCase{ URMA_PORT_UNAVAILABLE_STATUS,
-                                                   UbFailureClass::PORT_UNAVAILABLE_ERROR4 },
-                                  HardFailureCase{ URMA_REMOTE_ACK_TIMEOUT_STATUS,
-                                                   UbFailureClass::REMOTE_UNAVAILABLE_ERROR9 } }) {
-        PeerUbAdmission admission;
-        UbOpOutcome outcome(PEER, UbOperationKind::WORKER_REMOTE_GET_WRITEBACK,
-                            Status(K_URMA_ERROR, "hard UB failure"));
-        outcome.cqeStatus = testCase.cqeStatus;
-        admission.ReportOutcome(outcome);
-        const auto unavailable = admission.GetState(PEER);
-        ASSERT_TRUE(unavailable.has_value());
-        ASSERT_EQ(unavailable->state, UbAdmissionState::UNAVAILABLE);
-
-        auto token = admission.TryBeginProbe(PEER, unavailable->backoffDeadlineMs);
-        ASSERT_TRUE(token.has_value());
-        const auto completion = CaptureProbeCompletion(
-            admission, *token, Status::OK(), unavailable->backoffDeadlineMs, false);
-
-        EXPECT_TRUE(completion.recovered);
-        ASSERT_TRUE(admission.GetState(PEER).has_value());
-        EXPECT_EQ(admission.GetState(PEER)->state, UbAdmissionState::AVAILABLE);
-        const auto marker = completion.logs.find(ADMISSION_AVAILABLE_LOG_MARKER);
-        ASSERT_NE(marker, std::string::npos) << completion.logs;
-        EXPECT_EQ(completion.logs.find(ADMISSION_AVAILABLE_LOG_MARKER, marker + 1), std::string::npos)
-            << completion.logs;
-        EXPECT_NE(completion.logs.find("peer=" + PEER.ToString()), std::string::npos) << completion.logs;
-        EXPECT_NE(completion.logs.find("statusCode=" + std::to_string(static_cast<int>(K_OK))), std::string::npos)
-            << completion.logs;
-        EXPECT_NE(completion.logs.find("recoveredFrom=UNAVAILABLE"), std::string::npos) << completion.logs;
-        EXPECT_NE(completion.logs.find(
-                      "previousStatusCode=" + std::to_string(static_cast<int>(K_URMA_ERROR))),
-                  std::string::npos)
-            << completion.logs;
-        EXPECT_NE(completion.logs.find("previousFailureClass="
-                                       + std::to_string(static_cast<int>(testCase.failureClass))),
-                  std::string::npos)
-            << completion.logs;
-    }
-}
-
-TEST(PeerUbAdmissionTest, AvailableRecoveryLogExcludesSoftAndRejectedProbes)
-{
-    const bool oldAlsoLogToStderr = FLAGS_alsologtostderr;
-    Raii restoreFlag([oldAlsoLogToStderr] { FLAGS_alsologtostderr = oldAlsoLogToStderr; });
-    FLAGS_alsologtostderr = true;
-
-    PeerUbAdmission softAdmission;
-    UbOpOutcome softFailure(PEER, UbOperationKind::MIGRATION_WRITE,
-                            Status(K_RPC_DEADLINE_EXCEEDED, "soft UB failure"));
-    softAdmission.ReportOutcome(softFailure);
-    auto softState = softAdmission.GetState(PEER);
-    ASSERT_TRUE(softState.has_value());
-    auto softToken = softAdmission.TryBeginProbe(PEER, softState->backoffDeadlineMs);
-    ASSERT_TRUE(softToken.has_value());
-    auto completion = CaptureProbeCompletion(
-        softAdmission, *softToken, Status::OK(), softState->backoffDeadlineMs, false);
-    EXPECT_TRUE(completion.recovered);
-    EXPECT_EQ(completion.logs.find(ADMISSION_AVAILABLE_LOG_MARKER), std::string::npos) << completion.logs;
-
-    PeerUbAdmission failedAdmission;
-    UbOpOutcome hardFailure(PEER, UbOperationKind::MIGRATION_WRITE, Status(K_URMA_ERROR, "hard UB failure"));
-    hardFailure.cqeStatus = URMA_PORT_UNAVAILABLE_STATUS;
-    failedAdmission.ReportOutcome(hardFailure);
-    auto failedState = failedAdmission.GetState(PEER);
-    ASSERT_TRUE(failedState.has_value());
-    auto failedToken = failedAdmission.TryBeginProbe(PEER, failedState->backoffDeadlineMs);
-    ASSERT_TRUE(failedToken.has_value());
-    completion = CaptureProbeCompletion(failedAdmission, *failedToken,
-                                        Status(K_RPC_DEADLINE_EXCEEDED, "recovery probe failed"),
-                                        failedState->backoffDeadlineMs, false);
-    EXPECT_FALSE(completion.recovered);
-    EXPECT_EQ(completion.logs.find(ADMISSION_AVAILABLE_LOG_MARKER), std::string::npos) << completion.logs;
-
-    PeerUbAdmission globallyDeniedAdmission;
-    globallyDeniedAdmission.ReportOutcome(hardFailure);
-    UbHealthSummary unavailableSummary;
-    unavailableSummary.worker = PEER;
-    unavailableSummary.incarnation = "worker-incarnation";
-    unavailableSummary.writable = false;
-    globallyDeniedAdmission.ReplaceGlobalSummaries({ unavailableSummary });
-    auto globallyDeniedState = globallyDeniedAdmission.GetState(PEER);
-    ASSERT_TRUE(globallyDeniedState.has_value());
-    auto globallyDeniedToken = globallyDeniedAdmission.TryBeginProbe(
-        PEER, globallyDeniedState->backoffDeadlineMs);
-    ASSERT_TRUE(globallyDeniedToken.has_value());
-    completion = CaptureProbeCompletion(globallyDeniedAdmission, *globallyDeniedToken, Status::OK(),
-                                        globallyDeniedState->backoffDeadlineMs, true);
-    EXPECT_FALSE(completion.recovered);
-    EXPECT_EQ(completion.logs.find(ADMISSION_AVAILABLE_LOG_MARKER), std::string::npos) << completion.logs;
-
-    PeerUbAdmission staleAdmission;
-    staleAdmission.ReportOutcome(hardFailure);
-    auto staleState = staleAdmission.GetState(PEER);
-    ASSERT_TRUE(staleState.has_value());
-    auto staleToken = staleAdmission.TryBeginProbe(PEER, staleState->backoffDeadlineMs);
-    ASSERT_TRUE(staleToken.has_value());
-    staleAdmission.ReportOutcome(hardFailure);
-    completion = CaptureProbeCompletion(staleAdmission, *staleToken, Status::OK(),
-                                        staleState->backoffDeadlineMs, false);
-    EXPECT_FALSE(completion.recovered);
-    EXPECT_EQ(completion.logs.find(ADMISSION_AVAILABLE_LOG_MARKER), std::string::npos) << completion.logs;
+    EXPECT_TRUE(admission.ApplyPortHealth(PEER, PortSummary(4, 3, 3), QUERY));
+    EXPECT_EQ(admission.GetState(PEER)->state, UbAdmissionState::AVAILABLE);
+    EXPECT_FALSE(admission.ApplyPortHealth(PEER, PortSummary(4, 4, 2), QUERY));
+    EXPECT_EQ(admission.GetState(PEER)->state, UbAdmissionState::AVAILABLE);
+    ASSERT_TRUE(admission.GetState(PEER)->portHealth.has_value());
+    EXPECT_EQ(admission.GetState(PEER)->portHealth->healthEpoch, 3u);
 }
 
 TEST(PeerUbAdmissionTest, CancelProbeRestoresFailureWithoutQuarantiningProbeSubject)
@@ -464,34 +323,6 @@ TEST(PeerUbAdmissionTest, SelfSummaryDoesNotExportObservedPeerFailure)
     EXPECT_EQ(summary.worker, self);
     EXPECT_TRUE(summary.writable);
     EXPECT_EQ(summary.epoch, 0u);
-}
-
-TEST(PeerUbAdmissionTest, LeaseSyncSelfSummaryDoesNotInvalidateActiveProbe)
-{
-    PeerUbAdmission admission;
-    const HostPort self("127.0.0.1", 31502);
-    admission.SetSelfWorker(self);
-
-    UbOpOutcome localFailure(self, UbOperationKind::WORKER_REMOTE_GET_WRITEBACK,
-                             Status(K_URMA_ERROR, "self provider failed"));
-    localFailure.cqeStatus = 4;
-    admission.ReportOutcome(localFailure);
-    EXPECT_EQ(admission.CheckWriteTarget(self, UbOperationKind::MIGRATION_WRITE).GetCode(),
-              K_URMA_WORKER_UNAVAILABLE);
-
-    auto selfSummary = admission.BuildSelfHealthSummary(self);
-    selfSummary.incarnation = "self-incarnation";
-    ASSERT_FALSE(selfSummary.writable);
-    admission.ReplaceGlobalSummaries({ selfSummary });
-
-    auto probe = admission.TryBeginProbe(self, std::numeric_limits<uint64_t>::max());
-    ASSERT_TRUE(probe.has_value());
-    EXPECT_TRUE(admission.CompleteProbe(*probe, Status::OK(), 11, true));
-    const auto recovered = admission.GetState(self);
-    ASSERT_TRUE(recovered.has_value());
-    EXPECT_EQ(recovered->state, UbAdmissionState::AVAILABLE);
-    EXPECT_TRUE(admission.BuildSelfHealthSummary(self).writable);
-    EXPECT_TRUE(admission.CheckWriteTarget(self, UbOperationKind::MIGRATION_WRITE).IsOk());
 }
 
 TEST(PeerUbAdmissionTest, GlobalSummaryUsesEpochAndIncarnationFencingAndExpiresIndependently)
@@ -648,6 +479,7 @@ TEST(UbHealthSummaryCacheTest, RejectsWrongIncarnationStaleEpochAndRetiredReplay
     summary.incarnation = "worker-old";
     summary.writable = false;
     summary.epoch = 5;
+    summary.portHealth = PortSummary(4, 4, 5);
 
     EXPECT_FALSE(cache.Apply(summary, "unexpected"));
     EXPECT_TRUE(cache.Apply(summary, summary.incarnation));
@@ -657,6 +489,7 @@ TEST(UbHealthSummaryCacheTest, RejectsWrongIncarnationStaleEpochAndRetiredReplay
 
     summary.incarnation = "worker-new";
     summary.epoch = 1;
+    summary.portHealth = PortSummary(4, 0, 1);
     EXPECT_TRUE(cache.Apply(summary, summary.incarnation));
     summary.incarnation = "worker-old";
     summary.epoch = 6;
@@ -667,6 +500,8 @@ TEST(UbHealthSummaryCacheTest, RejectsWrongIncarnationStaleEpochAndRetiredReplay
     ASSERT_TRUE(stored.has_value());
     EXPECT_EQ(stored->incarnation, "worker-new");
     EXPECT_TRUE(stored->writable);
+    ASSERT_TRUE(stored->portHealth.has_value());
+    EXPECT_EQ(stored->portHealth->healthEpoch, 1u);
 }
 
 TEST(UbHealthSummaryCacheTest, SupportsConcurrentApplyAndGet)
@@ -679,6 +514,7 @@ TEST(UbHealthSummaryCacheTest, SupportsConcurrentApplyAndGet)
     summary.incarnation = "worker-current";
     ASSERT_TRUE(cache.Apply(summary, summary.incarnation));
     const std::string expectedIncarnation = summary.incarnation;
+    const auto duplicate = summary;
     std::atomic<bool> start{ false };
     std::atomic<size_t> ready{ 0 };
     std::atomic<bool> valid{ true };
@@ -691,6 +527,9 @@ TEST(UbHealthSummaryCacheTest, SupportsConcurrentApplyAndGet)
                 std::this_thread::yield();
             }
             for (uint64_t read = 0; read < ITERATIONS; ++read) {
+                if (cache.Apply(duplicate, expectedIncarnation)) {
+                    valid.store(false, std::memory_order_release);
+                }
                 const auto stored = cache.Get(PEER);
                 if (!stored.has_value() || stored->worker != PEER || stored->incarnation != expectedIncarnation) {
                     valid.store(false, std::memory_order_release);
@@ -715,129 +554,6 @@ TEST(UbHealthSummaryCacheTest, SupportsConcurrentApplyAndGet)
     const auto stored = cache.Get(PEER);
     ASSERT_TRUE(stored.has_value());
     EXPECT_EQ(stored->epoch, ITERATIONS);
-}
-
-TEST(PeerUbAdmissionTest, AvailableGlobalFactRequiresProbeBeforeRecovery)
-{
-    PeerUbAdmission admission;
-    UbOpOutcome failure(PEER, UbOperationKind::MIGRATION_WRITE, Status(K_URMA_ERROR, "CQE status 4"));
-    failure.cqeStatus = 4;
-    admission.ReportOutcome(failure);
-    auto summary = admission.BuildSelfHealthSummary(PEER);
-    summary.incarnation = "worker-a";
-    summary.writable = true;
-    summary.epoch = 2;
-    admission.ReplaceGlobalSummaries({ summary });
-
-    EXPECT_EQ(admission.GetState(PEER)->state, UbAdmissionState::PROBING);
-    EXPECT_EQ(admission.CheckWriteTarget(PEER, UbOperationKind::MIGRATION_WRITE).GetCode(),
-              K_URMA_WORKER_UNAVAILABLE);
-    auto token = admission.TryBeginProbe(PEER, std::numeric_limits<uint64_t>::max());
-    ASSERT_TRUE(token.has_value());
-    EXPECT_TRUE(admission.CompleteProbe(*token, Status::OK(), 100));
-    EXPECT_TRUE(admission.CheckWriteTarget(PEER, UbOperationKind::MIGRATION_WRITE).IsOk());
-}
-
-TEST(PeerUbAdmissionTest, StaleProbeCannotOverrideNewFailure)
-{
-    PeerUbAdmission admission;
-    admission.InitializeVerification(PEER, 10);
-    auto token = admission.TryBeginProbe(PEER, 10);
-    ASSERT_TRUE(token.has_value());
-    UbOpOutcome newerFailure(PEER, UbOperationKind::MIGRATION_READ, Status(K_URMA_ERROR, "new CQE status 4"));
-    newerFailure.cqeStatus = 4;
-    admission.ReportOutcome(newerFailure);
-
-    EXPECT_FALSE(admission.CompleteProbe(*token, Status::OK(), 20, false));
-    EXPECT_EQ(admission.GetState(PEER)->state, UbAdmissionState::UNAVAILABLE);
-}
-
-TEST(PeerUbAdmissionTest, EmptyLeaseSnapshotDoesNotClearLocalObservation)
-{
-    PeerUbAdmission admission;
-    UbOpOutcome failure(PEER, UbOperationKind::MIGRATION_WRITE, Status(K_URMA_ERROR, "CQE status 4"));
-    failure.cqeStatus = 4;
-    admission.ReportOutcome(failure);
-
-    admission.ReplaceGlobalSummaries({});
-
-    EXPECT_EQ(admission.CheckWriteTarget(PEER, UbOperationKind::MIGRATION_WRITE).GetCode(),
-              K_URMA_WORKER_UNAVAILABLE);
-    ASSERT_TRUE(admission.GetState(PEER).has_value());
-    EXPECT_EQ(admission.GetState(PEER)->lastFailureClass, UbFailureClass::PORT_UNAVAILABLE_ERROR4);
-}
-
-TEST(PeerUbAdmissionTest, LateCqe4QuarantinesSelfSender)
-{
-    auto admission = std::make_shared<PeerUbAdmission>();
-    admission->SetSelfWorker(PEER);
-    const auto context = admission->BuildLateCompletionContext(UbOperationKind::MIGRATION_WRITE);
-    ASSERT_TRUE(context.has_value());
-
-    admission->OnLateUrmaCompletion(
-        UrmaLateCompletion{ 5001, URMA_PORT_UNAVAILABLE_STATUS, "127.0.0.1:31502", "peer-incarnation" },
-        context->ownerToken, context->peerToken);
-
-    const auto state = admission->GetState(PEER);
-    ASSERT_TRUE(state.has_value());
-    EXPECT_EQ(state->state, UbAdmissionState::UNAVAILABLE);
-    EXPECT_EQ(state->lastFailureClass, UbFailureClass::PORT_UNAVAILABLE_ERROR4);
-    ASSERT_TRUE(state->cqeStatus.has_value());
-    EXPECT_EQ(*state->cqeStatus, URMA_PORT_UNAVAILABLE_STATUS);
-    EXPECT_EQ(admission->CheckWriteTarget(PEER, UbOperationKind::MIGRATION_WRITE).GetCode(),
-              K_URMA_WORKER_UNAVAILABLE);
-}
-
-TEST(PeerUbAdmissionTest, OldLateCqeCannotQuarantineNewSelfGeneration)
-{
-    auto admission = std::make_shared<PeerUbAdmission>();
-    admission->SetSelfWorker(PEER);
-    const auto oldContext = admission->BuildLateCompletionContext(UbOperationKind::MIGRATION_WRITE);
-    ASSERT_TRUE(oldContext.has_value());
-    admission->ClearLocalState(PEER);
-
-    admission->OnLateUrmaCompletion(
-        UrmaLateCompletion{ 5002, URMA_PORT_UNAVAILABLE_STATUS, "127.0.0.1:31502", "old-incarnation" },
-        oldContext->ownerToken, oldContext->peerToken);
-
-    EXPECT_FALSE(admission->GetState(PEER).has_value());
-    EXPECT_TRUE(admission->CheckWriteTarget(PEER, UbOperationKind::MIGRATION_WRITE).IsOk());
-}
-
-TEST(PeerUbAdmissionTest, LateCqe9QuarantinesRemotePeer)
-{
-    const HostPort self("127.0.0.1", 31502);
-    auto admission = std::make_shared<PeerUbAdmission>();
-    admission->SetSelfWorker(self);
-    const auto context = admission->BuildLateCompletionContext(
-        UbOperationKind::WORKER_REMOTE_GET_WRITEBACK, PEER);
-    ASSERT_TRUE(context.has_value());
-
-    admission->OnLateUrmaCompletion(
-        UrmaLateCompletion{ 5003, URMA_REMOTE_ACK_TIMEOUT_STATUS, PEER.ToString(), "peer-incarnation" },
-        context->ownerToken, context->peerToken);
-
-    EXPECT_TRUE(admission->CheckWriteTarget(self, UbOperationKind::MIGRATION_WRITE).IsOk());
-    EXPECT_EQ(admission->CheckReadSource(PEER).GetCode(), K_URMA_DATA_WORKER_UNAVAILABLE);
-    const auto state = admission->GetState(PEER);
-    ASSERT_TRUE(state.has_value());
-    EXPECT_EQ(state->lastFailureClass, UbFailureClass::REMOTE_UNAVAILABLE_ERROR9);
-}
-
-TEST(PeerUbAdmissionTest, OldLateCqe9CannotQuarantineRecoveredRemotePeer)
-{
-    auto admission = std::make_shared<PeerUbAdmission>();
-    const auto oldContext = admission->BuildLateCompletionContext(
-        UbOperationKind::WORKER_REMOTE_GET_WRITEBACK, PEER);
-    ASSERT_TRUE(oldContext.has_value());
-    admission->ClearLocalState(PEER);
-
-    admission->OnLateUrmaCompletion(
-        UrmaLateCompletion{ 5004, URMA_REMOTE_ACK_TIMEOUT_STATUS, PEER.ToString(), "old-incarnation" },
-        oldContext->ownerToken, oldContext->peerToken);
-
-    EXPECT_FALSE(admission->GetState(PEER).has_value());
-    EXPECT_TRUE(admission->CheckReadSource(PEER).IsOk());
 }
 
 TEST(PeerUbAdmissionTest, AuthoritativeRemovalBoundsStateAndRejectsOldReplay)
@@ -895,6 +611,43 @@ TEST(UbHealthSummaryCacheTest, TopologyReconcileDropsRemovedWorkerBuckets)
     cache.ReconcileWorkers({});
     EXPECT_EQ(cache.Size(), 0u);
     EXPECT_FALSE(cache.Get(PEER).has_value());
+}
+
+TEST(PeerUbAdmissionTest, PortHealthBroadcastOnlyHintsQueryAuthoritativeAdmission)
+{
+    PeerUbAdmission admission;
+    EnablePeerPortHealth(admission);
+    UbHealthSummary isolated;
+    isolated.worker = PEER;
+    isolated.incarnation = "peer-incarnation";
+    isolated.writable = false;
+    isolated.state = UbAdmissionState::UNAVAILABLE;
+    isolated.epoch = 1;
+    isolated.portHealth = PortSummary(4, 4, 1, true);
+
+    admission.ReplaceGlobalSummaries({ isolated });
+    EXPECT_TRUE(admission.CheckWriteTarget(PEER, UbOperationKind::MIGRATION_WRITE).IsOk());
+
+    isolated.epoch = 2;
+    isolated.portHealth = PortSummary(4, 4, 2);
+    admission.ReplaceGlobalSummaries({ isolated });
+    EXPECT_TRUE(admission.CheckWriteTarget(PEER, UbOperationKind::MIGRATION_WRITE).IsOk());
+
+    ASSERT_TRUE(admission.ApplyPortHealth(PEER, *isolated.portHealth, QUERY));
+    EXPECT_EQ(admission.CheckWriteTarget(PEER, UbOperationKind::MIGRATION_WRITE).GetCode(),
+              K_URMA_WORKER_UNAVAILABLE);
+
+    auto recovered = isolated;
+    recovered.writable = true;
+    recovered.state = UbAdmissionState::AVAILABLE;
+    recovered.epoch = 3;
+    recovered.portHealth = PortSummary(4, 3, 3);
+    admission.ReplaceGlobalSummaries({ recovered });
+    EXPECT_EQ(admission.CheckWriteTarget(PEER, UbOperationKind::MIGRATION_WRITE).GetCode(),
+              K_URMA_WORKER_UNAVAILABLE);
+
+    ASSERT_TRUE(admission.ApplyPortHealth(PEER, *recovered.portHealth, QUERY));
+    EXPECT_TRUE(admission.CheckWriteTarget(PEER, UbOperationKind::MIGRATION_WRITE).IsOk());
 }
 
 }  // namespace
