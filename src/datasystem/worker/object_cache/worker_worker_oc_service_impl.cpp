@@ -111,6 +111,15 @@ std::string GetRemoteAddressForLog(const GetObjectRemoteReqPb &req)
     return "";
 }
 
+// UB data-transfer logs describe the RPC request direction (src=requester, dst=this worker), which reads
+// inverted against the data flow direction (worker pushes to the SDK). Append explicit roles.
+std::string AppendRequesterProviderForLog(const std::string &prefix, const std::string &requesterAddr,
+                                          const std::string &providerAddr)
+{
+    return prefix + AppendSrcDstForLog(requesterAddr, providerAddr)
+           + FormatString(", requester=%s, provider=%s", requesterAddr.c_str(), providerAddr.c_str());
+}
+
 Status GetRemoteAddressFromBatchGetReq(const BatchGetObjectRemoteReqPb &req, HostPort &requestAddress)
 {
     CHECK_FAIL_RETURN_STATUS(req.requests_size() > 0, K_INVALID, "BatchGetObjectRemote request is empty");
@@ -148,7 +157,7 @@ void LogBatchGetObjectRemoteFinish(const LatencyTraceConfig &config, const Batch
     // Per-phase breakdown: RemoteLockEntry / RemoteTryRLatch / RemoteWriteFastTransport.
     SLOW_LOG_IF_OR_VLOG(
         INFO, config.processSlowerThanUs > 0 && elapsedUs >= config.processSlowerThanUs, 1,
-        AppendSrcDstForLog(
+        AppendRequesterProviderForLog(
             FormatString("[Get/RemotePull] finish, count: %d, firstObjectKey: %s, payload size: %zu, start "
                          "remainingTime: %zu, cost: %.3fms, breakdown: %s",
                          req.requests_size(), firstObjectKey, payload.size(), realRemainingTime, elapsedMs,
@@ -225,7 +234,7 @@ Status WorkerWorkerOCServiceImpl::GetObjectRemote(
         req.has_urma_info() ? "UB" : (req.has_ucp_info() ? "RDMA" : "RPC_PAYLOAD");
     SLOW_LOG_IF_OR_VLOG(
         INFO, config.processSlowerThanUs > 0 && elapsedUs >= config.processSlowerThanUs, 1,
-        AppendSrcDstForLog(
+        AppendRequesterProviderForLog(
             FormatString("[GetObjectRemote] finish, objectKey: %s, requestTransport: %s, dataSource: %d, "
                          "payloadCount: %zu, cost: %.3fms",
                          req.object_key(), requestTransport, static_cast<int>(rsp.data_source()), payload.size(),
@@ -268,7 +277,7 @@ Status WorkerWorkerOCServiceImpl::ProcessSingleGetObjectRemote(GetObjectRemoteRe
     SLOW_LOG_IF_OR_VLOG(
         INFO,
         (config.processSlowerThanUs > 0 && elapsedUs >= config.processSlowerThanUs) || FLAGS_enable_perf_trace_log, 1,
-        AppendSrcDstForLog(
+        AppendRequesterProviderForLog(
             FormatString("Processing pull object[%s] offset[%ld] size[%ld], expectedDataSize[%ld], version[%ld], "
                          "hasUrmaInfo[%d], cost: %.3fms",
                          req.object_key(), req.read_offset(), req.read_size(), req.data_size(), req.version(),

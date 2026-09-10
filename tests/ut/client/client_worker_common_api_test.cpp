@@ -17,9 +17,11 @@
 #include "datasystem/client/worker_api/client_worker_common_api.h"
 
 #include <gtest/gtest.h>
+#include <cstdlib>
 #include <utility>
 
 #include "datasystem/client/worker_api/listen_worker.h"
+#include "datasystem/common/rdma/fast_transport_manager_wrapper.h"
 #include "ut/common.h"
 
 namespace datasystem {
@@ -209,6 +211,36 @@ TEST_P(InvalidWorkerMemoryAlignmentTest, FallsBackToDefaultAlignment)
 
 INSTANTIATE_TEST_SUITE_P(InvalidWorkerAlignments, InvalidWorkerMemoryAlignmentTest,
                          ::testing::Values(3u, 6u, 513u, 8192u));
+
+class ClientFastTransportLocalAddrTest : public ::testing::Test {
+protected:
+    void TearDown() override
+    {
+        ASSERT_EQ(unsetenv("POD_IP"), 0);
+    }
+};
+
+TEST_F(ClientFastTransportLocalAddrTest, ResolvesPodIpWhenPresent)
+{
+    ASSERT_EQ(setenv("POD_IP", "10.0.0.42", 1), 0);
+    auto addr = GetClientFastTransportLocalAddr();
+    EXPECT_EQ(addr.Host(), "10.0.0.42");
+    EXPECT_EQ(addr.Port(), 0);
+}
+
+TEST_F(ClientFastTransportLocalAddrTest, EmptyWhenPodIpMissing)
+{
+    ASSERT_EQ(unsetenv("POD_IP"), 0);
+    auto addr = GetClientFastTransportLocalAddr();
+    EXPECT_TRUE(addr.Empty());
+    EXPECT_EQ(addr.Port(), -1);
+}
+
+TEST_F(ClientFastTransportLocalAddrTest, EmptyWhenPodIpBlank)
+{
+    ASSERT_EQ(setenv("POD_IP", "", 1), 0);
+    EXPECT_TRUE(GetClientFastTransportLocalAddr().Empty());
+}
 
 }  // namespace
 }  // namespace ut

@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 
 #include "datasystem/common/inject/inject_point.h"
 #include "datasystem/common/flags/common_flags.h"
@@ -110,6 +111,17 @@ void SetClientUbNumaConfig(bool affinityEnabled, uint32_t rrType, uint32_t srcCh
 #ifdef USE_URMA
     UrmaManager::SetClientUbNumaConfig(affinityEnabled, rrType, srcChipPolicy, inflightWrDiffThreshold, configSource);
 #endif
+}
+
+HostPort GetClientFastTransportLocalAddr()
+{
+    // SDK processes have no listening port; request_address only identifies the requester in
+    // worker-side logs and UB admission keys, so port 0 means "no listener".
+    const char *podIp = std::getenv("POD_IP");
+    if (podIp == nullptr || podIp[0] == '\0') {
+        return HostPort();
+    }
+    return HostPort(podIp, 0);
 }
 
 Status InitializeFastTransportManager(const HostPort &hostport)
