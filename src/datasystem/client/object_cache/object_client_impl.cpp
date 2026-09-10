@@ -4855,6 +4855,9 @@ void ObjectClientImpl::CleanupWarmupObjects(const std::vector<std::string> &warm
 
 Status ObjectClientImpl::DoWarmupClientWorkerConnection()
 {
+    // Warmup issues synthetic data-plane Set/Get that share the worker-side per-request log
+    // paths; keep them request-sampled instead of inheriting Init's LOG_SAMPLE_NONE (#1174).
+    TraceGuard traceGuard = Trace::Instance().SetRequestTraceUUID();
     try {
         constexpr uint32_t warmupTtlSecond = 5;
         // Same-node large values exercise SHM; meta-owner small values exercise RPC.

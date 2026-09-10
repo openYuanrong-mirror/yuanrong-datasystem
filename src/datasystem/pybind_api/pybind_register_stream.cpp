@@ -54,7 +54,7 @@ PybindDefineRegisterer g_pybind_define_f_StreamClient("StreamClient", PRIORITY_L
         }))
         .def("init",
              [](StreamClient &client) {
-                 TraceGuard traceGuard = Trace::Instance().SetRequestTraceUUID();
+                 TraceGuard traceGuard = Trace::Instance().SetTraceUUID();
                  return client.Init();
              })
         .def("CreateProducer",
@@ -93,7 +93,7 @@ PybindDefineRegisterer g_pybind_define_f_StreamClient("StreamClient", PRIORITY_L
              })
         .def("DeleteStream",
              [](StreamClient &client, const std::string &streamName) {
-                 TraceGuard traceGuard = Trace::Instance().SetRequestTraceUUID();
+                 TraceGuard traceGuard = Trace::Instance().SetTraceUUID();
                  auto status = client.DeleteStream(streamName);
                  if (status.IsError()) {
                      LOG(ERROR) << FormatString("DeleteStream failed for stream %s with error %s", streamName,
@@ -139,7 +139,7 @@ PybindDefineRegisterer g_pybind_define_f_Producer("Producer", PRIORITY_LOW, [](c
                  return producer.Send(element);
              })
         .def("Close", [](Producer &producer) {
-            TraceGuard traceGuard = Trace::Instance().SetRequestTraceUUID();
+            TraceGuard traceGuard = Trace::Instance().SetTraceUUID();
             return producer.Close();
         });
 });
@@ -166,7 +166,7 @@ PybindDefineRegisterer g_pybind_define_f_Consumer("Consumer", PRIORITY_LOW, [](c
                  return consumer.Ack(element_id);
              })
         .def("Close", [](Consumer &consumer) {
-            TraceGuard traceGuard = Trace::Instance().SetRequestTraceUUID();
+            TraceGuard traceGuard = Trace::Instance().SetTraceUUID();
             return consumer.Close();
         });
 });

@@ -267,7 +267,7 @@ PybindDefineRegisterer g_pybind_define_f_KVClient("KVClient", PRIORITY_LOW, [](c
         py::arg("dataPlacementPolicy") = DataPlacementPolicy::PREFERRED_SAME_NODE)
         .def("Init",
              [](ObjectClientImpl &client) {
-                TraceGuard traceGuard = Trace::Instance().SetRequestTraceUUID();
+                TraceGuard traceGuard = Trace::Instance().SetTraceUUID();
                 bool needRollbackState;
                 auto rc = client.Init(needRollbackState, true);
                 client.CompleteHandler(rc.IsError(), needRollbackState);
@@ -570,7 +570,7 @@ PybindDefineRegisterer g_pybind_define_f_KVClient("KVClient", PRIORITY_LOW, [](c
              })
         .def("HealthCheck",
              [](ObjectClientImpl &client) {
-                TraceGuard traceGuard = Trace::Instance().SetRequestTraceUUID();
+                TraceGuard traceGuard = Trace::Instance().SetTraceUUID();
                 ServerState state;
                 Status healthState = client.HealthCheck(state);
                 return healthState;

@@ -22,8 +22,11 @@
 - Verified:
   - `Trace::Instance()` uses the active BRPC `RequestContext` trace when one is bound to the current bthread and otherwise falls back to `thread_local` state.
   - `SetTraceUUID()` generates a new UUID-based trace ID unless the current thread already has one.
-  - `SetRequestTraceUUID()` creates a root trace, marks it as a request-log-sampling trace for public SDK request APIs,
-    and creates a local sampling decision immediately when LogSampler is enabled.
+  - `SetRequestTraceUUID()` creates a root trace, marks it as a request-log-sampling trace for public SDK data-plane
+    request APIs, and creates a local sampling decision immediately when LogSampler is enabled. Lifecycle and
+    control-plane APIs (Init/ShutDown/Connect/UpdateToken/UpdateAkSk/Close/DeleteStream/PreRegisterDeviceMemory
+    and PerfClient diagnostics) use `SetTraceUUID()` instead so
+    their logs and downstream handler logs are never request-sampled (issue #1174).
   - `GenerateComponentTraceId()` constructs an owned component name plus a 12-character UUID suffix without changing current trace state.
   - `SetPrefix()` stores a trace prefix, currently set from `Context::SetTraceId`.
   - `SetTraceNewID()` imports a supplied ID; callers use it both for propagation and for manually constructed background IDs.
@@ -41,7 +44,7 @@
 | --- | --- | --- |
 | `Trace::Instance()` | access current thread trace state | singleton is per-thread, not process-global |
 | `SetTraceUUID()` | create root trace ID | use for non-request/internal scopes |
-| `SetRequestTraceUUID()` | create request root trace ID | use at public SDK request entrypoints that should participate in request-log sampling; stores the first local sampling decision in `Trace` when local sampling is enabled |
+| `SetRequestTraceUUID()` | create request root trace ID | use at public SDK data-plane request entrypoints (Set/Get/Del/Exist/Create/Put/...) that should participate in request-log sampling; lifecycle, credential, and session-teardown entrypoints use `SetTraceUUID()` so they are never request-sampled; stores the first local sampling decision in `Trace` when local sampling is enabled |
 | `GenerateComponentTraceId()` | construct a bounded component ID | accepts fixed character-array names of 1–36 bytes; returns name, semicolon, and the last 12 UUID characters without modifying trace/prefix/sampling state |
 | `SetTraceNewID()` | import supplied trace ID | used for propagation and manually constructed IDs; truncates to 49 bytes |
 | `GetContext()` / `SetTraceContext()` | capture and restore full trace context | use when request-log marker and sampling decision must follow async work; `SetTraceContext()` creates a local decision for undecided request contexts when local sampling is enabled |
@@ -55,7 +58,11 @@
 ## Propagation Model
 
 - Practical effect:
-  - public SDK request API entrypoints call `Trace::Instance().SetRequestTraceUUID()`;
+  - public SDK data-plane request API entrypoints call `Trace::Instance().SetRequestTraceUUID()`;
+  - lifecycle/control-plane SDK entrypoints (Init/ShutDown/Connect/UpdateToken/UpdateAkSk/Close/DeleteStream/
+    PreRegisterDeviceMemory) call
+    `Trace::Instance().SetTraceUUID()` — traceID still propagates, but the RPC carries `LOG_SAMPLE_NONE` so
+    worker-side handler logs are background-classified and never request-sampled;
   - non-request/background work uses `Trace::Instance().SetTraceUUID()` or imported trace IDs without request markers;
   - asynchronous or cross-thread request flows capture and reapply full `TraceContext` explicitly;
   - BRPC request attachments carry the same request-log sampling state as a 1-byte `LogSampleState` appended after the `TRCID:V1` traceID frame; `AttachTraceIDToAttachment()` encodes traceID + state from the caller's `Trace`, and the generated `CallMethod` prologue (`ExtractTraceIDAndSampleState()` + `ScopedRequestContext` + `ApplyLogSampleState()`) restores both on the worker so the handler participates in `LogSampler` instead of being bypassed. Wire format and the transport-neutral helpers live in `src/datasystem/common/rpc/trace_attachment.h` and `src/datasystem/common/log/log_sample_state.h`;

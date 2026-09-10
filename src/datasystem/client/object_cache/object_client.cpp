@@ -41,7 +41,7 @@ ObjectClient::~ObjectClient()
 
 Status ObjectClient::ShutDown()
 {
-    TraceGuard traceGuard = Trace::Instance().SetRequestTraceUUID();
+    TraceGuard traceGuard = Trace::Instance().SetTraceUUID();
     if (impl_) {
         bool needRollbackState;
         auto rc = impl_->ShutDown(needRollbackState);
@@ -53,7 +53,7 @@ Status ObjectClient::ShutDown()
 
 Status ObjectClient::Init()
 {
-    TraceGuard traceGuard = Trace::Instance().SetRequestTraceUUID();
+    TraceGuard traceGuard = Trace::Instance().SetTraceUUID();
     bool needRollbackState;
     auto rc = impl_->Init(needRollbackState, true);
     impl_->CompleteHandler(rc.IsError(), needRollbackState);
@@ -113,13 +113,13 @@ Status ObjectClient::GDecreaseRef(const std::vector<std::string> &objectKeys,
 
 Status ObjectClient::UpdateToken(SensitiveValue token)
 {
-    TraceGuard traceGuard = Trace::Instance().SetRequestTraceUUID();
+    TraceGuard traceGuard = Trace::Instance().SetTraceUUID();
     return impl_->UpdateToken(token);
 }
 
 Status ObjectClient::UpdateAkSk(const std::string accesskey, SensitiveValue secretkey)
 {
-    TraceGuard traceGuard = Trace::Instance().SetRequestTraceUUID();
+    TraceGuard traceGuard = Trace::Instance().SetTraceUUID();
     return impl_->UpdateAkSk(accesskey, secretkey);
 }
 

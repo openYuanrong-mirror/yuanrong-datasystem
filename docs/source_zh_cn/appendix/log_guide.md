@@ -160,7 +160,7 @@ LogSampler 提供统一随机哈希阈值采样，替代旧的 `log_rate_limit` 
 - 请求采样决策随 RPC 元数据传播（LogSampleState），跨 client/worker 保持同一 trace 的一致结果
 - request sampled-in 时，该请求的 INFO/VLOG/ERROR/WARNING/SLOW_LOG 和 access 日志都直接输出（请求日志完整性优先）
 - request reject 只直接阻断 INFO/VLOG；diagnostic/access 不把 reject 当作直接丢弃条件，继续各自补采样
-- 仅 SDK 请求 trace 参与采样；后台线程日志不受本方案控制，始终全量输出
+- 仅 SDK **数据面请求** trace 参与采样（如 Set/Get/Del/Exist/Expire/Create/Put/MSet/MGet/Read 等）；生命周期与控制面 API（Init/ShutDown/Connect/UpdateToken/UpdateAkSk/Close/DeleteStream/PreRegisterDeviceMemory 等）使用普通 trace，不参与请求采样，其 client 与 worker 侧日志始终全量输出（边界：仅在线程无活跃请求 trace 的**顶层调用**时生效；嵌套在数据面请求作用域内调用时继承外层请求采样决策，排障时若生命周期日志仍被采样应先排查嵌套调用）；后台线程日志不受本方案控制，始终全量输出
 - 配置权威源：worker；client 通过 register/heartbeat 接收 worker 下发的 `LogSampleConfigPb`
 
 ### 参数语义与 OR 规则

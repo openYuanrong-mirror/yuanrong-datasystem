@@ -41,7 +41,7 @@ StreamClient::~StreamClient()
 
 Status StreamClient::ShutDown()
 {
-    TraceGuard traceGuard = Trace::Instance().SetRequestTraceUUID();
+    TraceGuard traceGuard = Trace::Instance().SetTraceUUID();
     if (impl_) {
         bool needRollbackState;
         auto rc = impl_->ShutDown(needRollbackState);
@@ -53,7 +53,7 @@ Status StreamClient::ShutDown()
 
 Status StreamClient::Init(bool reportWorkerLost)
 {
-    TraceGuard traceGuard = Trace::Instance().SetRequestTraceUUID();
+    TraceGuard traceGuard = Trace::Instance().SetTraceUUID();
     bool needRollbackState;
     auto rc = impl_->Init(ip_, port_, needRollbackState, reportWorkerLost);
     impl_->CompleteHandler(rc.IsError(), needRollbackState);
@@ -62,13 +62,13 @@ Status StreamClient::Init(bool reportWorkerLost)
 
 Status StreamClient::UpdateToken(SensitiveValue token)
 {
-    TraceGuard traceGuard = Trace::Instance().SetRequestTraceUUID();
+    TraceGuard traceGuard = Trace::Instance().SetTraceUUID();
     return impl_->UpdateToken(token);
 }
 
 Status StreamClient::UpdateAkSk(const std::string accessKey, SensitiveValue secretKey)
 {
-    TraceGuard traceGuard = Trace::Instance().SetRequestTraceUUID();
+    TraceGuard traceGuard = Trace::Instance().SetTraceUUID();
     return impl_->UpdateAkSk(accessKey, secretKey);
 }
 
@@ -100,7 +100,7 @@ Status StreamClient::Subscribe(const std::string &streamName, const struct Subsc
 
 Status StreamClient::DeleteStream(const std::string &streamName)
 {
-    TraceGuard traceGuard = Trace::Instance().SetRequestTraceUUID();
+    TraceGuard traceGuard = Trace::Instance().SetTraceUUID();
     PerfPoint point(PerfKey::CLIENT_DELETE_STREAM_ALL);
     auto access = AccessRecorder::Stream(AccessRecorderKey::DS_STREAM_DELETE_STREAM);
     auto rc = impl_->DeleteStream(streamName);
