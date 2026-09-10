@@ -543,6 +543,11 @@ private:
                                    QueryMetadataFromMasterResult &result, bool queryEtcdMeta = true);
     Status DispatchQueryMetadataGroups(std::unordered_map<HostPort, std::vector<std::string>> &objectKeysByMaster,
                                        uint64_t subTimeout, std::vector<BatchQueryMetaResult> &batchQueryResults);
+    Status ProcessQueryMetadataResults(const Status &lastRc, bool traceEnabled,
+                                       const std::vector<std::string> &objectKeys,
+                                       const std::unordered_set<std::string> &routeFailedObjectKeys, bool queryEtcdMeta,
+                                       std::vector<BatchQueryMetaResult> &batchQueryResults,
+                                       QueryMetadataFromMasterResult &result, PerfPoint &point);
     Status MergeQueryMetadataResults(std::vector<BatchQueryMetaResult> &batchQueryResults, bool traceEnabled,
                                      QueryMetadataFromMasterResult &result,
                                      ObjectKeysQueryMetaFailed &objectKeysQueryMetaFailed,

@@ -209,6 +209,25 @@ std::unordered_map<std::string, uint64_t> FilterFinalFailedRemoteGetVersions(
     }
     return finalFailedKeyVersions;
 }
+
+bool IsPeerDeadMetadataRecovered(const std::unordered_set<std::string> &routeFailedObjectKeys,
+                                 const std::unordered_set<std::string> &objectKeysPuzzled,
+                                 const std::vector<QueryMetaInfoPb> &queryMetas)
+{
+    if (routeFailedObjectKeys.empty() && objectKeysPuzzled.empty()) {
+        return false;
+    }
+    std::unordered_set<std::string> recoveredObjectKeys;
+    recoveredObjectKeys.reserve(queryMetas.size());
+    for (const auto &queryMeta : queryMetas) {
+        recoveredObjectKeys.emplace(queryMeta.meta().object_key());
+    }
+    auto isRecovered = [&recoveredObjectKeys](const auto &objectKey) {
+        return recoveredObjectKeys.find(objectKey) != recoveredObjectKeys.end();
+    };
+    return std::all_of(routeFailedObjectKeys.begin(), routeFailedObjectKeys.end(), isRecovered)
+           && std::all_of(objectKeysPuzzled.begin(), objectKeysPuzzled.end(), isRecovered);
+}
 }  // namespace
 
 const std::unordered_set<StatusCode> &WorkerOcServiceGetImpl::GetRemoteGetRetryCodes(bool fastTransportEnabled)
@@ -1950,6 +1969,55 @@ Status WorkerOcServiceGetImpl::ProcessQueryMetaFailedObjsWhenMetaStoredInEtcd(
     return Status::OK();
 }
 
+Status WorkerOcServiceGetImpl::ProcessQueryMetadataResults(
+    const Status &lastRc, bool traceEnabled, const std::vector<std::string> &objectKeys,
+    const std::unordered_set<std::string> &routeFailedObjectKeys, bool queryEtcdMeta,
+    std::vector<BatchQueryMetaResult> &batchQueryResults, QueryMetadataFromMasterResult &result, PerfPoint &point)
+{
+    static_cast<void>(objectKeys);
+    ObjectKeysQueryMetaFailed objectKeysQueryMetaFailed;
+    std::map<std::string, uint64_t> deletingObjectsWithVersion;
+    if (auto mergeRc = MergeQueryMetadataResults(batchQueryResults, traceEnabled, result, objectKeysQueryMetaFailed,
+                                                 deletingObjectsWithVersion);
+        mergeRc.IsError()) {
+        return lastRc.GetCode() == K_RPC_PEER_DEAD ? lastRc : mergeRc;
+    }
+
+    if (lastRc.GetCode() == K_RPC_PEER_DEAD && !FLAGS_enable_l2_cache_fallback) {
+        return lastRc;
+    }
+
+    auto &queryMetas = result.queryMetas;
+    auto &absentObjectKeysWithVersion = result.absentObjectKeysWithVersion;
+    INJECT_POINT("worker.get_no_metadata", [&queryMetas, &result, &objectKeys, &absentObjectKeysWithVersion]() {
+        queryMetas.clear();
+        result.payloads.clear();
+        for (const auto &id : objectKeys) {
+            (void)absentObjectKeysWithVersion.emplace(id, 0);
+        }
+        return Status::OK();
+    });
+
+    point.RecordAndReset(PerfKey::WORKER_QUERY_META_HANDLE_NOT_FOUND);
+    if (auto finalizeRc = FinalizeAbsentQueryMetadata(routeFailedObjectKeys, objectKeysQueryMetaFailed, queryEtcdMeta,
+                                                      queryMetas, absentObjectKeysWithVersion,
+                                                      deletingObjectsWithVersion);
+        finalizeRc.IsError()) {
+        return lastRc.GetCode() == K_RPC_PEER_DEAD ? lastRc : finalizeRc;
+    }
+
+    if (lastRc.GetCode() == K_RPC_PEER_DEAD) {
+        const auto &objectKeysPuzzled = std::get<OBJECTS_PUZZLED_IDX>(objectKeysQueryMetaFailed);
+        if (!IsPeerDeadMetadataRecovered(routeFailedObjectKeys, objectKeysPuzzled, queryMetas)) {
+            return lastRc;
+        }
+        point.RecordAndReset(PerfKey::WORKER_QUERY_META_OTHER);
+        return Status::OK();
+    }
+    point.RecordAndReset(PerfKey::WORKER_QUERY_META_OTHER);
+    return lastRc;
+}
+
 Status WorkerOcServiceGetImpl::QueryMetadataFromMaster(const std::vector<std::string> &objectKeys, uint64_t subTimeout,
                                                        QueryMetadataFromMasterResult &result, bool queryEtcdMeta)
 {
@@ -1957,7 +2025,6 @@ Status WorkerOcServiceGetImpl::QueryMetadataFromMaster(const std::vector<std::st
     auto config = GetServerLatencyTraceConfig();
     const bool traceEnabled = ShouldCollectLatencyTrace(config);
     std::vector<master::QueryMetaInfoPb> &queryMetas = result.queryMetas;
-    std::map<std::string, uint64_t> &absentObjectKeysWithVersion = result.absentObjectKeysWithVersion;
     INJECT_POINT("worker.before_query_meta");
     // 1. Get map of objectKeys grouped by master
     point.RecordAndReset(PerfKey::WORKER_QUERY_META_ROUTER);
@@ -1975,34 +2042,8 @@ Status WorkerOcServiceGetImpl::QueryMetadataFromMaster(const std::vector<std::st
     queryMetas.reserve(queryMetas.size() + objectKeys.size());
     Status lastRc = DispatchQueryMetadataGroups(objKeysGrpByMaster, subTimeout, batchQueryResults);
     point.RecordAndReset(PerfKey::WORKER_QUERY_META_HANDLE_RESULT);
-    // 3. Statistics the metadata results just queried.
-    ObjectKeysQueryMetaFailed objectKeysQueryMetaFailed;
-    std::map<std::string, uint64_t> deletingObjectsWithVersion;
-    Status mergeRc = MergeQueryMetadataResults(batchQueryResults, traceEnabled, result, objectKeysQueryMetaFailed,
-                                               deletingObjectsWithVersion);
-
-    // A foreground metadata-owner failure is terminal. Do not turn an explicit
-    // dead-peer result into K_NOT_FOUND through the ETCD recovery fallback.
-    if (lastRc.GetCode() == K_RPC_PEER_DEAD) {
-        return lastRc;
-    }
-    RETURN_IF_NOT_OK(mergeRc);
-
-    INJECT_POINT("worker.get_no_metadata", [&queryMetas, &result, &objectKeys, &absentObjectKeysWithVersion]() {
-        queryMetas.clear();
-        result.payloads.clear();
-        for (const auto &id : objectKeys) {
-            (void)absentObjectKeysWithVersion.emplace(id, 0);
-        }
-        return Status::OK();
-    });
-
-    point.RecordAndReset(PerfKey::WORKER_QUERY_META_HANDLE_NOT_FOUND);
-    RETURN_IF_NOT_OK(FinalizeAbsentQueryMetadata(routeFailedObjectKeys, objectKeysQueryMetaFailed, queryEtcdMeta,
-                                                 queryMetas, absentObjectKeysWithVersion,
-                                                 deletingObjectsWithVersion));
-    point.RecordAndReset(PerfKey::WORKER_QUERY_META_OTHER);
-    return lastRc;
+    return ProcessQueryMetadataResults(lastRc, traceEnabled, objectKeys, routeFailedObjectKeys, queryEtcdMeta,
+                                       batchQueryResults, result, point);
 }
 
 Status WorkerOcServiceGetImpl::FinalizeAbsentQueryMetadata(

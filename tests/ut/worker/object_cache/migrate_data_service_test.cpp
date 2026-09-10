@@ -39,6 +39,9 @@
 #include "securec.h"
 
 #include "ut/common.h"
+#define private public
+#include "datasystem/common/kvstore/etcd/etcd_store.h"
+#undef private
 #include "eviction_manager_common.h"
 #include "../../../common/binmock/binmock.h"
 #include "cluster/test_port_allocator.h"
@@ -77,6 +80,7 @@ DS_DECLARE_double(eviction_heat_initial_counter);
 DS_DECLARE_uint32(eviction_heat_max_counter);
 DS_DECLARE_int64(batch_get_threshold_mb);
 DS_DECLARE_bool(oc_io_from_l2cache_need_metadata);
+DS_DECLARE_bool(enable_l2_cache_fallback);
 DS_DECLARE_string(l2_cache_type);
 
 using namespace ::testing;
@@ -1389,6 +1393,12 @@ public:
         TimerQueue::GetInstance()->Initialize();
     }
 
+    void TearDown() override
+    {
+        RELEASE_STUBS;
+        CommonTest::TearDown();
+    }
+
 protected:
     void RouteObjectToMaster(const std::string &objectKey, const HostPort &masterAddress)
     {
@@ -1700,6 +1710,126 @@ TEST_F(NotifyRemoteGetMigrationTest, QueryMetadataKeepsPeerDeadWhenAnotherOwnerR
     };
 
     EXPECT_EQ(run().GetCode(), K_RPC_PEER_DEAD);
+}
+
+TEST_F(NotifyRemoteGetMigrationTest, QueryMetadataRecoversPeerDeadFromEtcd)
+{
+    const bool oldNeedMetadata = FLAGS_oc_io_from_l2cache_need_metadata;
+    const std::string oldL2CacheType = FLAGS_l2_cache_type;
+    Raii restoreFlags([oldNeedMetadata, oldL2CacheType]() {
+        FLAGS_oc_io_from_l2cache_need_metadata = oldNeedMetadata;
+        FLAGS_l2_cache_type = oldL2CacheType;
+    });
+    FLAGS_oc_io_from_l2cache_need_metadata = true;
+    FLAGS_l2_cache_type = "sfs";
+
+    const std::string objectKey = "peer-dead-with-etcd-metadata";
+    RouteObjectToMaster(objectKey, leavingWorkerAddress_);
+    auto api = std::make_shared<MigrateTestWorkerMasterOCApi>(leavingWorkerAddress_, localAddress_);
+    api->queryMeta_ = [](master::QueryMetaReqPb &, uint64_t, master::QueryMetaRspPb &,
+                         std::vector<RpcMessage> &) { return Status(K_RPC_PEER_DEAD, "metadata owner is dead"); };
+    workerMasterApiManager_->SetDefaultApi(api);
+
+    auto queryMeta = MakeQueryMeta();
+    queryMeta.mutable_meta()->set_object_key(objectKey);
+    queryMeta.mutable_meta()->set_primary_address(leavingWorkerAddress_.ToString());
+    queryMeta.mutable_meta()->mutable_config()->set_write_mode(
+        static_cast<uint32_t>(WriteMode::WRITE_THROUGH_L2_CACHE));
+    std::string serializedMeta;
+    ASSERT_TRUE(queryMeta.meta().SerializeToString(&serializedMeta));
+
+    EtcdStore etcdStore("unused");
+    impl_->etcdStore_ = &etcdStore;
+    etcdStore.keepAliveTimeout_.store(false);
+    BINEXPECT_CALL(&EtcdStore::RawGet, (_, _, _, _))
+        .Times(1)
+        .WillOnce(Invoke([serializedMeta](const std::string &, RangeSearchResult &res, int64_t, int32_t) {
+            res.value = serializedMeta;
+            return Status::OK();
+        }));
+
+    ScopedRequestContext requestContext;
+    GetRequestContext()->reqTimeoutDuration.Init(1'000);
+    WorkerOcServiceGetImpl::QueryMetadataFromMasterResult result;
+    auto rc = impl_->QueryMetadataFromMaster({ objectKey }, 0, result);
+
+    ASSERT_TRUE(rc.IsOk()) << rc.ToString();
+    ASSERT_EQ(result.queryMetas.size(), 1);
+    EXPECT_EQ(result.queryMetas.front().meta().object_key(), objectKey);
+    EXPECT_EQ(result.queryMetas.front().address(), leavingWorkerAddress_.ToString());
+    EXPECT_TRUE(result.absentObjectKeysWithVersion.empty());
+}
+
+TEST_F(NotifyRemoteGetMigrationTest, QueryMetadataPreservesPeerDeadWhenL2FallbackDisabled)
+{
+    const bool oldNeedMetadata = FLAGS_oc_io_from_l2cache_need_metadata;
+    const bool oldEnableL2CacheFallback = FLAGS_enable_l2_cache_fallback;
+    const std::string oldL2CacheType = FLAGS_l2_cache_type;
+    Raii restoreFlags([oldNeedMetadata, oldEnableL2CacheFallback, oldL2CacheType]() {
+        FLAGS_oc_io_from_l2cache_need_metadata = oldNeedMetadata;
+        FLAGS_enable_l2_cache_fallback = oldEnableL2CacheFallback;
+        FLAGS_l2_cache_type = oldL2CacheType;
+    });
+    FLAGS_oc_io_from_l2cache_need_metadata = true;
+    FLAGS_enable_l2_cache_fallback = false;
+    FLAGS_l2_cache_type = "sfs";
+
+    const std::string objectKey = "peer-dead-with-l2-fallback-disabled";
+    RouteObjectToMaster(objectKey, leavingWorkerAddress_);
+    auto api = std::make_shared<MigrateTestWorkerMasterOCApi>(leavingWorkerAddress_, localAddress_);
+    api->queryMeta_ = [](master::QueryMetaReqPb &, uint64_t, master::QueryMetaRspPb &,
+                         std::vector<RpcMessage> &) { return Status(K_RPC_PEER_DEAD, "metadata owner is dead"); };
+    workerMasterApiManager_->SetDefaultApi(api);
+
+    EtcdStore etcdStore("unused");
+    impl_->etcdStore_ = &etcdStore;
+    etcdStore.keepAliveTimeout_.store(false);
+    BINEXPECT_CALL(&EtcdStore::RawGet, (_, _, _, _)).Times(0);
+
+    ScopedRequestContext requestContext;
+    GetRequestContext()->reqTimeoutDuration.Init(1'000);
+    WorkerOcServiceGetImpl::QueryMetadataFromMasterResult result;
+    auto rc = impl_->QueryMetadataFromMaster({ objectKey }, 0, result);
+
+    EXPECT_EQ(rc.GetCode(), K_RPC_PEER_DEAD);
+    EXPECT_TRUE(result.queryMetas.empty());
+}
+
+TEST_F(NotifyRemoteGetMigrationTest, QueryMetadataPreservesPeerDeadWhenEtcdFallbackFails)
+{
+    const bool oldNeedMetadata = FLAGS_oc_io_from_l2cache_need_metadata;
+    const std::string oldL2CacheType = FLAGS_l2_cache_type;
+    Raii restoreFlags([oldNeedMetadata, oldL2CacheType]() {
+        FLAGS_oc_io_from_l2cache_need_metadata = oldNeedMetadata;
+        FLAGS_l2_cache_type = oldL2CacheType;
+    });
+    FLAGS_oc_io_from_l2cache_need_metadata = true;
+    FLAGS_l2_cache_type = "sfs";
+
+    const std::string objectKey = "peer-dead-with-invalid-etcd-metadata";
+    RouteObjectToMaster(objectKey, leavingWorkerAddress_);
+    auto api = std::make_shared<MigrateTestWorkerMasterOCApi>(leavingWorkerAddress_, localAddress_);
+    api->queryMeta_ = [](master::QueryMetaReqPb &, uint64_t, master::QueryMetaRspPb &,
+                         std::vector<RpcMessage> &) { return Status(K_RPC_PEER_DEAD, "metadata owner is dead"); };
+    workerMasterApiManager_->SetDefaultApi(api);
+
+    EtcdStore etcdStore("unused");
+    impl_->etcdStore_ = &etcdStore;
+    etcdStore.keepAliveTimeout_.store(false);
+    BINEXPECT_CALL(&EtcdStore::RawGet, (_, _, _, _))
+        .Times(1)
+        .WillOnce(Invoke([](const std::string &, RangeSearchResult &res, int64_t, int32_t) {
+            res.value = "invalid-object-meta";
+            return Status::OK();
+        }));
+
+    ScopedRequestContext requestContext;
+    GetRequestContext()->reqTimeoutDuration.Init(1'000);
+    WorkerOcServiceGetImpl::QueryMetadataFromMasterResult result;
+    auto rc = impl_->QueryMetadataFromMaster({ objectKey }, 0, result);
+
+    EXPECT_EQ(rc.GetCode(), K_RPC_PEER_DEAD);
+    EXPECT_TRUE(result.queryMetas.empty());
 }
 
 TEST_F(NotifyRemoteGetMigrationTest, QueryMetadataReturnsErrorWhenEtcdStoreUnavailable)
