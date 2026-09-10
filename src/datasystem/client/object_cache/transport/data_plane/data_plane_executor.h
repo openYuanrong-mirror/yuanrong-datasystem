@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 
 #include "datasystem/client/object_cache/transport/data_plane/data_plane_manager.h"
 #include "datasystem/client/object_cache/transport/transport_advisor.h"
@@ -49,7 +50,8 @@ public:
     Status Execute(const HostPort &workerAddr, const Operation &operation, bool traceEnabled = false);
 
     Status ExecuteForDataLocation(const HostPort &workerAddr, uint64_t locationTopologyVersion,
-                                  const Operation &operation, bool traceEnabled = false);
+                                  const Operation &operation, bool traceEnabled = false,
+                                  std::optional<TransportHint> transportHint = std::nullopt);
 
 private:
     struct AttemptPlan {
@@ -71,7 +73,7 @@ private:
                             const std::vector<TransportHint> &fallbackHints, uint64_t locationTopologyVersion,
                             TransportPhaseLatencyRecorder *recorder);
 
-    Status ExecuteImpl(const HostPort &workerAddr, uint64_t locationTopologyVersion,
+    Status ExecuteImpl(const HostPort &workerAddr, uint64_t locationTopologyVersion, TransportHint hint,
                        const Operation &operation, bool traceEnabled);
 
     // Decide whether a failed operation should be retried after a transporter rebuild, perform the

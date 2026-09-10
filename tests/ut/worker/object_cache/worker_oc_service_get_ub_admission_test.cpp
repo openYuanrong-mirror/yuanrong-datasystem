@@ -27,10 +27,13 @@
 #include "datasystem/common/object_cache/ub_health_summary_codec.h"
 #include "datasystem/common/object_cache/urma_fallback_tcp_limiter.h"
 #include "datasystem/common/rpc/brpc_status_util.h"
+#include "datasystem/common/util/raii.h"
 #define private public
 #include "datasystem/worker/object_cache/service/worker_oc_service_get_impl.h"
 #include "datasystem/worker/object_cache/worker_worker_oc_service_impl.h"
 #undef private
+
+DS_DECLARE_bool(enable_transport_fallback);
 
 namespace datasystem {
 namespace object_cache {
@@ -61,10 +64,18 @@ WorkerOcServiceCrudParam BuildGetParam(WorkerRequestManager &requestManager, std
         .allowDirectoryLag = false,
         .metadataRpcFailureReported = {} };
 }
+
+Status CheckRemoteReadAdmission(WorkerOcServiceGetImpl &impl, const HostPort &worker,
+                                WorkerOcServiceGetImpl::ReadTransportFallback fallback, bool &useFastTransport)
+{
+    return impl.CheckRemoteReadAdmission(worker.ToString(), fallback, useFastTransport);
+}
 }  // namespace
 
-TEST(WorkerOcServiceGetUbAdmissionTest, UnavailableDataWorkerReadSourceFailsFast)
+TEST(WorkerOcServiceGetUbAdmissionTest, UnavailableDataWorkerReadSourceUsesConfiguredFallback)
 {
+    const bool oldTransportFallback = FLAGS_enable_transport_fallback;
+    Raii restoreFlag([oldTransportFallback]() { FLAGS_enable_transport_fallback = oldTransportFallback; });
     auto admission = std::make_shared<PeerUbAdmission>();
     UbOpOutcome outcome{ DATA_WORKER, UbOperationKind::WORKER_REMOTE_GET_WRITEBACK,
                          Status(K_URMA_ERROR, "remote get writeback failed") };
@@ -76,10 +87,23 @@ TEST(WorkerOcServiceGetUbAdmissionTest, UnavailableDataWorkerReadSourceFailsFast
     auto param = BuildGetParam(requestManager, objectTable);
     WorkerOcServiceGetImpl getImpl(param, nullptr, nullptr, nullptr, nullptr, LOCAL_WORKER, nullptr, admission);
 
-    auto rc = getImpl.CheckRemoteReadAdmission(DATA_WORKER.ToString());
+    FLAGS_enable_transport_fallback = false;
+    bool useFastTransport = true;
+    auto rc = CheckRemoteReadAdmission(getImpl, DATA_WORKER, WorkerOcServiceGetImpl::ReadTransportFallback::FORBIDDEN,
+                                       useFastTransport);
 
     ASSERT_TRUE(rc.IsError());
     EXPECT_EQ(rc.GetCode(), StatusCode::K_URMA_DATA_WORKER_UNAVAILABLE);
+    FLAGS_enable_transport_fallback = true;
+    useFastTransport = true;
+    rc = CheckRemoteReadAdmission(getImpl, DATA_WORKER, WorkerOcServiceGetImpl::ReadTransportFallback::FORBIDDEN,
+                                  useFastTransport);
+    EXPECT_EQ(rc.GetCode(), StatusCode::K_URMA_DATA_WORKER_UNAVAILABLE);
+    EXPECT_TRUE(useFastTransport);
+    EXPECT_TRUE(CheckRemoteReadAdmission(getImpl, DATA_WORKER, WorkerOcServiceGetImpl::ReadTransportFallback::ALLOWED,
+                                         useFastTransport)
+                    .IsOk());
+    EXPECT_FALSE(useFastTransport);
 }
 
 TEST(WorkerOcServiceGetUbAdmissionTest, RemoteGetWritebackRejectsUnavailableTargetBeforeSend)
@@ -141,7 +165,9 @@ TEST(WorkerOcServiceGetUbAdmissionTest, LegacyRemoteReadFailureDoesNotHardQuaran
 
     getImpl.ReportRemoteReadOutcome(DATA_WORKER.ToString(), Status(K_URMA_ERROR, "remote get failed"), "unit_test");
 
-    auto rc = getImpl.CheckRemoteReadAdmission(DATA_WORKER.ToString());
+    bool useFastTransport = true;
+    auto rc = CheckRemoteReadAdmission(getImpl, DATA_WORKER, WorkerOcServiceGetImpl::ReadTransportFallback::FORBIDDEN,
+                                       useFastTransport);
     ASSERT_TRUE(rc.IsOk()) << rc.ToString();
     EXPECT_FALSE(admission->GetState(DATA_WORKER).has_value());
 }
@@ -158,7 +184,9 @@ TEST(WorkerOcServiceGetUbAdmissionTest, RemoteReadRpcTimeoutDoesNotHardQuarantin
     getImpl.ReportRemoteReadOutcome(DATA_WORKER.ToString(), Status(K_RPC_DEADLINE_EXCEEDED, "remote get rpc timeout"),
                                     "rpc_timeout");
 
-    auto rc = getImpl.CheckRemoteReadAdmission(DATA_WORKER.ToString());
+    bool useFastTransport = true;
+    auto rc = CheckRemoteReadAdmission(getImpl, DATA_WORKER, WorkerOcServiceGetImpl::ReadTransportFallback::FORBIDDEN,
+                                       useFastTransport);
     ASSERT_TRUE(rc.IsOk()) << rc.ToString();
     auto state = admission->GetState(DATA_WORKER);
     ASSERT_TRUE(state.has_value());
@@ -175,7 +203,10 @@ TEST(WorkerOcServiceGetUbAdmissionTest, RequesterConnectFailureDoesNotHardBlockW
     getImpl.ReportRemoteReadOutcome(DATA_WORKER.ToString(), Status(K_URMA_CONNECT_FAILED, "requester connect failed"),
                                     "requester_connect");
 
-    EXPECT_TRUE(getImpl.CheckRemoteReadAdmission(DATA_WORKER.ToString()).IsOk());
+    bool useFastTransport = true;
+    EXPECT_TRUE(CheckRemoteReadAdmission(getImpl, DATA_WORKER, WorkerOcServiceGetImpl::ReadTransportFallback::FORBIDDEN,
+                                         useFastTransport)
+                    .IsOk());
     EXPECT_FALSE(admission->GetState(DATA_WORKER).has_value());
 }
 
@@ -314,7 +345,11 @@ TEST(WorkerOcServiceGetUbAdmissionTest, ExplicitRemoteGetDetailMarksProviderUnav
 
     getImpl.ReportRemoteReadOutcome(DATA_WORKER.ToString(), rsp, "remote_get_response");
 
-    EXPECT_EQ(getImpl.CheckRemoteReadAdmission(DATA_WORKER.ToString()).GetCode(), K_URMA_DATA_WORKER_UNAVAILABLE);
+    bool useFastTransport = true;
+    EXPECT_EQ(CheckRemoteReadAdmission(getImpl, DATA_WORKER, WorkerOcServiceGetImpl::ReadTransportFallback::FORBIDDEN,
+                                       useFastTransport)
+                  .GetCode(),
+              K_URMA_DATA_WORKER_UNAVAILABLE);
 }
 
 TEST(WorkerOcServiceGetUbAdmissionTest, SingleRemoteGetErrorResponseFormsObservationBeforeReturningFailure)
@@ -334,7 +369,10 @@ TEST(WorkerOcServiceGetUbAdmissionTest, SingleRemoteGetErrorResponseFormsObserva
     EXPECT_EQ(rc.GetCode(), K_URMA_ERROR);
     EXPECT_EQ(rsp.error().error_code(), K_URMA_ERROR);
     EXPECT_EQ(rsp.error().error_msg(), providerRc.GetMsg());
-    EXPECT_EQ(getImpl.CheckRemoteReadAdmission(DATA_WORKER.ToString()).GetCode(),
+    bool useFastTransport = true;
+    EXPECT_EQ(CheckRemoteReadAdmission(getImpl, DATA_WORKER, WorkerOcServiceGetImpl::ReadTransportFallback::FORBIDDEN,
+                                       useFastTransport)
+                  .GetCode(),
               K_URMA_DATA_WORKER_UNAVAILABLE);
 }
 
@@ -352,7 +390,11 @@ TEST(WorkerOcServiceGetUbAdmissionTest, BatchRemoteGetUsesPerResponseFailureDeta
 
     getImpl.ReportRemoteReadOutcome(DATA_WORKER.ToString(), rsp, "batch_remote_get_response");
 
-    EXPECT_EQ(getImpl.CheckRemoteReadAdmission(DATA_WORKER.ToString()).GetCode(), K_URMA_DATA_WORKER_UNAVAILABLE);
+    bool useFastTransport = true;
+    EXPECT_EQ(CheckRemoteReadAdmission(getImpl, DATA_WORKER, WorkerOcServiceGetImpl::ReadTransportFallback::FORBIDDEN,
+                                       useFastTransport)
+                  .GetCode(),
+              K_URMA_DATA_WORKER_UNAVAILABLE);
 }
 
 TEST(WorkerOcServiceGetUbAdmissionTest, BatchTransportFailureMarksEveryCoveredResponse)

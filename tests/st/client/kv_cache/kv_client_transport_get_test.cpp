@@ -1931,10 +1931,14 @@ TEST_F(KVClientTransportGetTest, InlineCapacityLimitFallsBack)
 
     TransportRpcCounts before;
     GetRpcCounts(before);
+    WorkerQueryAndGetCounts ownerBefore;
+    GetWorkerQueryAndGetCounts(META_OWNER_INDEX, ownerBefore);
     Optional<Buffer> buffer;
     DS_ASSERT_OK(reader_->Get(key, buffer));
     TransportRpcCounts after;
     GetRpcCounts(after);
+    WorkerQueryAndGetCounts ownerAfter;
+    GetWorkerQueryAndGetCounts(META_OWNER_INDEX, ownerAfter);
 
     ASSERT_TRUE(buffer);
     ASSERT_EQ(buffer->GetSize(), value.size());
@@ -1942,6 +1946,8 @@ TEST_F(KVClientTransportGetTest, InlineCapacityLimitFallsBack)
     ASSERT_EQ(AccessTransportTracker::ToString(), ExpectedTransport());
     ASSERT_EQ(after.queryAndGet, before.queryAndGet + 1);
     ASSERT_EQ(after.getObjectRemote, before.getObjectRemote + 1);
+    ASSERT_EQ(ownerAfter.metadataMisses, ownerBefore.metadataMisses)
+        << "A locally readable object exceeding inline capacity must not depend on its metadata owner";
 }
 
 TEST_F(KVClientTransportGetTest, DirectBatchGetRoundTrips32Keys)

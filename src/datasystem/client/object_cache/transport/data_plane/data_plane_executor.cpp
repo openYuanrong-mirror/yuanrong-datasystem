@@ -198,31 +198,36 @@ Status DataPlaneExecutor::ExecuteFallbacks(const HostPort &workerAddr, const Ope
 
 Status DataPlaneExecutor::Execute(const HostPort &workerAddr, const Operation &operation, bool traceEnabled)
 {
-    return ExecuteImpl(workerAddr, 0, operation, traceEnabled);
+    RETURN_RUNTIME_ERROR_IF_NULL(advisor_);
+    return ExecuteImpl(workerAddr, 0, advisor_->GetTransportHint(workerAddr), operation, traceEnabled);
 }
 
 Status DataPlaneExecutor::ExecuteForDataLocation(const HostPort &workerAddr, uint64_t locationTopologyVersion,
-                                                 const Operation &operation, bool traceEnabled)
+                                                 const Operation &operation, bool traceEnabled,
+                                                 std::optional<TransportHint> transportHint)
 {
-    return ExecuteImpl(workerAddr, locationTopologyVersion, operation, traceEnabled);
+    if (!transportHint.has_value()) {
+        RETURN_RUNTIME_ERROR_IF_NULL(advisor_);
+        transportHint = advisor_->GetTransportHint(workerAddr);
+    }
+    return ExecuteImpl(workerAddr, locationTopologyVersion, *transportHint, operation, traceEnabled);
 }
 
 Status DataPlaneExecutor::ExecuteImpl(const HostPort &workerAddr, uint64_t locationTopologyVersion,
-                                      const Operation &operation, bool traceEnabled)
+                                      TransportHint hint, const Operation &operation, bool traceEnabled)
 {
     RETURN_RUNTIME_ERROR_IF_NULL(manager_);
-    RETURN_RUNTIME_ERROR_IF_NULL(advisor_);
     CHECK_FAIL_RETURN_STATUS(static_cast<bool>(operation), K_INVALID, "Data-plane operation is empty");
     std::optional<TransportPhaseLatencyRecorder> recorder;
     TransportPhaseLatencyRecorder *phaseRecorder = nullptr;
     if (traceEnabled) {
         phaseRecorder = &recorder.emplace(workerAddr);
     }
-    const TransportHint hint = advisor_->GetTransportHint(workerAddr);
     const AttemptPlan initialAttempt{ hint, INITIAL_ATTEMPT, "connection_acquire", "data_transfer" };
     AttemptResult result = ExecuteAttempt(workerAddr, operation, initialAttempt, locationTopologyVersion,
                                           phaseRecorder);
     if (hint == TransportHint::SHM_CANDIDATE && IsShmFallbackError(result.status)) {
+        RETURN_RUNTIME_ERROR_IF_NULL(advisor_);
         if (IsWorkerDrainingForScaleIn(result.status)) {
             manager_->MarkShmDraining(workerAddr);
             const bool shouldRefresh = advisor_->ObserveDrainingShmFailure(workerAddr);

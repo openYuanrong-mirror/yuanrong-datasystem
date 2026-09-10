@@ -85,6 +85,7 @@ DS_DECLARE_string(cluster_name);
 DS_DECLARE_bool(oc_io_from_l2cache_need_metadata);
 DS_DECLARE_bool(authorization_enable);
 DS_DECLARE_bool(enable_data_replication);
+DS_DECLARE_bool(enable_transport_fallback);
 DS_DECLARE_uint32(data_migrate_rate_limit_mb);
 DS_DEFINE_bool(enable_l2_cache_fallback, true, "Control whether enable fallback to L2 cache when worker failed.");
 using namespace datasystem::worker;
@@ -1386,8 +1387,11 @@ Status WorkerOcServiceGetImpl::GetObjectFromRemoteWorkerAndDump(const std::strin
 template <typename Req>
 Status WorkerOcServiceGetImpl::PrepareGetRequestHelper(const std::string &srcIpAddr, uint64_t dataSize,
                                                        ReadObjectKV &objectKV, Req &reqPb, bool &shmUnitAllocated,
-                                                       std::shared_ptr<ShmOwner> shmOwner)
+                                                       std::shared_ptr<ShmOwner> shmOwner, bool useFastTransport)
 {
+    if (!useFastTransport) {
+        return Status::OK();
+    }
     // If fast transport is enabled, or if shmOwner is not nullptr, memory distribution/allocation needs to be
     // processed.
     if (!IsFastTransportEnabled() && shmOwner == nullptr) {
@@ -1483,7 +1487,7 @@ Status WorkerOcServiceGetImpl::ConstructBatchGetRequest(const std::string &addre
                                                         std::vector<std::string> &successIds,
                                                         std::vector<ReadKey> &needRetryIds,
                                                         std::unordered_set<std::string> &failedIds,
-                                                        BatchGetObjectRemoteReqPb &reqPb)
+                                                        BatchGetObjectRemoteReqPb &reqPb, bool useFastTransport)
 {
     PerfPoint point(PerfKey::WORKER_CONSTRUCT_BATCH_GET_REQ);
     // The function is placed together with PrepareGetRequestHelper,
@@ -1493,15 +1497,17 @@ Status WorkerOcServiceGetImpl::ConstructBatchGetRequest(const std::string &addre
     std::vector<std::shared_ptr<ShmOwner>> shmOwners;
     std::vector<uint32_t> shmIndexMapping(infos.size(), std::numeric_limits<uint32_t>::max());
     // Skip early allocate if the request is both RH2D enabled and supported.
-    if (!IsRemoteH2DEnabled() || request == nullptr || request->GetClientCommUuid().empty()) {
-        RETURN_IF_NOT_OK(AggregateAllocateHelper(infos, shmOwners, shmIndexMapping));
-    } else {
-        // Assume the client works with only one device id, so only one connection is needed.
-        (*reqPb.mutable_comm_id()) = request->GetClientCommUuid();
+    if (useFastTransport) {
+        if (!IsRemoteH2DEnabled() || request == nullptr || request->GetClientCommUuid().empty()) {
+            RETURN_IF_NOT_OK(AggregateAllocateHelper(infos, shmOwners, shmIndexMapping));
+        } else {
+            // Assume the client works with only one device id, so only one connection is needed.
+            (*reqPb.mutable_comm_id()) = request->GetClientCommUuid();
+        }
     }
 
     std::string transportInstanceId;
-    if (GetLocalTransportInstanceId(transportInstanceId).IsOk()) {
+    if (useFastTransport && GetLocalTransportInstanceId(transportInstanceId).IsOk()) {
         (*reqPb.mutable_urma_instance_id()) = transportInstanceId;
     }
     bool requestReady = false;
@@ -1547,7 +1553,8 @@ Status WorkerOcServiceGetImpl::ConstructBatchGetRequest(const std::string &addre
         if (shmIndexMapping.size() > objectIndex && shmOwners.size() > shmIndexMapping[objectIndex]) {
             shmOwner = shmOwners[shmIndexMapping[objectIndex]];
         }
-        status = PrepareGetRequestHelper(address, meta.data_size(), objectKV, subReq, shmUnitAllocated, shmOwner);
+        status = PrepareGetRequestHelper(address, meta.data_size(), objectKV, subReq, shmUnitAllocated, shmOwner,
+                                         useFastTransport);
         if (status.IsError()) {
             handleIndividualStatus(status);
             continue;
@@ -1593,7 +1600,11 @@ Status WorkerOcServiceGetImpl::PullObjectDataFromRemoteWorker(const std::string 
                      objectKV.GetReadOffset(), objectKV.GetReadSize()),
         localAddress_.ToString(), address);
     INJECT_POINT("worker.remote_get_failed");
-    RETURN_IF_NOT_OK(CheckRemoteReadAdmission(address));
+    bool useFastTransport = IsFastTransportEnabled();
+    // A remote H2D commId requires the fast-transport request layout and cannot be consumed by TCP.
+    const auto fallback =
+        objectKV.commId_ == nullptr ? ReadTransportFallback::ALLOWED : ReadTransportFallback::FORBIDDEN;
+    RETURN_IF_NOT_OK(CheckRemoteReadAdmission(address, fallback, useFastTransport));
     std::shared_ptr<WorkerRemoteWorkerOCApi> workerStub;
     RETURN_IF_NOT_OK_PRINT_ERROR_MSG(CreateRemoteWorkerApi(address, localAddress_, akSkManager_, workerStub),
                                      "Create remote worker api failed.");
@@ -1614,7 +1625,7 @@ Status WorkerOcServiceGetImpl::PullObjectDataFromRemoteWorker(const std::string 
         (*reqPb.mutable_comm_id()) = (*objectKV.commId_);
     }
     std::string transportInstanceId;
-    if (GetLocalTransportInstanceId(transportInstanceId).IsOk()) {
+    if (useFastTransport && GetLocalTransportInstanceId(transportInstanceId).IsOk()) {
         reqPb.set_urma_instance_id(transportInstanceId);
     }
 
@@ -1626,10 +1637,11 @@ Status WorkerOcServiceGetImpl::PullObjectDataFromRemoteWorker(const std::string 
         dataSizeChange = false;
         bool shmUnitAllocated = false;
         // Prepare the protobuf with urma/ucp info for data transfer if applicable.
-        RETURN_IF_NOT_OK(PrepareGetRequestHelper(address, dataSize, objectKV, reqPb, shmUnitAllocated));
+        RETURN_IF_NOT_OK(
+            PrepareGetRequestHelper(address, dataSize, objectKV, reqPb, shmUnitAllocated, nullptr, useFastTransport));
         int64_t timeoutMs = GetRequestContext()->reqTimeoutDuration.CalcRealRemainingTime();
         INJECT_POINT("worker_oc_service_get_impl.pull_object_data_from_remote_worker.before_get_from_remote");
-        const auto &retryCodes = GetRemoteGetRetryCodes(IsFastTransportEnabled());
+        const auto &retryCodes = GetRemoteGetRetryCodes(useFastTransport);
         Status rc = RetryOnErrorRepent(
             timeoutMs,
             [&workerStub, &reqPb, &rspPb, &clientApi, &address, this](int32_t) {
@@ -1707,19 +1719,29 @@ Status WorkerOcServiceGetImpl::PullObjectDataFromRemoteWorker(const std::string 
         INFO, config.rpcSlowerThanUs > 0 && remoteGetUs >= config.rpcSlowerThanUs, 1,
         AppendSrcDstForLog(
             FormatString("Remote get success, objectKey: %s, path: %s, cost: %.3fms", objectKV.GetObjKey(),
-                         IsUrmaEnabled() ? "UB" : (IsUcpEnabled() ? "RDMA" : "TCP"), remoteGetMs),
+                         useFastTransport ? (IsUrmaEnabled() ? "UB" : "RDMA") : "TCP", remoteGetMs),
             localAddress_.ToString(), address));
     return Status::OK();
 }
 
-Status WorkerOcServiceGetImpl::CheckRemoteReadAdmission(const std::string &address) const
+Status WorkerOcServiceGetImpl::CheckRemoteReadAdmission(const std::string &address, ReadTransportFallback fallback,
+                                                        bool &useFastTransport) const
 {
     if (ubAdmission_ == nullptr) {
         return Status::OK();
     }
     HostPort peer;
     RETURN_IF_NOT_OK(peer.ParseString(address));
-    return ubAdmission_->CheckReadSource(peer);
+    auto status = ubAdmission_->CheckReadSource(peer);
+    if (status.GetCode() == K_URMA_DATA_WORKER_UNAVAILABLE && FLAGS_enable_transport_fallback
+        && fallback == ReadTransportFallback::ALLOWED) {
+        useFastTransport = false;
+        LOG_EVERY_N(WARNING, K_URMA_WARNING_LOG_EVERY_N)
+            << "[Get] UB read source is unavailable; continue through the existing TCP fallback, peer: "
+            << peer.ToString() << ", status: " << status.ToString();
+        return Status::OK();
+    }
+    return status;
 }
 
 void WorkerOcServiceGetImpl::ReportRemoteReadOutcome(const std::string &address, const Status &status,
@@ -2504,9 +2526,10 @@ Status WorkerOcServiceGetImpl::GetObjectFromAnywhereWithLock(const ReadKey &read
         if (rc.IsOk()) {
             RETURN_IF_NOT_OK(UpdateRequestForSuccess(objectKV, request));
             return Status::OK();
-        } else if (!IsRemoteH2DEnabled()) {
+        } else if (rc.GetCode() != K_NOT_FOUND && !IsRemoteH2DEnabled()) {
             return rc;
         }
+        // A metadata-only local entry is a cache miss, not a failure of the resolved remote copy.
         // For RemoteH2D scenario, data never reaches shared memory, so need to re-do get entirely.
     }
     SetObjectEntryAccordingToMeta(meta, GetMetadataSize(), *entry);
@@ -3612,7 +3635,7 @@ Status WorkerOcServiceGetImpl::KeepObjectDataInMemory(ReadObjectKV &objectKV)
         RETURN_IF_NOT_OK(GetObjectFromPersistenceAndDumpWithoutCopyMeta(objectKV, false, false));
         CacheHitInfo::Instance().IncL2Hit(1);
     } else {
-        return Status(K_RUNTIME_ERROR, "object not found in local");
+        return Status(K_NOT_FOUND, "object not found in local");
     }
     return Status::OK();
 }

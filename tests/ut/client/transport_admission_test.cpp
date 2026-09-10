@@ -553,11 +553,8 @@ TEST(ReplicaReaderAdmissionTest, BatchChecksUnavailableEndpointOnceAndContinuesH
     EXPECT_TRUE(results[2].status.IsOk());
 }
 
-TEST(ReplicaReaderAdmissionTest, ClientReadSourceDeniedFastSkipsToNextReplica)
+TEST(ReplicaReaderAdmissionTest, ClientReadSourceDeniedFallsBackToSameProviderTcp)
 {
-    // The client-side admission denial (K_URMA_READ_SOURCE_DENIED) must fast-skip a replica
-    // exactly like the worker-authoritative K_URMA_DATA_WORKER_UNAVAILABLE, and the surfaced
-    // error must be the denial code (not 2008).
     ApiDeadlineGuard deadline(1000);
     const auto failedProvider = MakeAddress(34);
     const auto healthyProvider = MakeAddress(35);
@@ -586,10 +583,137 @@ TEST(ReplicaReaderAdmissionTest, ClientReadSourceDeniedFastSkipsToNextReplica)
     EXPECT_TRUE(reader.ReadBatch(requests).IsOk());
     EXPECT_EQ(admissionChecks[failedProvider], 1u);
     EXPECT_EQ(admissionChecks[healthyProvider], 1u);
-    EXPECT_EQ(manager->transportBuildCount, 1);
-    EXPECT_EQ(results[0].status.GetCode(), K_URMA_READ_SOURCE_DENIED);
-    EXPECT_EQ(results[1].status.GetCode(), K_URMA_READ_SOURCE_DENIED);
+    EXPECT_EQ(manager->transportBuildCount, 2);
+    EXPECT_TRUE(results[0].status.IsOk());
+    EXPECT_TRUE(results[1].status.IsOk());
     EXPECT_TRUE(results[2].status.IsOk());
+    ASSERT_EQ(manager->builtTransporters.size(), 2u);
+    auto failedTransporter = std::find_if(
+        manager->builtTransporters.begin(), manager->builtTransporters.end(),
+        [failedProvider](const auto &transporter) { return transporter->providerAddress == failedProvider; });
+    ASSERT_NE(failedTransporter, manager->builtTransporters.end());
+    EXPECT_EQ((*failedTransporter)->kind, AccessTransportKind::TCP);
+    EXPECT_EQ((*failedTransporter)->batchGetCount, 1);
+    EXPECT_EQ(results[0].attemptedKind, AccessTransportKind::TCP);
+    EXPECT_EQ(results[1].attemptedKind, AccessTransportKind::TCP);
+}
+
+TEST(ReplicaReaderAdmissionTest, LargeOrDisabledFallbackFailsFastWithoutTcpSubmission)
+{
+    const bool savedFallback = FLAGS_enable_transport_fallback;
+    Raii restoreFallback([savedFallback] { FLAGS_enable_transport_fallback = savedFallback; });
+    for (const bool fallback : { false, true }) {
+        FLAGS_enable_transport_fallback = fallback;
+        for (const bool batch : { false, true }) {
+            for (const uint64_t bytes : std::vector<uint64_t>{ UrmaFallbackTcpLimiter::kMaxSinglePayloadBytes,
+                                                              8ULL * 1024 * 1024 + 65536 }) {
+                ApiDeadlineGuard deadline(1000);
+                const auto provider = MakeAddress(36);
+                auto manager = std::make_shared<FakeDataPlaneManager>();
+                auto executor = std::make_shared<DataPlaneExecutor>(
+                    manager, std::make_shared<FixedTransportAdvisor>(TransportHint::UB_CANDIDATE));
+                size_t checks = 0;
+                ReplicaReader reader(executor, std::make_shared<DeadlineRetry>(), std::make_shared<ThreadPool>(1),
+                    [&checks](const HostPort &, AccessTransportKind &kind) {
+                        kind = AccessTransportKind::UB;
+                        return ++checks == 1 ? Status(K_URMA_READ_SOURCE_DENIED, "waiting for UB probe")
+                                             : Status::OK();
+                    });
+                auto location = MakeReplicaLocation("large-ub-read", bytes, { provider });
+                ObjectReadItemResult result;
+                auto context = std::make_shared<TransportReadContext>();
+                ReplicaReadRequest request{ &location, &result, context };
+                auto rc = batch ? reader.ReadBatch({ request }) : reader.Read(location, result, context);
+                EXPECT_EQ(rc.GetCode(), K_URMA_READ_SOURCE_DENIED);
+                EXPECT_EQ(checks, 1U);
+                EXPECT_TRUE(manager->builtTransporters.empty());
+                EXPECT_EQ(result.attemptedKind, AccessTransportKind::UB);
+                EXPECT_GT(ApiDeadline::Instance().ApiRemainingUs(), 0);
+            }
+        }
+    }
+}
+
+TEST(ReplicaReaderAdmissionTest, SmallFallbackAlsoHonorsDisabledSwitch)
+{
+    const bool savedFallback = FLAGS_enable_transport_fallback;
+    Raii restoreFallback([savedFallback] { FLAGS_enable_transport_fallback = savedFallback; });
+    FLAGS_enable_transport_fallback = false;
+    ApiDeadlineGuard deadline(1000);
+    auto manager = std::make_shared<FakeDataPlaneManager>();
+    auto executor = std::make_shared<DataPlaneExecutor>(
+        manager, std::make_shared<FixedTransportAdvisor>(TransportHint::UB_CANDIDATE));
+    ReplicaReader reader(executor, std::make_shared<DeadlineRetry>(), std::make_shared<ThreadPool>(1),
+                         [](const HostPort &, AccessTransportKind &kind) {
+                             kind = AccessTransportKind::UB;
+                             return Status(K_URMA_READ_SOURCE_DENIED, "UB denied");
+                         });
+    auto location = MakeReplicaLocation("small-no-fallback", 4, { MakeAddress(37) });
+    ObjectReadItemResult result;
+    EXPECT_EQ(reader.Read(location, result, std::make_shared<TransportReadContext>()).GetCode(),
+              K_URMA_READ_SOURCE_DENIED);
+    EXPECT_TRUE(manager->builtTransporters.empty());
+    EXPECT_GT(ApiDeadline::Instance().ApiRemainingUs(), 0);
+}
+
+TEST(ReplicaReaderAdmissionTest, LargeDeniedReadUsesHealthyReplicaWithoutTcp)
+{
+    const bool savedFallback = FLAGS_enable_transport_fallback;
+    Raii restoreFallback([savedFallback] { FLAGS_enable_transport_fallback = savedFallback; });
+    FLAGS_enable_transport_fallback = true;
+    for (const bool batch : { false, true }) {
+        ApiDeadlineGuard deadline(1000);
+        const auto denied = MakeAddress(38);
+        const auto healthy = MakeAddress(39);
+        auto manager = std::make_shared<FakeDataPlaneManager>();
+        auto executor = std::make_shared<DataPlaneExecutor>(
+            manager, std::make_shared<FixedTransportAdvisor>(TransportHint::UB_CANDIDATE));
+        ReplicaReader reader(
+            executor, std::make_shared<DeadlineRetry>(), std::make_shared<ThreadPool>(1),
+            [denied](const HostPort &address, AccessTransportKind &kind) {
+                kind = AccessTransportKind::UB;
+                return address == denied ? Status(K_URMA_READ_SOURCE_DENIED, "UB denied") : Status::OK();
+            });
+        auto location = MakeReplicaLocation("large-replica-read", 8ULL * 1024 * 1024 + 65536, { denied, healthy });
+        ObjectReadItemResult result;
+        auto context = std::make_shared<TransportReadContext>();
+        ReplicaReadRequest request{ &location, &result, context };
+        ASSERT_TRUE((batch ? reader.ReadBatch({ request }) : reader.Read(location, result, context)).IsOk());
+        ASSERT_EQ(manager->builtTransporters.size(), 1U);
+        EXPECT_EQ(manager->builtTransporters.front()->kind, AccessTransportKind::UB);
+        EXPECT_EQ(manager->builtTransporters.front()->providerAddress, healthy);
+    }
+}
+
+TEST(ReplicaReaderAdmissionTest, FallbackQuotaExhaustionHonorsDeadlineAndReleasesPartialBatch)
+{
+    const bool savedFallback = FLAGS_enable_transport_fallback;
+    Raii restoreFallback([savedFallback] { FLAGS_enable_transport_fallback = savedFallback; });
+    FLAGS_enable_transport_fallback = true;
+    UrmaFallbackTcpLimiter::Ticket occupied;
+    ASSERT_TRUE(UrmaFallbackTcpLimiter::TryAcquireProcessScope(
+        UrmaFallbackTcpLimiter::kMaxPendingBytes - 6, Status::OK(), "test", occupied, false).IsOk());
+    auto manager = std::make_shared<FakeDataPlaneManager>();
+    auto executor = std::make_shared<DataPlaneExecutor>(
+        manager, std::make_shared<FixedTransportAdvisor>(TransportHint::UB_CANDIDATE));
+    ReplicaReader reader(
+        executor, std::make_shared<DeadlineRetry>(), std::make_shared<ThreadPool>(1),
+        [](const HostPort &, AccessTransportKind &kind) {
+            kind = AccessTransportKind::UB;
+            return Status(K_URMA_READ_SOURCE_DENIED, "UB denied");
+        });
+    auto first = MakeReplicaLocation("quota-a", 4, { MakeAddress(39) });
+    auto second = MakeReplicaLocation("quota-b", 4, { MakeAddress(39) });
+    ObjectReadItemResult firstResult;
+    ObjectReadItemResult secondResult;
+    ApiDeadlineGuard deadline(20);
+    EXPECT_EQ(reader.ReadBatch({ { &first, &firstResult }, { &second, &secondResult } }).GetCode(),
+              K_URMA_READ_SOURCE_DENIED);
+    EXPECT_LE(ApiDeadline::Instance().ApiRemainingUs(), 0);
+    EXPECT_NE(secondResult.status.GetMsg().find("fallback tcp payload rejected by limiter"), std::string::npos);
+    EXPECT_EQ(manager->transportBuildCount, 0);
+    UrmaFallbackTcpLimiter::Ticket remaining;
+    EXPECT_TRUE(UrmaFallbackTcpLimiter::TryAcquireProcessScope(6, Status::OK(), "test", remaining).IsOk());
 }
 
 TEST(TransportLayerAdmissionTest, ReadSourceDeniedReportsUbKindWithoutTouchingTracker)
@@ -640,7 +764,7 @@ TEST(ReplicaReaderAdmissionTest, DeniedUbSourceThenFailedTcpReplicaReportsTcpAsA
                 return Status::OK();
             }
             deniedKind = AccessTransportKind::UB;
-            return Status(K_URMA_READ_SOURCE_DENIED, "client denied read source");
+            return Status(K_URMA_DATA_WORKER_UNAVAILABLE, "authoritative UB source unavailable");
         });
     auto location = MakeReplicaLocation("denied-then-tcp", 4, { deniedProvider, tcpProvider });
     ObjectReadItemResult result;
@@ -651,7 +775,7 @@ TEST(ReplicaReaderAdmissionTest, DeniedUbSourceThenFailedTcpReplicaReportsTcpAsA
     EXPECT_EQ(AccessTransportTracker::ToString(), "SHM");
 }
 
-TEST(ReplicaReaderAdmissionTest, UbOnlyDenialKeepsAttemptedKindAtUb)
+TEST(ReplicaReaderAdmissionTest, AuthoritativeUbDenialKeepsAttemptedKindAtUb)
 {
     // Regression guard for the original bug: when only the UB admission denial happens (no replica
     // executes), attemptedKind stays UB so the access log reports UB instead of the SHM default.
@@ -666,13 +790,14 @@ TEST(ReplicaReaderAdmissionTest, UbOnlyDenialKeepsAttemptedKindAtUb)
                 return Status::OK();
             }
             deniedKind = AccessTransportKind::UB;
-            return Status(K_URMA_READ_SOURCE_DENIED, "client denied read source");
+            return Status(K_URMA_DATA_WORKER_UNAVAILABLE, "authoritative UB source unavailable");
         });
     auto location = MakeReplicaLocation("ub-only-denied", 4, { deniedProvider });
     ObjectReadItemResult result;
     ReplicaReadBatch requests{ { &location, &result } };
 
-    EXPECT_EQ(reader.ReadBatch(requests).GetCode(), K_URMA_READ_SOURCE_DENIED);
+    EXPECT_EQ(reader.ReadBatch(requests).GetCode(), K_URMA_DATA_WORKER_UNAVAILABLE);
+    EXPECT_EQ(manager->transportBuildCount, 0);
     EXPECT_EQ(result.attemptedKind, AccessTransportKind::UB);
 }
 
@@ -1111,6 +1236,49 @@ TEST(TransportLayerAdmissionTest, Cqe4DoesNotDirectlyCloseAdmission)
     EXPECT_TRUE(layer.Set(*buffer, MakeSetParam()).IsOk());
     std::shared_ptr<ObjectBuffer> nextBuffer;
     EXPECT_TRUE(layer.Create(MakeAddress(31), "next", 64, MakeCreateParam(), nextBuffer).IsOk());
+}
+
+TEST(TransportLayerAdmissionTest, UbAllocationKeepsSetTransportAndExplicitTcpPolicy)
+{
+    for (const auto hint : { TransportHint::SHM_CANDIDATE, TransportHint::TCP_ONLY }) {
+        auto manager = std::make_shared<FakeDataPlaneManager>();
+        auto advisor = std::make_shared<FixedTransportAdvisor>(TransportHint::UB_CANDIDATE);
+        TestTransportLayer layer(manager, advisor);
+        std::shared_ptr<ObjectBuffer> buffer;
+        ASSERT_TRUE(layer.Create(MakeAddress(38), "ub-allocation", 64, MakeCreateParam(), buffer).IsOk());
+        // Match the allocation metadata installed by UbTransporter::Create after SHM is unavailable.
+        ObjectBufferInternal::GetMutableInfo(*buffer).ubUrmaDataInfo = std::make_shared<UrmaRemoteAddrPb>();
+        auto ub = manager->builtTransporters.front();
+        advisor->SetHint(hint);
+        ASSERT_TRUE(layer.Set(*buffer, MakeSetParam()).IsOk());
+        EXPECT_EQ(ub->setCount, hint == TransportHint::SHM_CANDIDATE ? 1 : 0);
+        if (hint == TransportHint::TCP_ONLY) {
+            EXPECT_EQ(manager->builtTransporters.back()->kind, AccessTransportKind::TCP);
+            EXPECT_EQ(manager->builtTransporters.back()->setCount, 1);
+        }
+    }
+}
+
+TEST(TransportLayerAdmissionTest, UniformUbMSetKeepsAllocationTransportButMixedBatchKeepsShm)
+{
+    for (const bool allUb : { true, false }) {
+        auto manager = std::make_shared<FakeDataPlaneManager>();
+        auto advisor = std::make_shared<FixedTransportAdvisor>(TransportHint::UB_CANDIDATE);
+        TestTransportLayer layer(manager, advisor);
+        std::vector<std::shared_ptr<ObjectBuffer>> buffers;
+        ASSERT_TRUE(layer.MCreate(MakeAddress(39), { "ub-first", "second" }, { 64, 64 },
+                                  MakeCreateParam(), buffers).IsOk());
+        ObjectBufferInternal::GetMutableInfo(*buffers[0]).ubUrmaDataInfo = std::make_shared<UrmaRemoteAddrPb>();
+        if (allUb) {
+            ObjectBufferInternal::GetMutableInfo(*buffers[1]).ubUrmaDataInfo = std::make_shared<UrmaRemoteAddrPb>();
+        }
+        auto ub = manager->builtTransporters.front();
+        advisor->SetHint(TransportHint::SHM_CANDIDATE);
+        TransportMSetResult result;
+        ASSERT_TRUE(layer.MSet(buffers, MakeSetParam(), result).IsOk());
+        EXPECT_EQ(result.actualKind, allUb ? AccessTransportKind::UB : AccessTransportKind::SHM);
+        EXPECT_EQ(ub->mSetCount, allUb ? 1 : 0);
+    }
 }
 
 TEST(TransportLayerAdmissionTest, Cqe4DoesNotDirectlyBlockSharedMemoryTransport)

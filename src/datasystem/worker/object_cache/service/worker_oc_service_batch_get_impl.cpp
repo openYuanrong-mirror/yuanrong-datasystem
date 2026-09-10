@@ -777,11 +777,16 @@ Status WorkerOcServiceGetImpl::PrepareBatchGetRemoteRequest(BatchGetRemoteReques
                              "Fail to get objects from remote worker, no object copy exists.");
     INJECT_POINT("worker.before_GetObjectFromRemoteWorkerAndDump");
     context.point.RecordAndReset(PerfKey::WORKER_BATCH_GET_CONSTRUCT_GET_REQUEST);
-    RETURN_IF_NOT_OK(CheckRemoteReadAdmission(context.address));
+    const bool pipelineH2D = context.request != nullptr
+                             && OsXprtPipln::IsPiplnH2DRequest(context.request->GetH2DChunkManager());
+    // Pipeline H2D requires its fast-transport buffers, so only ordinary batches may fall back to TCP.
+    const auto fallback = pipelineH2D ? ReadTransportFallback::FORBIDDEN : ReadTransportFallback::ALLOWED;
+    RETURN_IF_NOT_OK(CheckRemoteReadAdmission(context.address, fallback, context.useFastTransport));
     RETURN_IF_NOT_OK(ConstructBatchGetRequest(context.address, context.infos, context.request, context.successIds,
-                                              context.needRetryIds, context.failedIds, context.reqPb));
+                                              context.needRetryIds, context.failedIds, context.reqPb,
+                                              context.useFastTransport));
     VLOG(1) << AppendSrcDstForLog(FormatString("[Get] Remote pull, count: %d, path: %s", context.reqPb.requests_size(),
-                                               IsUrmaEnabled() ? "UB" : (IsUcpEnabled() ? "RDMA" : "TCP")),
+                                               context.useFastTransport ? (IsUrmaEnabled() ? "UB" : "RDMA") : "TCP"),
                                   localAddress_.ToString(), context.address);
     INJECT_POINT("worker.remote_get_failed");
     context.point.RecordAndReset(PerfKey::WORKER_BATCH_GET_CREATE_REMOTE_API);
@@ -793,7 +798,7 @@ Status WorkerOcServiceGetImpl::SendBatchGetRemoteRequest(const std::string &addr
                                                          int64_t migrateDataTimeoutMs, uint64_t rpcSlowerThanUs,
                                                          PerfPoint &point, BatchGetObjectRemoteReqPb &reqPb,
                                                          BatchGetObjectRemoteRspPb &rspPb,
-                                                         std::vector<RpcMessage> &payloads)
+                                                         std::vector<RpcMessage> &payloads, bool useFastTransport)
 {
     std::shared_ptr<WorkerRemoteWorkerOCApi> workerStub;
     RETURN_IF_NOT_OK_PRINT_ERROR_MSG(CreateRemoteWorkerApi(address, localAddress_, akSkManager_, workerStub),
@@ -809,7 +814,7 @@ Status WorkerOcServiceGetImpl::SendBatchGetRemoteRequest(const std::string &addr
     Raii inflightGuard([inflightGauge]() { inflightGauge.Dec(); });
     Timer timer;
     constexpr int32_t minRetryOnceRpcMs = 1;  // The first level of retryIntervalsMs.
-    const auto &retryCodes = GetRemoteGetRetryCodes(IsFastTransportEnabled());
+    const auto &retryCodes = GetRemoteGetRetryCodes(useFastTransport);
     auto rc = RetryOnErrorRepent(
         timeoutMs,
         [this, &workerStub, &reqPb, &rspPb, &clientApi, &address, &payloads, &hostAddr, &request](int32_t) {
@@ -833,7 +838,7 @@ Status WorkerOcServiceGetImpl::SendBatchGetRemoteRequest(const std::string &addr
     SLOW_LOG_IF_OR_VLOG(
         INFO, rpcSlowerThanUs > 0 && elapsedUs >= rpcSlowerThanUs, 1,
         AppendSrcDstForLog(FormatString("[Get] Remote done, count: %d, path: %s, cost: %.3fms", reqPb.requests_size(),
-                                        IsUrmaEnabled() ? "UB" : (IsUcpEnabled() ? "RDMA" : "TCP"), elapsedMs),
+                                        useFastTransport ? (IsUrmaEnabled() ? "UB" : "RDMA") : "TCP", elapsedMs),
                            localAddress_.ToString(), address));
     return rc;
 }
@@ -863,15 +868,18 @@ Status WorkerOcServiceGetImpl::BatchGetObjectFromRemoteWorker(const std::string 
             reqPb.mutable_requests()->Reserve(static_cast<int>(infos.size()));
         }
         PerfPoint point(PerfKey::WORKER_BATCH_GET_CONSTRUCT_AND_SEND);
+        bool useFastTransport = IsFastTransportEnabled();
         Status rc;
         {
             PerfPoint detailPoint(PerfKey::WORKER_BATCH_GET_CONSTRUCT_AND_SEND_PRE);
             HostPort hostAddr;
             rc = PrepareBatchGetRemoteRequest({ address, infos, request, successIds, needRetryIds, failedIds,
-                                                detailPoint, hostAddr, checkConnectStatus, reqPb });
+                                                detailPoint, hostAddr, checkConnectStatus, reqPb,
+                                                useFastTransport });
             if (rc.IsOk()) {
                 rc = SendBatchGetRemoteRequest(address, hostAddr, request, MIGRATE_DATA_TIMEOUT_MS,
-                                               traceConfig.rpcSlowerThanUs, detailPoint, reqPb, rspPb, payloads);
+                                               traceConfig.rpcSlowerThanUs, detailPoint, reqPb, rspPb, payloads,
+                                               useFastTransport);
                 DelayReleaseBatchRemoteGetShmUnits(reqPb, infos, rc);
             }
         }

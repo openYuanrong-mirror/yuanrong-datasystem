@@ -100,7 +100,7 @@ public:
                                int32_t requestTimeoutMs, bool isSeal = false);
     void BuildTransportReadRequest(const std::vector<std::string> &objectKeys, client::ObjectReadRequest &request,
                                    std::vector<Status> &itemStatuses, int64_t subTimeoutMs,
-                                   bool queryL2Cache);
+                                   bool queryL2Cache, const std::vector<HostPort> &excludedWorkers = {});
     Status BuildTransportGetResponse(
         client::ObjectReadItemResult &item, GetRspPb &response,
         std::unordered_map<std::string, std::shared_ptr<ObjectBufferInfo>> &ubBufferInfos, uint64_t &payloadSize);
@@ -109,13 +109,14 @@ public:
     Status ApplyTransportReadResult(const std::vector<std::string> &objectKeys,
                                     const client::ObjectReadRequest &request, client::ObjectReadResult &result,
                                     const Status &transportStatus, std::vector<std::shared_ptr<Buffer>> &buffers,
-                                    std::vector<Status> &itemStatuses, AccessTransportKind &actualKind);
+                                    std::vector<Status> &itemStatuses, AccessTransportKind &actualKind,
+                                    std::vector<HostPort> &excludedWorkers);
     Status FinishTransportRead(const std::vector<Status> &itemStatuses, AccessTransportKind actualKind,
                                const Status &transportStatus);
     Status ReadTransportRound(const std::vector<std::string> &objectKeys, bool traceEnabled, int64_t subTimeoutMs,
                               bool queryL2Cache, std::vector<std::shared_ptr<Buffer>> &buffers,
                               std::vector<Status> &itemStatuses, AccessTransportKind &actualKind,
-                              Status &transportStatus);
+                              Status &transportStatus, std::vector<HostPort> &excludedWorkers);
     Status GetFromTransportLayer(const std::vector<std::string> &objectKeys,
                                  std::vector<std::shared_ptr<Buffer>> &buffers, bool traceEnabled,
                                  int64_t subTimeoutMs, bool queryL2Cache);
@@ -149,6 +150,7 @@ public:
                     const bool isLocal, const SensitiveValue &token);
 
 private:
+    std::shared_ptr<client::TransportReadContext> CreateTransportReadContext(int64_t subTimeoutMs, bool queryL2Cache);
     std::unique_ptr<client::TransportLayer> &transportLayer_;
     std::shared_ptr<client::Routing> &routing_;
     const int32_t &requestTimeoutMs_;

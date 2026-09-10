@@ -65,6 +65,7 @@
 #include "tests/ut/worker/object_cache/test_placement_facade.h"
 #include "ut/common.h"
 #define private public
+#include "datasystem/worker/object_cache/data_migrator/data_migrator.h"
 #include "datasystem/worker/object_cache/worker_oc_service_impl.h"
 #include "datasystem/worker/object_cache/worker_worker_oc_service_impl.h"
 #undef private
@@ -1077,6 +1078,36 @@ TEST_F(WorkerOcServiceImplTest, RemoteGetTryLockMissDoesNotLeaveEmptyEntry)
         EXPECT_THAT(rc.GetMsg(), Not(HasSubstr("realObject is null")));
         EXPECT_EQ(objectTable_->Contains(objectKey).GetCode(), K_NOT_FOUND);
     }
+}
+
+TEST_F(WorkerOcServiceImplTest, MigrationUbAdmissionUsesExistingTcpFallback)
+{
+    const bool oldTransportFallback = FLAGS_enable_transport_fallback;
+    const std::string oldTransportMode = FLAGS_data_migrate_urma_transport_mode;
+    Raii restoreFlag([oldTransportFallback, oldTransportMode]() {
+        FLAGS_enable_transport_fallback = oldTransportFallback;
+        FLAGS_data_migrate_urma_transport_mode = oldTransportMode;
+    });
+    BINEXPECT_CALL(&datasystem::IsUrmaEnabled, ()).WillRepeatedly(Return(true));
+    const HostPort target("127.0.0.1", 18482);
+    PeerUbAdmission admission;
+    UbOpOutcome failure(target, UbOperationKind::MIGRATION_WRITE, Status(K_URMA_ERROR, "remote ack timeout"));
+    failure.cqeStatus = URMA_REMOTE_ACK_TIMEOUT_STATUS;
+    admission.ReportOutcome(failure);
+    DataMigrator migrator(MigrateType::SCALE_DOWN, metadataRoute_, topologyRuntime_.Engine()->Membership(),
+                          *endpointPolicy_, &exitRequested_, localAddress_, nullptr, objectTable_);
+    migrator.SetUbAdmission(&admission);
+    FLAGS_enable_transport_fallback = true;
+    FLAGS_data_migrate_urma_transport_mode = "write";
+    EXPECT_TRUE(migrator.CheckUbAdmission(target, UbOperationKind::MIGRATION_WRITE).IsOk());
+
+    FLAGS_data_migrate_urma_transport_mode = "read";
+    EXPECT_EQ(migrator.CheckUbAdmission(target, UbOperationKind::MIGRATION_READ).GetCode(),
+              K_URMA_WORKER_UNAVAILABLE);
+
+    FLAGS_enable_transport_fallback = false;
+    EXPECT_EQ(migrator.CheckUbAdmission(target, UbOperationKind::MIGRATION_WRITE).GetCode(),
+              K_URMA_WORKER_UNAVAILABLE);
 }
 
 TEST_F(WorkerOcServiceImplTest, RemoteGetL2MissDoesNotLeaveEmptyEntry)
@@ -2640,12 +2671,13 @@ TEST_F(WorkerOcServiceImplTest, QueryMetaDataFromMasterReportsMetadataRpcSuccess
 TEST_F(WorkerOcServiceImplTest, QueryMetaDataFromMasterDoesNotReportLocalRetryBudgetTimeoutAsPeerFailure)
 {
     ScopedRequestContext requestContext;
-    GetRequestContext()->reqTimeoutDuration.Init(1);
     const HostPort masterAddress("127.0.0.1", 18482);
     auto api = std::make_shared<FakeWorkerMasterOCApi>(masterAddress);
-    master::QueryMetaRspPb movingRsp;
-    movingRsp.set_meta_is_moving(true);
-    api->SetQueryMetaResponse(movingRsp);
+    api->SetQueryMetaHandler([](int, master::QueryMetaRspPb &response) {
+        response.set_meta_is_moving(true);
+        GetRequestContext()->reqTimeoutDuration.Init(0);
+        return Status::OK();
+    });
     auto apiManager = std::make_shared<FakeWorkerMasterApiManager>(localAddress_, metadataRoute_);
     apiManager->SetApi(api);
     std::vector<std::pair<std::string, StatusCode>> observations;
@@ -2658,6 +2690,7 @@ TEST_F(WorkerOcServiceImplTest, QueryMetaDataFromMasterDoesNotReportLocalRetryBu
     master::QueryMetaRspPb rsp;
     std::vector<RpcMessage> payloads;
 
+    GetRequestContext()->reqTimeoutDuration.Init(1000);
     auto rc = getImpl.QueryMetaDataFromMasterImpl(masterAddress, K_META_MOVING_RETRY_TIMEOUT_MS, { "obj" }, rsp,
                                                   payloads);
 

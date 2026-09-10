@@ -78,7 +78,7 @@ protected:
 private:
     bool IsRetryableLocationError(const Status &status) const;
     Status ReadReplicaOnce(const ReplicaReadRequest &request, int replicaIndex, size_t round,
-                           const HostPort &workerAddr, bool traceEnabled);
+                           const HostPort &workerAddr, bool traceEnabled, bool &deterministicDenial);
 
     std::shared_ptr<DataPlaneExecutor> executor_;
     std::shared_ptr<DeadlineRetry> retry_;

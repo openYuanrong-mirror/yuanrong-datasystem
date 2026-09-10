@@ -272,6 +272,7 @@ private:
 
     Status CheckSourceAdmission() const;
     Status CheckTargetAdmission(const HostPort &target, DataPlaneAdmissionRole role) const;
+    Status CheckUbAdmission(const HostPort &worker, UbOperationKind operation) const;
     Status SelectRedirectTarget(const std::string &originAddr, uint64_t totalSize,
                                 std::shared_ptr<SelectionStrategy> &strategy, HostPort &target) const;
     bool LearnStructuredUbFailure(const MigrateDataHandler::MigrateResult &result, bool &localOperator);

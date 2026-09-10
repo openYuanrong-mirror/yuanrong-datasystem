@@ -6,6 +6,7 @@
 
 #include "datasystem/client/object_cache/bound_mode.h"
 #include "datasystem/common/inject/inject_point.h"
+#include "datasystem/common/rpc/api_deadline.h"
 
 namespace datasystem {
 namespace object_cache {
@@ -25,7 +26,21 @@ public:
     Status MultiPublish(const std::vector<std::shared_ptr<ObjectBufferInfo>> &bufferInfo, const PublishParam &param, MultiPublishRspPb &rsp, const std::vector<const DeviceBlobList *> &deviceBlobRefs) override { return Status::OK(); }
     Status DecreaseWorkerRef(const std::vector<ShmKey> &objectKeys) override { return Status::OK(); }
     Status PipelineRH2D(PiplnRh2dParam &piplnRh2dParam, GetRspPb &rsp) override { return Status::OK(); }
-    Status Get(const GetParam &getParam, uint32_t &version, GetRspPb &rsp, std::vector<RpcMessage> &payloads) override { return Status::OK(); }
+    Status Get(const GetParam &, uint32_t &, GetRspPb &, std::vector<RpcMessage> &) override
+    {
+        ++getCalls;
+        if (expireDeadlineOnGet) {
+            ApiDeadline::Instance().InitUs(0);
+        }
+        if (repeatedGetStatus != K_OK) {
+            return Status(repeatedGetStatus, "injected repeated Get response");
+        }
+        return Status(getCalls == 1 ? firstGetStatus : K_INVALID, "injected Get response");
+    }
+    size_t getCalls = 0;
+    StatusCode firstGetStatus = K_OK;
+    StatusCode repeatedGetStatus = K_OK;
+    bool expireDeadlineOnGet = false;
     Status InvalidateBuffer(const std::string &objectKey) override { return Status::OK(); }
     Status GIncreaseWorkerRef(const std::vector<std::string> &firstIncIds, std::vector<std::string> &failedObjectKeys, const std::string &remoteClientId) override { return Status::OK(); }
     Status ReleaseGRefs(const std::string &remoteClientId) override { return Status::OK(); }
@@ -116,6 +131,17 @@ protected:
         deps.host.checkConnection = [] { return Status::OK(); };
         deps.host.checkConnWhileShmModify = [] { return Status::OK(); };
         deps.host.isBufferAlive = [](uint32_t) { return true; };
+        deps.host.handleDirectGetFailure = [](const std::shared_ptr<IClientWorkerApi> &, const Status &) {};
+        deps.getWorkerApiNode = [this](std::shared_ptr<IClientWorkerApi> &api, std::unique_ptr<Raii> &guard,
+                                       WorkerNode &node) {
+            EXPECT_FALSE(getGuardHeld);
+            ++getApiCalls;
+            getGuardHeld = true;
+            guard = std::make_unique<Raii>([this] { getGuardHeld = false; });
+            api = mockApi;
+            node = LOCAL_WORKER;
+            return Status::OK();
+        };
         bound = std::make_unique<BoundMode>(deps);
     }
 
@@ -141,6 +167,8 @@ protected:
     bool enableH2D = false;
     int parallismNum = 0;
     std::unique_ptr<BoundMode> bound;
+    bool getGuardHeld = false;
+    size_t getApiCalls = 0;
 };
 
 TEST_F(BoundModeTest, ConstructObjKeyWithTenantIdPrefixesTenant)
@@ -174,6 +202,57 @@ TEST_F(BoundModeTest, DecreaseReferenceCntWorkerErrorPropagates)
     bound->DecreaseReferenceCnt(shmId, false, 7);
     ASSERT_EQ(mockApi->DecreaseShmRefCalls, 1);
     inject::Clear("client.DecreaseReferenceCnt");
+}
+
+TEST_F(BoundModeTest, UbGetRetryReacquiresWorkerApiAndPreservesTerminalError)
+{
+    for (auto code : {K_URMA_ERROR, K_URMA_WORKER_UNAVAILABLE, K_URMA_DATA_WORKER_UNAVAILABLE}) {
+        ApiDeadlineGuard deadline(1000);
+        mockApi->firstGetStatus = code;
+        mockApi->getCalls = 0;
+        getApiCalls = 0;
+        std::vector<std::shared_ptr<Buffer>> buffers(1);
+        EXPECT_EQ(bound->GetFromLocalWorker({"key"}, 0, buffers, false, false, 1000).GetCode(), K_INVALID);
+        EXPECT_EQ(mockApi->getCalls, 2U);
+        EXPECT_EQ(getApiCalls, 2U);
+        EXPECT_FALSE(getGuardHeld);
+    }
+}
+
+TEST_F(BoundModeTest, NonUbGetFailureDoesNotRetry)
+{
+    ApiDeadlineGuard deadline(1000);
+    mockApi->firstGetStatus = K_INVALID;
+    std::vector<std::shared_ptr<Buffer>> buffers(1);
+    EXPECT_EQ(bound->GetFromLocalWorker({"key"}, 0, buffers, false, false, 1000).GetCode(), K_INVALID);
+    EXPECT_EQ(mockApi->getCalls, 1U);
+    EXPECT_EQ(getApiCalls, 1U);
+    EXPECT_FALSE(getGuardHeld);
+}
+
+TEST_F(BoundModeTest, UbGetRetryStopsAtDeadlineAndPreservesLastError)
+{
+    ApiDeadlineGuard deadline(1000);
+    mockApi->firstGetStatus = K_URMA_ERROR;
+    mockApi->expireDeadlineOnGet = true;
+    std::vector<std::shared_ptr<Buffer>> buffers(1);
+    EXPECT_EQ(bound->GetFromLocalWorker({"key"}, 0, buffers, false, false, 1000).GetCode(), K_URMA_ERROR);
+    EXPECT_EQ(mockApi->getCalls, 1U);
+    EXPECT_EQ(getApiCalls, 1U);
+    EXPECT_FALSE(getGuardHeld);
+}
+
+TEST_F(BoundModeTest, PersistentUbGetFailureStopsAtIndependentAttemptLimit)
+{
+    ApiDeadlineGuard deadline(10'000);
+    mockApi->repeatedGetStatus = K_URMA_ERROR;
+    std::vector<std::shared_ptr<Buffer>> buffers(1);
+
+    EXPECT_EQ(bound->GetFromLocalWorker({ "key" }, 0, buffers, false, false, 10'000).GetCode(), K_URMA_ERROR);
+    EXPECT_EQ(mockApi->getCalls, 4U);
+    EXPECT_EQ(getApiCalls, 4U);
+    EXPECT_GT(ApiDeadline::Instance().ApiRemainingUs(), 0);
+    EXPECT_FALSE(getGuardHeld);
 }
 }  // namespace
 }  // namespace object_cache

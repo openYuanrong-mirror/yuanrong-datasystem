@@ -33,6 +33,7 @@
 #include "datasystem/worker/object_cache/data_migrator/strategy/spill_node_selector.h"
 
 DS_DECLARE_string(data_migrate_urma_transport_mode);
+DS_DECLARE_bool(enable_transport_fallback);
 
 namespace datasystem {
 namespace object_cache {
@@ -53,8 +54,8 @@ Status DataMigrator::CheckSourceAdmission() const
                           ? DataPlaneAdmissionRole::TOPOLOGY_SCALE_IN_SOURCE
                           : DataPlaneAdmissionRole::ORDINARY_SOURCE;
     RETURN_IF_NOT_OK(endpointPolicy_.CheckDataPlaneAdmission(localAddress_, role));
-    if (IsUrmaEnabled() && FLAGS_data_migrate_urma_transport_mode != "read" && ubAdmission_ != nullptr) {
-        RETURN_IF_NOT_OK(ubAdmission_->CheckWriteTarget(localAddress_, UbOperationKind::MIGRATION_WRITE));
+    if (FLAGS_data_migrate_urma_transport_mode != "read") {
+        RETURN_IF_NOT_OK(CheckUbAdmission(localAddress_, UbOperationKind::MIGRATION_WRITE));
     }
     return Status::OK();
 }
@@ -62,12 +63,25 @@ Status DataMigrator::CheckSourceAdmission() const
 Status DataMigrator::CheckTargetAdmission(const HostPort &target, DataPlaneAdmissionRole role) const
 {
     RETURN_IF_NOT_OK(endpointPolicy_.CheckDataPlaneAdmission(target, role));
-    if (IsUrmaEnabled() && ubAdmission_ != nullptr) {
-        const auto operation = FLAGS_data_migrate_urma_transport_mode == "read" ? UbOperationKind::MIGRATION_READ
-                                                                               : UbOperationKind::MIGRATION_WRITE;
-        RETURN_IF_NOT_OK(ubAdmission_->CheckWriteTarget(target, operation));
+    const auto operation = FLAGS_data_migrate_urma_transport_mode == "read" ? UbOperationKind::MIGRATION_READ
+                                                                           : UbOperationKind::MIGRATION_WRITE;
+    return CheckUbAdmission(target, operation);
+}
+
+Status DataMigrator::CheckUbAdmission(const HostPort &worker, UbOperationKind operation) const
+{
+    if (!IsUrmaEnabled() || ubAdmission_ == nullptr) {
+        return Status::OK();
     }
-    return Status::OK();
+    auto status = ubAdmission_->CheckWriteTarget(worker, operation);
+    const bool canUseTcpFallback = FLAGS_enable_transport_fallback && FLAGS_data_migrate_urma_transport_mode == "write";
+    if (status.IsError() && canUseTcpFallback) {
+        LOG_EVERY_N(WARNING, MIGRATION_RETRY_LOG_EVERY_N)
+            << "[Migrate Data] UB admission denied for " << worker.ToString()
+            << "; continue through the existing TCP fallback: " << status.ToString();
+        return Status::OK();
+    }
+    return status;
 }
 
 std::shared_ptr<SelectionStrategy> DataMigrator::GetStrategyByType()
@@ -649,7 +663,8 @@ bool DataMigrator::LearnStructuredUbFailure(const MigrateDataHandler::MigrateRes
 
 bool DataMigrator::IsLocalMigrationOperatorUnavailable() const
 {
-    if (!IsUrmaEnabled() || ubAdmission_ == nullptr) {
+    const bool canUseTcpFallback = FLAGS_enable_transport_fallback && FLAGS_data_migrate_urma_transport_mode == "write";
+    if (!IsUrmaEnabled() || ubAdmission_ == nullptr || canUseTcpFallback) {
         return false;
     }
     return ubAdmission_->CheckWriteTarget(localAddress_, UbOperationKind::MIGRATION_WRITE).IsError();

@@ -1619,6 +1619,77 @@ TEST_F(NotifyRemoteGetMigrationTest, FinalRemoteGetCleanupFiltersRecoveredAttemp
     EXPECT_EQ(removeMetaCalls, 1U);
 }
 
+TEST_F(NotifyRemoteGetMigrationTest, LocalPayloadMissReachesResolvedRemoteAndPreservesFailure)
+{
+    constexpr char hook[] = "worker.before_GetObjectFromRemoteWorkerAndDump";
+    Raii clearInject([&] { (void)inject::Clear(hook); });
+    ScopedRequestContext requestContext;
+    for (const auto &testCase : { std::make_pair(K_RPC_PEER_DEAD, "return(K_RPC_PEER_DEAD)"),
+                                 std::make_pair(K_URMA_WAIT_TIMEOUT, "return(K_URMA_WAIT_TIMEOUT)") }) {
+        const std::string objectKey = "metadata-only-local-copy";
+        auto object = std::make_unique<object_cache::ObjCacheShmUnit>();
+        object->SetLifeState(ObjectLifeState::OBJECT_SEALED);
+        object->stateInfo.SetDataFormat(DataFormat::BINARY);
+        object->stateInfo.SetIncompleted(false);
+        auto entry = std::make_shared<SafeObjType>(std::move(object));
+        DS_ASSERT_OK(entry->WLock());
+        Raii unlock([&] { entry->WUnlock(); });
+        const ReadKey readKey(objectKey);
+        ReadObjectKV objectKV(readKey, *entry);
+        ASSERT_TRUE(entry->Get()->IsGetDataEnablelFromLocal());
+        ASSERT_FALSE(entry->Get()->IsShmUnitExistsAndComplete());
+        EXPECT_EQ(impl_->KeepObjectDataInMemory(objectKV).GetCode(), K_NOT_FOUND);
+        auto queryMeta = MakeQueryMeta();
+        queryMeta.mutable_meta()->set_object_key(objectKey);
+        queryMeta.mutable_meta()->set_primary_address(leavingWorkerAddress_.ToString());
+        queryMeta.set_address(leavingWorkerAddress_.ToString());
+        std::vector<RpcMessage> payloads;
+        GetRequestContext()->reqTimeoutDuration.Init(1'000);
+        DS_ASSERT_OK(inject::Clear(hook));
+        DS_ASSERT_OK(inject::Set(hook, testCase.second));
+
+        auto rc = impl_->GetObjectFromAnywhereWithLock(readKey, nullptr, entry, queryMeta, payloads);
+
+        EXPECT_EQ(rc.GetCode(), testCase.first);
+        EXPECT_EQ(inject::GetExecuteCount(hook), 1U);
+        EXPECT_TRUE(entry->IsWLockedByCurrentThread());
+    }
+}
+
+TEST_F(NotifyRemoteGetMigrationTest, LocalL2ReadErrorDoesNotMasqueradeAsPayloadMiss)
+{
+    constexpr char hook[] = "worker.before_GetObjectFromRemoteWorkerAndDump";
+    std::string oldFallback;
+    ASSERT_TRUE(GetCommandLineOption("enable_l2_cache_fallback", oldFallback));
+    Raii restore([&] {
+        std::string error;
+        (void)SetCommandLineOption("enable_l2_cache_fallback", oldFallback, error);
+        (void)inject::Clear(hook);
+    });
+    std::string error;
+    ASSERT_TRUE(SetCommandLineOption("enable_l2_cache_fallback", "true", error)) << error;
+    const std::string objectKey = "local-l2-read-error";
+    auto object = std::make_unique<object_cache::ObjCacheShmUnit>();
+    object->stateInfo.SetDataFormat(DataFormat::BINARY);
+    object->modeInfo.SetWriteMode(WriteMode::WRITE_THROUGH_L2_CACHE);
+    auto entry = std::make_shared<SafeObjType>(std::move(object));
+    DS_ASSERT_OK(entry->WLock());
+    Raii unlock([&] { entry->WUnlock(); });
+    auto queryMeta = MakeQueryMeta();
+    queryMeta.mutable_meta()->set_object_key(objectKey);
+    queryMeta.set_address(leavingWorkerAddress_.ToString());
+    std::vector<RpcMessage> payloads;
+    ScopedRequestContext requestContext;
+    GetRequestContext()->reqTimeoutDuration.Init(1'000);
+    DS_ASSERT_OK(inject::Set(hook, "return(K_RPC_PEER_DEAD)"));
+
+    auto rc = impl_->GetObjectFromAnywhereWithLock(ReadKey(objectKey), nullptr, entry, queryMeta, payloads);
+
+    EXPECT_EQ(rc.GetCode(), K_RUNTIME_ERROR);
+    EXPECT_NE(rc.GetMsg().find("persistenceApi is nullptr"), std::string::npos);
+    EXPECT_EQ(inject::GetExecuteCount(hook), 0U);
+}
+
 #ifdef USE_NPU
 TEST_F(NotifyRemoteGetMigrationTest, GetObjectFromAnywhereAllowsNullRequestWithRemoteH2D)
 {
