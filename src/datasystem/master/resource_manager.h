@@ -27,6 +27,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <string>
 #include <unordered_map>
 
 #include "datasystem/cluster/membership/membership_endpoint_view.h"
@@ -50,8 +51,9 @@ public:
 
     /**
      * @brief Construct the resource manager.
+     * @param[in] refreshIdentity Stable identity used to stagger background store refreshes.
      */
-    ResourceManager();
+    explicit ResourceManager(std::string refreshIdentity = {});
 
     /**
      * @brief Deconstruct the reousrce manager.
@@ -92,10 +94,10 @@ public:
     Status GetEvictionPolicyUpdateProgress(uint64_t epoch, master::GetEvictionPolicyUpdateProgressRspPb &rsp);
 
     /**
-     * @brief Bind the shared rollout store and recover the last committed intent before serving requests.
+     * @brief Bind the shared rollout store and recover the last committed intent.
      * @param[in] loader Exact-read callback for the rollout key.
      * @param[in] cas Callback-form CAS for the rollout key.
-     * @return K_OK when the store is bound and any durable intent is recovered.
+     * @return K_OK after binding; transient load failures stay fail-closed until refresh succeeds.
      */
     Status InitEvictionPolicyRolloutStore(RolloutLoader loader, RolloutCas cas);
 
@@ -118,6 +120,12 @@ protected:
     void SwitchSnapshots();
 
 private:
+    enum class EvictionPolicyRolloutStoreState : uint8_t {
+        UNINITIALIZED,
+        LOADING,
+        READY,
+    };
+
     /**
      * @brief Build a scheduling snapshot from the latest entry in both snapshot buffers.
      * @param[out] snapshot The merged scheduling snapshot.
@@ -152,6 +160,7 @@ private:
     };
 
     static constexpr int64_t WORKER_THREAD_INTERVAL_MS = 10 * 1000;
+    const std::string refreshIdentity_;
     Thread workerThread_;
     std::mutex taskMutex_;
     std::condition_variable taskCv_;
@@ -172,6 +181,9 @@ private:
     std::shared_ptr<const master::EvictionPolicyRolloutPb> evictionPolicyRollout_;
     RolloutLoader evictionPolicyRolloutLoader_;
     RolloutCas evictionPolicyRolloutCas_;
+    std::atomic<EvictionPolicyRolloutStoreState> evictionPolicyRolloutStoreState_{
+        EvictionPolicyRolloutStoreState::UNINITIALIZED
+    };
     // Progress belongs to the active rollout epoch and is protected by evictionPolicyMutex_ so publishing a
     // new epoch and clearing stale worker observations is one atomic state transition.
     std::unordered_map<std::string, master::EvictionPolicyWorkerProgressPb> evictionPolicyWorkerProgress_;

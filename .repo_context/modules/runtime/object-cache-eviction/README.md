@@ -75,8 +75,11 @@
     对象进度和有界失败原因，`ResourceReportRspPb` 返回 `EvictionPolicyUpdatePb`；`NodeSelector` 每轮仅推进一个
     batch，batch 上限为 4096。master `ResourceManager` 接受 controller 提交的
     PRECHECK/COMMIT、epoch/target/batch/cohort 和准入门槛，
-    通过 coordination backend CAS 持久化 rollout，启动加载并周期刷新其他 master 的提交，再按 worker 地址稳定 hash
-    下发。`GetEvictionPolicyUpdateProgress` 返回该 master 最近观测的 worker ACK；worker 明细保留用于诊断，但
+    通过 coordination backend CAS 持久化 rollout，启动加载并周期刷新其他 master 的提交。首次加载遇到暂态控制面
+    错误时 worker 继续启动，但 ResourceManager 在确认 rollout 或确认 key 不存在前拒绝资源上报；后台线程继续周期
+    刷新，首次等待按 worker 地址稳定 hash 分散到一个刷新周期内，成功后恢复资源上报，再按 worker 地址稳定 hash
+    下发。
+    `GetEvictionPolicyUpdateProgress` 返回该 master 最近观测的 worker ACK；worker 明细保留用于诊断，但
     READY/CONVERTING/ACTIVE/FAILED 计数只统计当前 rollout epoch，避免上一 epoch 的失败状态污染新任务进度；
     跨 master READY barrier 由控制器汇总。
     worker 在 drain 前通过原子文件持久化 transition intent，重启恢复 last-good，并只允许未完成 COMMIT 向同一
@@ -298,7 +301,10 @@
   - `ctest -R SpillEvictionTest`
   - `ctest -R KVCacheClientEvictTest`
   - `ctest -R EvictPrimaryRedirectScaleTest`
+  - `bazel test //tests/ut/master/object_cache:resource_manager_policy_rollout_test --dynamic_mode=off`
 - Representative tests:
+  - `tests/ut/master/object_cache/resource_manager_policy_rollout_test.cpp`：首次 NOT_READY/纯 RPC 超时后，
+    后台恢复持久化 rollout 或确认 key 不存在；未确认存储状态、读取错误和坏数据期间保持资源上报门禁。
   - `tests/ut/worker/object_cache/worker_oc_eviction_test.cpp`
   - `tests/ut/worker/object_cache/worker_oc_spill_eviction_test.cpp`
   - `tests/st/client/kv_cache/kv_cache_client_evict_test.cpp`

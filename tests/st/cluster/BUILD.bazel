@@ -53,6 +53,7 @@ cc_library(
     includes = [".."],
     visibility = ["//tests:__subpackages__"],
     deps = [
+        "//src/datasystem/cluster:cluster_topology",
         "//src/datasystem/cluster:cluster_topology_keyspace",
         "//src/datasystem/common/coordinator:coordinator_store",
         "//src/datasystem/common/coordinator:static_coordinator_discovery",
