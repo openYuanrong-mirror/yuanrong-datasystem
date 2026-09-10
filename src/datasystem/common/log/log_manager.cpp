@@ -199,6 +199,10 @@ Status LogManager::DoLogFileRolling()
         for (auto &file : files) {
             auto size = FileSize(file);
             CHECK_FAIL_RETURN_STATUS(size >= 0, K_RUNTIME_ERROR, "Get file size failed");
+            if (size == 0) {
+                LOG_IF_ERROR(DeleteFile(file), "Delete empty log archive failed: " + file);
+                continue;
+            }
             int64_t timestamp;
             RETURN_IF_NOT_OK(GetFileModifiedTime(file, timestamp));
             fileMap.emplace(timestamp, FileUnit(file, size));

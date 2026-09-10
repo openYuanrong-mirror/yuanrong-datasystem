@@ -1090,5 +1090,53 @@ TEST_F(LoggingTest, TestClientLogNameEnvAfterLoggingRestart)
 
     ASSERT_EQ(FLAGS_log_filename, "test_client_after_restart");
 }
+
+TEST_F(LoggingTest, RollingDeletesEmptyRotatedFiles)
+{
+    FLAGS_log_compress = false;
+    FLAGS_log_filename = "ds_llt";
+    FLAGS_max_log_file_num = 5;
+    const std::string emptyInfoArchive = FLAGS_log_dir + "/ds_llt.INFO.20260907120000_000.log";
+    const std::string dataInfoArchive = FLAGS_log_dir + "/ds_llt.INFO.20260907130000_000.log";
+    const std::string emptyAccessArchive = FLAGS_log_dir + "/" + ACCESS_LOG_NAME + ".20260907120000_000.log";
+    const std::string emptyRequestOutArchive = FLAGS_log_dir + "/" + REQUEST_OUT_LOG_NAME + ".20260907120000_000.log";
+    const std::string emptyActiveInfo = FLAGS_log_dir + "/ds_llt.INFO.log";
+    const std::string emptyActiveAccess = FLAGS_log_dir + "/" + ACCESS_LOG_NAME + ".log";
+    DS_ASSERT_OK(CreateTextFile("ds_llt.INFO.20260907130000_000.log", 1024));
+    {
+        std::ofstream ofs(emptyInfoArchive, std::ios::out | std::ios::trunc);
+        ASSERT_TRUE(ofs.is_open());
+    }
+    {
+        std::ofstream ofs(emptyAccessArchive, std::ios::out | std::ios::trunc);
+        ASSERT_TRUE(ofs.is_open());
+    }
+    {
+        std::ofstream ofs(emptyRequestOutArchive, std::ios::out | std::ios::trunc);
+        ASSERT_TRUE(ofs.is_open());
+    }
+    {
+        std::ofstream ofs(emptyActiveInfo, std::ios::out | std::ios::trunc);
+        ASSERT_TRUE(ofs.is_open());
+    }
+    {
+        std::ofstream ofs(emptyActiveAccess, std::ios::out | std::ios::trunc);
+        ASSERT_TRUE(ofs.is_open());
+    }
+
+    DS_ASSERT_OK(LogManager::DoLogFileRolling());
+
+    EXPECT_FALSE(FileExist(emptyInfoArchive));
+    EXPECT_FALSE(FileExist(emptyAccessArchive));
+    EXPECT_FALSE(FileExist(emptyRequestOutArchive));
+    EXPECT_TRUE(FileExist(dataInfoArchive));
+    // Active log names carry no timestamp segment, so rolling must never touch them.
+    EXPECT_TRUE(FileExist(emptyActiveInfo));
+    EXPECT_TRUE(FileExist(emptyActiveAccess));
+
+    DS_EXPECT_OK(DeleteFile(dataInfoArchive));
+    DS_EXPECT_OK(DeleteFile(emptyActiveInfo));
+    DS_EXPECT_OK(DeleteFile(emptyActiveAccess));
+}
 }  // namespace ut
 }  // namespace datasystem
