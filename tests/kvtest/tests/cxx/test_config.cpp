@@ -317,7 +317,7 @@ TEST(ParseTestMode_NeedsRemoteWorker) {
     ASSERT_FALSE(NeedsRemoteWorker(TestMode::GET_LOCAL));
     ASSERT_TRUE(NeedsRemoteWorker(TestMode::SET_REMOTE));
     ASSERT_TRUE(NeedsRemoteWorker(TestMode::GET_CROSS_NODE));
-    ASSERT_TRUE(NeedsRemoteWorker(TestMode::GET_REMOTE_DIRECT));
+    ASSERT_FALSE(NeedsRemoteWorker(TestMode::GET_REMOTE_DIRECT));
     ASSERT_TRUE(NeedsRemoteWorker(TestMode::GET_REMOTE_CROSS));
 }
 
@@ -364,6 +364,33 @@ TEST(LoadConfig_TestMode_RemoteWorker) {
     ASSERT_TRUE(LoadConfig(path, cfg));
     ASSERT_EQ(cfg.remoteWorker.host, "192.168.1.100");
     ASSERT_EQ(cfg.remoteWorker.port, 31501);
+    CleanupDir(cfg.outputDir);
+    std::remove(path.c_str());
+}
+
+TEST(LoadConfig_GetRemoteDirectWithoutRemoteWorker) {
+    auto path = WriteTempConfig(R"({
+        "etcd_address":"x:1","listen_port":9000,
+        "test_mode":"get_remote_direct","worker_memory_mb":4096
+    })");
+    Config cfg;
+    ASSERT_TRUE(LoadConfig(path, cfg));
+    ASSERT_TRUE(cfg.remoteWorker.host.empty());
+    ASSERT_TRUE(cfg.ShouldUseServiceDiscoveryForRemoteDirect());
+    CleanupDir(cfg.outputDir);
+    std::remove(path.c_str());
+}
+
+TEST(LoadConfig_GetRemoteDirectWithRemoteWorkerUsesDirectConnection) {
+    auto path = WriteTempConfig(R"({
+        "etcd_address":"x:1","listen_port":9000,
+        "test_mode":"get_remote_direct","worker_memory_mb":4096,
+        "remote_worker":{"host":"192.0.2.10","port":31501}
+    })");
+    Config cfg;
+    ASSERT_TRUE(LoadConfig(path, cfg));
+    ASSERT_EQ(cfg.remoteWorker.host, "192.0.2.10");
+    ASSERT_FALSE(cfg.ShouldUseServiceDiscoveryForRemoteDirect());
     CleanupDir(cfg.outputDir);
     std::remove(path.c_str());
 }

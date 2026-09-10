@@ -50,8 +50,8 @@ TestMode ParseTestMode(const std::string &s)
 
 bool NeedsRemoteWorker(TestMode mode)
 {
-    return mode == TestMode::SET_REMOTE || mode == TestMode::GET_CROSS_NODE || mode == TestMode::GET_REMOTE_DIRECT
-           || mode == TestMode::GET_REMOTE_CROSS || mode == TestMode::MIXED_REMOTE_SET_GET
+    return mode == TestMode::SET_REMOTE || mode == TestMode::GET_CROSS_NODE || mode == TestMode::GET_REMOTE_CROSS
+           || mode == TestMode::MIXED_REMOTE_SET_GET
            || mode == TestMode::MIXED_LOCAL_SET_CROSS_GET || mode == TestMode::MIXED_REMOTE_SET_REMOTE_CROSS_GET
            || mode == TestMode::MSET_REMOTE || mode == TestMode::MGET_CROSS_NODE || mode == TestMode::MGET_REMOTE_DIRECT
            || mode == TestMode::MGET_REMOTE_CROSS;
@@ -650,7 +650,9 @@ bool LoadConfig(const std::string &path, Config &cfg, const std::string &outputD
             << ", total_rounds=" << cfg.totalRounds << ", duration_seconds=" << cfg.durationSeconds
             << ", round_cleanup_wait_ms=" << cfg.roundCleanupWaitMs << ", set_api=" << cfg.setApi
             << ", cleanup_method=" << cfg.cleanupMethod;
-        if (NeedsRemoteWorker(cfg.testMode)) {
+        if (cfg.ShouldUseServiceDiscoveryForRemoteDirect()) {
+            log << ", remote_client=service_discovery";
+        } else if (NeedsRemoteWorker(cfg.testMode) || !cfg.remoteWorker.host.empty()) {
             log << ", remote_worker=" << cfg.remoteWorker.host << ":" << cfg.remoteWorker.port;
         }
     } else {

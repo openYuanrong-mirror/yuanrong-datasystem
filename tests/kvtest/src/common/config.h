@@ -122,6 +122,12 @@ struct Config {
     bool verifyFailOp = false;                     // true = verify failure fails the op
 
     int NumReadThreads() const { return numTotalThreads - numThreads; }
+
+    /** @brief Whether get_remote_direct should discover its worker dynamically. */
+    bool ShouldUseServiceDiscoveryForRemoteDirect() const
+    {
+        return testMode == TestMode::GET_REMOTE_DIRECT && remoteWorker.host.empty();
+    }
 };
 
 // Parse "8MB" -> 8388608, "512KB" -> 524288, "1024" -> 1024
