@@ -3442,28 +3442,50 @@ Status ObjectClientImpl::RunClientDirectPipelineRH2D(const std::vector<std::stri
 Status ObjectClientImpl::GetWithLatch(const std::vector<std::string> &objectKeys, std::vector<std::string> &vals,
                                       int64_t subTimeoutMs, std::vector<Optional<Buffer>> &buffers, size_t &dataSize)
 {
+    // subTimeoutMs only bounds waiting for an unavailable object, not the whole API request.
+    ApiDeadlineGuard deadline(requestTimeoutMs_);
     vals.clear();
     Status rc = Get(objectKeys, subTimeoutMs, buffers);
-    for (auto &buffer : buffers) {
+    for (size_t i = 0; i < buffers.size(); ++i) {
+        auto &buffer = buffers[i];
         if (buffer) {
-            // Use the SDK-internal helper so the read-and-copy works whether the
-            // shm buffer has a metadata-header lock or not (oc_metadata_header=false
-            // → DisabledLock → no latch needed for safe reads).
-            RETURN_IF_NOT_OK(buffer->CopyDataWithRLatch([&] {
-                const void *data = buffer->ImmutableData();
-                if (data == nullptr || buffer->GetSize() == 0) {
-                    vals.emplace_back();
-                    return Status::OK();
-                }
-                vals.emplace_back(reinterpret_cast<const char *>(data), buffer->GetSize());
-                dataSize += buffer->GetSize();
-                return Status::OK();
-            }));
+            std::string value;
+            RETURN_IF_NOT_OK(CopyGetBufferToString(objectKeys[i], subTimeoutMs, buffer, value));
+            dataSize += value.size();
+            vals.emplace_back(std::move(value));
         } else {
             vals.emplace_back();
         }
     }
     return rc;
+}
+
+Status ObjectClientImpl::CopyGetBufferToString(const std::string &objectKey, int64_t subTimeoutMs,
+                                               Optional<Buffer> &buffer, std::string &value)
+{
+    auto copy = [&buffer, &value]() {
+        return buffer->CopyDataWithRLatch([&buffer, &value]() {
+            const auto *data = static_cast<const char *>(buffer->ImmutableData());
+            value = data == nullptr || buffer->GetSize() == 0 ? std::string() : std::string(data, buffer->GetSize());
+            return Status::OK();
+        });
+    };
+    const Status copyRc = copy();
+    if ((copyRc.GetCode() != K_RPC_UNAVAILABLE && copyRc.GetCode() != K_BUFFER_DEPRECATED)
+        || !enableCrossNodeConnection_ || transportLayer_ == nullptr || std::atomic_load(&routing_) == nullptr) {
+        return copyRc;
+    }
+    // A successful Get RPC can race SHM disconnect before the application copies its result.
+    // Discard that mapping and re-read this key through the existing bounded transport path.
+    buffer = Optional<Buffer>();
+    value.clear();
+    RETURN_IF_NOT_OK(ApiDeadline::Instance().CheckApiDeadline());
+    std::vector<std::shared_ptr<Buffer>> replacement(1);
+    RETURN_IF_NOT_OK(routedMode_->GetFromTransportLayer(
+        { objectKey }, replacement, IsClientLatencyTraceActive(), subTimeoutMs, true));
+    CHECK_FAIL_RETURN_STATUS(replacement[0] != nullptr, K_NOT_FOUND, "Object unavailable after SHM read disconnect");
+    buffer = Optional<Buffer>(std::move(*replacement[0]));
+    return copy();
 }
 
 Status ObjectClientImpl::Get(const std::vector<std::string> &objectKeys, int64_t subTimeoutMs,

@@ -25,17 +25,22 @@
 #include <cstdint>
 #include <future>
 #include <limits>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "datasystem/common/flags/common_flags.h"
 #include "datasystem/common/log/access_recorder.h"
 #include "datasystem/common/log/log.h"
 #include "datasystem/common/log/trace.h"
 #include "datasystem/common/metrics/kv_metrics.h"
+#include "datasystem/common/object_cache/urma_fallback_tcp_limiter.h"
 #include "datasystem/common/rpc/api_deadline.h"
 #include "datasystem/common/util/status_helper.h"
+
+DS_DECLARE_bool(enable_transport_fallback);
 
 namespace datasystem {
 namespace client {
@@ -56,12 +61,32 @@ Status MakeStaleTransportSnapshotStatus(const Status &status)
     return Status(K_NOT_READY, std::string(STALE_TRANSPORT_SNAPSHOT_MESSAGE) + ": " + status.ToString());
 }
 
+struct TcpFallbackAttempt {
+    std::optional<TransportHint> hint;
+    bool deterministicDenial{ false };
+};
+
+// Success retains quota in ticket. Transient quota refusal rewrites denyStatus;
+// policy and payload-size refusal leave the original denial intact.
+TcpFallbackAttempt TryAcquireTcpFallback(Status &denyStatus, uint64_t bytes, UrmaFallbackTcpLimiter::Ticket &ticket)
+{
+    if (denyStatus.GetCode() != K_URMA_READ_SOURCE_DENIED) {
+        return {};
+    }
+    if (!FLAGS_enable_transport_fallback || bytes >= UrmaFallbackTcpLimiter::kMaxSinglePayloadBytes) {
+        return { std::nullopt, true };
+    }
+    auto allowance = UrmaFallbackTcpLimiter::TryAcquireProcessScope(bytes, denyStatus, "worker->client", ticket);
+    if (allowance.IsError()) {
+        denyStatus = std::move(allowance);
+        return {};
+    }
+    return { TransportHint::TCP_ONLY, false };
+}
+
 bool IsReadSourceUnavailableStatus(const Status &status)
 {
     if (status.GetCode() == K_URMA_DATA_WORKER_UNAVAILABLE) {
-        return true;
-    }
-    if (status.GetCode() == K_URMA_READ_SOURCE_DENIED) {
         return true;
     }
     return IsNonRetryableRpcError(status);
@@ -117,6 +142,7 @@ struct ReadChunk {
     Status endpointStatus = Status(K_NOT_READY, "Endpoint read was not started");
     DataGetBatchResult results;
     bool attempted = false;
+    bool deterministicDenial = false;
     AccessTransportKind attemptedKind = AccessTransportKind::SHM;
 };
 
@@ -222,8 +248,8 @@ void AdvanceRetryableReplica(ReadState &state, const Status &itemStatus)
     state.exhausted = true;
 }
 
-// Skip the current replica on UB admission denial or a dead RPC peer. UB admission
-// errors surface unchanged if all replicas are exhausted; peer-dead is refreshable.
+// Worker-authoritative source unavailability and dead transports skip to another replica.
+// Client-local UB admission denial is consumed earlier by a same-worker TCP downgrade.
 bool IsReadSourceUnavailable(const Status &status)
 {
     return IsReadSourceUnavailableStatus(status);
@@ -274,8 +300,8 @@ bool ReplicaReader::IsRetryableLocationError(const Status &status) const
     switch (status.GetCode()) {
         case K_URMA_NEED_CONNECT:
         case K_URMA_CONNECT_FAILED:
-        case K_URMA_DATA_WORKER_UNAVAILABLE:
         case K_URMA_READ_SOURCE_DENIED:
+        case K_URMA_DATA_WORKER_UNAVAILABLE:
         case K_WORKER_PULL_OBJECT_NOT_FOUND:
         case K_OUT_OF_MEMORY:
             return true;
@@ -295,7 +321,7 @@ Status ReplicaReader::Backoff(int64_t &backoffMs) const
 }
 
 Status ReplicaReader::ReadReplicaOnce(const ReplicaReadRequest &request, int replicaIndex, size_t round,
-                                      const HostPort &workerAddr, bool traceEnabled)
+                                      const HostPort &workerAddr, bool traceEnabled, bool &deterministicDenial)
 {
     const auto &location = *request.location;
     auto &result = *request.result;
@@ -304,12 +330,13 @@ Status ReplicaReader::ReadReplicaOnce(const ReplicaReadRequest &request, int rep
             << ", replica count: " << location.object_locations_size() << ", expected size: " << location.object_size()
             << ", round: " << round << ", remaining deadline us: " << ApiDeadline::Instance().ApiRemainingUs();
     AccessTransportKind attemptedKind = AccessTransportKind::SHM;
-    Status rc = Status::OK();
-    if (readAdmissionCheck_) {
-        rc = readAdmissionCheck_(workerAddr, attemptedKind);
-    }
+    Status admissionStatus = readAdmissionCheck_ ? readAdmissionCheck_(workerAddr, attemptedKind) : Status::OK();
+    UrmaFallbackTcpLimiter::Ticket fallbackTicket;
+    const auto fallback = TryAcquireTcpFallback(admissionStatus, location.object_size(), fallbackTicket);
+    deterministicDenial = fallback.deterministicDenial;
     DataGetResult data;
-    if (rc.IsOk()) {
+    Status rc = admissionStatus;
+    if (admissionStatus.IsOk() || fallback.hint.has_value()) {
         DataGetRequest dataRequest{ location.object_key(), location.object_size(), request.context };
         rc = executor_->ExecuteForDataLocation(
             workerAddr, location.topology_version(),
@@ -317,7 +344,7 @@ Status ReplicaReader::ReadReplicaOnce(const ReplicaReadRequest &request, int rep
                 attemptedKind = MergeTransportKind(attemptedKind, transporter.Kind());
                 return transporter.Get(dataRequest, data);
             },
-            traceEnabled);
+            traceEnabled, fallback.hint);
         if (readOutcomeReport_) {
             readOutcomeReport_(workerAddr, data.response);
         }
@@ -363,7 +390,8 @@ Status ReplicaReader::Read(const master::ObjectLocationInfoPb &location, ObjectR
             }
             HostPort workerAddr;
             RETURN_IF_NOT_OK(workerAddr.ParseString(location.object_locations(replicaIndex)));
-            Status rc = ReadReplicaOnce(request, replicaIndex, round, workerAddr, traceEnabled);
+            bool deterministicDenial = false;
+            Status rc = ReadReplicaOnce(request, replicaIndex, round, workerAddr, traceEnabled, deterministicDenial);
             if (rc.IsOk()) {
                 return Status::OK();
             }
@@ -373,6 +401,12 @@ Status ReplicaReader::Read(const master::ObjectLocationInfoPb &location, ObjectR
                 return rc;
             }
             lastError = rc;
+            if (deterministicDenial && replicaIndex + 1 >= location.object_locations_size()) {
+                return rc;
+            }
+            if (deterministicDenial) {
+                continue;
+            }
             if (rc.GetCode() == K_WORKER_PULL_OBJECT_NOT_FOUND) {
                 ++notFoundReplicas;
             }
@@ -507,11 +541,29 @@ Status ReplicaReader::ReadBatch(const ReplicaReadBatch &requests, bool traceEnab
                 TraceGuard traceGuard = Trace::Instance().SetTraceContext(traceContext);
                 Status dispatchStatus = InitTimeoutsFromDispatch(remainingUs, dispatchTime);
                 bool outcomeReported = false;
+                Status fallbackStatus = admissionStatus;
                 for (auto &chunk : endpointWork->chunks) {
-                    if (admissionStatus.IsError()) {
+                    Status chunkAdmissionStatus = fallbackStatus;
+                    std::optional<TransportHint> transportHint;
+                    std::vector<UrmaFallbackTcpLimiter::Ticket> fallbackTickets;
+                    if (chunkAdmissionStatus.GetCode() == K_URMA_READ_SOURCE_DENIED) {
+                        fallbackTickets.reserve(chunk.requests.size());
+                        for (const auto &request : chunk.requests) {
+                            UrmaFallbackTcpLimiter::Ticket ticket;
+                            auto fallback = TryAcquireTcpFallback(chunkAdmissionStatus, request.expectedSize, ticket);
+                            transportHint = fallback.hint;
+                            chunk.deterministicDenial = fallback.deterministicDenial;
+                            if (!fallback.hint.has_value()) {
+                                break;
+                            }
+                            fallbackTickets.emplace_back(std::move(ticket));
+                        }
+                    }
+                    if (chunkAdmissionStatus.IsError() && !transportHint.has_value()) {
                         chunk.attempted = true;
-                        chunk.attemptedKind = deniedKind;
-                        chunk.endpointStatus = admissionStatus;
+                        chunk.attemptedKind = chunkAdmissionStatus.GetCode() == K_URMA_READ_SOURCE_DENIED
+                                                  ? AccessTransportKind::UB : deniedKind;
+                        chunk.endpointStatus = chunkAdmissionStatus;
                         continue;
                     }
                     if (dispatchStatus.IsError()) {
@@ -527,7 +579,7 @@ Status ReplicaReader::ReadBatch(const ReplicaReadBatch &requests, bool traceEnab
                                 chunk.attemptedKind = MergeTransportKind(chunk.attemptedKind, t.Kind());
                                 return t.Get(chunk.requests.front(), data);
                             },
-                            traceEnabled);
+                            traceEnabled, transportHint);
                         chunk.results.resize(1);
                         chunk.results.front().status = unaryStatus;
                         // Preserve structured Provider failure detail even when the unary request failed.
@@ -543,13 +595,14 @@ Status ReplicaReader::ReadBatch(const ReplicaReadBatch &requests, bool traceEnab
                                 chunk.attemptedKind = MergeTransportKind(chunk.attemptedKind, t.Kind());
                                 return t.BatchGet(chunk.requests, chunk.results);
                             },
-                            traceEnabled);
+                            traceEnabled, transportHint);
                     }
                     if (!outcomeReported && readOutcomeReport_) {
                         for (const auto &result : chunk.results) {
                             if (result.data.response.has_provider_ub_failure_detail()) {
                                 readOutcomeReport_(endpointWork->address, result.data.response);
                                 outcomeReported = true;
+                                fallbackStatus = Status(K_URMA_READ_SOURCE_DENIED, "Provider UB failure in batch read");
                                 break;
                             }
                         }
@@ -599,7 +652,7 @@ Status ReplicaReader::ReadBatch(const ReplicaReadBatch &requests, bool traceEnab
                         AdvanceRetryableReplica(state, itemStatus);
                         continue;
                     }
-                    if (IsReadSourceUnavailable(itemStatus)) {
+                    if (chunk.deterministicDenial || IsReadSourceUnavailable(itemStatus)) {
                         RecordRefreshableLocation(itemStatus, state.refreshableLocation);
                         AdvanceUnavailableReplica(state, itemStatus);
                         continue;

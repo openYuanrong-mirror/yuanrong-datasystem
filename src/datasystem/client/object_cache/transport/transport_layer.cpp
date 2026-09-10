@@ -815,6 +815,11 @@ namespace {
 // Sampling interval for the routed Set triage log below: one line per N publish attempts so the Set
 // hot path is not flooded; aggregate transport-kind/byte counters live in the metrics.
 constexpr int ROUTED_SET_TRIAGE_LOG_RATE = 1000;
+
+bool IsUbWriteAllocation(const ObjectBuffer &buffer)
+{
+    return ObjectBufferInternal::GetInfo(buffer).ubUrmaDataInfo != nullptr;
+}
 }  // namespace
 
 void TransportLayer::LogSetResult(const HostPort &workerAddr, TransportHint hint, const Status &rc,
@@ -838,7 +843,11 @@ Status TransportLayer::Set(ObjectBuffer &buffer, const TransportSetParam &param,
     RETURN_RUNTIME_ERROR_IF_NULL(manager_);
     RETURN_RUNTIME_ERROR_IF_NULL(advisor_);
     const HostPort workerAddr = ObjectBufferInternal::GetInfo(buffer).workerAddr;
-    const TransportHint hint = advisor_->GetTransportHint(workerAddr);
+    TransportHint hint = advisor_->GetTransportHint(workerAddr);
+    // Create may have fallen back from same-host SHM to UB; publish that allocation through UB too.
+    if (hint == TransportHint::SHM_CANDIDATE && IsUbWriteAllocation(buffer)) {
+        hint = TransportHint::UB_CANDIDATE;
+    }
     const auto setStart = std::chrono::steady_clock::now();
     LocalUbSenderOperation operation;
     RETURN_IF_NOT_OK(CheckLocalUbSenderAdmission(hint));
@@ -1035,7 +1044,12 @@ Status TransportLayer::MSet(const std::vector<std::shared_ptr<ObjectBuffer>> &bu
     RETURN_RUNTIME_ERROR_IF_NULL(manager_);
     RETURN_RUNTIME_ERROR_IF_NULL(advisor_);
     const HostPort workerAddr = ObjectBufferInternal::GetInfo(*buffers.front()).workerAddr;
-    const TransportHint hint = advisor_->GetTransportHint(workerAddr);
+    TransportHint hint = advisor_->GetTransportHint(workerAddr);
+    if (hint == TransportHint::SHM_CANDIDATE
+        && std::all_of(buffers.begin(), buffers.end(),
+                       [](const auto &buffer) { return IsUbWriteAllocation(*buffer); })) {
+        hint = TransportHint::UB_CANDIDATE;
+    }
     LocalUbSenderOperation operation;
     RETURN_IF_NOT_OK(CheckLocalUbSenderAdmission(hint));
     std::shared_ptr<IDataTransporter> transporter;

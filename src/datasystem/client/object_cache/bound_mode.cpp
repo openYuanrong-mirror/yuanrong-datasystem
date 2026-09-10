@@ -19,6 +19,7 @@
  */
 
 #include "datasystem/client/object_cache/bound_mode.h"
+#include "datasystem/client/object_cache/transport/common/deadline_retry.h"
 #include "datasystem/common/log/latency_phase.h"
 #include "datasystem/client/object_cache/worker_failover.h"
 #include "datasystem/common/util/memory.h"
@@ -70,6 +71,7 @@ Status GetWorkerGetFailure(const GetRspPb &rsp, const HostPort &worker, const st
 }
 
 const std::string K_SEPARATOR = "$";
+constexpr size_t MAX_UB_GET_ATTEMPTS = 4;
 
 #ifdef USE_URMA
 AccessTransportKind MergeTransportKind(AccessTransportKind lhs, AccessTransportKind rhs)
@@ -790,21 +792,42 @@ Status BoundMode::GetFromLocalWorker(const std::vector<std::string> &objectKeys,
                                      std::vector<std::shared_ptr<Buffer>> &buffers, bool queryL2Cache,
                                      bool isRH2DSupported, int32_t requestTimeoutMs)
 {
-    std::shared_ptr<IClientWorkerApi> workerApi;
-    std::unique_ptr<Raii> raii;
-    WorkerNode workerNode;
-    RETURN_IF_NOT_OK(getWorkerApiNode_(workerApi, raii, workerNode));
-    GetParam getParam{ .objectKeys = objectKeys,
-                       .subTimeoutMs = subTimeoutMs,
-                       .readParams = {},
-                       .queryL2Cache = queryL2Cache,
-                       .isRH2DSupported = isRH2DSupported,
-                       .requestTimeoutMs = requestTimeoutMs };
-    auto rc = GetBuffersFromWorker(workerApi, getParam, buffers);
-    if (rc.GetCode() == K_CLIENT_WORKER_DISCONNECT) {
-        rc = RecoverWorkerAndRetryGet(workerApi, getParam, workerNode, objectKeys, buffers);
+    client::DeadlineRetry retry;
+    int64_t backoffMs = 1;
+    Status rc;
+    size_t attempts = 0;
+    while (attempts < MAX_UB_GET_ATTEMPTS) {
+        ++attempts;
+        std::shared_ptr<IClientWorkerApi> workerApi;
+        std::unique_ptr<Raii> raii;
+        WorkerNode workerNode;
+        RETURN_IF_NOT_OK(getWorkerApiNode_(workerApi, raii, workerNode));
+        GetParam getParam{ .objectKeys = objectKeys,
+                           .subTimeoutMs = subTimeoutMs,
+                           .readParams = {},
+                           .queryL2Cache = queryL2Cache,
+                           .isRH2DSupported = isRH2DSupported,
+                           .requestTimeoutMs = requestTimeoutMs };
+        rc = GetBuffersFromWorker(workerApi, getParam, buffers);
+        if (rc.GetCode() == K_CLIENT_WORKER_DISCONNECT) {
+            rc = RecoverWorkerAndRetryGet(workerApi, getParam, workerNode, objectKeys, buffers);
+        }
+        host_.handleDirectGetFailure(workerApi, rc);
+        const bool ubUnavailable = rc.GetCode() == K_URMA_ERROR || rc.GetCode() == K_URMA_WORKER_UNAVAILABLE
+                                   || rc.GetCode() == K_URMA_DATA_WORKER_UNAVAILABLE;
+        if (isRH2DSupported || !ubUnavailable) {
+            return rc;
+        }
+        if (attempts == MAX_UB_GET_ATTEMPTS) {
+            break;
+        }
+        // A failed UB RPC retains its old receive buffer for late completions; retry with a new allocation.
+        raii.reset();
+        if (retry.Backoff(backoffMs).IsError()) {
+            break;
+        }
+        buffers.assign(objectKeys.size(), nullptr);
     }
-    host_.handleDirectGetFailure(workerApi, rc);
     return rc;
 }
 

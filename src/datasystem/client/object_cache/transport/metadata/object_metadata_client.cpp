@@ -59,6 +59,15 @@ bool IsMetadataOwnerRouteFailure(StatusCode code)
 constexpr int32_t ROUTE_DEGRADATION_INNER_RETRIES = 2;
 constexpr int64_t ROUTE_DEGRADATION_RETRY_BACKOFF_MS = 100;
 
+Status MakeStaleMetadataRouteStatus(const Status &rc)
+{
+    Status stale(K_NOT_READY, std::string(STALE_TRANSPORT_SNAPSHOT_MESSAGE) + ": " + rc.ToString());
+    if (IsNonRetryableRpcError(rc) && IsBrpcRequestDefinitelyNotSent(rc)) {
+        stale.WithExtra(METADATA_INGRESS_NOT_SENT);
+    }
+    return stale;
+}
+
 Status ValidateAndResetItems(const ObjectMetadataBatch &items)
 {
     CHECK_FAIL_RETURN_STATUS(!items.empty(), K_INVALID, "Metadata query items are empty");
@@ -340,11 +349,22 @@ Status ObjectMetadataClient::PrepareQueryRetry(const HostPort &address, const Ob
                                                int64_t &backoffMs, int32_t &routeDegradationRetries,
                                                TransportPhaseLatencyRecorder *recorder)
 {
+    const bool fallbackUbInlineToTcp =
+        rpcDispatched && context.mode == InlineTransportMode::UB && rc.GetCode() == K_URMA_NEED_CONNECT;
     const bool quarantineUbBuffers =
         rpcDispatched && context.mode == InlineTransportMode::UB && NeedDelayReleaseShmUnit(rc);
     if (quarantineUbBuffers) {
         DelayReleaseUbBuffers(context, rc, "rpc_status");
         context.DisableInlineData();
+    }
+    if (fallbackUbInlineToTcp) {
+        manager_->ResetDataPlane(address);
+        context.DisableInlineData();
+        context.mode = InlineTransportMode::TCP;
+        VLOG(1) << "[TransportGet][Metadata] UB connection requires rebuild after dispatch; retry QueryAndGet "
+                   "through TCP, meta owner: "
+                << address.ToString() << ", status: " << rc.ToString();
+        return Status::OK();
     }
     const bool routeFailure = IsMetadataOwnerRouteFailure(rc.GetCode());
     // UNAVAILABLE invalidates the channel, not necessarily the owner. Read-only non-SHM queries
@@ -355,25 +375,8 @@ Status ObjectMetadataClient::PrepareQueryRetry(const HostPort &address, const Ob
         manager_->Teardown(address);
     }
     if (routeFailure) {
-        if (IsAmbiguousMetadataOwnerRouteFailure(rc.GetCode())
-            && routeDegradationRetries < ROUTE_DEGRADATION_INNER_RETRIES) {
-            ++routeDegradationRetries;
-            VLOG(1) << "[TransportGet][Metadata] Retry degraded meta owner in place, meta owner: "
-                    << address.ToString() << ", inner retry: " << routeDegradationRetries
-                    << ", status: " << rc.ToString();
-            int64_t degradationBackoffMs = ROUTE_DEGRADATION_RETRY_BACKOFF_MS * routeDegradationRetries;
-            RETURN_IF_NOT_OK(retry_->Backoff(degradationBackoffMs));
-            if (quarantineUbBuffers) {
-                RETURN_IF_NOT_OK(PrepareUbInlineRequest(address, items, context, recorder));
-            }
-            return Status::OK();
-        }
-        if (metadataFailureHandler_) {
-            metadataFailureHandler_(address, rc);
-        }
-        VLOG(1) << "[TransportGet][Metadata] Return stale route for outer retry, meta owner: "
-                << address.ToString() << ", dispatched: " << rpcDispatched << ", status: " << rc.ToString();
-        return Status(K_NOT_READY, STALE_TRANSPORT_SNAPSHOT_MESSAGE);
+        return HandleMetadataRouteFailure(address, items, rc, rpcDispatched, quarantineUbBuffers, context,
+                                          routeDegradationRetries, recorder);
     }
     if (rpcDispatched && context.mode == InlineTransportMode::SHM) {
         VLOG(1) << "[TransportGet][Metadata] Do not replay an ambiguous SHM QueryAndGet: " << rc.ToString();
@@ -391,6 +394,32 @@ Status ObjectMetadataClient::PrepareQueryRetry(const HostPort &address, const Ob
         RETURN_IF_NOT_OK(PrepareUbInlineRequest(address, items, context, recorder));
     }
     return Status::OK();
+}
+
+Status ObjectMetadataClient::HandleMetadataRouteFailure(
+    const HostPort &address, const ObjectMetadataBatch &items, const Status &rc, bool rpcDispatched,
+    bool quarantineUbBuffers, InlineRequestContext &context, int32_t &routeDegradationRetries,
+    TransportPhaseLatencyRecorder *recorder)
+{
+    if (IsAmbiguousMetadataOwnerRouteFailure(rc.GetCode())
+        && routeDegradationRetries < ROUTE_DEGRADATION_INNER_RETRIES) {
+        ++routeDegradationRetries;
+        VLOG(1) << "[TransportGet][Metadata] Retry degraded meta owner in place, meta owner: "
+                << address.ToString() << ", inner retry: " << routeDegradationRetries
+                << ", status: " << rc.ToString();
+        int64_t degradationBackoffMs = ROUTE_DEGRADATION_RETRY_BACKOFF_MS * routeDegradationRetries;
+        RETURN_IF_NOT_OK(retry_->Backoff(degradationBackoffMs));
+        if (quarantineUbBuffers) {
+            RETURN_IF_NOT_OK(PrepareUbInlineRequest(address, items, context, recorder));
+        }
+        return Status::OK();
+    }
+    if (metadataFailureHandler_) {
+        metadataFailureHandler_(address, rc);
+    }
+    VLOG(1) << "[TransportGet][Metadata] Return stale route for outer retry, meta owner: "
+            << address.ToString() << ", dispatched: " << rpcDispatched << ", status: " << rc.ToString();
+    return MakeStaleMetadataRouteStatus(rc);
 }
 
 void ObjectMetadataClient::DelayReleaseUbBuffers(InlineRequestContext &context, const Status &reason,

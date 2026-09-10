@@ -157,6 +157,7 @@ CoordinatorLeaderRouter::CandidateRoundResult CoordinatorLeaderRouter::TryCandid
     Status &lastStatus, bool &hasCoordinatorResponse)
 {
     bool hasResponse = false;
+    bool headerlessNotReady = false;
     std::optional<std::string> nextRoundLeaderHint;
     while (!candidates.empty()) {
         auto address = std::move(candidates.front());
@@ -168,14 +169,17 @@ CoordinatorLeaderRouter::CandidateRoundResult CoordinatorLeaderRouter::TryCandid
         const auto remainingCandidateCount = 1 + CountUnattemptedCandidates(candidates, attempted);
         auto attempt = TryCandidate(address, rpc, deadline, maxRpcTimeout, retryInterval, recoveryControl,
                                     remainingCandidateCount);
+        const bool readinessOnly = attempt.rpcAttempted && !attempt.rpc.header.has_value()
+                                   && attempt.rpc.status.GetCode() == K_NOT_READY;
         const bool acceptedResponse =
-            attempt.rpc.header.has_value() && attempt.observation == ResponseObservation::ACCEPTED;
+            readinessOnly || (attempt.rpc.header.has_value() && attempt.observation == ResponseObservation::ACCEPTED);
         if ((attempt.rpcAttempted || !attempt.deadlineReached) && (acceptedResponse || !hasCoordinatorResponse)) {
             lastStatus = attempt.rpc.status.IsOk() ? Status(K_NOT_READY, "Coordinator is not serving business RPCs")
                                                    : attempt.rpc.status;
         }
         hasCoordinatorResponse = hasCoordinatorResponse || acceptedResponse;
         hasResponse = hasResponse || attempt.hasResponse;
+        headerlessNotReady = headerlessNotReady || readinessOnly;
         if (attempt.observation == ResponseObservation::ROUTE_CHANGED) {
             return { RoundAction::RETRY_CURRENT_ROUTE, lastStatus, {} };
         }
@@ -192,6 +196,9 @@ CoordinatorLeaderRouter::CandidateRoundResult CoordinatorLeaderRouter::TryCandid
         }
     }
 
+    if (headerlessNotReady && !hasResponse) {
+        return { RoundAction::COMPLETE, lastStatus, {} };
+    }
     return FinishRound(hasResponse || hasCoordinatorResponse, lastStatus, std::move(nextRoundLeaderHint));
 }
 

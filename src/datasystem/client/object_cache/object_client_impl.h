@@ -912,6 +912,9 @@ private:
      */
     Status CheckConnectionWhileShmModify();
 
+    Status CopyGetBufferToString(const std::string &objectKey, int64_t subTimeoutMs,
+                                 Optional<Buffer> &buffer, std::string &value);
+
     /**
      * @brief Get shared memory data buffers from worker.
      * @param[in] workerApi The worker that handles get request.

@@ -56,7 +56,7 @@ TransportReadRetryPolicy ClassifyTransportReadRetry(const Status &status)
     if (client::IsWorkerDrainingForScaleIn(status)) {
         return TransportReadRetryPolicy::DRAINING;
     }
-    if (client::IsTransportSnapshotStaleLocation(status)) {
+    if (client::IsTransportSnapshotStaleLocation(status) || status.GetCode() == K_NO_AVAILABLE_WORKER) {
         return TransportReadRetryPolicy::STALE;
     }
     return TransportReadRetryPolicy::NONE;
@@ -466,10 +466,8 @@ Status RoutedMode::ProcessTransportPut(
     return setRc;
 }
 
-void RoutedMode::BuildTransportReadRequest(const std::vector<std::string> &objectKeys,
-                                           client::ObjectReadRequest &request,
-                                           std::vector<Status> &itemStatuses, int64_t subTimeoutMs,
-                                           bool queryL2Cache)
+std::shared_ptr<client::TransportReadContext> RoutedMode::CreateTransportReadContext(
+    int64_t subTimeoutMs, bool queryL2Cache)
 {
     auto context = std::make_shared<client::TransportReadContext>();
     context->requestContext.clientId = host_.getClientId();
@@ -481,8 +479,14 @@ void RoutedMode::BuildTransportReadRequest(const std::vector<std::string> &objec
     context->requestContext.tenantId = requestTenantId.empty() ? tenantId_ : requestTenantId;
     context->subTimeoutMs = subTimeoutMs;
     context->queryL2Cache = queryL2Cache;
-    request.context = std::move(context);
+    return context;
+}
 
+void RoutedMode::BuildTransportReadRequest(const std::vector<std::string> &objectKeys,
+    client::ObjectReadRequest &request, std::vector<Status> &itemStatuses, int64_t subTimeoutMs,
+    bool queryL2Cache, const std::vector<HostPort> &excludedWorkers)
+{
+    request.context = CreateTransportReadContext(subTimeoutMs, queryL2Cache);
     auto routing = std::atomic_load(&routing_);
     if (routing == nullptr) {
         std::fill(itemStatuses.begin(), itemStatuses.end(), Status(K_NOT_READY, "Object route is not ready"));
@@ -491,8 +495,13 @@ void RoutedMode::BuildTransportReadRequest(const std::vector<std::string> &objec
         return;
     }
     std::unordered_map<HostPort, std::vector<std::string>> groupedKeys;
-    Status routeStatus =
-        routing->SelectWorkers(objectKeys, client::DataPlacementPolicy::PREFERRED_META_OWNER, groupedKeys);
+    Status routeStatus = routing->SelectWorkers(objectKeys, client::DataPlacementPolicy::PREFERRED_META_OWNER,
+        groupedKeys, excludedWorkers);
+    if (routeStatus.GetCode() == K_NO_AVAILABLE_WORKER && !excludedWorkers.empty()) {
+        // Preserve the bounded single-Worker retry when no survivor is currently routable.
+        routeStatus =
+            routing->SelectWorkers(objectKeys, client::DataPlacementPolicy::PREFERRED_META_OWNER, groupedKeys);
+    }
     if (routeStatus.IsError()) {
         std::fill(itemStatuses.begin(), itemStatuses.end(), routeStatus);
         LOG(ERROR) << "[TransportGet][Route] Route selection failed, key count: " << objectKeys.size()
@@ -621,7 +630,8 @@ Status RoutedMode::ApplyTransportReadResult(const std::vector<std::string> &obje
                                             const client::ObjectReadRequest &request,
                                             client::ObjectReadResult &result, const Status &transportStatus,
                                             std::vector<std::shared_ptr<Buffer>> &buffers,
-                                            std::vector<Status> &itemStatuses, AccessTransportKind &actualKind)
+                                            std::vector<Status> &itemStatuses, AccessTransportKind &actualKind,
+                                            std::vector<HostPort> &excludedWorkers)
 {
     // a fully-failed Get still reflects the real transport instead of the SHM default from Reset().
     actualKind = static_cast<AccessTransportKind>(
@@ -654,6 +664,11 @@ Status RoutedMode::ApplyTransportReadResult(const std::vector<std::string> &obje
                 << "[TransportGet][Result] Object result is missing, key: " << item.objectKey
                 << ", request index: " << item.requestIndex
                 << ", status: " << itemStatuses[item.requestIndex].ToString();
+        }
+        const auto &status = itemStatuses[item.requestIndex];
+        if ((client::IsWorkerDrainingForScaleIn(status) || client::IsMetadataIngressUnavailable(status))
+            && std::find(excludedWorkers.begin(), excludedWorkers.end(), item.metaOwner) == excludedWorkers.end()) {
+            excludedWorkers.emplace_back(item.metaOwner);
         }
     }
     if (VLOG_IS_ON(1)) {
@@ -694,19 +709,19 @@ Status RoutedMode::ReadTransportRound(const std::vector<std::string> &objectKeys
                                       int64_t subTimeoutMs, bool queryL2Cache,
                                       std::vector<std::shared_ptr<Buffer>> &buffers,
                                       std::vector<Status> &itemStatuses, AccessTransportKind &actualKind,
-                                      Status &transportStatus)
+                                      Status &transportStatus, std::vector<HostPort> &excludedWorkers)
 {
     client::ObjectReadRequest request;
     request.traceEnabled = traceEnabled;
     AddLatencyTickIfEnabled(traceEnabled, LatencyTickKey::CLIENT_DIRECT_ROUTE_START);
-    BuildTransportReadRequest(objectKeys, request, itemStatuses, subTimeoutMs, queryL2Cache);
+    BuildTransportReadRequest(objectKeys, request, itemStatuses, subTimeoutMs, queryL2Cache, excludedWorkers);
     AddLatencyTickIfEnabled(traceEnabled, LatencyTickKey::CLIENT_DIRECT_ROUTE_END);
     client::ObjectReadResult result;
     transportStatus = request.items.empty() ? Status(K_NOT_READY, "No object route is available")
                                             : transportLayer_->Get(request, result);
     AddLatencyTickIfEnabled(traceEnabled, LatencyTickKey::CLIENT_DIRECT_MATERIALIZE_START);
-    Status applyStatus =
-        ApplyTransportReadResult(objectKeys, request, result, transportStatus, buffers, itemStatuses, actualKind);
+    Status applyStatus = ApplyTransportReadResult(objectKeys, request, result, transportStatus, buffers, itemStatuses,
+                                                  actualKind, excludedWorkers);
     AddLatencyTickIfEnabled(traceEnabled, LatencyTickKey::CLIENT_DIRECT_MATERIALIZE_END);
     return applyStatus;
 }
@@ -722,11 +737,12 @@ Status RoutedMode::GetFromTransportLayer(const std::vector<std::string> &objectK
     AccessTransportKind actualKind = AccessTransportKind::SHM;
     Status transportStatus(K_NOT_READY, "No object route is available");
     std::vector<TransportReadRetryState> retryStates;
+    std::vector<HostPort> excludedWorkers;
     client::DeadlineRetry retry;
     bool refreshRequested = false;
 
     RETURN_IF_NOT_OK(ReadTransportRound(objectKeys, traceEnabled, subTimeoutMs, queryL2Cache, buffers, itemStatuses,
-                                        actualKind, transportStatus));
+                                        actualKind, transportStatus, excludedWorkers));
     CollectInitialTransportReadRetryStates(itemStatuses, retryStates);
 
     while (ApiDeadline::Instance().ApiRemainingUs() > 0) {
@@ -751,7 +767,7 @@ Status RoutedMode::GetFromTransportLayer(const std::vector<std::string> &objectK
         roundResult.buffers.resize(retryKeys.size());
         roundResult.statuses.resize(retryKeys.size(), Status(K_NOT_READY, "Object Get has not completed"));
         RETURN_IF_NOT_OK(ReadTransportRound(retryKeys, traceEnabled, subTimeoutMs, queryL2Cache, roundResult.buffers,
-                                            roundResult.statuses, actualKind, transportStatus));
+                                            roundResult.statuses, actualKind, transportStatus, excludedWorkers));
         CollectRetryTransportReadRound(retryIndexes, roundResult, buffers, itemStatuses, retryStates);
     }
     ApplyTransportReadRetryBudgetFailure(retryStates, itemStatuses);

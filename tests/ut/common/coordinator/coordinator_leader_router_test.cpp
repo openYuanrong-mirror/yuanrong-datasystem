@@ -803,6 +803,67 @@ TEST_F(CoordinatorLeaderRouterTest, DeadlineWithoutAcceptedResponseRemainsTimeou
     EXPECT_EQ(calls, 1);
 }
 
+TEST_F(CoordinatorLeaderRouterTest, HeaderlessNotReadyDoesNotSkipHealthyCandidate)
+{
+    snapshots = { { "127.0.0.1:30001", "127.0.0.1:30002" } };
+    Router router(Dependencies());
+    ASSERT_TRUE(router.Execute(
+        [](const HostPort &, std::chrono::milliseconds) { return Response(State::SERVING); },
+        Deadline(std::chrono::milliseconds(10)), std::chrono::milliseconds(10),
+        std::chrono::milliseconds(1)).IsOk());
+    std::vector<std::string> attempts;
+    const auto status = router.Execute(
+        [&](const HostPort &address, std::chrono::milliseconds) -> Router::RpcResult {
+            attempts.emplace_back(address.ToString());
+            if (address.Port() == 30001) {
+                return { Status(K_NOT_READY, "candidate recovering"), std::nullopt };
+            }
+            return Response(State::SERVING);
+        },
+        Deadline(std::chrono::milliseconds(10)), std::chrono::milliseconds(10), std::chrono::milliseconds(1));
+    EXPECT_TRUE(status.IsOk());
+    EXPECT_EQ(attempts, (std::vector<std::string>{ "127.0.0.1:30001", "127.0.0.1:30002" }));
+    EXPECT_EQ(refreshCalls, 0U);
+}
+
+TEST_F(CoordinatorLeaderRouterTest, HeaderlessNotReadySurvivesLaterCandidateTimeout)
+{
+    snapshots = { { "127.0.0.1:30001", "127.0.0.1:30002" } };
+    Router router(Dependencies());
+    size_t attempts = 0;
+    const auto status = router.Execute(
+        [&](const HostPort &, std::chrono::milliseconds timeout) -> Router::RpcResult {
+            if (++attempts == 1) {
+                return { Status(K_NOT_READY, "candidate recovering"), std::nullopt };
+            }
+            now += timeout;
+            return TransportError(K_RPC_DEADLINE_EXCEEDED);
+        },
+        Deadline(std::chrono::milliseconds(3)), std::chrono::milliseconds(3), std::chrono::milliseconds(1));
+    EXPECT_EQ(status.GetCode(), K_NOT_READY);
+    EXPECT_EQ(status.GetMsg(), "candidate recovering");
+    EXPECT_EQ(attempts, 2U);
+}
+
+TEST_F(CoordinatorLeaderRouterTest, HeaderlessNotReadyStopsBeforeDiscoveryRefresh)
+{
+    snapshots = { { "127.0.0.1:30001" } };
+    Router router(Dependencies());
+    size_t attempts = 0;
+    const auto status = router.Execute(
+        [&](const HostPort &, std::chrono::milliseconds) -> Router::RpcResult {
+            ++attempts;
+            return { Status(K_NOT_READY, "topology bootstrap is not ready"), std::nullopt };
+        },
+        Deadline(std::chrono::milliseconds(3)), std::chrono::milliseconds(3), std::chrono::milliseconds(1));
+    EXPECT_EQ(status.GetCode(), K_NOT_READY);
+    EXPECT_EQ(attempts, 1U);
+    EXPECT_EQ(refreshCalls, 0U);
+    EXPECT_TRUE(waits.empty());
+    EXPECT_FALSE(router.GetLeaderIdentity().has_value());
+    EXPECT_TRUE(publishedIdentities.empty());
+}
+
 TEST_F(CoordinatorLeaderRouterTest, RepeatedRouteChangesRespectOriginalDeadline)
 {
     snapshots = { { "127.0.0.1:30001" } };

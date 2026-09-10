@@ -3204,10 +3204,41 @@ TEST(ObjectMetadataClientTest, PersistentOwnerDeadlineWrapsAfterBoundedInnerRetr
     const auto rc = metadata.QueryAndGet(MakeAddress(41), batch, nullptr);
 
     EXPECT_TRUE(IsTransportSnapshotStaleLocation(rc));
+    EXPECT_FALSE(IsMetadataIngressUnavailable(rc));
     EXPECT_EQ(invokeCount, 3);
     ASSERT_EQ(failures.size(), 1u);
     EXPECT_EQ(failures[0].first, MakeAddress(41));
     EXPECT_EQ(failures[0].second.GetCode(), K_RPC_DEADLINE_EXCEEDED);
+}
+
+TEST(ObjectMetadataClientTest, RefusedMetadataIngressPreservesNotSentProof)
+{
+    for (const int error : { ECONNREFUSED, EHOSTDOWN }) {
+        SCOPED_TRACE(error);
+        ApiDeadlineGuard deadline(1000);
+        auto manager = std::make_shared<FakeDataPlaneManager>();
+        const auto original = MapBrpcErrorCodeToStatus(
+            error, "[E" + std::to_string(error) + "]metadata ingress connection failed");
+        ASSERT_TRUE(IsBrpcRequestDefinitelyNotSent(original));
+        manager->queryAndGetHandler = [original](const HostPort &, const QueryAndGetReqPb &,
+                                                 QueryAndGetRspPb &, std::vector<RpcMessage> &) { return original; };
+        ObjectMetadataClient metadata(manager, std::make_shared<DeadlineRetry>());
+        auto results = MakeMetadataItems({ { 0, "key", MakeAddress(41) } });
+        auto batch = MakeMetadataBatch(results);
+
+        const auto rc = metadata.QueryAndGet(MakeAddress(41), batch, nullptr);
+
+        EXPECT_TRUE(IsMetadataIngressUnavailable(rc));
+        EXPECT_NE(rc.GetMsg().find("metadata ingress connection failed"), std::string::npos);
+        EXPECT_EQ(manager->rpcBuildCount, 1);
+        EXPECT_FALSE(IsMetadataIngressUnavailable(MakeStaleSnapshotStatus(MakeAddress(41))));
+        const auto ambiguous = MapBrpcErrorCodeToStatus(
+            error, "[E1008]previous attempt timed out [R1][E" + std::to_string(error) + "]connection failed");
+        ASSERT_FALSE(IsBrpcRequestDefinitelyNotSent(ambiguous));
+        manager->queryAndGetHandler = [ambiguous](const HostPort &, const QueryAndGetReqPb &,
+                                                  QueryAndGetRspPb &, std::vector<RpcMessage> &) { return ambiguous; };
+        EXPECT_FALSE(IsMetadataIngressUnavailable(metadata.QueryAndGet(MakeAddress(41), batch, nullptr)));
+    }
 }
 
 TEST(ObjectMetadataClientTest, PeerDeadTearsDownWithoutRetry)
@@ -3604,6 +3635,37 @@ TEST(ObjectMetadataClientTest, UbConnectionFailureFallsBackToTcp)
     EXPECT_TRUE(bufferProvider->lastOwner.expired());
 }
 
+TEST(ObjectMetadataClientTest, DispatchedUbReconnectFallsBackToTcp)
+{
+    ApiDeadlineGuard deadline(1000);
+    auto manager = std::make_shared<FakeDataPlaneManager>();
+    auto bufferProvider = std::make_shared<FakeUbBufferProvider>();
+    int invokeCount = 0;
+    manager->queryAndGetHandler = [&invokeCount](const HostPort &address, const QueryAndGetReqPb &request,
+                                                 QueryAndGetRspPb &response, std::vector<RpcMessage> &) {
+        ++invokeCount;
+        if (invokeCount == 1) {
+            EXPECT_TRUE(request.data_request().has_ub());
+            return Status(K_URMA_NEED_CONNECT, "provider connection requires rebuild");
+        }
+        EXPECT_TRUE(request.data_request().has_tcp());
+        AddLocation(response, "key", address, 6);
+        return Status::OK();
+    };
+    ObjectMetadataClient metadata(manager, std::make_shared<DeadlineRetry>(),
+                                  std::make_shared<FixedTransportAdvisor>(TransportHint::UB_CANDIDATE),
+                                  bufferProvider, 16);
+    auto results = MakeMetadataItems({ { 0, "key", MakeAddress(41) } });
+    auto batch = MakeMetadataBatch(results);
+
+    ASSERT_TRUE(metadata.QueryAndGet(MakeAddress(41), batch, nullptr).IsOk());
+    EXPECT_EQ(invokeCount, 2);
+    EXPECT_EQ(manager->transportBuildCount, 1);
+    ASSERT_EQ(manager->builtTransporters.size(), 1u);
+    EXPECT_EQ(manager->builtTransporters.front()->closeCount, 1);
+    EXPECT_TRUE(bufferProvider->lastOwner.expired());
+}
+
 TEST(ObjectReadFlowTest, BatchReadyItemsOnceOnCallerAndPreservesMetadataErrorPosition)
 {
     ApiDeadlineGuard deadline(1000);
@@ -3838,10 +3900,11 @@ TEST(ObjectClientTransportTest, ReadTransportRoundPreservesMixedItemStatusesWhen
     std::vector<Status> itemStatuses(objectKeys.size(), Status(K_NOT_READY, "pending"));
     AccessTransportKind actualKind = AccessTransportKind::SHM;
     Status transportStatus;
+    std::vector<HostPort> excludedWorkers;
 
     ASSERT_TRUE(client->routedMode_
                     ->ReadTransportRound(objectKeys, false, 1000, false, buffers, itemStatuses, actualKind,
-                                         transportStatus)
+                                         transportStatus, excludedWorkers)
                     .IsOk());
     EXPECT_TRUE(IsTransportSnapshotStaleLocation(transportStatus));
     ASSERT_EQ(itemStatuses.size(), 2u);
@@ -3896,6 +3959,100 @@ TEST(ObjectClientTransportTest, DrainingLocationRetriesOnlyPendingKeys)
     EXPECT_EQ(metadata->keyGroups[1], std::vector<std::string>({ "draining" }));
     EXPECT_EQ(replicas->batchKeys, std::vector<std::vector<std::string>>({ objectKeys }));
     EXPECT_EQ(replicas->unaryKeys, std::vector<std::string>({ "draining" }));
+    EXPECT_NE(buffers[0], nullptr);
+    EXPECT_NE(buffers[1], nullptr);
+}
+
+TEST(ObjectClientTransportTest, DrainingMetadataOwnerRetriesThroughSurvivorBeforeRingRefresh)
+{
+    for (const bool notSent : { false, true }) {
+        SCOPED_TRACE(notSent);
+        ApiDeadlineGuard deadline(1000);
+        const auto firstWorker = MakeAddress(41);
+        const auto secondWorker = MakeAddress(42);
+        const std::string objectKey = "draining-owner";
+        auto routing = MakeRouting({ firstWorker, secondWorker });
+        HostPort drainingOwner;
+        auto routeStatus = routing->SelectWorker(objectKey, DataPlacementPolicy::PREFERRED_META_OWNER, drainingOwner);
+        ASSERT_TRUE(routeStatus.IsOk()) << routeStatus.ToString();
+        const auto survivor = drainingOwner == firstWorker ? secondWorker : firstWorker;
+
+        auto metadata = std::make_shared<FakeObjectMetadataClient>();
+        metadata->queryAndGetHandler = [&drainingOwner, notSent](const HostPort &address, const ObjectMetadataBatch &) {
+            if (address != drainingOwner) {
+                return Status::OK();
+            }
+            auto status = notSent ? MakeStaleSnapshotStatus(address) : MakeWorkerDrainingStatus();
+            if (notSent) {
+                status.WithExtra(METADATA_INGRESS_NOT_SENT);
+            }
+            return status;
+        };
+        metadata->inlineKinds[objectKey] = AccessTransportKind::TCP;
+        auto replicas = std::make_shared<FakeReplicaReader>();
+        auto transportLayer = std::make_unique<TestTransportLayer>(std::make_shared<FakeDataPlaneManager>());
+        transportLayer->SetObjectRead(std::make_unique<ObjectReadFlow>(
+            metadata, replicas, std::make_shared<ThreadPool>(0, 2, "object_read_test")));
+
+        ConnectOptions options;
+        options.host = "127.0.0.1";
+        options.port = 31501;
+        auto client = std::make_shared<object_cache::ObjectClientImpl>(options);
+        auto workerApi = std::make_shared<object_cache::ClientWorkerRemoteApi>(MakeAddress(31501));
+        workerApi->clientId_ = "draining-owner-failover-test-client";
+        client->workerApi_.emplace_back(workerApi);
+        client->transportLayer_ = std::move(transportLayer);
+        std::atomic_store(&client->routing_, routing);
+
+        std::vector<std::shared_ptr<Buffer>> buffers(1);
+        auto getStatus = client->routedMode_->GetFromTransportLayer({ objectKey }, buffers, false, 1000, false);
+        ASSERT_TRUE(getStatus.IsOk()) << getStatus.ToString();
+        ASSERT_EQ(metadata->addresses.size(), 2u);
+        EXPECT_EQ(metadata->addresses[0], drainingOwner);
+        EXPECT_EQ(metadata->addresses[1], survivor);
+        EXPECT_TRUE(replicas->unaryKeys.empty());
+        EXPECT_NE(buffers[0], nullptr);
+    }
+}
+
+TEST(ObjectClientTransportTest, NoAvailableWorkerRefreshesAndRetriesBatchRoute)
+{
+    ApiDeadlineGuard deadline(1000);
+    const auto ownerAddress = MakeAddress(41);
+    auto rejectOnce = std::make_shared<RejectWorkerFilter>(1);
+    auto metadata = std::make_shared<FakeObjectMetadataClient>();
+    auto replicas = std::make_shared<FakeReplicaReader>();
+    replicas->resultHandler = [](const std::string &, ObjectReadItemResult &result) {
+        result.data.kind = AccessTransportKind::TCP;
+        result.data.response.set_data_size(4);
+        result.data.response.set_data_source(DataTransferSource::DATA_IN_PAYLOAD);
+        RpcMessage payload;
+        ASSERT_TRUE(payload.CopyString("data").IsOk());
+        result.data.rpcPayloads.emplace_back(std::move(payload));
+    };
+    auto transportLayer = std::make_unique<TestTransportLayer>(std::make_shared<FakeDataPlaneManager>());
+    transportLayer->SetObjectRead(
+        std::make_unique<ObjectReadFlow>(metadata, replicas, std::make_shared<ThreadPool>(0, 2, "route_retry_test")));
+
+    ConnectOptions options;
+    options.host = "127.0.0.1";
+    options.port = 31501;
+    auto client = std::make_shared<object_cache::ObjectClientImpl>(options);
+    auto workerApi = std::make_shared<object_cache::ClientWorkerRemoteApi>(MakeAddress(31501));
+    workerApi->clientId_ = "route-unavailable-retry-client";
+    client->workerApi_.emplace_back(workerApi);
+    client->transportLayer_ = std::move(transportLayer);
+    auto routing = MakeSingleWorkerRouting(ownerAddress, { rejectOnce });
+    std::atomic_store(&client->routing_, routing);
+    const std::vector<std::string> objectKeys{ "route-a", "route-b" };
+    std::vector<std::shared_ptr<Buffer>> buffers(objectKeys.size());
+    ASSERT_TRUE(client->routedMode_->GetFromTransportLayer(objectKeys, buffers, false, 1000, false).IsOk());
+    EXPECT_GE(rejectOnce->Checks(), 3u);
+    EXPECT_GT(routing->refresher_->forceRefreshDeadlineMs_.load(), 0);
+    ASSERT_EQ(metadata->keyGroups.size(), 1u);
+    EXPECT_EQ(metadata->keyGroups.front(), objectKeys);
+    ASSERT_EQ(replicas->batchKeys.size(), 1u);
+    EXPECT_EQ(replicas->batchKeys.front(), objectKeys);
     EXPECT_NE(buffers[0], nullptr);
     EXPECT_NE(buffers[1], nullptr);
 }
@@ -4205,6 +4362,128 @@ TEST(ObjectClientTransportTest, BatchExternalOwnersMaterializeIntoIndependentSdk
     EXPECT_EQ(std::string(static_cast<const char *>(secondBuffer->ImmutableData()), secondBuffer->GetSize()), "two?");
     secondBuffer.reset();
     EXPECT_TRUE(weakOwner.expired());
+}
+
+class StringGetCopyTest : public ::testing::Test {
+protected:
+    class ReadOwner : public FakeBufferOwner {
+    public:
+        ReadOwner() : FakeBufferOwner(4, true) {}
+        Status CheckAlive() const override { return failure; }
+        Status failure;
+    };
+
+    void SetUp() override
+    {
+        ConnectOptions options;
+        options.host = "127.0.0.1";
+        options.port = 31501;
+        client = std::make_shared<object_cache::ObjectClientImpl>(options);
+        client->enableCrossNodeConnection_ = true;
+        auto api = std::make_shared<object_cache::ClientWorkerRemoteApi>(MakeAddress(31501));
+        api->clientId_ = "string-get-copy-test";
+        client->workerApi_.emplace_back(api);
+        metadata = std::make_shared<FakeObjectMetadataClient>();
+        metadata->inlineKinds["key"] = AccessTransportKind::TCP;
+        auto transport = std::make_unique<TestTransportLayer>(std::make_shared<FakeDataPlaneManager>());
+        transport->SetObjectRead(std::make_unique<ObjectReadFlow>(metadata, std::make_shared<FakeReplicaReader>(),
+                                                               std::make_shared<ThreadPool>(0, 1, "copy_retry_test")));
+        client->transportLayer_ = std::move(transport);
+        std::atomic_store(&client->routing_, MakeSingleWorkerRouting(MakeAddress(31502)));
+    }
+
+    void MakeShmBuffer(Status failure)
+    {
+        owner = std::make_shared<ReadOwner>();
+        std::memcpy(owner->data.data(), "old!", 4);
+        ObjectReadItemResult item;
+        item.objectKey = "key";
+        item.data.externalData = owner->data.data();
+        item.data.externalSize = owner->data.size();
+        item.data.externalOwner = owner;
+        ExternalBufferMeta meta;
+        meta.metadataSize = 0;
+        meta.shmId = ShmKey::Intern("copy-test-shm");
+        meta.workerAddr = MakeAddress(31501);
+        item.data.externalMeta = meta;
+        std::shared_ptr<Buffer> materialized;
+        ASSERT_TRUE(client->routedMode_->MaterializeTransportItem(item.objectKey, item, materialized).IsOk());
+        buffer = Optional<Buffer>(std::move(*materialized));
+        owner->failure = std::move(failure);
+    }
+
+    std::shared_ptr<object_cache::ObjectClientImpl> client;
+    std::shared_ptr<FakeObjectMetadataClient> metadata;
+    std::shared_ptr<ReadOwner> owner;
+    Optional<Buffer> buffer;
+};
+
+TEST_F(StringGetCopyTest, DisconnectAndDeprecatedMappingRereadOnlyAffectedKey)
+{
+    ApiDeadlineGuard deadline(1000);
+    for (auto code : { K_RPC_UNAVAILABLE, K_BUFFER_DEPRECATED }) {
+        MakeShmBuffer(Status(code, "SHM session expired before copy"));
+        std::weak_ptr<ReadOwner> oldOwner = owner;
+        owner.reset();
+        metadata->queryAndGetHandler = [&oldOwner](const HostPort &, const ObjectMetadataBatch &) {
+            EXPECT_TRUE(oldOwner.expired());
+            return Status::OK();
+        };
+        std::string value;
+        ASSERT_TRUE(client->CopyGetBufferToString("key", 0, buffer, value).IsOk());
+        EXPECT_EQ(value, "data");
+        EXPECT_TRUE(oldOwner.expired());
+    }
+    EXPECT_EQ(metadata->keyGroups, std::vector<std::vector<std::string>>({ { "key" }, { "key" } }));
+    metadata->queryAndGetHandler = nullptr;
+    metadata->itemStatuses["key"] = Status(K_NOT_FOUND, "no remaining replica");
+    MakeShmBuffer(Status(K_RPC_UNAVAILABLE, "disconnected"));
+    std::string value = "must-not-return-old-data";
+    EXPECT_EQ(client->CopyGetBufferToString("key", 0, buffer, value).GetCode(), K_NOT_FOUND);
+    EXPECT_FALSE(buffer);
+    EXPECT_TRUE(value.empty());
+}
+
+TEST_F(StringGetCopyTest, DoesNotRetryUnrelatedErrorsDisabledFailoverOrExpiredDeadline)
+{
+    ApiDeadlineGuard deadline(1000);
+    std::string value;
+    MakeShmBuffer(Status::OK());
+    ASSERT_TRUE(client->CopyGetBufferToString("key", 0, buffer, value).IsOk());
+    EXPECT_EQ(value, "old!");
+    MakeShmBuffer(Status(K_RUNTIME_ERROR, "buffer is not visible"));
+    EXPECT_EQ(client->CopyGetBufferToString("key", 0, buffer, value).GetCode(), K_RUNTIME_ERROR);
+    MakeShmBuffer(Status(K_RPC_UNAVAILABLE, "disconnected"));
+    client->enableCrossNodeConnection_ = false;
+    EXPECT_EQ(client->CopyGetBufferToString("key", 0, buffer, value).GetCode(), K_RPC_UNAVAILABLE);
+    client->enableCrossNodeConnection_ = true;
+    ApiDeadline::Instance().InitUs(0);
+    EXPECT_EQ(client->CopyGetBufferToString("key", 0, buffer, value).GetCode(), K_RPC_DEADLINE_EXCEEDED);
+    EXPECT_TRUE(metadata->keyGroups.empty());
+}
+
+TEST_F(StringGetCopyTest, ObjectWaitTimeoutDoesNotReplaceRequestDeadline)
+{
+    InitBatchGetMetrics();
+    client->enableLocalCache_ = false;
+    client->requestTimeoutMs_ = 60000;
+    bool transition = false;
+    ASSERT_TRUE(client->clientStateManager_->ProcessInit(transition).IsOk());
+    client->clientStateManager_->CompleteHandler(false, transition);
+    metadata->queryAndGetHandler = [](const HostPort &, const ObjectMetadataBatch &) {
+        EXPECT_GT(ApiDeadline::Instance().ApiRemainingUs(), 100000);
+        EXPECT_LE(ApiDeadline::Instance().ApiRemainingUs(), 60000000);
+        return Status::OK();
+    };
+    for (const int64_t objectWaitMs : { 0, 100 }) {
+        std::vector<std::string> values;
+        std::vector<Optional<Buffer>> buffers;
+        size_t bytes = 0;
+        ASSERT_TRUE(client->GetWithLatch({ "key" }, values, objectWaitMs, buffers, bytes).IsOk());
+        EXPECT_EQ(values, std::vector<std::string>{ "data" });
+        EXPECT_EQ(bytes, 4U);
+    }
+    EXPECT_EQ(metadata->keyGroups.size(), 2U);
 }
 
 TEST(ObjectClientTransportTest, RoutedShmBufferUsesTargetSessionLockId)
@@ -4959,7 +5238,7 @@ TEST(ObjectReadFlowTest, DeniedUbSourceThenFailedTcpAttemptAggregatesTcpActualKi
                 return Status::OK();
             }
             deniedKind = AccessTransportKind::UB;
-            return Status(K_URMA_READ_SOURCE_DENIED, "client denied read source");
+            return Status(K_URMA_DATA_WORKER_UNAVAILABLE, "authoritative UB source unavailable");
         });
     ObjectReadFlow flow(metadata, std::move(reader), std::make_shared<ThreadPool>(0, 2, "object_read_test"));
     ObjectReadRequest request;
@@ -4973,7 +5252,7 @@ TEST(ObjectReadFlowTest, DeniedUbSourceThenFailedTcpAttemptAggregatesTcpActualKi
     EXPECT_EQ(result.actualKind, AccessTransportKind::TCP);
 }
 
-TEST(ObjectReadFlowTest, UbOnlyDenialAggregatesUbActualKind)
+TEST(ObjectReadFlowTest, AuthoritativeUbDenialAggregatesUbActualKind)
 {
     // With only a UB admission denial and no executed replica,
     // actualKind must aggregate to UB instead of the SHM default.
@@ -4998,7 +5277,7 @@ TEST(ObjectReadFlowTest, UbOnlyDenialAggregatesUbActualKind)
                 return Status::OK();
             }
             deniedKind = AccessTransportKind::UB;
-            return Status(K_URMA_READ_SOURCE_DENIED, "client denied read source");
+            return Status(K_URMA_DATA_WORKER_UNAVAILABLE, "authoritative UB source unavailable");
         });
     ObjectReadFlow flow(metadata, std::move(reader), std::make_shared<ThreadPool>(0, 2, "object_read_test"));
     ObjectReadRequest request;
@@ -5006,10 +5285,11 @@ TEST(ObjectReadFlowTest, UbOnlyDenialAggregatesUbActualKind)
     request.items = { { 0, "ub-only-denied", MakeAddress(41) } };
     ObjectReadResult result;
 
-    EXPECT_EQ(flow.Run(request, result).GetCode(), K_URMA_READ_SOURCE_DENIED);
+    EXPECT_EQ(flow.Run(request, result).GetCode(), K_URMA_DATA_WORKER_UNAVAILABLE);
     ASSERT_EQ(result.items.size(), 1u);
     EXPECT_EQ(result.items[0].attemptedKind, AccessTransportKind::UB);
     EXPECT_EQ(result.actualKind, AccessTransportKind::UB);
+    EXPECT_EQ(manager->transportBuildCount, 0);
 }
 
 TEST(ObjectClientTransportTest, TransportMSetParallelMemoryCopyPreservesPayload)
@@ -6556,8 +6836,7 @@ TEST(DataPlaneExecutorTest, DrainingShmFallbackReusesUbAndRefreshesOncePerPublis
     advisor->SetShmCandidateWorkers({ workerAddr, otherWorkerAddr });
     auto manager = std::make_shared<FakeDataPlaneManager>();
     manager->transporterGetStatuses = {
-        { MakeWorkerDrainingStatus() }, { Status::OK() }, { MakeWorkerDrainingStatus() },
-        { Status::OK() }, { MakeWorkerDrainingStatus() }, { Status::OK() }
+        { MakeWorkerDrainingStatus() }, { Status::OK() }, { MakeWorkerDrainingStatus() }, { Status::OK() }
     };
     int refreshCount = 0;
     DataPlaneExecutor executor(manager, advisor,
@@ -6581,7 +6860,12 @@ TEST(DataPlaneExecutorTest, DrainingShmFallbackReusesUbAndRefreshesOncePerPublis
     advisor->SetShmCandidateWorkers({ workerAddr, otherWorkerAddr });
     EXPECT_TRUE(executor.Execute(workerAddr, get).IsOk());
     EXPECT_EQ(refreshCount, 2);
-    ASSERT_EQ(manager->builtTransporters.size(), 6u);
+    ASSERT_EQ(manager->builtTransporters.size(), 4u);
+    // Advisor refresh alone does not rebuild the manager's retained endpoint transport slots.
+    EXPECT_EQ(manager->builtTransporters[0]->getCount, 1);
+    EXPECT_EQ(manager->builtTransporters[1]->getCount, 3);
+    EXPECT_EQ(manager->builtTransporters[2]->getCount, 1);
+    EXPECT_EQ(manager->builtTransporters[3]->getCount, 1);
     for (size_t i = 0; i < manager->builtTransporters.size(); i += 2) {
         EXPECT_EQ(manager->builtTransporters[i]->kind, AccessTransportKind::SHM);
         EXPECT_EQ(manager->builtTransporters[i + 1]->kind, AccessTransportKind::UB);
@@ -8697,6 +8981,14 @@ TEST(TransportLayerTest, CreateReplayConflictPreservesAmbiguousRpcFailure)
 
 TEST(TransportLayerTest, TcpFallbackKeepsAmbiguousShmAllocationForCleanup)
 {
+#ifdef USE_URMA
+    constexpr char mode[] = "tcp-fallback-cleanup";
+    if (!IsInitPolicyChild(mode)) {
+        RunInitPolicyTestInFreshProcess("TcpFallbackKeepsAmbiguousShmAllocationForCleanup", mode,
+                                       "TransportLayerTest");
+        return;
+    }
+#endif
     const bool enableUrma = FLAGS_enable_urma;
     Raii restoreEnableUrma([enableUrma]() { FLAGS_enable_urma = enableUrma; });
     FLAGS_enable_urma = false;

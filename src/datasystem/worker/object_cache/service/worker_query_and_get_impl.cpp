@@ -313,9 +313,11 @@ Status WorkerQueryAndGetImpl::EncodeLocalHits(RequestState &state)
             state.payloads.resize(payloadCount);
             state.tcpPayloadSize = tcpPayloadSize;
             auto *result = state.response.mutable_results(i);
-            result->clear_location();
             result->clear_data_result();
-            state.misses.emplace_back(objectKey);
+            if (rc.IsError()) {
+                result->clear_location();
+                state.misses.emplace_back(objectKey);
+            }
             VLOG_IF(1, rc.IsError()) << "[ObjectKey " << objectKey
                                      << "] QueryAndGet inline data fallback: " << rc.ToString();
         }
@@ -343,12 +345,11 @@ Status WorkerQueryAndGetImpl::EncodeLocalHit(RequestState &state, size_t index,
         EncodeShm(request.data_request().shm(), params, *result.mutable_data_result(), state, shmBytes);
         encoded = true;
     }
-    if (encoded) {
-        auto *location = result.mutable_location();
-        location->set_object_key(request.object_keys(static_cast<int>(index)));
-        location->add_object_locations(localAddress_.ToString());
-        location->set_object_size(params.dataSize);
-    }
+    // A complete local object remains readable in phase two when the inline buffer is too small.
+    auto *location = result.mutable_location();
+    location->set_object_key(request.object_keys(static_cast<int>(index)));
+    location->add_object_locations(localAddress_.ToString());
+    location->set_object_size(params.dataSize);
     return Status::OK();
 }
 
@@ -461,7 +462,7 @@ Status WorkerQueryAndGetImpl::FillMissLocations(RequestState &state) const
     RETURN_IF_NOT_OK(getProc_->QueryObjectLocations(state.misses, locations));
     for (int i = 0; i < state.request.object_keys_size(); ++i) {
         auto *result = state.response.mutable_results(i);
-        if (result->has_data_result()) {
+        if (result->has_location()) {
             continue;
         }
         const auto &objectKey = state.request.object_keys(i);

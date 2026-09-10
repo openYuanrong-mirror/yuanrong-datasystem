@@ -32,6 +32,7 @@ namespace client {
 inline constexpr char STALE_TRANSPORT_SNAPSHOT_MESSAGE[] =
     "Worker endpoint is absent from latest transport snapshot";
 inline constexpr char WORKER_DRAINING_FOR_SCALE_IN_MESSAGE[] = "Worker is draining for ScaleIn";
+inline constexpr char METADATA_INGRESS_NOT_SENT[] = "metadata_ingress_request_not_sent";
 
 inline bool IsTransportSnapshotStaleLocation(const Status &status)
 {
@@ -43,6 +44,11 @@ inline bool IsWorkerDrainingForScaleIn(const Status &status)
 {
     return status.GetCode() == K_NOT_READY
            && status.GetMsg().find(WORKER_DRAINING_FOR_SCALE_IN_MESSAGE) != std::string::npos;
+}
+
+inline bool IsMetadataIngressUnavailable(const Status &status)
+{
+    return IsTransportSnapshotStaleLocation(status) && status.GetExtra() == METADATA_INGRESS_NOT_SENT;
 }
 
 inline int64_t SelectLocationRefreshBackoffMs(bool draining, uint8_t retryCount, int64_t currentBackoffMs)

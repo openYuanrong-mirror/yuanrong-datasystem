@@ -495,7 +495,8 @@ private:
      */
     template <typename Req>
     Status PrepareGetRequestHelper(const std::string &srcIpAddr, uint64_t dataSize, ReadObjectKV &objectKV, Req &reqPb,
-                                   bool &shmUnitAllocated, std::shared_ptr<ShmOwner> shmOwner = nullptr);
+                                   bool &shmUnitAllocated, std::shared_ptr<ShmOwner> shmOwner = nullptr,
+                                   bool useFastTransport = true);
 
     /**
      * @brief Pull object data from remote worker.
@@ -841,6 +842,7 @@ private:
         HostPort &hostAddr;
         Status &checkConnectStatus;
         BatchGetObjectRemoteReqPb &reqPb;
+        bool &useFastTransport;
     };
 
     /**
@@ -866,7 +868,8 @@ private:
     Status SendBatchGetRemoteRequest(
         const std::string &address, const HostPort &hostAddr, const std::shared_ptr<GetRequest> &request,
         int64_t migrateDataTimeoutMs, uint64_t rpcSlowerThanUs, PerfPoint &point,
-        BatchGetObjectRemoteReqPb &reqPb, BatchGetObjectRemoteRspPb &rspPb, std::vector<RpcMessage> &payloads);
+        BatchGetObjectRemoteReqPb &reqPb, BatchGetObjectRemoteRspPb &rspPb, std::vector<RpcMessage> &payloads,
+        bool useFastTransport);
 
     static bool NeedDelayReleaseRemoteGetShm(const Status &status);
 
@@ -896,7 +899,7 @@ private:
     Status ConstructBatchGetRequest(const std::string &address, std::list<GetObjectInfo> &metas,
                                     const std::shared_ptr<GetRequest> &request, std::vector<std::string> &successIds,
                                     std::vector<ReadKey> &needRetryIds, std::unordered_set<std::string> &failedIds,
-                                    BatchGetObjectRemoteReqPb &reqPb);
+                                    BatchGetObjectRemoteReqPb &reqPb, bool useFastTransport);
 
     /**
      * @brief Helper function to process the sub response from batched response.
@@ -1123,6 +1126,8 @@ private:
         bool isSpill{ false };
     };
 
+    enum class ReadTransportFallback { ALLOWED, FORBIDDEN };
+
     struct ReplacePrimaryOutcome {
         std::unordered_set<std::string> confirmedIds;
         std::unordered_set<std::string> expiredIds;
@@ -1224,7 +1229,8 @@ private:
                                   const std::unordered_set<std::string> &attemptedObjectKeys,
                                   NotifyRemoteGetRspPb &rsp);
 
-    Status CheckRemoteReadAdmission(const std::string &address) const;
+    Status CheckRemoteReadAdmission(const std::string &address, ReadTransportFallback fallback,
+                                    bool &useFastTransport) const;
 
     void ReportRemoteReadOutcome(const std::string &address, const Status &status,
                                  const std::string &learnedFrom) const;
