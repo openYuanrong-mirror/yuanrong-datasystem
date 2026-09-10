@@ -19,6 +19,7 @@
 #include <future>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -258,28 +259,95 @@ TEST_F(CoordinatorLeaderRouterTest, ReadsFreshSnapshotForNextRoundAfterCoordinat
     EXPECT_EQ(waits, (std::vector<std::chrono::milliseconds>{ std::chrono::milliseconds(1) }));
 }
 
-TEST_F(CoordinatorLeaderRouterTest, DefersRedirectCycleToTheNextRound)
+TEST_F(CoordinatorLeaderRouterTest, DefersRedirectCycleToTheNextLogicalCall)
 {
     snapshots = { { "127.0.0.1:30001", "127.0.0.1:30002" } };
     Router router(Dependencies());
     std::vector<std::string> attempts;
+    bool hasLeader = false;
+    const auto rpc = [&attempts, &hasLeader](const HostPort &address, std::chrono::milliseconds) {
+        attempts.emplace_back(address.ToString());
+        if (hasLeader) {
+            return Response(State::SERVING);
+        }
+        const auto redirect =
+            address.ToString() == "127.0.0.1:30001" ? "127.0.0.1:30002" : "127.0.0.1:30001";
+        return Response(State::NOT_LEADER, Status(K_NOT_READY, "injected redirect cycle"), redirect);
+    };
+
+    // The redirect cycle dials each candidate exactly once; already-attempted addresses are
+    // deferred to the next logical call instead of being re-dialed within this one.
+    const auto status = router.Execute(rpc, Deadline(std::chrono::milliseconds(20)),
+                                       std::chrono::milliseconds(10), std::chrono::milliseconds(1));
+
+    EXPECT_EQ(status.GetCode(), K_NOT_READY);
+    EXPECT_EQ(attempts, (std::vector<std::string>{ "127.0.0.1:30001", "127.0.0.1:30002" }));
+
+    hasLeader = true;
+    EXPECT_TRUE(router.Execute(rpc, Deadline(std::chrono::seconds(1)), std::chrono::milliseconds(10),
+                               std::chrono::milliseconds(1))
+                    .IsOk());
+}
+
+TEST_F(CoordinatorLeaderRouterTest, RetriesFollowerCandidateInNextLogicalCall)
+{
+    snapshots = { { "127.0.0.1:30001" } };
+    Router router(Dependencies());
+    size_t attempts = 0;
+    bool isLeader = false;
+    const auto rpc = [&attempts, &isLeader](const HostPort &, std::chrono::milliseconds) {
+        ++attempts;
+        return isLeader ? Response(State::SERVING)
+                        : Response(State::NOT_LEADER, Status(K_NOT_READY, "injected follower"));
+    };
+
+    // The candidate answers as follower and the static discovery refresh brings no new
+    // address, so the same candidate is not dialed again within this logical call.
+    EXPECT_EQ(router.Execute(rpc, Deadline(std::chrono::milliseconds(20)), std::chrono::milliseconds(10),
+                             std::chrono::milliseconds(1))
+                  .GetCode(),
+              K_NOT_READY);
+    EXPECT_EQ(attempts, 1);
+
+    // A freshly elected leader is picked up by the next logical call.
+    isLeader = true;
+    EXPECT_TRUE(router.Execute(rpc, Deadline(std::chrono::seconds(1)), std::chrono::milliseconds(10),
+                               std::chrono::milliseconds(1))
+                    .IsOk());
+    EXPECT_EQ(attempts, 2);
+}
+
+// A static discovery snapshot must not reset the failed-candidate memory of one logical call:
+// with three dead replicas and two reachable followers (loss of majority), every candidate,
+// dead or alive, is dialed exactly once while the call still spends its whole budget.
+TEST_F(CoordinatorLeaderRouterTest, DoesNotRedialCandidatesAfterStaticDiscoveryRefresh)
+{
+    snapshots = { { "127.0.0.1:30001", "127.0.0.1:30002", "127.0.0.1:30003", "127.0.0.1:30004",
+                    "127.0.0.1:30005" } };
+    Router router(Dependencies());
+    std::unordered_map<std::string, size_t> dialCount;
 
     const auto status = router.Execute(
-        [&attempts](const HostPort &address, std::chrono::milliseconds) {
-            attempts.emplace_back(address.ToString());
-            if (attempts.size() == 3) {
-                return Response(State::SERVING);
+        [&dialCount](const HostPort &address, std::chrono::milliseconds) {
+            ++dialCount[address.ToString()];
+            const auto &value = address.ToString();
+            if (value == "127.0.0.1:30001" || value == "127.0.0.1:30002" || value == "127.0.0.1:30003") {
+                return TransportError(K_RPC_PEER_DEAD);
             }
-            const auto redirect =
-                address.ToString() == "127.0.0.1:30001" ? "127.0.0.1:30002" : "127.0.0.1:30001";
-            return Response(State::NOT_LEADER, Status(K_NOT_READY, "injected redirect cycle"), redirect);
+            return Response(State::NOT_LEADER, Status(K_NOT_READY, "injected follower"));
         },
-        Deadline(std::chrono::seconds(1)), std::chrono::milliseconds(10), std::chrono::milliseconds(1));
+        Deadline(std::chrono::milliseconds(3'000)), std::chrono::milliseconds(10),
+        std::chrono::milliseconds(1));
 
-    EXPECT_TRUE(status.IsOk());
-    EXPECT_EQ(attempts, (std::vector<std::string>{ "127.0.0.1:30001", "127.0.0.1:30002",
-                                                  "127.0.0.1:30001" }));
-    EXPECT_EQ(snapshotCalls, 2);
+    EXPECT_EQ(status.GetCode(), K_NOT_READY);
+    ASSERT_EQ(dialCount.size(), 5UL);
+    size_t totalDials = 0;
+    for (const auto &[address, count] : dialCount) {
+        EXPECT_EQ(count, 1UL) << address;
+        totalDials += count;
+    }
+    EXPECT_EQ(totalDials, 5UL);
+    EXPECT_GE(snapshotCalls, 2UL);
 }
 
 TEST_F(CoordinatorLeaderRouterTest, TriesNextCandidateWhenRecoveringLeaderBecomesUnreachable)
@@ -674,7 +742,9 @@ TEST_F(CoordinatorLeaderRouterTest, HeaderlessBusinessErrorWithFollowersRetainsN
         Deadline(std::chrono::milliseconds(3)), std::chrono::milliseconds(3),
         std::chrono::milliseconds(1));
     EXPECT_EQ(status.GetCode(), K_NOT_READY);
-    EXPECT_EQ(calls, 6);
+    // One dial per candidate: the static snapshot refresh does not reset failed-candidate
+    // memory, so the headerless error never overwrites the followers' NOT_LEADER verdict.
+    EXPECT_EQ(calls, 3);
 }
 
 TEST_F(CoordinatorLeaderRouterTest, UnattemptedCandidateCannotOverwriteAcceptedResponse)
@@ -697,9 +767,9 @@ TEST_F(CoordinatorLeaderRouterTest, UnattemptedCandidateCannotOverwriteAcceptedR
     }
 }
 
-TEST_F(CoordinatorLeaderRouterTest, LaterRoundTransportFailurePreservesAcceptedResponse)
+TEST_F(CoordinatorLeaderRouterTest, LaterCandidateTransportFailurePreservesAcceptedResponse)
 {
-    snapshots = { { "127.0.0.1:30001" } };
+    snapshots = { { "127.0.0.1:30001", "127.0.0.1:30002" } };
     Router router(Dependencies());
     size_t calls = 0;
     const auto status = router.Execute(
@@ -713,7 +783,7 @@ TEST_F(CoordinatorLeaderRouterTest, LaterRoundTransportFailurePreservesAcceptedR
         std::chrono::milliseconds(1));
     EXPECT_EQ(status.GetCode(), K_NOT_READY);
     EXPECT_EQ(status.GetMsg(), "leader election pending");
-    EXPECT_EQ(calls, 3);
+    EXPECT_EQ(calls, 2);
 }
 
 TEST_F(CoordinatorLeaderRouterTest, DeadlineWithoutAcceptedResponseRemainsTimeout)

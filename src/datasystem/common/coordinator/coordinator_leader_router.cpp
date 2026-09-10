@@ -62,6 +62,9 @@ Status CoordinatorLeaderRouter::Execute(const RpcCall &rpc, TimePoint deadline, 
 
     std::optional<std::string> leaderHint;
     Status lastStatus = DeadlineExceeded();
+    // Failed-candidate memory spans refresh rounds of one logical call, so a static discovery
+    // snapshot cannot re-dial dead replicas every round; a new logical call starts fresh.
+    std::unordered_set<std::string> attempted;
     bool hasCoordinatorResponse = false;
     while (dependencies_.now() < deadline) {
         std::deque<std::string> candidates;
@@ -80,11 +83,13 @@ Status CoordinatorLeaderRouter::Execute(const RpcCall &rpc, TimePoint deadline, 
         }
 
         auto result = TryCandidates(std::move(candidates), rpc, deadline, maxRpcTimeout, retryInterval, recoveryControl,
-                                    lastStatus, hasCoordinatorResponse);
+                                    attempted, lastStatus, hasCoordinatorResponse);
         if (result.action == RoundAction::COMPLETE) {
             return result.status;
         }
         if (result.action == RoundAction::RETRY_CURRENT_ROUTE) {
+            // Leadership changed mid-call; the same address may now serve, so allow one re-dial.
+            attempted.clear();
             leaderHint.reset();
             continue;
         }
@@ -148,10 +153,10 @@ Status CoordinatorLeaderRouter::Validate(const RpcCall &rpc, TimePoint deadline,
 
 CoordinatorLeaderRouter::CandidateRoundResult CoordinatorLeaderRouter::TryCandidates(
     std::deque<std::string> candidates, const RpcCall &rpc, TimePoint deadline, std::chrono::milliseconds maxRpcTimeout,
-    std::chrono::milliseconds retryInterval, bool recoveryControl, Status &lastStatus, bool &hasCoordinatorResponse)
+    std::chrono::milliseconds retryInterval, bool recoveryControl, std::unordered_set<std::string> &attempted,
+    Status &lastStatus, bool &hasCoordinatorResponse)
 {
     bool hasResponse = false;
-    std::unordered_set<std::string> attempted;
     std::optional<std::string> nextRoundLeaderHint;
     while (!candidates.empty()) {
         auto address = std::move(candidates.front());
