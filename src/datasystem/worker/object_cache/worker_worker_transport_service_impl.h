@@ -67,6 +67,7 @@ public:
 
 private:
     Status ResolveWorkerIncarnation(std::string &incarnation) const;
+    UbHealthSummary EncodeProbeHealthSummary(const std::string &incarnation, ProviderUbRecoveryProbeRspPb &rsp) const;
 
     std::shared_ptr<datasystem::object_cache::WorkerOCServiceImpl> ocClientWorkerSvc_;
     const HostPort localWorker_;

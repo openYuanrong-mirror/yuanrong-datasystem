@@ -236,6 +236,12 @@ public:
         return server_->IsLocalUbVerificationEligible(snapshot);
     }
 
+    bool BackoffRejectedUbProbeCandidate(PeerUbAdmission *admission, const HostPort &subject,
+                                         const Status &status, uint64_t nowMs)
+    {
+        return server_->BackoffRejectedUbProbeCandidate(admission, subject, status, nowMs);
+    }
+
     Status WaitForExitingRemoval(std::chrono::steady_clock::time_point deadline,
                                  const std::function<Status(int32_t)> &publish,
                                  const std::function<Status()> &observe,
@@ -585,6 +591,35 @@ TEST_F(WorkerOCServerTest, LocalUbVerificationRequiresActiveMultiWorkerTopology)
     EXPECT_TRUE(IsLocalUbVerificationEligible(*active));
     EXPECT_FALSE(IsLocalUbVerificationEligible(*single));
     EXPECT_FALSE(IsLocalUbVerificationEligible(*localAbsent));
+}
+
+TEST_F(WorkerOCServerTest, RejectedPeerProbeBacksOffWithoutConsumingLocalSenderCandidate)
+{
+    const uint64_t nowMs = 10'000;
+    const HostPort peerA("127.0.0.1", 31502);
+    const HostPort peerB("127.0.0.1", 31503);
+    PeerUbAdmission peers;
+    peers.InitializeVerification(peerA, nowMs);
+    peers.InitializeVerification(peerB, nowMs);
+    const auto rejected = peers.NextProbeCandidate(nowMs);
+    ASSERT_TRUE(rejected.has_value());
+    const auto expectedNext = *rejected == peerA ? peerB : peerA;
+
+    EXPECT_TRUE(BackoffRejectedUbProbeCandidate(
+        &peers, *rejected, Status(K_NOT_READY, "peer role is not admitted"), nowMs));
+
+    const auto rejectedState = peers.GetState(*rejected);
+    ASSERT_TRUE(rejectedState.has_value());
+    EXPECT_GT(rejectedState->backoffDeadlineMs, nowMs);
+    EXPECT_EQ(peers.NextProbeCandidate(nowMs), expectedNext);
+
+    const HostPort local("127.0.0.1", 31501);
+    PeerUbAdmission localSender;
+    localSender.SetSelfWorker(local);
+    localSender.InitializeVerification(local, nowMs);
+    EXPECT_FALSE(BackoffRejectedUbProbeCandidate(
+        &localSender, local, Status(K_NOT_READY, "no peer endpoint"), nowMs));
+    EXPECT_EQ(localSender.NextProbeCandidate(nowMs), local);
 }
 
 TEST_F(WorkerOCServerTest, FailedProbeResultAttachesObservationOnlyToErrorOutcome)

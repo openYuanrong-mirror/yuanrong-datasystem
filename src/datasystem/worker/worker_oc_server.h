@@ -581,6 +581,8 @@ private:
      * @brief Probe one due admission entry outside admission locks.
      */
     void RunOneUbRecoveryProbe();
+    bool BackoffRejectedUbProbeCandidate(PeerUbAdmission *admission, const HostPort &subject,
+                                         const Status &status, uint64_t nowMs);
 
     /**
      * @brief Attribute a completed recovery probe and settle its admission token.

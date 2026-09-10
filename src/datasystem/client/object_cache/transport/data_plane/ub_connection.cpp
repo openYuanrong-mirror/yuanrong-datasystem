@@ -50,6 +50,7 @@ Status UbConnection::Establish(const HostPort &workerAddr)
 
 Status UbConnection::Establish(const HostPort &workerAddr, TransportPhaseLatencyRecorder *recorder)
 {
+    Teardown();
     workerAddr_ = workerAddr;
     return EstablishUrma(recorder);
 }
@@ -73,7 +74,8 @@ Status UbConnection::EstablishUrma(TransportPhaseLatencyRecorder *recorder)
     RETURN_IF_NOT_OK(status);
     const auto phaseBegin = recorder == nullptr ? TransportPhaseLatencyRecorder::TimePoint{}
                                                 : recorder->StartPhase();
-    status = FinalizeOutboundConnection(response);
+    status = UrmaManager::Instance().FinalizeOutboundConnection(response, UrmaManager::ConnectionOwnership::CLIENT_REF,
+                                                                &clientOwner_);
     if (recorder != nullptr) {
         recorder->RecordPhase("urma_connection_finalize", phaseBegin, TransportLatencyThreshold::PROCESS);
     }
@@ -103,7 +105,8 @@ void UbConnection::Teardown()
     supportsPayloadOnlyClientBatchGet_.store(false, std::memory_order_release);
 #ifdef USE_URMA
     if (urmaReady_.exchange(false, std::memory_order_acq_rel)) {
-        (void)datasystem::RemoveRemoteFastTransportNode(workerAddr_);
+        UrmaManager::Instance().ReleaseClientConnection(workerAddr_.ToString(), clientOwner_);
+        clientOwner_.reset();
     }
 #else
     urmaReady_.store(false, std::memory_order_release);

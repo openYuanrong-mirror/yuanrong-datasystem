@@ -568,10 +568,6 @@ Status ObjectClientImpl::ShutDown(bool &needRollbackState, bool isDestruct)
     if (routing != nullptr) {
         routing->Shutdown();
     }
-    if (transportLayer_ != nullptr) {
-        transportLayer_->Shutdown();
-        transportLayer_.reset();
-    }
     asyncSetRPCPool_ = nullptr;
     asyncGetRPCPool_ = nullptr;
     asyncPipelineRH2DPool_ = nullptr;
@@ -597,9 +593,14 @@ Status ObjectClientImpl::ShutDown(bool &needRollbackState, bool isDestruct)
     for (const auto &api : workerApi_) {
         if (api != nullptr) {
             api->SetUrmaDataPlaneFailureCallback(nullptr);
+            api->SetUbHealthSummaryCallback(nullptr);
         }
     }
     failover_->DrainAsyncSwitchWorkerPool();
+    if (transportLayer_ != nullptr) {
+        transportLayer_->Shutdown();
+        transportLayer_.reset();
+    }
     // Step2: keep the local worker disconnect under the shutdown lock because it shares
     // the same shutdown-synchronized shm ref cleanup path. Other worker disconnects can
     // be deferred until after the lock is released.
@@ -736,6 +737,9 @@ Status ObjectClientImpl::InitTransportLayer()
         transportSignature_, asyncGetRPCPool_, fastTransportMemSize_, std::move(options));
     RETURN_IF_NOT_OK(transportLayer->Init());
     transportLayer_ = std::move(transportLayer);
+    for (size_t i = 0; i < workerApi_.size(); ++i) {
+        failover_->ConfigureUrmaDataPlaneFailureCallback(static_cast<WorkerNode>(i), workerApi_[i]);
+    }
     LOG(INFO) << "Client transport layer initialized";
     return Status::OK();
 }

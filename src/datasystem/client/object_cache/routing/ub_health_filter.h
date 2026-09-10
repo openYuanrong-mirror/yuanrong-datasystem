@@ -48,6 +48,8 @@ public:
     std::vector<HostPort> GetUnavailableWriteTargets() const;
     std::optional<UbPathState> GetWriteTargetObservation(const HostPort &addr) const;
     std::optional<UbPathState> GetLocalObservation(const HostPort &addr) const;
+    // Materialize a client-local probe candidate from a trusted non-writable Worker summary.
+    bool SeedProviderRecoveryFromGlobalSummary(const HostPort &addr);
     std::optional<ProviderUbRecoveryCandidate> TryBeginProviderRecovery(uint64_t nowMs);
     bool CompleteProviderRecovery(const ProviderUbRecoveryCandidate &candidate,
                                   const std::optional<UbHealthSummary> &summary, const Status &probeStatus,

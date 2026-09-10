@@ -18,6 +18,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -36,15 +37,20 @@
 #include "datasystem/client/object_cache/transport/object_buffer_internal.h"
 #include "datasystem/client/object_cache/transport/object_read/replica_reader.h"
 #include "datasystem/client/object_cache/transport/transport_layer.h"
+#include "datasystem/common/flags/common_flags.h"
 #include "datasystem/common/inject/inject_point.h"
 #include "datasystem/common/object_cache/provider_ub_failure_detail.h"
 #include "datasystem/common/object_cache/ub_health_summary_codec.h"
+#include "datasystem/common/object_cache/urma_fallback_tcp_limiter.h"
 #include "datasystem/common/rdma/fast_transport_manager_wrapper.h"
 #include "datasystem/common/rpc/api_deadline.h"
 #include "datasystem/common/util/raii.h"
+#include "datasystem/protos/meta_transport.pb.h"
 #if defined(USE_URMA) || defined(USE_URMA_MOCK)
 #include "datasystem/common/rdma/urma_manager.h"
 #endif
+
+DS_DECLARE_bool(enable_transport_fallback);
 
 namespace datasystem {
 namespace client {
@@ -871,6 +877,61 @@ TEST(UbHealthFilterTest, SameIncarnationWritableRecoveryClearsClientObservation)
     ASSERT_TRUE(filter.ApplySummary(summary, summary.incarnation));
     EXPECT_FALSE(filter.GetLocalObservation(provider).has_value());
     EXPECT_TRUE(filter.IsAvailable(provider));
+}
+
+TEST(TransportLayerAdmissionTest, GlobalUnavailableSchedulesProviderRecoveryOnce)
+{
+    const auto provider = MakeAddress(38);
+    auto filter = std::make_shared<UbHealthFilter>();
+    ClusterTopologyPb topology;
+    (*topology.mutable_members())[provider.ToString()].set_id("incarnation-a");
+    filter->ApplyTopologyIncarnations(topology);
+    UbHealthSummary summary;
+    summary.worker = provider;
+    summary.incarnation = "incarnation-a";
+    summary.writable = false;
+    summary.epoch = 4;
+    auto manager = std::make_shared<FakeDataPlaneManager>();
+    manager->providerProbeSummary = summary;
+    manager->providerProbeSummary.writable = true;
+    ++manager->providerProbeSummary.epoch;
+    TestTransportLayer layer(manager, std::make_shared<FixedTransportAdvisor>(TransportHint::UB_CANDIDATE), filter);
+    ASSERT_TRUE(layer.Init().IsOk());
+    ASSERT_TRUE(filter->ApplySummary(summary, summary.incarnation));
+
+    EXPECT_TRUE(layer.ScheduleProviderRecoveryFromGlobalSummary(provider));
+    EXPECT_FALSE(layer.ScheduleProviderRecoveryFromGlobalSummary(provider));
+    ASSERT_TRUE(manager->WaitForProviderProbeCount(1, PROBE_OBSERVATION_TIMEOUT));
+    EXPECT_EQ(manager->providerProbedWorkers, std::vector<HostPort>{ provider });
+    // The fake records a probe before TransportLayer applies its successful result.
+    const auto deadline = std::chrono::steady_clock::now() + PROBE_OBSERVATION_TIMEOUT;
+    while (!filter->IsAvailable(provider) && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_TRUE(filter->IsAvailable(provider));
+}
+
+TEST(TransportLayerAdmissionTest, SummaryRecoveryCallbackStopsAtShutdownAndSurvivesDestruction)
+{
+    const auto provider = MakeAddress(38);
+    auto filter = std::make_shared<UbHealthFilter>();
+    UbHealthSummary summary;
+    summary.worker = provider;
+    summary.incarnation = "incarnation-a";
+    summary.writable = false;
+    summary.epoch = 1;
+    ASSERT_TRUE(filter->ApplySummary(summary, summary.incarnation));
+    auto manager = std::make_shared<FakeDataPlaneManager>();
+    auto layer = std::make_unique<TestTransportLayer>(
+        manager, std::make_shared<FixedTransportAdvisor>(TransportHint::UB_CANDIDATE), filter);
+    auto callback = layer->MakeProviderRecoveryCallback();
+    layer->Shutdown();
+    EXPECT_FALSE(layer->ScheduleProviderRecoveryFromGlobalSummary(provider));
+    callback(provider);
+    EXPECT_FALSE(filter->GetLocalObservation(provider).has_value());
+    layer.reset();
+    callback(provider);
+    EXPECT_FALSE(filter->GetLocalObservation(provider).has_value());
 }
 
 TEST(UbHealthFilterTest, OnDemandRecoveryRequiresWritableSummaryAndDirectionalProbe)

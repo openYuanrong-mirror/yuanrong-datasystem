@@ -2971,9 +2971,29 @@ Status WorkerOCServer::ResolveUbProbeEndpoint(const HostPort &subject, HostPort 
     return Status(K_NOT_READY, "No active peer is available for the local UB sender probe");
 }
 
+bool WorkerOCServer::BackoffRejectedUbProbeCandidate(PeerUbAdmission *admission, const HostPort &subject,
+                                                     const Status &status, uint64_t nowMs)
+{
+    if (subject == hostPort_) {
+        return false;
+    }
+    auto token = admission->TryBeginProbe(subject, nowMs);
+    if (!token.has_value()) {
+        return false;
+    }
+    (void)admission->CompleteProbe(*token, status, nowMs, true);
+    return true;
+}
+
 void WorkerOCServer::RunOneUbRecoveryProbe()
 {
-    if (objCacheClientWorkerSvc_ == nullptr || objectEndpointPolicy_ == nullptr || topologyExitRequested_) {
+    if (objCacheClientWorkerSvc_ == nullptr || objectEndpointPolicy_ == nullptr || warmupExit_) {
+        return;
+    }
+    // Draining still needs verified migration targets; final warmup shutdown remains the stop boundary.
+    if (topologyExitRequested_
+        && objectEndpointPolicy_->CheckDataPlaneAdmission(
+            hostPort_, object_cache::DataPlaneAdmissionRole::TOPOLOGY_SCALE_IN_SOURCE).IsError()) {
         return;
     }
     auto *admission = objCacheClientWorkerSvc_->GetUbAdmission();
@@ -2982,28 +3002,28 @@ void WorkerOCServer::RunOneUbRecoveryProbe()
     if (!subject.has_value()) {
         return;
     }
+    HostPort endpoint;
+    const auto subjectRole = topologyExitRequested_ && *subject == hostPort_
+                                 ? object_cache::DataPlaneAdmissionRole::TOPOLOGY_SCALE_IN_SOURCE
+                                 : object_cache::DataPlaneAdmissionRole::NEW_MIGRATION_TARGET;
+    Status status = objectEndpointPolicy_->CheckDataPlaneAdmission(*subject, subjectRole);
+    if (status.IsOk()) {
+        status = ResolveUbProbeEndpoint(*subject, endpoint);
+    }
+    if (status.IsError()) {
+        (void)BackoffRejectedUbProbeCandidate(admission, *subject, status, nowMs);
+        return;
+    }
     auto token = admission->TryBeginProbe(*subject, nowMs);
     if (!token.has_value()) {
         return;
     }
-    HostPort endpoint;
-    Status status = objectEndpointPolicy_->CheckDataPlaneAdmission(
-        *subject, object_cache::DataPlaneAdmissionRole::NEW_MIGRATION_TARGET);
+    UrmaWriteFailure failure;
+    status = objCacheClientWorkerSvc_->ProbeUrmaConnectionToPeer(endpoint, &failure);
     if (status.IsOk()) {
-        status = ResolveUbProbeEndpoint(*subject, endpoint);
+        status = objectEndpointPolicy_->CheckDataPlaneAdmission(*subject, subjectRole);
     }
-    if (status.IsOk()) {
-        UrmaWriteFailure failure;
-        status = objCacheClientWorkerSvc_->ProbeUrmaConnectionToPeer(endpoint, &failure);
-        if (status.IsOk()) {
-            status = objectEndpointPolicy_->CheckDataPlaneAdmission(
-                *subject, object_cache::DataPlaneAdmissionRole::NEW_MIGRATION_TARGET);
-        }
-        FinishUbRecoveryProbe(admission, *token, *subject, endpoint, status, failure);
-        return;
-    }
-    const bool requireGlobalAvailable = *subject != hostPort_;
-    (void)admission->CompleteProbe(*token, status, GetSteadyClockTimeStampMs(), requireGlobalAvailable);
+    FinishUbRecoveryProbe(admission, *token, *subject, endpoint, status, failure);
 }
 
 void WorkerOCServer::FinishUbRecoveryProbe(PeerUbAdmission *admission, const UbProbeToken &token,

@@ -172,6 +172,9 @@ public:
      */
     Status ApplyWorkerSnapshot(WorkerSnapshot snapshot);
 
+    /** @brief Schedule the existing Provider recovery probe after accepting a non-writable global summary. */
+    bool ScheduleProviderRecoveryFromGlobalSummary(const HostPort &provider);
+    std::function<void(const HostPort &)> MakeProviderRecoveryCallback() const;
     void RecordRoutingRefresh(uint64_t ringVersion);
 
     void Shutdown();

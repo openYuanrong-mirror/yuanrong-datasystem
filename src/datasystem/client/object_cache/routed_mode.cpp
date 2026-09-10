@@ -341,7 +341,8 @@ Status RoutedMode::MultiCreateRouted(const std::vector<std::string> &objectKeyLi
     auto routing = std::atomic_load(&routing_);
     RETURN_RUNTIME_ERROR_IF_NULL(routing);
     std::unordered_map<HostPort, std::vector<std::string>> groupedKeys;
-    RETURN_IF_NOT_OK(routing->SelectWorkers(objectKeyList, dataPlacementPolicy_, groupedKeys));
+    RETURN_IF_NOT_OK(routing->SelectWorkers(objectKeyList, dataPlacementPolicy_, groupedKeys,
+                                            host_.mergeWriteTargetExclusions({})));
     // Map each key back to its original position so results land in the caller's order.
     std::unordered_map<std::string, size_t> keyIndex;
     keyIndex.reserve(sz);

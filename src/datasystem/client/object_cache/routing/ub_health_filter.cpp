@@ -286,6 +286,22 @@ std::optional<UbPathState> UbHealthFilter::GetLocalObservation(const HostPort &a
     return localAdmission_.GetState(addr);
 }
 
+bool UbHealthFilter::SeedProviderRecoveryFromGlobalSummary(const HostPort &addr)
+{
+    std::lock_guard<std::mutex> lock(incarnationMutex_);
+    auto summary = cache_.Get(addr);
+    if (!summary.has_value() || summary->writable) {
+        return false;
+    }
+    auto state = localAdmission_.GetState(addr);
+    if (state.has_value() && state->state != UbAdmissionState::AVAILABLE) {
+        return false;
+    }
+    localAdmission_.InitializeVerification(addr, GetSteadyClockTimeStampMs());
+    localObservationIncarnations_[addr] = summary->incarnation;
+    return true;
+}
+
 std::optional<ProviderUbRecoveryCandidate> UbHealthFilter::TryBeginProviderRecovery(uint64_t nowMs)
 {
     std::lock_guard<std::mutex> lock(incarnationMutex_);

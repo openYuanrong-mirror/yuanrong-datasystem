@@ -1009,6 +1009,10 @@ public:
 
 private:
     friend class UrmaConnectionTestAccess;
+    friend class UrmaManager;
+    // Connection identity is protected by the map; shared-accessor reuse can acquire owners concurrently.
+    std::atomic<size_t> clientOwners_{ 0 };
+    std::atomic<bool> workerOwned_{ false };
     std::unique_ptr<UrmaTargetJetty> targetJetty_;
     UrmaJfrInfo urmaJfrInfo_;
     UrmaRemoteSegmentMap tsegs_;
