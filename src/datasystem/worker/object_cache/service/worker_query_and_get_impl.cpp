@@ -28,6 +28,7 @@
 #include "datasystem/common/log/latency_phase.h"
 #include "datasystem/common/metrics/kv_metrics.h"
 #include "datasystem/common/object_cache/provider_ub_failure_detail.h"
+#include "datasystem/common/object_cache/ub_health_summary_codec.h"
 #include "datasystem/common/object_cache/shm_guard.h"
 #include "datasystem/common/rdma/fast_transport_manager_wrapper.h"
 #include "datasystem/common/shared_memory/delayed_release_shm_manager.h"
@@ -54,6 +55,18 @@ void FillLocation(const master::ObjectLocationInfoPb &source, QueryAndGetLocatio
     target.set_object_size(source.object_size());
     target.set_topology_version(source.topology_version());
     *target.mutable_object_locations() = source.object_locations();
+}
+
+void DelayReleaseUbBufferIfNeeded(const std::shared_ptr<ShmUnit> &shmUnit, const Status &status)
+{
+    if (!NeedDelayReleaseShmUnit(status)) {
+        return;
+    }
+    LOG_EVERY_T(WARNING, DELAY_RELEASE_LOG_INTERVAL_SEC)
+        << "[QUERY_AND_GET_DELAY_RELEASE_ADD] id=" << shmUnit->id
+        << ", identity=" << shmUnit->GetIdentity() << ", bytes=" << shmUnit->size
+        << ", delayMs=" << DEFAULT_SHM_DELAY_RELEASE_MS << ", reason=" << status;
+    DelayedReleaseShmManager::Instance().Add(shmUnit, std::chrono::milliseconds(DEFAULT_SHM_DELAY_RELEASE_MS));
 }
 }  // namespace
 
@@ -118,6 +131,13 @@ Status WorkerQueryAndGetImpl::DeliverResponse(
     const std::shared_ptr<ServerUnaryWriterReader<QueryAndGetRspPb, QueryAndGetReqPb>> &serverApi,
     RequestState &state) const
 {
+    auto provider = std::atomic_load(&ubHealthSummaryProvider_);
+    if (provider != nullptr) {
+        auto summary = (*provider)();
+        if (summary != nullptr) {
+            state.response.mutable_ub_health_summary()->CopyFrom(*summary);
+        }
+    }
     Status deliveryRc = serverApi->Write(state.response);
     if (deliveryRc.IsOk()) {
         deliveryRc = serverApi->SendPayload(state.payloads);
@@ -366,6 +386,9 @@ Status WorkerQueryAndGetImpl::EncodeUb(const QueryAndGetUbDataReqPb &request, si
     if (params.dataSize > request.buffer_size()) {
         return Status::OK();
     }
+    if (ubAdmission_ != nullptr) {
+        RETURN_IF_NOT_OK(ubAdmission_->CheckWriteTarget(localAddress_, UbOperationKind::CLIENT_GET_WRITEBACK));
+    }
     const auto &remote = request.buffer_infos(static_cast<int>(index));
     ShmGuard shmGuard(params.shmUnit, params.dataSize, params.metaSize);
     if (WorkerOcServiceCrudCommonApi::ShmEnable()) {
@@ -389,19 +412,16 @@ Status WorkerQueryAndGetImpl::EncodeUb(const QueryAndGetUbDataReqPb &request, si
     if (rc.IsError()) {
         const auto &address = remote.request_address();
         const HostPort failedEndpoint(address.host(), address.port());
+        const auto failedIdentity = failedEndpoint.Empty() ? "urma_instance_id=" + request.urma_instance_id()
+                                                           : failedEndpoint.ToString();
+        FillProviderUbFailureDetail(rc, failedIdentity, localAddress_.ToString(), failure.providerStatus,
+                                    failure.cqeStatus, *result.mutable_provider_ub_failure_detail());
         ReportLocalUbOperationFailure(ubAdmission_.get(), localAddress_, failedEndpoint,
                                       UbOperationKind::CLIENT_GET_WRITEBACK, rc, failure.providerStatus,
                                       failure.cqeStatus);
         result.mutable_status()->set_error_code(rc.GetCode());
         result.mutable_status()->set_error_msg(rc.GetMsg());
-        if (NeedDelayReleaseShmUnit(rc)) {
-            LOG_EVERY_T(WARNING, DELAY_RELEASE_LOG_INTERVAL_SEC)
-                << "[QUERY_AND_GET_DELAY_RELEASE_ADD] id=" << params.shmUnit->id
-                << ", identity=" << params.shmUnit->GetIdentity() << ", bytes=" << params.shmUnit->size
-                << ", delayMs=" << DEFAULT_SHM_DELAY_RELEASE_MS << ", reason=" << rc;
-            DelayedReleaseShmManager::Instance().Add(
-                params.shmUnit, std::chrono::milliseconds(DEFAULT_SHM_DELAY_RELEASE_MS));
-        }
+        DelayReleaseUbBufferIfNeeded(params.shmUnit, rc);
         return rc;
     }
     METRIC_ADD(metrics::KvMetricId::WORKER_TO_CLIENT_GET_URMA_TOTAL_BYTES, params.dataSize);

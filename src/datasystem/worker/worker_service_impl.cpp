@@ -435,7 +435,7 @@ Status WorkerServiceImpl::Heartbeat(const HeartbeatReqPb &req, HeartbeatRspPb &r
     return Status::OK();
 }
 
-void WorkerServiceImpl::SetUbHealthSummaryProvider(std::function<std::optional<UbHealthSummary>()> provider)
+void WorkerServiceImpl::SetUbHealthSummaryProvider(UbHealthSummaryProvider provider)
 {
     std::lock_guard<std::mutex> lock(ubHealthSummaryProviderMutex_);
     ubHealthSummaryProvider_ = std::move(provider);
@@ -443,7 +443,7 @@ void WorkerServiceImpl::SetUbHealthSummaryProvider(std::function<std::optional<U
 
 void WorkerServiceImpl::PopulateUbHealthSummary(HeartbeatRspPb &rsp) const
 {
-    std::function<std::optional<UbHealthSummary>()> provider;
+    UbHealthSummaryProvider provider;
     {
         std::lock_guard<std::mutex> lock(ubHealthSummaryProviderMutex_);
         provider = ubHealthSummaryProvider_;
@@ -452,7 +452,7 @@ void WorkerServiceImpl::PopulateUbHealthSummary(HeartbeatRspPb &rsp) const
         return;
     }
     auto summary = provider();
-    if (!summary.has_value()) {
+    if (summary == nullptr) {
         return;
     }
     cluster::MemberEndpoint endpoint;
@@ -461,9 +461,13 @@ void WorkerServiceImpl::PopulateUbHealthSummary(HeartbeatRspPb &rsp) const
         VLOG(1) << "Skip local Worker UB health summary without a topology membership identity: " << rc.ToString();
         return;
     }
-    summary->worker = localAddress_;
-    summary->incarnation = endpoint.identity.id;
-    EncodeUbHealthSummary(*summary, *rsp.mutable_ub_health_summary());
+    if (!summary->incarnation().empty() && summary->incarnation() != endpoint.identity.id) {
+        return;
+    }
+    auto *encoded = rsp.mutable_ub_health_summary();
+    encoded->CopyFrom(*summary);
+    encoded->set_worker_address(localAddress_.ToString());
+    encoded->set_incarnation(endpoint.identity.id);
 }
 
 std::set<int> WorkerServiceImpl::GetExpiredFdsForClient(const ClientKey &clientId)

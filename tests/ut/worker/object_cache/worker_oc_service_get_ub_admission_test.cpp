@@ -24,6 +24,7 @@
 
 #include "datasystem/common/object_cache/peer_ub_admission.h"
 #include "datasystem/common/object_cache/provider_ub_failure_detail.h"
+#include "datasystem/common/object_cache/ub_health_summary_codec.h"
 #include "datasystem/common/object_cache/urma_fallback_tcp_limiter.h"
 #include "datasystem/common/rpc/brpc_status_util.h"
 #define private public
@@ -84,7 +85,8 @@ TEST(WorkerOcServiceGetUbAdmissionTest, UnavailableDataWorkerReadSourceFailsFast
 TEST(WorkerOcServiceGetUbAdmissionTest, RemoteGetWritebackRejectsUnavailableTargetBeforeSend)
 {
     PeerUbAdmission admission;
-    EXPECT_TRUE(WorkerWorkerOCServiceImpl::CheckRemoteGetWriteTarget(&admission, REMOTE_GET_ENDPOINT).IsOk());
+    EXPECT_TRUE(WorkerWorkerOCServiceImpl::CheckRemoteGetWriteTarget(
+        &admission, DATA_WORKER, REMOTE_GET_ENDPOINT).IsOk());
 
     UbHealthSummary summary;
     summary.worker = REMOTE_GET_ENDPOINT;
@@ -96,11 +98,13 @@ TEST(WorkerOcServiceGetUbAdmissionTest, RemoteGetWritebackRejectsUnavailableTarg
     summary.lastStatusCode = StatusCode::K_URMA_ERROR;
     admission.ReplaceGlobalSummaries({ summary });
 
-    auto rc = WorkerWorkerOCServiceImpl::CheckRemoteGetWriteTarget(&admission, REMOTE_GET_ENDPOINT);
+    auto rc = WorkerWorkerOCServiceImpl::CheckRemoteGetWriteTarget(
+        &admission, DATA_WORKER, REMOTE_GET_ENDPOINT);
 
     ASSERT_TRUE(rc.IsError());
     EXPECT_EQ(rc.GetCode(), StatusCode::K_URMA_WORKER_UNAVAILABLE);
-    EXPECT_TRUE(WorkerWorkerOCServiceImpl::CheckRemoteGetWriteTarget(nullptr, REMOTE_GET_ENDPOINT).IsOk());
+    EXPECT_TRUE(WorkerWorkerOCServiceImpl::CheckRemoteGetWriteTarget(
+        nullptr, DATA_WORKER, REMOTE_GET_ENDPOINT).IsOk());
 }
 
 TEST(WorkerOcServiceGetUbAdmissionTest, EmptyBatchResponsePreservesRequestError)
@@ -389,7 +393,7 @@ TEST(WorkerOcServiceGetUbAdmissionTest, ClientWritebackDetailDecodesAsClientGetO
 
 TEST(WorkerOcServiceGetUbAdmissionTest, GetRequestRecordsWorkerToClientProviderFailure)
 {
-    GetRequest request(AccessRecorderKey::DS_POSIX_GET, DATA_WORKER.ToString());
+    GetRequest request(AccessRecorderKey::DS_POSIX_GET, DATA_WORKER);
     request.ubUrmaInfo_.mutable_request_address()->set_host(CLIENT_WRITEBACK_ENDPOINT.Host());
     request.ubUrmaInfo_.mutable_request_address()->set_port(CLIENT_WRITEBACK_ENDPOINT.Port());
     GetRspPb rsp;
@@ -408,7 +412,7 @@ TEST(WorkerOcServiceGetUbAdmissionTest, GetRequestRecordsWorkerToClientProviderF
 
 TEST(WorkerOcServiceGetUbAdmissionTest, ClientWritebackDetailUsesClientIdentityWhenUrmaAddressIsEmpty)
 {
-    GetRequest request(AccessRecorderKey::DS_POSIX_GET, DATA_WORKER.ToString());
+    GetRequest request(AccessRecorderKey::DS_POSIX_GET, DATA_WORKER);
     request.clientId_ = ClientKey::Intern("client-without-urma-host-port");
     GetRspPb rsp;
     UrmaWriteFailure failure{ .providerStatus = 4, .cqeStatus = 4 };
@@ -426,7 +430,7 @@ TEST(WorkerOcServiceGetUbAdmissionTest, ClientWritebackDetailUsesClientIdentityW
 
 TEST(WorkerOcServiceGetUbAdmissionTest, GetRequestAttachesOnlyMatchingObjectProviderFailure)
 {
-    GetRequest request(AccessRecorderKey::DS_POSIX_GET, DATA_WORKER.ToString());
+    GetRequest request(AccessRecorderKey::DS_POSIX_GET, DATA_WORKER);
     request.rawObjectKeys_ = { "first", "second" };
     request.objects_.emplace("first", GetObjInfo{});
     request.objects_.emplace("second", GetObjInfo{});
@@ -453,7 +457,7 @@ TEST(WorkerOcServiceGetUbAdmissionTest, GetRequestAttachesOnlyMatchingObjectProv
 TEST(WorkerOcServiceGetUbAdmissionTest, ClientWritebackFailureQuarantinesProviderSelfAdmission)
 {
     auto admission = std::make_shared<PeerUbAdmission>();
-    GetRequest request(AccessRecorderKey::DS_POSIX_GET, DATA_WORKER.ToString(), admission);
+    GetRequest request(AccessRecorderKey::DS_POSIX_GET, DATA_WORKER, admission);
     request.ubUrmaInfo_.mutable_request_address()->set_host(CLIENT_WRITEBACK_ENDPOINT.Host());
     request.ubUrmaInfo_.mutable_request_address()->set_port(CLIENT_WRITEBACK_ENDPOINT.Port());
     GetRspPb rsp;
@@ -467,10 +471,50 @@ TEST(WorkerOcServiceGetUbAdmissionTest, ClientWritebackFailureQuarantinesProvide
     EXPECT_EQ(self->lastFailureClass, UbFailureClass::PORT_UNAVAILABLE_ERROR4);
 }
 
+TEST(WorkerOcServiceGetUbAdmissionTest, Uc4WorkerE4WaitsForVerifiedSelfPortHealth)
+{
+    auto admission = std::make_shared<PeerUbAdmission>(UbPortHealthVerificationMode::VERIFIED_PORT_HEALTH);
+    admission->SetSelfWorker(DATA_WORKER);
+    GetRequest request(AccessRecorderKey::DS_POSIX_GET, DATA_WORKER, admission);
+    request.ubUrmaInfo_.mutable_request_address()->set_host(CLIENT_WRITEBACK_ENDPOINT.Host());
+    request.ubUrmaInfo_.mutable_request_address()->set_port(CLIENT_WRITEBACK_ENDPOINT.Port());
+    UrmaWriteFailure failure{ .providerStatus = URMA_PORT_UNAVAILABLE_STATUS,
+                              .cqeStatus = URMA_PORT_UNAVAILABLE_STATUS };
+    GetRspPb firstRsp;
+
+    request.RecordProviderUbWriteFailure(Status(K_URMA_ERROR, "client writeback failed"), firstRsp, &failure);
+
+    ASSERT_TRUE(firstRsp.has_provider_ub_failure_detail());
+    EXPECT_EQ(firstRsp.provider_ub_failure_detail().cqe_status(), URMA_PORT_UNAVAILABLE_STATUS);
+    ASSERT_TRUE(admission->GetState(DATA_WORKER).has_value());
+    EXPECT_EQ(admission->GetState(DATA_WORKER)->state, UbAdmissionState::SUSPECT);
+    EXPECT_TRUE(admission->CheckWriteTarget(DATA_WORKER, UbOperationKind::CLIENT_GET_WRITEBACK).IsOk());
+
+    ASSERT_TRUE(admission->ApplyPortHealth(
+        DATA_WORKER, UbPortHealthSummary{ true, 4, 3, 1, false }, UbPortHealthEvidenceSource::PASSIVE_SUMMARY));
+    EXPECT_EQ(admission->GetState(DATA_WORKER)->state, UbAdmissionState::AVAILABLE);
+    request.RecordProviderUbWriteFailure(Status(K_URMA_ERROR, "client writeback failed again"), firstRsp, &failure);
+    EXPECT_EQ(admission->GetState(DATA_WORKER)->state, UbAdmissionState::SUSPECT);
+
+    ASSERT_TRUE(admission->ApplyPortHealth(
+        DATA_WORKER, UbPortHealthSummary{ true, 4, 4, 2, false }, UbPortHealthEvidenceSource::PASSIVE_SUMMARY));
+    EXPECT_EQ(admission->GetState(DATA_WORKER)->state, UbAdmissionState::UNAVAILABLE);
+    EXPECT_EQ(admission->CheckWriteTarget(DATA_WORKER, UbOperationKind::CLIENT_GET_WRITEBACK).GetCode(),
+              K_URMA_WORKER_UNAVAILABLE);
+
+    request.ubBufferSize_ = 1;
+    GetObjInfo objectInfo;
+    uint64_t ubWriteOffset = 0;
+    GetRspPb blockedRsp;
+    const auto blocked = request.UbWriteHelper("key", 0, 1, 0, nullptr, objectInfo, 0, ubWriteOffset, blockedRsp);
+    EXPECT_EQ(blocked.GetCode(), K_URMA_WORKER_UNAVAILABLE);
+    EXPECT_EQ(ubWriteOffset, 0u);
+}
+
 TEST(WorkerOcServiceGetUbAdmissionTest, ClientAckTimeoutDoesNotQuarantineProvider)
 {
     auto admission = std::make_shared<PeerUbAdmission>();
-    GetRequest request(AccessRecorderKey::DS_POSIX_GET, DATA_WORKER.ToString(), admission);
+    GetRequest request(AccessRecorderKey::DS_POSIX_GET, DATA_WORKER, admission);
     request.ubUrmaInfo_.mutable_request_address()->set_host(CLIENT_WRITEBACK_ENDPOINT.Host());
     request.ubUrmaInfo_.mutable_request_address()->set_port(CLIENT_WRITEBACK_ENDPOINT.Port());
     GetRspPb rsp;

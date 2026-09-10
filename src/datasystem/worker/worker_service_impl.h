@@ -30,6 +30,7 @@
 #include "datasystem/common/ak_sk/ak_sk_manager.h"
 #include "datasystem/common/eventloop/event_loop.h"
 #include "datasystem/common/object_cache/peer_ub_admission.h"
+#include "datasystem/common/object_cache/ub_health_summary_codec.h"
 #include "datasystem/common/log/log.h"
 #include "datasystem/common/util/locks.h"
 #include "datasystem/common/util/net_util.h"
@@ -146,7 +147,7 @@ public:
         return workerStartId_;
     }
 
-    void SetUbHealthSummaryProvider(std::function<std::optional<UbHealthSummary>()> provider);
+    void SetUbHealthSummaryProvider(UbHealthSummaryProvider provider);
 
 private:
     void PopulateUbHealthSummary(HeartbeatRspPb &rsp) const;
@@ -212,7 +213,7 @@ private:
     const cluster::MembershipEndpointView &membership_;  // Read-only view owned by WorkerOCServer's Engine.
     const std::atomic<bool> &localExiting_;             // WorkerOCServer-owned local admission gate.
     mutable std::mutex ubHealthSummaryProviderMutex_;
-    std::function<std::optional<UbHealthSummary>()> ubHealthSummaryProvider_;
+    UbHealthSummaryProvider ubHealthSummaryProvider_;
 
     SharedMutex mutex_;                           // for unboundedUnixSockFds_
     std::unordered_map<int, uint64_t> unboundedUnixSockFds_;  // This is the fd that is not bound to the client.

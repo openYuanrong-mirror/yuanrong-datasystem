@@ -33,6 +33,7 @@
 #include "datasystem/common/perf/perf_manager.h"
 #include "datasystem/common/rdma/fast_transport_manager_wrapper.h"
 #include "datasystem/common/util/raii.h"
+#include "datasystem/common/object_cache/ub_health_summary_codec.h"
 #include "datasystem/common/util/status_helper.h"
 #include "datasystem/common/util/thread_local.h"
 #include "datasystem/common/util/validator.h"
@@ -462,6 +463,12 @@ Status GetRequest::ReturnToClient(const Status &rc)
     resp.mutable_last_rc()->set_error_code(lastRc.GetCode());
     resp.mutable_last_rc()->set_error_msg(lastRc.GetMsg());
     AttachRemoteProviderUbFailure(lastRc, resp);
+    if (ubHealthSummaryProvider_) {
+        auto summary = ubHealthSummaryProvider_();
+        if (summary != nullptr) {
+            resp.mutable_ub_health_summary()->CopyFrom(*summary);
+        }
+    }
     PerfPoint writePoint(PerfKey::WORKER_RETURN_TO_CLIENT_WRITE);
     RETURN_IF_NOT_OK_PRINT_ERROR_MSG(serverApi_->Write(resp), "Write reply to client stream failed.");
     RETURN_IF_NOT_OK_PRINT_ERROR_MSG(serverApi_->SendPayload(payloads), "SendPayload to client stream failed");
@@ -544,6 +551,10 @@ Status GetRequest::UbWriteHelper(const ObjectKey &objectKeyUri, uint64_t metaSiz
 {
     bool hasCapacity = ubWriteOffset <= ubBufferSize_ && readSize <= ubBufferSize_ - ubWriteOffset;
     if (hasCapacity) {
+        if (ubAdmission_ != nullptr && !operatorWorkerAddress_.Empty()) {
+            RETURN_IF_NOT_OK(
+                ubAdmission_->CheckWriteTarget(operatorWorkerAddress_, UbOperationKind::CLIENT_GET_WRITEBACK));
+        }
         METRIC_TIMER(metrics::KvMetricId::URMA_WRITE_LATENCY);
         const uint64_t localObjectAddressBase = reinterpret_cast<uint64_t>(shmUnit->GetPointer());
         uint64_t localSegAddress;
@@ -589,17 +600,17 @@ void GetRequest::RecordProviderUbWriteFailure(const Status &status, GetRspPb &re
     std::string failedEndpointIdentity =
         failedEndpoint.Empty() && !clientId_.Empty() ? "client_id=" + clientId_.ToString() : failedEndpoint.ToString();
     auto &detail = *resp.mutable_provider_ub_failure_detail();
+    const auto operatorIdentity = operatorWorkerAddress_.Empty() ? std::string{} : operatorWorkerAddress_.ToString();
     if (failure != nullptr) {
-        FillProviderUbFailureDetail(status, failedEndpointIdentity, operatorWorkerAddress_, failure->providerStatus,
+        FillProviderUbFailureDetail(status, failedEndpointIdentity, operatorIdentity, failure->providerStatus,
                                     failure->cqeStatus, detail);
     } else {
-        FillProviderUbFailureDetail(status, failedEndpointIdentity, operatorWorkerAddress_, std::nullopt,
+        FillProviderUbFailureDetail(status, failedEndpointIdentity, operatorIdentity, std::nullopt,
                                     std::nullopt, detail);
     }
-    HostPort operatorWorker;
-    if (operatorWorker.ParseString(operatorWorkerAddress_).IsOk()) {
+    if (!operatorWorkerAddress_.Empty()) {
         ReportLocalUbOperationFailure(
-            ubAdmission_.get(), operatorWorker, failedEndpoint, UbOperationKind::CLIENT_GET_WRITEBACK, status,
+            ubAdmission_.get(), operatorWorkerAddress_, failedEndpoint, UbOperationKind::CLIENT_GET_WRITEBACK, status,
             failure == nullptr ? std::nullopt : failure->providerStatus,
             failure == nullptr ? std::nullopt : failure->cqeStatus);
     }

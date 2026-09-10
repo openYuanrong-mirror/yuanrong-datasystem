@@ -33,6 +33,7 @@
 #include "datasystem/common/object_cache/object_base.h"
 #include "datasystem/common/object_cache/object_ref_info.h"
 #include "datasystem/common/object_cache/peer_ub_admission.h"
+#include "datasystem/common/object_cache/ub_health_summary_codec.h"
 #include "datasystem/common/object_cache/safe_object.h"
 #include "datasystem/common/rdma/fast_transport_base.h"
 #include "datasystem/common/util/memory.h"
@@ -112,9 +113,12 @@ using ObjectKey = std::string;
 class WorkerRequestManager;
 class GetRequest : public std::enable_shared_from_this<GetRequest> {
 public:
-    explicit GetRequest(AccessRecorderKey key, std::string operatorWorkerAddress = "",
-                        std::shared_ptr<PeerUbAdmission> ubAdmission = nullptr)
-        : operatorWorkerAddress_(std::move(operatorWorkerAddress)), ubAdmission_(std::move(ubAdmission))
+    explicit GetRequest(AccessRecorderKey key, HostPort operatorWorkerAddress = HostPort(),
+                        std::shared_ptr<PeerUbAdmission> ubAdmission = nullptr,
+                        UbHealthSummaryProvider ubHealthSummaryProvider = {})
+        : operatorWorkerAddress_(std::move(operatorWorkerAddress)),
+          ubAdmission_(std::move(ubAdmission)),
+          ubHealthSummaryProvider_(std::move(ubHealthSummaryProvider))
     {
         recorder_ = AccessRecorder::Object(key);
     };
@@ -264,8 +268,9 @@ private:
     bool hasUbGetInfo_ = false;
     UrmaRemoteAddrPb ubUrmaInfo_;
     uint64_t ubBufferSize_ = 0;
-    std::string operatorWorkerAddress_;
+    HostPort operatorWorkerAddress_;
     std::shared_ptr<PeerUbAdmission> ubAdmission_;
+    UbHealthSummaryProvider ubHealthSummaryProvider_;
 };
 
 class WorkerRequestManager {

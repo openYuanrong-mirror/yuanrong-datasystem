@@ -41,7 +41,8 @@ public:
      * @param[in] membership Read-only topology membership view that outlives this service.
      */
     WorkerWorkerTransportServiceImpl(std::shared_ptr<datasystem::object_cache::WorkerOCServiceImpl> clientSvc,
-                                     HostPort localWorker, const cluster::MembershipEndpointView &membership);
+                                     HostPort localWorker, const cluster::MembershipEndpointView &membership,
+                                     std::shared_ptr<AkSkManager> akSkManager);
 
     ~WorkerWorkerTransportServiceImpl() override;
 
@@ -62,12 +63,15 @@ public:
     Status ProbeProviderUbRecovery(const ProviderUbRecoveryProbeReqPb &req,
                                    ProviderUbRecoveryProbeRspPb &rsp) override;
 
+    Status QueryUbPortHealth(const QueryUbPortHealthReqPb &req, QueryUbPortHealthRspPb &rsp) override;
+
 private:
     Status ResolveWorkerIncarnation(std::string &incarnation) const;
 
     std::shared_ptr<datasystem::object_cache::WorkerOCServiceImpl> ocClientWorkerSvc_;
     const HostPort localWorker_;
     const cluster::MembershipEndpointView &membership_;
+    std::shared_ptr<AkSkManager> akSkManager_;
     uint64_t recoveryProbeSegmentAddress_{ 0 };
     uint64_t recoveryProbeDataOffset_{ 0 };
 };

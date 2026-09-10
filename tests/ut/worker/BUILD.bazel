@@ -15,6 +15,17 @@ ds_cc_test(
 )
 
 ds_cc_test(
+    name = "worker_self_port_health_test",
+    srcs = ["object_cache/worker_self_port_health_test.cpp"],
+    deps = [
+        "//tests:ub_port_test_support",
+        "//src/datasystem/common/object_cache:ub_health",
+        "//src/datasystem/worker/object_cache:worker_oc_service_impl",
+        "//tests/ut:ut_common",
+    ],
+)
+
+ds_cc_test(
     name = "metadata_route_resolver_test",
     srcs = ["metadata_route_resolver_test.cpp"],
     deps = [
@@ -150,10 +161,12 @@ ds_cc_test(
 ds_cc_test(
     name = "worker_oc_service_impl_test",
     srcs = [
+        "object_cache/query_ub_port_health_test.cpp",
         "object_cache/test_placement_facade.h",
         "object_cache/worker_oc_service_impl_test.cpp",
     ],
     deps = [
+        "//tests:ub_port_test_support",
         "//src/datasystem/worker:metadata_route_resolver",
         "//src/datasystem/cluster:cluster_topology",
         "//src/datasystem/common/ak_sk:ak_sk_manager",

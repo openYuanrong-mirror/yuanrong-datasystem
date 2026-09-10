@@ -26,6 +26,7 @@
 
 #include "datasystem/common/object_cache/object_base.h"
 #include "datasystem/common/object_cache/peer_ub_admission.h"
+#include "datasystem/common/object_cache/ub_health_summary_codec.h"
 #include "datasystem/utils/status.h"
 #include "datasystem/common/ak_sk/ak_sk_manager.h"
 #include "datasystem/common/rpc/rpc_message.h"
@@ -64,6 +65,12 @@ public:
      * @return Status of the call.
      */
     Status Get(std::shared_ptr<ServerUnaryWriterReader<GetRspPb, GetReqPb>> &serverApi);
+
+    void SetUbHealthSummaryProvider(UbHealthSummaryProvider provider)
+    {
+        std::atomic_store(&ubHealthSummaryProvider_,
+                          provider ? std::make_shared<const UbHealthSummaryProvider>(std::move(provider)) : nullptr);
+    }
 
     /**
      * @brief Acquire a resident local object for a side-effect-free direct read.
@@ -1221,6 +1228,8 @@ private:
     std::shared_ptr<MigrateDataRateController> rateController_;
 
     std::shared_ptr<PeerUbAdmission> ubAdmission_{ nullptr };
+
+    std::shared_ptr<const UbHealthSummaryProvider> ubHealthSummaryProvider_;
 
     std::unique_ptr<AsyncUpdateLocationManager> asyncUpdateLocationManager_{ nullptr };
 
