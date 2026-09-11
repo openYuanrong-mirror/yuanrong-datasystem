@@ -38,6 +38,7 @@ namespace datasystem {
 namespace client {
 namespace {
 constexpr auto HOST_MEMORY_FRAGMENT_INTERVAL = std::chrono::milliseconds(5);
+constexpr auto HOST_MEMORY_OPERATION_LOCK_RETRY_INTERVAL = std::chrono::milliseconds(1);
 constexpr size_t HOST_MEMORY_FRAGMENT_SIZE = 64UL * 1024UL * 1024UL;
 constexpr size_t HOST_MEMORY_PIN_MAX_RETRY_COUNT = 3;
 }  // namespace
@@ -98,7 +99,13 @@ ShmMmapTableEntry::PinFragment ShmMmapTableEntry::GetPinFragment(size_t fragment
 
 void ShmMmapTableEntry::PinHostMemory()
 {
-    std::lock_guard<std::mutex> lock(*hostMemoryOperationMutex_);
+    if (TrySkipPinBeforeOperation()) {
+        return;
+    }
+    std::unique_lock<std::timed_mutex> lock(*hostMemoryOperationMutex_, std::defer_lock);
+    if (!LockHostMemoryOperationForPin(lock)) {
+        return;
+    }
     const bool registrationEnabled = IsCudaHostMemoryRegistrationEnabled();
     const auto begin = std::chrono::steady_clock::now();
     const size_t fragmentCount = GetPinFragmentCount();
@@ -115,15 +122,7 @@ void ShmMmapTableEntry::PinHostMemory()
         LOG(WARNING) << "CUDA host memory pin injection failed with an unknown exception";
     }
     if (!registrationEnabled) {
-        (void)RegisterCudaHostMemory(pointer_, size_);
-        pinCompleted_.store(true, std::memory_order_release);
-        const auto elapsedUs =
-            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin);
-        LOG(INFO) << "[CudaHostMemory] Worker shared memory pin finished, clientId: " << clientId_
-                  << ", pointer: " << static_cast<void *>(pointer_) << ", size: " << size_
-                  << ", fragmentCount: " << fragmentCount
-                  << ", attemptedCount: 0, successCount: 0, failedCount: 0"
-                  << ", registrationEnabled: false, completed: true, elapsedUs: " << elapsedUs.count();
+        CompletePinWithoutRegistration(fragmentCount, begin);
         return;
     }
     pinAttempted_.store(true, std::memory_order_release);
@@ -140,7 +139,21 @@ void ShmMmapTableEntry::PinHostMemory()
               << ", successCount: " << pinResult.successCount << ", failedCount: " << failedCount
               << ", retryCount: " << pinResult.retryCount
               << ", stoppedByClientExit: " << pinResult.stoppedByClientExit
+              << ", stoppedByEntryRetirement: " << pinResult.stoppedByEntryRetirement
               << ", registrationEnabled: true, completed: true, elapsedUs: " << elapsedUs.count();
+}
+
+void ShmMmapTableEntry::CompletePinWithoutRegistration(
+    size_t fragmentCount, const std::chrono::steady_clock::time_point &begin)
+{
+    (void)RegisterCudaHostMemory(pointer_, size_);
+    pinCompleted_.store(true, std::memory_order_release);
+    const auto elapsedUs =
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin);
+    LOG(INFO) << "[CudaHostMemory] Worker shared memory pin finished, clientId: " << clientId_
+              << ", pointer: " << static_cast<void *>(pointer_) << ", size: " << size_
+              << ", fragmentCount: " << fragmentCount << ", attemptedCount: 0, successCount: 0, failedCount: 0"
+              << ", registrationEnabled: false, completed: true, elapsedUs: " << elapsedUs.count();
 }
 
 ShmMmapTableEntry::PinResult ShmMmapTableEntry::PinHostMemoryFragments()
@@ -149,21 +162,18 @@ ShmMmapTableEntry::PinResult ShmMmapTableEntry::PinHostMemoryFragments()
     size_t remainingRetryCount = HOST_MEMORY_PIN_MAX_RETRY_COUNT;
     const size_t fragmentCount = GetPinFragmentCount();
     for (size_t i = 0; i < fragmentCount; ++i) {
-        if (IsClientExiting()) {
-            result.stoppedByClientExit = true;
+        if (ShouldStopPinning(result)) {
             break;
         }
         if (i > 0) {
             std::this_thread::sleep_for(HOST_MEMORY_FRAGMENT_INTERVAL);
-            if (IsClientExiting()) {
-                result.stoppedByClientExit = true;
+            if (ShouldStopPinning(result)) {
                 break;
             }
         }
         ++result.attemptedFragmentCount;
         while (!PinHostMemoryFragment(i)) {
-            if (IsClientExiting()) {
-                result.stoppedByClientExit = true;
+            if (ShouldStopPinning(result)) {
                 return result;
             }
             if (remainingRetryCount == 0) {
@@ -190,6 +200,49 @@ bool ShmMmapTableEntry::IsClientExiting() const
     return clientExiting_ != nullptr && clientExiting_->load(std::memory_order_acquire);
 }
 
+bool ShmMmapTableEntry::IsRetired() const
+{
+    return retired_.load(std::memory_order_acquire);
+}
+
+bool ShmMmapTableEntry::TrySkipPinBeforeOperation()
+{
+    const bool clientExiting = IsClientExiting();
+    const bool retired = IsRetired();
+    if (!clientExiting && !retired) {
+        return false;
+    }
+    pinCompleted_.store(true, std::memory_order_release);
+    LOG(INFO) << "[CudaHostMemory] Worker shared memory pin skipped before operation, clientId: " << clientId_
+              << ", pointer: " << static_cast<void *>(pointer_) << ", size: " << size_
+              << ", clientExiting: " << clientExiting << ", entryRetired: " << retired;
+    return true;
+}
+
+bool ShmMmapTableEntry::LockHostMemoryOperationForPin(std::unique_lock<std::timed_mutex> &lock)
+{
+    while (!lock.try_lock_for(HOST_MEMORY_OPERATION_LOCK_RETRY_INTERVAL)) {
+        try {
+            INJECT_POINT_NO_RETURN("ShmMmapTableEntry.PinHostMemoryOperationLockWait");
+        } catch (const std::exception &e) {
+            LOG(WARNING) << "CUDA host memory pin lock-wait injection failed: " << e.what();
+        } catch (...) {
+            LOG(WARNING) << "CUDA host memory pin lock-wait injection failed with an unknown exception";
+        }
+        if (TrySkipPinBeforeOperation()) {
+            return false;
+        }
+    }
+    return !TrySkipPinBeforeOperation();
+}
+
+bool ShmMmapTableEntry::ShouldStopPinning(PinResult &result) const
+{
+    result.stoppedByClientExit = IsClientExiting();
+    result.stoppedByEntryRetirement = IsRetired();
+    return result.stoppedByClientExit || result.stoppedByEntryRetirement;
+}
+
 bool ShmMmapTableEntry::PinHostMemoryFragment(size_t fragmentIndex)
 {
     const auto fragment = GetPinFragment(fragmentIndex);
@@ -213,7 +266,12 @@ void ShmMmapTableEntry::SkipHostMemoryPin()
     pinCompleted_.store(true, std::memory_order_release);
 }
 
-void ShmMmapTableEntry::SetHostMemoryOperationMutex(const std::shared_ptr<std::mutex> &mutex)
+void ShmMmapTableEntry::MarkRetired() noexcept
+{
+    retired_.store(true, std::memory_order_release);
+}
+
+void ShmMmapTableEntry::SetHostMemoryOperationMutex(const std::shared_ptr<std::timed_mutex> &mutex)
 {
     if (mutex != nullptr) {
         hostMemoryOperationMutex_ = mutex;
@@ -288,7 +346,14 @@ ShmMmapTableEntry::~ShmMmapTableEntry()
 
 void ShmMmapTableEntry::UnpinHostMemory()
 {
-    std::lock_guard<std::mutex> lock(*hostMemoryOperationMutex_);
+    std::lock_guard<std::timed_mutex> lock(*hostMemoryOperationMutex_);
+    try {
+        INJECT_POINT_NO_RETURN("ShmMmapTableEntry.UnpinHostMemoryOperationLocked");
+    } catch (const std::exception &e) {
+        LOG(WARNING) << "CUDA host memory unpin operation-lock injection failed: " << e.what();
+    } catch (...) {
+        LOG(WARNING) << "CUDA host memory unpin operation-lock injection failed with an unknown exception";
+    }
     const auto begin = std::chrono::steady_clock::now();
     const size_t totalFragmentCount = GetPinFragmentCount();
     const size_t pinnedFragmentCount = pinnedFragmentCount_.load(std::memory_order_acquire);

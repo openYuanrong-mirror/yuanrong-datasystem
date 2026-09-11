@@ -26,7 +26,10 @@
 
 namespace datasystem {
 namespace client {
-ShmMmapTable::~ShmMmapTable() = default;
+ShmMmapTable::~ShmMmapTable()
+{
+    Clear();
+}
 
 Status ShmMmapTable::MmapAndStoreFd(const int &clientFd, const int &workerFd, const uint64_t &mmapSize,
                                     const std::string &tenantId, const std::string &clientId)

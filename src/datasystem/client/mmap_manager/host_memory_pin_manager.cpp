@@ -8,7 +8,6 @@
 /** Description: Client-wide serialized CUDA host-memory pinning/unpinning, deferred unmapping, and range lookup. */
 #include "datasystem/client/mmap_manager/host_memory_pin_manager.h"
 
-#include <algorithm>
 #include <exception>
 #include <utility>
 
@@ -48,11 +47,18 @@ void HostMemoryPinManager::Submit(const std::shared_ptr<ShmMmapTableEntry> &entr
     entry->SetHostMemoryOperationMutex(hostMemoryOperationMutex_);
     entry->SetClientExitingFlag(clientExiting_);
     {
-        std::lock_guard<std::mutex> lock(entriesMutex_);
-        entries_.erase(std::remove_if(entries_.begin(), entries_.end(),
-                                      [](const auto &registeredEntry) { return registeredEntry.expired(); }),
-                       entries_.end());
-        entries_.emplace_back(entry);
+        std::lock_guard<std::mutex> lock(registryWriteMutex_);
+        const auto currentSnapshot = std::atomic_load_explicit(&registrySnapshot_, std::memory_order_acquire);
+        auto nextRegistry = std::make_shared<EntryRegistry>();
+        nextRegistry->reserve(currentSnapshot->size() + 1);
+        for (const auto &registeredEntry : *currentSnapshot) {
+            if (!registeredEntry.expired()) {
+                nextRegistry->emplace_back(registeredEntry);
+            }
+        }
+        nextRegistry->emplace_back(entry);
+        std::shared_ptr<const EntryRegistry> nextSnapshot = std::move(nextRegistry);
+        std::atomic_store_explicit(&registrySnapshot_, std::move(nextSnapshot), std::memory_order_release);
     }
     try {
         pinThread_.Execute([entry] { entry->PinHostMemory(); });
@@ -75,20 +81,16 @@ Status HostMemoryPinManager::GetMemcpySegmentSizes(const void *hostPointer, size
 {
     segmentSizes.clear();
     std::shared_ptr<ShmMmapTableEntry> matchedEntry;
-    {
-        std::lock_guard<std::mutex> lock(entriesMutex_);
-        auto output = entries_.begin();
-        for (auto iter = entries_.begin(); iter != entries_.end(); ++iter) {
-            auto entry = iter->lock();
-            if (entry == nullptr) {
-                continue;
-            }
-            *output++ = *iter;
-            if (matchedEntry == nullptr && entry->Contains(hostPointer)) {
-                matchedEntry = std::move(entry);
-            }
+    const auto snapshot = std::atomic_load_explicit(&registrySnapshot_, std::memory_order_acquire);
+    for (const auto &registeredEntry : *snapshot) {
+        auto entry = registeredEntry.lock();
+        if (entry == nullptr) {
+            continue;
         }
-        entries_.erase(output, entries_.end());
+        if (entry->Contains(hostPointer)) {
+            matchedEntry = std::move(entry);
+            break;
+        }
     }
     if (matchedEntry != nullptr) {
         return matchedEntry->GetMemcpySegmentSizes(hostPointer, size, segmentSizes);

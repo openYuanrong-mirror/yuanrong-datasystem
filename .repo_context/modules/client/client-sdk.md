@@ -138,14 +138,18 @@
     Buffer-returning `Get` variants expose the Worker SHM directly without waiting for registration or allocating a
     temporary Host buffer. Registration and unregistration divide each Worker mapping into fixed 64 MiB fragments
     (with a smaller tail fragment when needed) and wait 5 ms between fragments during normal Worker cleanup, including
-    voluntary scale-down. Object/KV Client shutdown stops registration after any in-flight fragment returns, skips all
+    voluntary scale-down. Removing an mmap entry marks it retired before dropping the table reference, so a queued or
+    running registration stops after any in-flight fragment returns and unregisters only its successfully registered
+    prefix. Object/KV Client shutdown likewise stops registration after any in-flight fragment returns, skips all
     remaining registration fragments and their intervals, and skips the unregister interval. Client
     `DsCudaMemcpyAsync` splits H2D/D2H ranges at those planned fragment boundaries only when the Host pointer belongs to
     a Worker SHM mapping; other Host memory is submitted as one copy. The pin task retains the mmap entry, so shutdown
     cannot unpin or unmap it while registration is still running. Per-fragment register/unregister start and finish
     details are `VLOG(1)`; failures remain `ERROR`, while each whole Worker mapping emits `INFO` start/finish summaries
     with elapsed time and failure counts. A `DsCudaMemcpyAsync` crossing fragment boundaries emits one `VLOG(1)`
-    summary.
+    summary. Worker mapping publication copies live weak entries under a writer-only mutex and atomically publishes an
+    immutable registry Snapshot. Concurrent `DsCudaMemcpyAsync` range lookups atomically retain and scan one Snapshot,
+    so they neither block publication nor invoke a CUDA callback while holding an internal registry lock.
     CUDA-enabled applications must call `KVClient::RegisterCudaFuncs` before initializing any `KVClient`; the first
     valid process-wide callback table is frozen, and later registration attempts are ignored with a warning. All four
     callbacks (`hostRegister`, `hostUnregister`, `getErrorString`, and `memcpyAsync`) must be non-null for registration

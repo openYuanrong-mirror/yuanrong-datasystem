@@ -21,6 +21,7 @@
 #define DATASYSTEM_CLIENT_MMAP_SHM_MMAP_TABLE_ENTRY_H
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -61,7 +62,9 @@ public:
 
     void SkipHostMemoryPin();
 
-    void SetHostMemoryOperationMutex(const std::shared_ptr<std::mutex> &mutex);
+    void MarkRetired() noexcept override;
+
+    void SetHostMemoryOperationMutex(const std::shared_ptr<std::timed_mutex> &mutex);
 
     void SetClientExitingFlag(const std::shared_ptr<std::atomic<bool>> &clientExiting);
 
@@ -88,12 +91,19 @@ private:
         size_t attemptedFragmentCount{ 0 };
         size_t retryCount{ 0 };
         bool stoppedByClientExit{ false };
+        bool stoppedByEntryRetirement{ false };
     };
 
     void BuildPinRange();
     size_t GetPinFragmentCount() const;
     PinFragment GetPinFragment(size_t fragmentIndex) const;
     bool IsClientExiting() const;
+    bool IsRetired() const;
+    bool TrySkipPinBeforeOperation();
+    bool LockHostMemoryOperationForPin(std::unique_lock<std::timed_mutex> &lock);
+    bool ShouldStopPinning(PinResult &result) const;
+    void CompletePinWithoutRegistration(size_t fragmentCount,
+                                        const std::chrono::steady_clock::time_point &begin);
     bool PinHostMemoryFragment(size_t fragmentIndex);
     PinResult PinHostMemoryFragments();
     bool UnpinHostMemoryFragment(size_t fragmentIndex);
@@ -101,8 +111,9 @@ private:
 
     const std::string clientId_;
     PinRange pinRange_;
-    std::shared_ptr<std::mutex> hostMemoryOperationMutex_{ std::make_shared<std::mutex>() };
+    std::shared_ptr<std::timed_mutex> hostMemoryOperationMutex_{ std::make_shared<std::timed_mutex>() };
     std::shared_ptr<std::atomic<bool>> clientExiting_;
+    std::atomic<bool> retired_{ false };
     std::atomic<bool> pinCompleted_{ false };
     std::atomic<bool> pinAttempted_{ false };
     std::atomic<size_t> pinnedFragmentCount_{ 0 };
