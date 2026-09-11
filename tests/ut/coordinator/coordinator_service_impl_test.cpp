@@ -660,9 +660,10 @@ TEST_F(CoordinatorServiceImplTest, CollectionRootsCannotBePutOrExactlyDeleted)
     service->recoveryStateProvider_ = [](const std::string &) { return coordinator::TopologyRecoveryState::READY; };
     std::unique_ptr<cluster::TopologyKeyHelper> keys;
     DS_ASSERT_OK(cluster::TopologyKeyHelper::Create("mutation-root", keys));
-    const std::array<std::string, 6> collectionRoots{
+    const std::array<std::string, 7> collectionRoots{
         keys->MigrateTaskTable() + "/", keys->DeleteTaskTable() + "/", keys->NotifyTable() + "/",
-        keys->ProbeTable() + "/",       keys->MembershipTable() + "/", keys->ScaleInMetadataDoneTable() + "/"
+        keys->ProbeTable() + "/",       keys->MembershipTable() + "/", keys->UbHealthTable() + "/",
+        keys->ScaleInMetadataDoneTable() + "/"
     };
     const auto revisionBefore = service->memStore_->CurrentRevision();
     auto store = service->store_;
@@ -688,6 +689,105 @@ TEST_F(CoordinatorServiceImplTest, CollectionRootsCannotBePutOrExactlyDeleted)
 
     service->store_ = std::move(store);
     service->topologyControlHost_ = std::move(controlHost);
+    DS_ASSERT_OK(service->Shutdown());
+}
+
+TEST_F(CoordinatorServiceImplTest, UbHealthSupportsTtlPutExactAndTableRangeAsOrdinaryClusterData)
+{
+    constexpr char clusterName[] = "ub-ready";
+    constexpr char peerAddress[] = "127.0.0.1:31502";
+    auto service = MakeService();
+    DS_ASSERT_OK(InitializeRunning(*service));
+    EnableElection(*service);
+    auto recoveryState = coordinator::TopologyRecoveryState::READY;
+    int recoveryStateCalls = 0;
+    service->recoveryStateProvider_ = [&](const std::string &observedClusterName) {
+        EXPECT_EQ(observedClusterName, clusterName);
+        ++recoveryStateCalls;
+        return recoveryState;
+    };
+    std::unique_ptr<cluster::TopologyKeyHelper> keys;
+    DS_ASSERT_OK(cluster::TopologyKeyHelper::Create(clusterName, keys));
+    const std::string tablePrefix = keys->UbHealthTable() + "/";
+    const std::string localKey = tablePrefix + MEMBER_ADDRESS;
+    const std::string peerKey = tablePrefix + peerAddress;
+
+    coordinator::PutReqPb put;
+    put.set_key(localKey);
+    put.set_value("local-health");
+    put.set_ttl(MEMBERSHIP_TTL_MS);
+    coordinator::PutRspPb putResponse;
+    DS_ASSERT_OK(service->Put(put, putResponse));
+    EXPECT_EQ(putResponse.header().state(), coordinator::ResponseHeader::SERVING);
+
+    put.set_key(peerKey);
+    put.set_value("peer-health");
+    coordinator::PutRspPb peerPutResponse;
+    DS_ASSERT_OK(service->Put(put, peerPutResponse));
+
+    coordinator::RangeReqPb exactRange;
+    exactRange.set_key(localKey);
+    coordinator::RangeRspPb exactResponse;
+    DS_ASSERT_OK(service->Range(exactRange, exactResponse));
+    ASSERT_EQ(exactResponse.kvs_size(), 1);
+    EXPECT_EQ(exactResponse.kvs(0).value(), "local-health");
+
+    coordinator::RangeReqPb tableRange;
+    tableRange.set_key(tablePrefix);
+    tableRange.set_range_end(keys->UbHealthTable() + "0");
+    coordinator::RangeRspPb tableResponse;
+    DS_ASSERT_OK(service->Range(tableRange, tableResponse));
+    EXPECT_EQ(tableResponse.kvs_size(), 2);
+
+    coordinator::KeepAliveReqPb keepAlive;
+    keepAlive.set_key(localKey);
+    coordinator::KeepAliveRspPb keepAliveResponse;
+    EXPECT_EQ(service->KeepAlive(keepAlive, keepAliveResponse).GetCode(), K_INVALID);
+
+    recoveryState = coordinator::TopologyRecoveryState::RECOVERING;
+    put.set_key(tablePrefix + "127.0.0.1:31503");
+    put.set_value("blocked-health");
+    coordinator::PutRspPb recoveringResponse;
+    DS_ASSERT_OK(service->Put(put, recoveringResponse));
+    EXPECT_EQ(recoveringResponse.header().state(), coordinator::ResponseHeader::RECOVERING);
+    std::vector<KeyValueEntry> blockedEntries;
+    int64_t revision = 0;
+    DS_ASSERT_OK(service->store_->Range(put.key(), "", blockedEntries, revision));
+    EXPECT_TRUE(blockedEntries.empty());
+    EXPECT_EQ(recoveryStateCalls, 5);
+
+    DS_ASSERT_OK(service->Shutdown());
+}
+
+TEST_F(CoordinatorServiceImplTest, UbHealthRejectsInvalidKeysRootMutationAndCrossTableRange)
+{
+    auto service = MakeService();
+    DS_ASSERT_OK(InitializeRunning(*service));
+    service->recoveryStateProvider_ = [](const std::string &) { return coordinator::TopologyRecoveryState::READY; };
+    std::unique_ptr<cluster::TopologyKeyHelper> keys;
+    DS_ASSERT_OK(cluster::TopologyKeyHelper::Create("ub-boundary", keys));
+    const std::string tablePrefix = keys->UbHealthTable() + "/";
+
+    for (const auto &key : { tablePrefix + "not-an-address",
+                             std::string("/datasystem_ub_health/datasystem/cluster/") + MEMBER_ADDRESS }) {
+        coordinator::PutReqPb put;
+        put.set_key(key);
+        put.set_value("invalid");
+        coordinator::PutRspPb response;
+        EXPECT_EQ(service->Put(put, response).GetCode(), K_INVALID);
+    }
+
+    coordinator::PutReqPb rootPut;
+    rootPut.set_key(tablePrefix);
+    rootPut.set_value("invalid-root");
+    coordinator::PutRspPb rootResponse;
+    EXPECT_EQ(service->Put(rootPut, rootResponse).GetCode(), K_INVALID);
+
+    coordinator::RangeReqPb crossTableRange;
+    crossTableRange.set_key(tablePrefix);
+    crossTableRange.set_range_end(keys->MembershipTable() + "0");
+    coordinator::RangeRspPb crossTableResponse;
+    EXPECT_EQ(service->Range(crossTableRange, crossTableResponse).GetCode(), K_INVALID);
     DS_ASSERT_OK(service->Shutdown());
 }
 

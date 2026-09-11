@@ -388,6 +388,7 @@ TEST_F(TopologyRecoveryManagerTest, ParsesAllTopologyKeyKindsInDefaultAndNamedCl
             { keys->NotifyTable() + "/", TopologyCoordinationKeyKind::NOTIFY, "" },
             { keys->ProbeTable() + "/", TopologyCoordinationKeyKind::PROBE, "" },
             { keys->MembershipTable() + "/", TopologyCoordinationKeyKind::MEMBERSHIP, "" },
+            { keys->UbHealthTable() + "/", TopologyCoordinationKeyKind::UB_HEALTH, "" },
             { keys->ScaleInMetadataDoneTable() + "/", TopologyCoordinationKeyKind::SCALE_IN_METADATA_DONE, "" },
             { keys->MigrateTaskTable() + "/" + migrateTaskId, TopologyCoordinationKeyKind::MIGRATE_TASK,
               migrateTaskId },
@@ -396,6 +397,7 @@ TEST_F(TopologyRecoveryManagerTest, ParsesAllTopologyKeyKindsInDefaultAndNamedCl
             { keys->NotifyTable() + "/" + MEMBER_A, TopologyCoordinationKeyKind::NOTIFY, MEMBER_A },
             { keys->ProbeTable() + "/" + MEMBER_A, TopologyCoordinationKeyKind::PROBE, MEMBER_A },
             { keys->MembershipTable() + "/" + MEMBER_A, TopologyCoordinationKeyKind::MEMBERSHIP, MEMBER_A },
+            { keys->UbHealthTable() + "/" + MEMBER_A, TopologyCoordinationKeyKind::UB_HEALTH, MEMBER_A },
             { keys->ScaleInMetadataDoneTable() + "/" + metadataDoneKey,
               TopologyCoordinationKeyKind::SCALE_IN_METADATA_DONE, metadataDoneKey },
             { keys->RolloutTable() + "/" + EVICTION_POLICY_ROLLOUT_KEY,
@@ -429,7 +431,7 @@ TEST_F(TopologyRecoveryManagerTest, RejectsReservedClusterNames)
 {
     std::unique_ptr<cluster::TopologyKeyHelper> keys;
     for (const std::string name :
-         { "topology", "tasks", "notify", "probe", "cluster", "scale-in-metadata-done", "control" }) {
+         { "topology", "tasks", "notify", "probe", "cluster", "ub_health", "scale-in-metadata-done", "control" }) {
         EXPECT_EQ(cluster::TopologyKeyHelper::Create(name, keys).GetCode(), K_INVALID);
     }
 }
@@ -445,6 +447,9 @@ TEST_F(TopologyRecoveryManagerTest, RejectsInvalidPhysicalKeysAndResetsParsedOut
         "/datasystem/topology",
         "/datasystem/bad!/topology/",
         "/datasystem/cluster/not-an-address",
+        "/datasystem/ub_health/not-an-address",
+        "/datasystem/blue/ub_health/not-an-address",
+        "/datasystem_ub_health/datasystem/cluster/" + std::string(MEMBER_A),
         "/datasystem/control/unknown",
         "/datasystem/blue/control/unknown",
     };

@@ -328,6 +328,7 @@ public:
     bool IsMemberLeaseTimedOut() const noexcept;
 
     const std::string &GetMembershipTableName() const noexcept;
+    const std::string &GetUbHealthTableName() const noexcept;
     Status PutWithMembershipLease(const std::string &tableName, const std::string &key, const std::string &value);
     Status GetMembershipSidecar(const std::string &tableName,
                                 std::vector<std::pair<std::string, std::string>> &records) const;

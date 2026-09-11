@@ -31,6 +31,7 @@
 #include "datasystem/common/flags/common_flags.h"
 #include "datasystem/client/object_cache/client_worker_api/iclient_worker_api.h"
 #include "datasystem/client/object_cache/object_client_impl.h"
+#include "datasystem/cluster/repository/topology_key_helper.h"
 #include "datasystem/common/immutable_string/immutable_string_pool.h"
 #include "datasystem/common/inject/inject_point.h"
 #include "datasystem/common/kvstore/etcd/etcd_store.h"
@@ -61,7 +62,6 @@ constexpr char PROVIDER_GET_ENTER_INJECT[] = "worker.GetObjectRemote.afterRead";
 constexpr char PROVIDER_BATCH_GET_ENTER_INJECT[] = "worker.BatchGetObjectRemote.afterRead";
 constexpr char GLOBAL_SUMMARY_COMMITTED_INJECT[] = "PeerUbAdmission.ReplaceGlobalSummaries.afterCommit";
 constexpr char UB_HEALTH_BEFORE_PUBLISH_INJECT[] = "UbHealthLeaseSync.beforePublish";
-constexpr char UB_HEALTH_SIDECAR_ROOT[] = "/datasystem_ub_health";
 constexpr char CLIENT_WARMUP_SET_DONE[] = "ObjectClientImpl.ClientWorkerWarmup.SetDone";
 constexpr char CLIENT_WARMUP_GET_DONE[] = "ObjectClientImpl.ClientWorkerWarmup.GetDone";
 constexpr char CLIENT_WARMUP_DELETE_DONE[] = "ObjectClientImpl.ClientWorkerWarmup.DeleteDone";
@@ -2505,7 +2505,9 @@ protected:
         DS_ASSERT_OK(cluster_->GetWorkerAddr(0, scenario.sourceWorker));
         scenario.store = InitTestEtcdInstance();
         ASSERT_NE(scenario.store, nullptr);
-        scenario.table = std::string(UB_HEALTH_SIDECAR_ROOT) + GetMembershipTableName();
+        std::unique_ptr<cluster::TopologyKeyHelper> keys;
+        DS_ASSERT_OK(cluster::TopologyKeyHelper::Create(FLAGS_cluster_name, keys));
+        scenario.table = keys->UbHealthTable();
         const auto createRc = scenario.store->CreateTableWithExactPrefix(scenario.table, scenario.table);
         ASSERT_TRUE(createRc.IsOk() || createRc.GetCode() == K_DUPLICATED) << createRc.ToString();
         scenario.key = NewObjectKey();

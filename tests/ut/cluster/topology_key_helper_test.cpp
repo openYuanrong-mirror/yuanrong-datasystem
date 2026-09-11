@@ -59,6 +59,7 @@ TEST(TopologyKeyHelperTest, BuildsClusterScopedKeyspaces)
     EXPECT_EQ(ExactPath(keys->ProbeTable(), key), "/datasystem/cluster_a-1.0/probe/" + address);
     DS_ASSERT_OK(TopologyKeyHelper::MembershipKey(address, key));
     EXPECT_EQ(ExactPath(keys->MembershipTable(), key), "/datasystem/cluster_a-1.0/cluster/" + address);
+    EXPECT_EQ(ExactPath(keys->UbHealthTable(), key), "/datasystem/cluster_a-1.0/ub_health/" + address);
     DS_ASSERT_OK(TopologyKeyHelper::ScaleInMetadataDoneKey(KEYSPACE_CONTRACT_EPOCH,
                                                            std::string(ASCII_A_SOURCE_ID_SIZE, 'a'), taskId, key));
     EXPECT_EQ(ExactPath(keys->ScaleInMetadataDoneTable(), key),
@@ -88,6 +89,7 @@ TEST(TopologyKeyHelperTest, BuildsUnscopedKeyspacesForEmptyClusterName)
     EXPECT_EQ(ExactPath(keys->ProbeTable(), key), "/datasystem/probe/" + address);
     DS_ASSERT_OK(TopologyKeyHelper::MembershipKey(address, key));
     EXPECT_EQ(ExactPath(keys->MembershipTable(), key), "/datasystem/cluster/" + address);
+    EXPECT_EQ(ExactPath(keys->UbHealthTable(), key), "/datasystem/ub_health/" + address);
     DS_ASSERT_OK(TopologyKeyHelper::ScaleInMetadataDoneKey(KEYSPACE_CONTRACT_EPOCH,
                                                            std::string(ASCII_A_SOURCE_ID_SIZE, 'a'), taskId, key));
     EXPECT_EQ(ExactPath(keys->ScaleInMetadataDoneTable(), key),
@@ -140,7 +142,7 @@ TEST(TopologyKeyHelperTest, EnforcesClusterNameContractWithoutNormalization)
     auto *original = keys.get();
     const std::vector<std::string> invalidNames = {
         "-cluster", "a/b", "a%2Fb", "a" + std::string(128, 'z'),
-        "topology", "tasks", "notify", "probe", "cluster", "scale-in-metadata-done"
+        "topology", "tasks", "notify", "probe", "cluster", "ub_health", "scale-in-metadata-done"
     };
     for (const auto &name : invalidNames) {
         EXPECT_EQ(TopologyKeyHelper::Create(name, keys).GetCode(), K_INVALID) << name;

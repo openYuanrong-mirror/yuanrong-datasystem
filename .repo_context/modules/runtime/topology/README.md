@@ -115,9 +115,9 @@
   CAS; controller identity is not persisted, and deterministic batch/task identities make duplicate reconciliation safe.
 - `CoordinatorStoreBackend` adapts one cluster-scoped view of the existing in-memory `CoordinatorStore` to the unchanged
   `ICoordinationBackend` KV/CAS contract. It owns no thread, watch, lease, or recovery state. Coordinator RPC ingress
-  accepts only physical keys that strictly parse into one of the seven topology keyspaces; there is no `OTHER` kind or
-  generic-RPC bypass. This policy stays above `CoordinatorStore`, whose internal KV/range/watch/TTL semantics remain
-  generic.
+  accepts only physical keys that strictly parse into a registered topology-coordination keyspace; there is no `OTHER`
+  kind or generic-RPC bypass. This policy stays above `CoordinatorStore`, whose internal KV/range/watch/TTL semantics
+  remain generic.
 - `TopologyControlHost` is the Coordinator-process lifecycle owner for `cluster_name -> TopologyControllerRuntime`.
   It admits only clusters whose membership mutation has committed, waits for `TopologyRecoveryManager` to report READY,
   starts/stops Runtime dependencies outside its mutex, enforces the active-cluster cap, and keeps each cluster's
@@ -361,8 +361,9 @@
 
 - Keyspace supports an optional cluster scope. A non-empty validated name uses
   `/datasystem/{cluster_name}/...`; an empty name uses `/datasystem/...` without an empty path segment. Multi-cluster
-  deployments sharing one backend must use non-empty distinct names. The seven logical paths are topology,
-  tasks/migrate, tasks/delete, notify, probe, cluster membership, and ScaleIn metadata-done markers. Coordinator Service
+  deployments sharing one backend must use non-empty distinct names. Registered cluster paths are topology,
+  tasks/migrate, tasks/delete, notify, probe, cluster membership, UB health, ScaleIn metadata-done markers, and control.
+  Coordinator Service
   parses the physical start key and validates exact/prefix range boundaries before response-header admission or Store
   access, so unknown, malformed, or cross-keyspace requests have no recovery or Store side effect. Each probe PUT is a
   non-authoritative, overwriteable single-target event under `root/probe/<witness_address>`. Normal watch delivery handles
@@ -373,8 +374,8 @@
   membership prefix, and allocation-free physical watch-key classification across Coordinator and ETCD layouts.
   `EtcdStore::CreateTableWithExactPrefix`
   registers these paths without legacy `FLAGS_cluster_name` prefix rewriting. `TopologyEngine::Builder` owns
-  registration for the shared ETCD Store; Worker business composition does not construct topology keys or table
-  mappings. `TopologyEngine` maps classified key kinds to Worker/Controller delivery policy.
+  registration for the shared ETCD Store; the Worker obtains the UB health table from the Engine-owned helper and
+  registers that exact sidecar prefix. `TopologyEngine` maps classified key kinds to Worker/Controller delivery policy.
 - There is no persisted Worker-local topology authority. ETCD restart recovery reads the latest legal topology and
   reconstructs deterministic work. The in-memory Coordinator backend recovers only the latest topology from Workers;
   task/notify records are treated as absent and regenerated. Candidate arbitration is cluster-scoped and resource
@@ -400,8 +401,11 @@
   window before enabling control decisions. Revision-bearing `GetAll` does not fall back to an ordinary read: a backend
   without a consistent snapshot revision returns `K_NOT_SUPPORTED`.
 - UB health is a non-authoritative membership sidecar rather than topology state. Each URMA-enabled Worker periodically
-  publishes one self-only summary under a separate keyspace using the active membership lease/TTL and consumes the
-  bounded O(N) snapshot into `PeerUbAdmission`. Workers with URMA disabled do not start the lease-sidecar sync loop.
+  publishes one self-only summary under `/datasystem/ub_health/<worker_address>` or
+  `/datasystem/<cluster_name>/ub_health/<worker_address>` using the active membership lease/TTL and consumes the bounded
+  O(N) snapshot into `PeerUbAdmission`. Coordinator validates canonical addresses, allows same-table ranges, rejects
+  collection-root mutations and cross-table ranges, and applies ordinary per-cluster recovery admission. Workers with
+  URMA disabled do not start the lease-sidecar sync loop.
   Missing leased records clear global quarantine, malformed live records preserve the last accepted quarantine, and
   neither path erases process-local failure evidence. Topology membership and Failure
   planning remain the only authoritative ownership inputs.
