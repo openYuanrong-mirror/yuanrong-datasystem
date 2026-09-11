@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """Tests for tools/procmon.py pure functions."""
 
+import csv
 import io
+import json
 import os
 import socket
+import tempfile
 import unittest
+from contextlib import ExitStack
 from unittest.mock import MagicMock, patch, mock_open
 
 
 # Make procmon importable
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'tools'))
-from procmon import (add_jemalloc_metrics, find_pid, read_jemalloc_bvars,
+from procmon import (CSV_FIELDS, add_brpc_metrics, main,
+                     add_jemalloc_metrics, find_pid, read_brpc_bvars,
                      read_proc_stat,
                      read_proc_mem_breakdown, read_tcp_attempt_fails_stats,
                      read_port_traffic, _parse_netlink_diag_response, format_mb)
@@ -425,23 +430,30 @@ class TestFormatMb(unittest.TestCase):
         self.assertEqual(format_mb(512 * 1024), "0.5")
 
 
-class TestReadJemallocBvars(unittest.TestCase):
+class TestReadBrpcBvars(unittest.TestCase):
     @patch('procmon.urlopen')
     def test_reads_builtin_vars_wildcard(self, mock_urlopen):
         response = MagicMock()
         response.read.return_value = (
             b'anon_jemalloc_allocated_bytes : 1048576\n'
             b'anon_jemalloc_active_bytes : 2097152\n'
+            b'anon_jemalloc_background_thread_enabled : 1\n'
+            b'anon_jemalloc_background_thread_num_runs : 42\n'
             b'anon_jemalloc_stats_available : 1\n')
         mock_urlopen.return_value.__enter__.return_value = response
 
-        values = read_jemalloc_bvars(31501, host='10.0.0.1')
+        values = read_brpc_bvars(31501, host='10.0.0.1')
 
         self.assertEqual(values['anon_jemalloc_allocated_bytes'], 1048576)
+        self.assertEqual(values['anon_jemalloc_background_thread_enabled'], 1)
+        self.assertEqual(values['anon_jemalloc_background_thread_num_runs'], 42)
         self.assertEqual(values['anon_jemalloc_stats_available'], 1)
         request_url = mock_urlopen.call_args[0][0]
-        self.assertEqual(request_url,
-                         'http://10.0.0.1:31501/vars/anon_jemalloc_*?console=1')
+        self.assertTrue(request_url.startswith(
+            'http://10.0.0.1:31501/vars/anon_jemalloc_*,'))
+        self.assertIn('bthread_count', request_url)
+        self.assertIn('rpc_server_31501_*_concurrency', request_url)
+        self.assertTrue(request_url.endswith('?console=1'))
 
     @patch('procmon.urlopen')
     def test_brackets_ipv6_builtin_host(self, mock_urlopen):
@@ -449,15 +461,14 @@ class TestReadJemallocBvars(unittest.TestCase):
         response.read.return_value = b'anon_jemalloc_stats_available : 1\n'
         mock_urlopen.return_value.__enter__.return_value = response
 
-        read_jemalloc_bvars(31501, host='fd00::10')
+        read_brpc_bvars(31501, host='fd00::10')
 
-        self.assertEqual(
-            mock_urlopen.call_args[0][0],
-            'http://[fd00::10]:31501/vars/anon_jemalloc_*?console=1')
+        self.assertTrue(mock_urlopen.call_args[0][0].startswith(
+            'http://[fd00::10]:31501/vars/anon_jemalloc_*,'))
 
     @patch('procmon.urlopen', side_effect=OSError('disabled'))
     def test_unavailable_builtin_services_degrades_gracefully(self, _mock):
-        self.assertEqual(read_jemalloc_bvars(31501), {})
+        self.assertEqual(read_brpc_bvars(31501), {})
 
 
 class TestAddJemallocMetrics(unittest.TestCase):
@@ -484,6 +495,137 @@ class TestAddJemallocMetrics(unittest.TestCase):
         self.assertNotIn('jemalloc_allocated_mb', row)
         self.assertEqual(row['jemalloc_stats_available'], 0)
         self.assertEqual(row['jemalloc_stats_read_failures'], 3)
+
+
+class TestBrpcRuntimeMetrics(unittest.TestCase):
+    @patch('procmon.urlopen')
+    def test_runtime_stats_without_jemalloc_and_malformed_values(self, mock_urlopen):
+        response = MagicMock()
+        response.read.return_value = (
+            b'bthread_count : 30\n'
+            b'bthread_keytable_count : 70\n'
+            b'bthread_worker_count : 16\n'
+            b'bthread_worker_usage : 2.5\n'
+            b'bthread_group_status : "0 2 3 "\n'
+            b'rpc_server_31501_ds_get_concurrency : 4\n'
+            b'rpc_server_31501_ds_publish_concurrency : 5\n'
+            b'rpc_server_31501_ds_get_max_concurrency : 100\n'
+            b'rpc_server_31501_concurrency : 0\n'
+            b'rpc_server_31502_ds_get_concurrency : 90\n'
+            b'anon_jemalloc_stats_available : 0\n'
+            b'broken : nan\n'
+            b'infinite : inf\n'
+            b'invalid line\n')
+        mock_urlopen.return_value.__enter__.return_value = response
+        values = read_brpc_bvars(31501)
+        row = {}
+        add_jemalloc_metrics(row, values)
+        add_brpc_metrics(row, values, 31501)
+        self.assertEqual(row['bthread_count'], 30)
+        self.assertEqual(row['bthread_keytable_count'], 70)
+        self.assertEqual(row['bthread_worker_count'], 16)
+        self.assertEqual(row['bthread_worker_usage'], 2.5)
+        self.assertEqual(row['bthread_local_runqueue_count'], 5)
+        self.assertEqual(row['brpc_active_requests'], 9)
+        self.assertEqual(row['brpc_stats_available'], 1)
+        self.assertEqual(row['brpc_method_concurrency'], '{"ds_get":4,"ds_publish":5}')
+        self.assertEqual(row['bthread_group_status'], '{"1":2,"2":3}')
+        self.assertNotIn('broken', values)
+        self.assertNotIn('infinite', values)
+        self.assertNotIn('jemalloc_allocated_mb', row)
+        self.assertNotIn('bthread_concurrency', CSV_FIELDS)
+        self.assertEqual(mock_urlopen.call_count, 1)
+
+    def test_missing_is_not_zero(self):
+        row = {}
+        add_brpc_metrics(row, {}, 31501)
+        self.assertEqual(row, {'brpc_stats_available': 0})
+        for queues in ('', '0 broken 2', '0 -1 2'):
+            row = {}
+            add_brpc_metrics(row, {'bthread_group_status': queues}, 31501)
+            self.assertNotIn('bthread_local_runqueue_count', row)
+            self.assertNotIn('bthread_group_status', row)
+            self.assertNotIn('brpc_active_requests', row)
+
+    def test_idle_values_are_recorded_as_zero(self):
+        row = {}
+        add_brpc_metrics(row, {
+            'bthread_count': 0,
+            'bthread_group_status': '0 0 ',
+            'rpc_server_31501_ds_get_concurrency': 0,
+        }, 31501)
+        self.assertEqual(row['brpc_active_requests'], 0)
+        self.assertEqual(row['bthread_local_runqueue_count'], 0)
+        self.assertEqual(row['brpc_stats_available'], 1)
+        self.assertEqual(row['brpc_method_concurrency'], '{}')
+        self.assertEqual(row['bthread_group_status'], '{}')
+
+    def test_sparse_details_keep_service_identity_and_total(self):
+        bvars = {f'rpc_server_31501_service_method_{i}_concurrency': 0
+                 for i in range(115)}
+        bvars.update({
+            'rpc_server_31501_worker_create_concurrency': 13,
+            'rpc_server_31501_master_create_concurrency': 2,
+            'bthread_group_status': '0 ' * 64,
+        })
+        row = {}
+        add_brpc_metrics(row, bvars, 31501)
+        self.assertEqual(row['brpc_active_requests'], 15)
+        self.assertEqual(row['brpc_method_concurrency'],
+                         '{"master_create":2,"worker_create":13}')
+        self.assertEqual(row['bthread_group_status'], '{}')
+        self.assertEqual(row['bthread_local_runqueue_count'], 0)
+
+
+class TestRuntimeCsvOutput(unittest.TestCase):
+    def test_main_writes_runtime_metrics_then_empty_values_on_failure(self):
+        output = io.StringIO()
+        with ExitStack() as stack:
+            stack.enter_context(patch('sys.argv', [
+                'procmon.py', '--pid', '123', '--brpc-bvar-port', '31501']))
+            stack.enter_context(patch('sys.stdout', output))
+            for name, value in {
+                'time.sleep': None, 'signal.signal': None,
+                'os.sysconf': 100, 'read_proc_fd_count': 3,
+                'read_tcp_attempt_fails_stats': (None, None),
+            }.items():
+                stack.enter_context(patch('procmon.' + name, return_value=value))
+            stack.enter_context(patch('procmon.read_proc_stat',
+                                     side_effect=[100, 101, 102, None]))
+            stack.enter_context(patch('procmon.read_proc_mem_breakdown',
+                                     return_value=(1048576, 524288, 524288)))
+            stack.enter_context(patch('procmon.read_brpc_bvars', side_effect=[{
+                'bthread_count': 20,
+                'bthread_group_status': '1 2 ',
+                'rpc_server_31501_ds_get_concurrency': 4,
+            }, {}]))
+            main()
+        rows = list(csv.DictReader(io.StringIO(output.getvalue())))
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]['rss_mb'], '1.000')
+        self.assertEqual(rows[0]['brpc_active_requests'], '4')
+        self.assertEqual(rows[0]['bthread_local_runqueue_count'], '3')
+        self.assertEqual(rows[0]['brpc_stats_read_failures'], '0')
+        self.assertEqual(rows[1]['bthread_count'], '')
+        self.assertEqual(rows[1]['brpc_active_requests'], '')
+        self.assertEqual(rows[1]['brpc_stats_read_failures'], '1')
+
+    def test_old_csv_header_is_rejected_without_modifying_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'resource_monitor.csv')
+            original = 'timestamp,pid,rss_mb\nold,123,1\n'
+            with open(path, 'w') as out:
+                out.write(original)
+            with patch('sys.argv', ['procmon.py', '--pid', '123', '--output', path, '--background']), \
+                    patch('procmon._daemonize') as daemonize, \
+                    patch('sys.stderr', new_callable=io.StringIO), \
+                    patch('procmon.os.sysconf', return_value=100), \
+                    self.assertRaises(SystemExit) as error:
+                main()
+            self.assertEqual(error.exception.code, 2)
+            daemonize.assert_not_called()
+            with open(path) as old:
+                self.assertEqual(old.read(), original)
 
 
 if __name__ == '__main__':

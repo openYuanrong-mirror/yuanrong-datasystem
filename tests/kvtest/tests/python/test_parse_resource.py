@@ -102,5 +102,56 @@ class TestParseResource(unittest.TestCase):
             os.unlink(path)
 
 
+    def test_runtime_charts_preserve_units_zero_values_and_missing_samples(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'resource.csv')
+            with open(path, 'w', newline='') as stream:
+                writer = csv.DictWriter(stream, fieldnames=[
+                    'timestamp', 'bthread_count', 'bthread_keytable_count',
+                    'bthread_keytable_memory', 'bthread_worker_count',
+                    'bthread_worker_usage', 'brpc_active_requests',
+                    'bthread_local_runqueue_count', 'brpc_stats_available',
+                    'brpc_stats_read_failures', 'brpc_method_concurrency',
+                    'bthread_group_status'])
+                writer.writeheader()
+                writer.writerow({
+                    'timestamp': '2026-09-01T00:00:00+00:00',
+                    'bthread_count': 20, 'bthread_keytable_count': 80,
+                    'bthread_keytable_memory': 4096, 'bthread_worker_count': 8,
+                    'bthread_worker_usage': 1.25, 'brpc_active_requests': 0,
+                    'bthread_local_runqueue_count': 0, 'brpc_stats_available': 1,
+                    'brpc_stats_read_failures': 0,
+                    'brpc_method_concurrency': '{"example_get":0}',
+                    'bthread_group_status': '0 0 '})
+                writer.writerow({
+                    'timestamp': '2026-09-01T00:00:01+00:00',
+                    'brpc_stats_available': 0, 'brpc_stats_read_failures': 1})
+            data = load_resource_csv(path)
+            page = render_html(data)
+        payload, _ = json.JSONDecoder().raw_decode(page.split('const DATA=', 1)[1])
+        self.assertEqual(len(payload['charts']), 5)
+        plotted = {metric['key']: metric for chart in payload['charts']
+                   for metric in chart['metrics']}
+        self.assertEqual(plotted['bthread_keytable_memory']['unit'], ' bytes')
+        self.assertEqual(plotted['bthread_worker_usage']['unit'], ' workers')
+        self.assertEqual(payload['rows'][0]['brpc_active_requests'], 0)
+        self.assertNotIn('brpc_active_requests', payload['rows'][1])
+        self.assertEqual(payload['rows'][1]['brpc_stats_available'], 0)
+        self.assertNotIn('brpc_method_concurrency', plotted)
+        self.assertNotIn('bthread_group_status', plotted)
+        self.assertNotIn('bthread_concurrency', plotted)
+
+    def test_old_csv_does_not_gain_empty_runtime_charts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'resource.csv')
+            with open(path, 'w') as stream:
+                stream.write('timestamp,rss_mb,bthread_count\n'
+                             '2026-09-01T00:00:00+00:00,100,\n')
+            page = render_html(load_resource_csv(path))
+        payload, _ = json.JSONDecoder().raw_decode(page.split('const DATA=', 1)[1])
+        self.assertEqual([chart['title'] for chart in payload['charts']],
+                         ['Process memory'])
+
+
 if __name__ == '__main__':
     unittest.main()

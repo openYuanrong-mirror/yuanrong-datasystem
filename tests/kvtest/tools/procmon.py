@@ -4,7 +4,10 @@
 import argparse
 import atexit
 import csv
+import json
+import math
 import os
+import re
 import signal
 import socket
 import struct
@@ -25,12 +28,21 @@ JEMALLOC_BVAR_COLUMNS = {
     'anon_jemalloc_muzzy_bytes': 'jemalloc_muzzy_mb',
 }
 
+BTHREAD_BVAR_COLUMNS = [
+    'bthread_keytable_count', 'bthread_keytable_memory', 'bthread_count',
+    'bthread_worker_count', 'bthread_worker_usage',
+]
+
 CSV_FIELDS = [
     'timestamp', 'pid', 'cpu_pct', 'rss_mb', 'anon_mb', 'shared_mb', 'fd',
     'tcp_fails_per_sec', 'tcp_fail_rate_pct', 'bytes_in_mb_per_sec',
     'bytes_out_mb_per_sec',
 ] + list(JEMALLOC_BVAR_COLUMNS.values()) + [
     'jemalloc_stats_available', 'jemalloc_stats_read_failures',
+] + BTHREAD_BVAR_COLUMNS + [
+    'bthread_group_status', 'bthread_local_runqueue_count',
+    'brpc_active_requests', 'brpc_method_concurrency',
+    'brpc_stats_available', 'brpc_stats_read_failures',
 ]
 
 
@@ -364,30 +376,66 @@ def read_port_traffic(port, timeout=5):
     return total_sent, total_recv
 
 
-def read_jemalloc_bvars(port, host='127.0.0.1', timeout=2):
-    """Read jemalloc metrics from BRPC builtin services, if available."""
+def read_brpc_text(port, path, host='127.0.0.1', timeout=2):
     url_host = f'[{host}]' if ':' in host and not host.startswith('[') else host
     # BRPC renders HTML for Python's User-Agent; console=1 forces plain text.
-    url = f'http://{url_host}:{port}/vars/anon_jemalloc_*?console=1'
+    url = f'http://{url_host}:{port}/{path}?console=1'
     try:
         with urlopen(url, timeout=timeout) as response:
-            body = response.read().decode('utf-8', errors='replace')
+            return response.read().decode('utf-8', errors='replace')
     except (OSError, TimeoutError, ValueError):
-        return {}
+        return ''
 
+
+def read_brpc_bvars(port, host='127.0.0.1', timeout=2):
+    """Read selected allocator, scheduler and per-method RPC statistics."""
+    patterns = ['anon_jemalloc_*'] + BTHREAD_BVAR_COLUMNS + [
+        'bthread_group_status', f'rpc_server_{port}_*_concurrency',
+    ]
+    body = read_brpc_text(port, 'vars/' + ','.join(patterns), host, timeout)
     values = {}
     for line in body.splitlines():
         name, separator, raw_value = line.partition(':')
         if not separator:
             continue
         name = name.strip()
-        if not name.startswith('anon_jemalloc_'):
+        raw_value = raw_value.strip()
+        if name == 'bthread_group_status':
+            values[name] = raw_value.strip('"')
             continue
         try:
-            values[name] = float(raw_value.strip())
+            value = float(raw_value)
+            if math.isfinite(value):
+                values[name] = value
         except ValueError:
             continue
     return values
+
+
+def add_brpc_metrics(row, bvars, port):
+    row['brpc_stats_available'] = int('bthread_count' in bvars)
+    for name in BTHREAD_BVAR_COLUMNS:
+        if name in bvars:
+            row[name] = (bvars[name] if name == 'bthread_worker_usage'
+                         else int(bvars[name]))
+    queues = bvars.get('bthread_group_status')
+    if queues is not None and re.fullmatch(r'\s*\d+(?:\s+\d+)*\s*', queues):
+        lengths = list(map(int, queues.split()))
+        row['bthread_local_runqueue_count'] = sum(lengths)
+        row['bthread_group_status'] = json.dumps(
+            {str(i): size for i, size in enumerate(lengths) if size},
+            separators=(',', ':'))
+    prefix = f'rpc_server_{port}_'
+    methods = {name: int(value) for name, value in bvars.items()
+               if name.startswith(prefix) and name.endswith('_concurrency')
+               and name != prefix + 'concurrency'
+               and not name.endswith('_max_concurrency')}
+    if methods:
+        row['brpc_active_requests'] = sum(methods.values())
+        active = {name[len(prefix):-len('_concurrency')]: value
+                  for name, value in methods.items() if value != 0}
+        row['brpc_method_concurrency'] = json.dumps(
+            active, sort_keys=True, separators=(',', ':'))
 
 
 def add_jemalloc_metrics(row, bvars):
@@ -462,7 +510,7 @@ def main():
                              "ESTABLISHED sockets on the port. When omitted, no "
                              "traffic monitoring is done.")
     parser.add_argument("--brpc-bvar-port", type=int, default=None,
-                        help="Read anon_jemalloc_* metrics from BRPC /vars on "
+                        help="Read jemalloc, bthread and active RPC metrics from BRPC on "
                              "this port. Missing builtin services or bvars are "
                              "reported as empty CSV cells.")
     parser.add_argument("--brpc-bvar-host", default="127.0.0.1",
@@ -476,9 +524,6 @@ def main():
     if args.background and not args.output:
         parser.error("--output is required when --background is used")
 
-    if args.background:
-        _daemonize()
-
     clock_ticks = os.sysconf("SC_CLK_TCK")
 
     if args.output:
@@ -488,6 +533,13 @@ def main():
         else:
             output_path = args.output
         needs_header = not os.path.exists(output_path) or os.path.getsize(output_path) == 0
+        if not needs_header:
+            with open(output_path, newline='') as existing:
+                if next(csv.reader(existing), None) != CSV_FIELDS:
+                    parser.error("Existing output has a different CSV schema; "
+                                 "use a new --output path or archive the old file.")
+        if args.background:
+            _daemonize()
         outfile = open(output_path, "a", buffering=1, newline='')
         atexit.register(outfile.close)
         out = outfile
@@ -513,6 +565,7 @@ def main():
     prev_fails, prev_opens = read_tcp_attempt_fails_stats()
     prev_sent, prev_recv = (read_port_traffic(args.port)
                             if args.port else (None, None))
+    brpc_stats_read_failures = 0
     start_time = prev_time
 
     running = True
@@ -597,9 +650,13 @@ def main():
                                      if bytes_out_per_sec is not None else None),
         }
         if args.brpc_bvar_port:
-            bvars = read_jemalloc_bvars(args.brpc_bvar_port,
-                                        host=args.brpc_bvar_host)
+            bvars = read_brpc_bvars(args.brpc_bvar_port,
+                                    host=args.brpc_bvar_host)
             add_jemalloc_metrics(row, bvars)
+            add_brpc_metrics(row, bvars, args.brpc_bvar_port)
+            if not row['brpc_stats_available']:
+                brpc_stats_read_failures += 1
+            row['brpc_stats_read_failures'] = brpc_stats_read_failures
         writer.writerow(row)
         out.flush()
 
