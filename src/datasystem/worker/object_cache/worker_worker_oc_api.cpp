@@ -60,6 +60,18 @@ Status WorkerLocalWorkerOCApi::GetObjectRemote(GetObjectRemoteReqPb &req, GetObj
     return service_->GetObjectRemote(req, rsp, payload);
 }
 
+Status WorkerLocalWorkerOCApi::QueryUbPortHealth(const std::string &expectedWorkerIncarnation,
+                                                 int32_t timeoutMs, QueryUbPortHealthRspPb &rsp)
+{
+    (void)timeoutMs;
+    RETURN_RUNTIME_ERROR_IF_NULL(service_);
+    RETURN_RUNTIME_ERROR_IF_NULL(akSkManager_);
+    QueryUbPortHealthReqPb req;
+    req.set_expected_worker_incarnation(expectedWorkerIncarnation);
+    RETURN_IF_NOT_OK(akSkManager_->GenerateSignature(req));
+    return service_->QueryUbPortHealth(req, rsp);
+}
+
 WorkerRemoteWorkerOCApi::WorkerRemoteWorkerOCApi(HostPort hostPort, HostPort localHostPort,
                                                  std::shared_ptr<AkSkManager> akSkManager)
     : hostPort_(std::move(hostPort)), localHostPort_(std::move(localHostPort)), akSkManager_(std::move(akSkManager))
@@ -265,6 +277,20 @@ Status WorkerRemoteWorkerOCApi::GetHashRing(uint64_t currentVersion, int32_t tim
     options.SetTimeout(timeoutMs);
     auto rc = brpcSession_->GetPeerHashRing(options, req, rsp);
     return WithRpcDiag(rc, "GetHashRing", localHostPort_, hostPort_);
+}
+
+Status WorkerRemoteWorkerOCApi::QueryUbPortHealth(const std::string &expectedWorkerIncarnation,
+                                                  int32_t timeoutMs, QueryUbPortHealthRspPb &rsp)
+{
+    CHECK_FAIL_RETURN_STATUS(brpcSession_ != nullptr, K_NOT_READY, "Worker RPC session is null");
+    CHECK_FAIL_RETURN_STATUS(timeoutMs > 0, K_INVALID, "UB port health query timeout must be positive");
+    QueryUbPortHealthReqPb req;
+    req.set_expected_worker_incarnation(expectedWorkerIncarnation);
+    RETURN_IF_NOT_OK(akSkManager_->GenerateSignature(req));
+    RpcOptions options;
+    options.SetTimeout(timeoutMs);
+    auto rc = brpcSession_->QueryUbPortHealth(options, req, rsp);
+    return WithRpcDiag(rc, "QueryUbPortHealth", localHostPort_, hostPort_);
 }
 
 void WorkerRemoteWorkerOCApi::ForgetClusterStateRequest(int64_t tag)

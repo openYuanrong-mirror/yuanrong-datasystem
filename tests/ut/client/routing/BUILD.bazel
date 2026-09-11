@@ -19,7 +19,9 @@ ds_cc_test(
     deps = [
         "//tests:ub_port_test_support",
         "//src/datasystem/client/object_cache/routing:routing",
+        "//src/datasystem/common/flags:dynamic_flag_config",
         "//src/datasystem/common/object_cache:common_object_cache",
+        "//src/datasystem/common/util:raii",
         "//src/datasystem/protos:cluster_topology_cc_proto",
         "//tests/ut:ut_common",
     ],

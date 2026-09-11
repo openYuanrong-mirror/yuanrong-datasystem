@@ -4893,7 +4893,7 @@ TEST(ObjectClientTransportTest, LateHealthSummaryDoesNotAccessDestroyedClient)
         }
         UbHealthSummaryApplyHook SnapshotCallback()
         {
-            std::lock_guard<std::mutex> lock(ubHealthSummaryCallbackMutex_);
+            std::lock_guard<bthread::Mutex> lock(ubHealthSummaryCallbackMutex_);
             return ubHealthSummaryCallback_;
         }
     };

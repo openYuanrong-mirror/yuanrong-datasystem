@@ -437,7 +437,7 @@ Status WorkerServiceImpl::Heartbeat(const HeartbeatReqPb &req, HeartbeatRspPb &r
 
 void WorkerServiceImpl::SetUbHealthSummaryProvider(UbHealthSummaryProvider provider)
 {
-    std::lock_guard<std::mutex> lock(ubHealthSummaryProviderMutex_);
+    std::lock_guard<bthread::Mutex> lock(ubHealthSummaryProviderMutex_);
     ubHealthSummaryProvider_ = std::move(provider);
 }
 
@@ -445,7 +445,7 @@ void WorkerServiceImpl::PopulateUbHealthSummary(HeartbeatRspPb &rsp) const
 {
     UbHealthSummaryProvider provider;
     {
-        std::lock_guard<std::mutex> lock(ubHealthSummaryProviderMutex_);
+        std::lock_guard<bthread::Mutex> lock(ubHealthSummaryProviderMutex_);
         provider = ubHealthSummaryProvider_;
     }
     if (!provider) {

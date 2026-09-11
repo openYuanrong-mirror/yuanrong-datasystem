@@ -52,37 +52,44 @@ DataPlaneManager::UbHealthCallbackState::UbHealthCallbackState(DataPlaneManager 
 
 void DataPlaneManager::UbHealthCallbackState::Detach()
 {
-    std::unique_lock<std::mutex> lock(mutex_);
+    std::unique_lock<bthread::Mutex> lock(mutex_);
     manager_ = nullptr;
-    drained_.wait(lock, [this] { return activeObservers_ == 0; });
+    while (activeCallbacks_ != 0) {
+        drained_.wait(lock);
+    }
+}
+
+DataPlaneManager::UbHealthCallbackState::Lease DataPlaneManager::UbHealthCallbackState::Acquire()
+{
+    std::lock_guard<bthread::Mutex> lock(mutex_);
+    if (manager_ != nullptr) {
+        ++activeCallbacks_;
+    }
+    return Lease(this, manager_);
+}
+
+DataPlaneManager::UbHealthCallbackState::Lease::~Lease()
+{
+    if (manager_ != nullptr) {
+        std::lock_guard<bthread::Mutex> lock(owner_->mutex_);
+        if (--owner_->activeCallbacks_ == 0) {
+            owner_->drained_.notify_all();
+        }
+    }
 }
 
 void DataPlaneManager::UbHealthCallbackState::ObserveSummary(const UbHealthSummary &summary)
 {
-    DataPlaneManager *manager = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (manager_ == nullptr) {
-            return;
-        }
-        manager = manager_;
-        ++activeObservers_;
+    auto lease = Acquire();
+    if (!lease) {
+        return;
     }
     try {
-        manager->ObserveUbHealthSummary(summary);
+        lease.manager_->ObserveUbHealthSummary(summary);
     } catch (const std::exception &error) {
         LOG(ERROR) << "Client UB health observation callback threw: " << error.what();
     } catch (...) {
         LOG(ERROR) << "Client UB health observation callback threw";
-    }
-    FinishObservation();
-}
-
-void DataPlaneManager::UbHealthCallbackState::FinishObservation()
-{
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (--activeObservers_ == 0) {
-        drained_.notify_all();
     }
 }
 
@@ -627,31 +634,28 @@ void DataPlaneManager::ObserveUbHealthSummary(const UbHealthSummary &summary)
         return;
     }
     auto incarnation = topology->workerIncarnations->find(summary.worker);
+    UbHealthSummary accepted;
     if (incarnation == topology->workerIncarnations->end()
         || incarnation->second != summary.incarnation
-        || !observedUbHealthSummaries_.Apply(summary, incarnation->second)) {
-        return;
-    }
-    auto accepted = observedUbHealthSummaries_.Get(summary.worker);
-    if (!accepted.has_value()) {
+        || !observedUbHealthSummaries_.Apply(summary, incarnation->second, accepted)) {
         return;
     }
     if (ubHealthSummaryHook_) {
         try {
-            ubHealthSummaryHook_(*accepted);
+            ubHealthSummaryHook_(accepted);
         } catch (const std::exception &error) {
             LOG(ERROR) << "Client passive UB health hook threw: " << error.what();
         } catch (...) {
             LOG(ERROR) << "Client passive UB health hook threw";
         }
     }
-    if (!accepted->portHealth.has_value()) {
+    if (!accepted.portHealth.has_value()) {
         return;
     }
     const bool hinted = ubPortHealthVerifier_.NotifySummaryHint(
-        *accepted, static_cast<uint64_t>(GetSteadyClockTimeStampMs()));
-    if (ShouldIsolateForUbPortHealth(*accepted->portHealth)) {
-        const bool requested = RequestUbPortHealthVerification(accepted->worker);
+        accepted, static_cast<uint64_t>(GetSteadyClockTimeStampMs()));
+    if (ShouldIsolateForUbPortHealth(*accepted.portHealth)) {
+        const bool requested = RequestUbPortHealthVerification(accepted.worker);
         if (hinted && !requested && ubHealthWakeHook_) {
             ubHealthWakeHook_();
         }

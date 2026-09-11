@@ -25,6 +25,8 @@
 #include <string>
 #include <unordered_map>
 
+#include <bthread/mutex.h>
+
 #include "datasystem/common/object_cache/peer_ub_admission.h"
 
 namespace datasystem::cluster {
@@ -87,7 +89,7 @@ private:
     void CompressIsolatedDeadlinesLocked(const HostPort &completedPeer, uint64_t nowMs);
 
     const uint64_t queryIntervalMs_;
-    mutable std::mutex mutex_;
+    mutable bthread::Mutex mutex_;
     std::unordered_map<HostPort, PeerState> peers_;
 };
 

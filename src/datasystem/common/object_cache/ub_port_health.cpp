@@ -17,22 +17,40 @@
 #include "datasystem/common/object_cache/ub_port_health.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstddef>
-#include <condition_variable>
 #include <exception>
 #include <iterator>
 #include <limits>
-#include <mutex>
 #include <sstream>
 #include <thread>
 #include <utility>
 
-#include "datasystem/common/log/logging.h"
+#include "datasystem/common/log/log.h"
+#include "datasystem/common/util/uuid_generator.h"
+
+#include <bthread/condition_variable.h>
+#include <bthread/mutex.h>
 
 namespace datasystem {
 namespace {
 using Clock = std::chrono::steady_clock;
+constexpr size_t HEX_CHAR_COUNT_PER_BYTE = 2;
+constexpr size_t HEX_HIGH_NIBBLE_SHIFT = 4;
+constexpr uint8_t HEX_LOW_NIBBLE_MASK = 0x0f;
+constexpr char HEX_DIGITS[] = "0123456789abcdef";
+
+std::string EncodeHexPrefix(const uint8_t *bytes, size_t size)
+{
+    std::string encoded(size * HEX_CHAR_COUNT_PER_BYTE, '\0');
+    for (size_t i = 0; i < size; ++i) {
+        const auto outputOffset = i * HEX_CHAR_COUNT_PER_BYTE;
+        encoded[outputOffset] = HEX_DIGITS[bytes[i] >> HEX_HIGH_NIBBLE_SHIFT];
+        encoded[outputOffset + 1] = HEX_DIGITS[bytes[i] & HEX_LOW_NIBBLE_MASK];
+    }
+    return encoded;
+}
 
 bool HasSamePortObservation(const UbPortHealthSnapshot &lhs, const UbPortHealthSnapshot &rhs)
 {
@@ -174,6 +192,31 @@ bool NeedsPeriodicQuery(const std::shared_ptr<const UbPortHealthSnapshot> &snaps
 }
 }  // namespace
 
+std::string FormatUbHealthIncarnationPrefix(const uint8_t *incarnation, size_t size)
+{
+    if (incarnation == nullptr || size == 0) {
+        return {};
+    }
+    if (size == UUID_SIZE) {
+        std::array<char, UUID_STRING_BUFFER_SIZE> printableUuid{};
+        auto rc = BytesUuidToString(incarnation, size, printableUuid.data(), printableUuid.size());
+        if (rc.IsOk()) {
+            return std::string(printableUuid.data(), UB_HEALTH_INCARNATION_LOG_PREFIX_LENGTH);
+        }
+    }
+    const auto bytesToEncode = std::min(size, UB_HEALTH_INCARNATION_LOG_PREFIX_LENGTH / HEX_CHAR_COUNT_PER_BYTE);
+    return EncodeHexPrefix(incarnation, bytesToEncode);
+}
+
+std::string FormatUbHealthIncarnationPrefix(const std::string &incarnation)
+{
+    std::vector<uint8_t> bytes;
+    bytes.reserve(incarnation.size());
+    std::transform(incarnation.begin(), incarnation.end(), std::back_inserter(bytes),
+                   [](char value) { return static_cast<uint8_t>(value); });
+    return FormatUbHealthIncarnationPrefix(bytes.data(), bytes.size());
+}
+
 class UbPortHealthMonitor::Impl {
 public:
     Impl(std::shared_ptr<IUbPortStatusProvider> provider, std::weak_ptr<IUbPortHealthObserver> observer,
@@ -192,7 +235,7 @@ public:
 
     Status Start()
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<bthread::Mutex> lock(mutex_);
         if (state_ == State::RUNNING) {
             return Status::OK();
         }
@@ -226,12 +269,14 @@ public:
     {
         std::thread worker;
         {
-            std::unique_lock<std::mutex> lock(mutex_);
+            std::unique_lock<bthread::Mutex> lock(mutex_);
             if (state_ == State::STOPPED) {
                 return;
             }
             if (state_ == State::STOPPING) {
-                stateCv_.wait(lock, [this] { return state_ != State::STOPPING; });
+                while (state_ == State::STOPPING) {
+                    stateCv_.wait(lock);
+                }
                 return;
             }
             state_ = State::STOPPING;
@@ -242,7 +287,7 @@ public:
             worker.join();
         }
         {
-            std::lock_guard<std::mutex> lock(mutex_);
+            std::lock_guard<bthread::Mutex> lock(mutex_);
             refreshRequested_ = false;
             verificationRequested_ = false;
             queryInFlight_ = false;
@@ -252,7 +297,7 @@ public:
         }
         ClearStoppedSnapshot();
         {
-            std::lock_guard<std::mutex> lock(mutex_);
+            std::lock_guard<bthread::Mutex> lock(mutex_);
             state_ = State::STOPPED;
         }
         stateCv_.notify_all();
@@ -265,7 +310,7 @@ public:
             return Status(K_INVALID, "UB port health max age must not be negative");
         }
 
-        std::unique_lock<std::mutex> lock(mutex_);
+        std::unique_lock<bthread::Mutex> lock(mutex_);
         if (state_ != State::RUNNING) {
             return state_ == State::STOPPING ? Status(K_SHUTTING_DOWN, "UB port health monitor is stopping")
                                              : Status(K_NOT_READY, "UB port health monitor is not running");
@@ -286,10 +331,13 @@ public:
             verificationRequested_ = true;
             cv_.notify_all();
         }
-        if (!cv_.wait_for(lock, UB_PORT_HEALTH_REFRESH_WAIT_TIMEOUT, [this, targetCompletion] {
-                return state_ != State::RUNNING || completedQueries_ >= targetCompletion;
-            })) {
-            return Status(K_RPC_DEADLINE_EXCEEDED, "Timed out waiting for UB port health refresh");
+        const auto deadline = Clock::now() + UB_PORT_HEALTH_REFRESH_WAIT_TIMEOUT;
+        while (state_ == State::RUNNING && completedQueries_ < targetCompletion) {
+            const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(deadline - Clock::now());
+            if (remaining <= std::chrono::microseconds::zero()) {
+                return Status(K_RPC_DEADLINE_EXCEEDED, "Timed out waiting for UB port health refresh");
+            }
+            cv_.wait_for(lock, std::max<int64_t>(1, remaining.count()));
         }
         if (state_ != State::RUNNING) {
             return Status(K_SHUTTING_DOWN, "UB port health monitor stopped while refreshing");
@@ -302,7 +350,7 @@ public:
         if (maxAge < std::chrono::milliseconds::zero()) {
             return Status(K_INVALID, "UB port health max age must not be negative");
         }
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<bthread::Mutex> lock(mutex_);
         if (state_ != State::RUNNING) {
             return Status(K_NOT_READY, "UB port health monitor is not running");
         }
@@ -329,7 +377,7 @@ public:
         if (target == nullptr) {
             return Status(K_INVALID, "UB port health observer is expired");
         }
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<bthread::Mutex> lock(mutex_);
         if (state_ == State::STOPPING) {
             return Status(K_SHUTTING_DOWN, "UB port health monitor is stopping");
         }
@@ -354,7 +402,7 @@ public:
         if (triggerPending_.exchange(true, std::memory_order_acq_rel)) {
             return;
         }
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<bthread::Mutex> lock(mutex_);
         if (state_ != State::RUNNING) {
             triggerPending_.store(false, std::memory_order_release);
             return;
@@ -392,21 +440,25 @@ private:
 
     void Run()
     {
-        std::unique_lock<std::mutex> lock(mutex_);
+        std::unique_lock<bthread::Mutex> lock(mutex_);
         while (state_ == State::RUNNING) {
             auto snapshot = std::atomic_load(&snapshot_);
             if (!refreshRequested_ && !NeedsPeriodicQuery(snapshot)) {
-                cv_.wait(lock, [this] {
-                    return state_ != State::RUNNING || refreshRequested_
-                           || NeedsPeriodicQuery(std::atomic_load(&snapshot_));
-                });
+                while (state_ == State::RUNNING && !refreshRequested_
+                       && !NeedsPeriodicQuery(std::atomic_load(&snapshot_))) {
+                    cv_.wait(lock);
+                }
                 continue;
             }
 
             const auto now = Clock::now();
             if (hasQueryStarted_ && now < lastQueryStarted_ + queryInterval_) {
-                cv_.wait_until(lock, lastQueryStarted_ + queryInterval_,
-                               [this] { return state_ != State::RUNNING; });
+                const auto queryDeadline = lastQueryStarted_ + queryInterval_;
+                while (state_ == State::RUNNING && Clock::now() < queryDeadline) {
+                    const auto remaining =
+                        std::chrono::duration_cast<std::chrono::microseconds>(queryDeadline - Clock::now());
+                    cv_.wait_for(lock, std::max<int64_t>(1, remaining.count()));
+                }
                 continue;
             }
 
@@ -456,7 +508,7 @@ private:
     {
         std::vector<std::shared_ptr<IUbPortHealthObserver>> targets;
         {
-            std::lock_guard<std::mutex> lock(mutex_);
+            std::lock_guard<bthread::Mutex> lock(mutex_);
             for (auto iter = observers_.begin(); iter != observers_.end();) {
                 auto target = iter->lock();
                 if (target != nullptr) {
@@ -525,7 +577,7 @@ private:
                                 const std::shared_ptr<const UbPortHealthSnapshot> &published, const Status &queryStatus)
     {
         {
-            std::lock_guard<std::mutex> lock(mutex_);
+            std::lock_guard<bthread::Mutex> lock(mutex_);
             if (state_ != State::RUNNING) {
                 return Status(K_SHUTTING_DOWN, "UB port health monitor stopped during query");
             }
@@ -560,9 +612,9 @@ private:
     std::shared_ptr<const UbPortHealthSnapshot> lastConfirmedSnapshot_;
     std::optional<UbPortHealthSnapshot> lastLoggedSnapshot_;
 
-    mutable std::mutex mutex_;
-    std::condition_variable cv_;
-    std::condition_variable stateCv_;
+    mutable bthread::Mutex mutex_;
+    bthread::ConditionVariable cv_;
+    bthread::ConditionVariable stateCv_;
     std::thread worker_;
     State state_{ State::STOPPED };
     bool refreshRequested_{ false };

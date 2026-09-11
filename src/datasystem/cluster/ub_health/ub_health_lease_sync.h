@@ -49,6 +49,8 @@ public:
 
 private:
     void Run();
+    std::unordered_map<std::string, UbHealthSummary> DecodeLeaseSummaries(
+        const std::vector<std::pair<std::string, std::string>> &records) const;
 
     LeasePublisher publisher_;
     SnapshotLoader loader_;
@@ -60,6 +62,7 @@ private:
     std::chrono::milliseconds interval_;
     std::atomic<bool> started_{ false };
     std::atomic<bool> stopping_{ false };
+    // Runs only on the dedicated native sync Thread.
     std::mutex mutex_;
     std::mutex syncMutex_;
     std::condition_variable cv_;

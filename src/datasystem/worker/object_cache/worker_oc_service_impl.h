@@ -58,6 +58,7 @@
 #include "datasystem/common/util/format.h"
 #include "datasystem/common/util/net_util.h"
 #include "datasystem/common/object_cache/safe_table.h"
+#include "datasystem/cluster/ub_health/remote_ub_port_health_verifier.h"
 #include "datasystem/common/util/queue/shm_circular_queue.h"
 #include "datasystem/common/util/status_helper.h"
 #include "datasystem/common/util/thread.h"
@@ -80,6 +81,7 @@
 #include "datasystem/cluster/runtime/topology_engine.h"
 #include "datasystem/worker/object_cache/async_rpc_request_manager.h"
 #include "datasystem/worker/object_cache/async_send_manager.h"
+#include "datasystem/worker/object_cache/data_migrator/data_migrator.h"
 #include "datasystem/worker/object_cache/kv_event/kv_event_publisher.h"
 #include "datasystem/worker/object_cache/metadata_recovery_manager.h"
 #include "datasystem/worker/object_cache/worker_master_oc_api.h"
@@ -99,6 +101,7 @@
 // Keep bthread headers after project RPC/log headers so brpc logging macros (CHECK_EQ etc.) are
 // established before bthread/mutex.h (which uses but does not define them) avoid redefinition pitfalls.
 #include <bthread/mutex.h>
+#include <bthread/condition_variable.h>
 
 namespace datasystem {
 namespace master {
@@ -120,6 +123,40 @@ class WorkerOCServiceImpl : public WorkerOCService,
                             public IWorkerOCService,
                             public IUbPortHealthObserver {
 public:
+    class UbHealthCallbackState {
+    public:
+        explicit UbHealthCallbackState(WorkerOCServiceImpl *service);
+        ~UbHealthCallbackState() = default;
+
+        void Detach();
+        void RequestVerification(const HostPort &peer);
+        void ObserveSummary(const UbHealthSummary &summary);
+        bool ApplyVerifiedPortHealth(const cluster::RemoteUbQueryTicket &ticket, const UbPortHealthSummary &summary);
+        void ScheduleVerification();
+        bool IsAttached() const;
+        Status QueryPortHealth(const cluster::RemoteUbQueryTicket &ticket, UbHealthSummary &summary);
+
+    private:
+        class Lease {
+        public:
+            Lease(UbHealthCallbackState *owner, WorkerOCServiceImpl *service) : owner_(owner), service_(service) {}
+            ~Lease();
+            Lease(const Lease &) = delete;
+            Lease &operator=(const Lease &) = delete;
+            explicit operator bool() const { return service_ != nullptr; }
+
+        private:
+            friend class UbHealthCallbackState;
+            UbHealthCallbackState *owner_;
+            WorkerOCServiceImpl *service_;
+        };
+        Lease Acquire();
+        mutable bthread::Mutex mutex_;
+        bthread::ConditionVariable drained_;
+        size_t activeCallbacks_ = 0;
+        WorkerOCServiceImpl *service_;
+    };
+
     using AsyncTasksDoneChecker = std::function<Status(
         const std::string &, std::chrono::steady_clock::time_point, const cluster::CancellationToken &)>;
 
@@ -614,6 +651,10 @@ public:
     Status QuerySelfUbPortHealth(const QueryUbPortHealthReqPb &req, QueryUbPortHealthRspPb &rsp) const;
 
     void ReplaceGlobalUbHealthSummaries(const std::vector<UbHealthSummary> &summaries);
+
+    void RequestPeerUbPortHealthVerification(const HostPort &peer);
+
+    void ObservePeerUbHealthSummary(const UbHealthSummary &summary, bool allowNewQuery = true);
 
     PeerUbAdmission *GetUbAdmission() const
     {
@@ -1539,10 +1580,32 @@ private:
 
     std::shared_ptr<WorkerSelfPortHealth> selfPortHealth_{ std::make_shared<WorkerSelfPortHealth>() };
 
+    std::shared_ptr<UbHealthCallbackState> ubHealthCallbackState_;
+
+    std::shared_ptr<cluster::RemoteUbPortHealthVerifier> remoteUbPortHealthVerifier_{
+        std::make_shared<cluster::RemoteUbPortHealthVerifier>()
+    };
+    std::shared_ptr<ThreadPool> remoteUbPortHealthQueryPool_{ std::make_shared<ThreadPool>(
+        0, cluster::REMOTE_UB_PORT_HEALTH_MAX_CONCURRENT_QUERIES, "worker-ub-health") };
+    std::shared_ptr<std::atomic<bool>> remoteUbQueryTaskScheduled_{
+        std::make_shared<std::atomic<bool>>(false)
+    };
+    std::shared_ptr<std::atomic<size_t>> remoteUbQueriesInFlight_{
+        std::make_shared<std::atomic<size_t>>(0)
+    };
+
     struct PublishedSelfUbHealth;
     // Control-plane publication only; response readers load the immutable snapshot without taking this lock.
-    mutable std::mutex selfUbHealthPublicationMutex_;
+    mutable bthread::Mutex selfUbHealthPublicationMutex_;
     mutable std::shared_ptr<const PublishedSelfUbHealth> publishedSelfUbHealthSummary_;
+
+    UbHealthSummaryCache observedPeerUbHealthSummaries_;
+
+    void SchedulePeerUbPortHealthVerification();
+
+    void ConfigurePeerUbHealthCallbacks();
+
+    void ConfigureDataMigrator(DataMigrator &migrator);
 
     std::shared_ptr<WorkerOcServiceDeleteImpl> deleteProc_{ nullptr };
 

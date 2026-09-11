@@ -193,11 +193,11 @@
     originating TransportLayer's sender state; the foreground waiter is detached at timeout. If a
     status-4 CQE arrives later, it requests the same process-local port query and releases the retained Event. The
     shutdown gate prevents an old CQE from affecting a destroyed transport, and the
-    retained Event cannot extend the Client or payload lifetime. Client write admission releases the sender-state lock
-    before transport I/O, so the URMA poller never waits behind a foreground completion wait. A stack-owned operation
-    token tracks admitted UB Create/Set/MCreate/MSet work without holding the state lock. One atomic gate stores both
-    the closing bit and active-token count, so shutdown closes new UB operations and drains existing tokens through
-    one linearized state before destroying the data plane.
+    retained Event cannot extend the Client or payload lifetime. Client write admission uses a CAS on one atomic gate
+    containing both the closing bit and active-token count, so it holds no sender-state lock around transport I/O.
+    A stack-owned operation token tracks admitted UB Create/Set/MCreate/MSet work; shutdown closes new operations in
+    the same modification order and drains existing tokens through a bthread-compatible mutex/CV pair before
+    destroying the data plane.
   - Client CQE-9 write-target isolation applies to UB writes in routed-only and local-cache modes. A quarantined bound
     Worker remains eligible when its same-host SHM capability keeps the Set off UB; a bound Worker without SHM
     capability joins the routing exclusion set and Set selects another eligible Worker. Request-local retry exclusions

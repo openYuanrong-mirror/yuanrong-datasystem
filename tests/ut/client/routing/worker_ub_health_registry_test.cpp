@@ -14,20 +14,31 @@
  * limitations under the License.
  */
 
+#include <array>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
 
 #include <gtest/gtest.h>
 
+#include "tests/support/fake_ub_port_status_provider.h"
+
 #include "datasystem/client/object_cache/routing/worker_ub_health_registry.h"
+#include "datasystem/common/flags/common_flags.h"
 #include "datasystem/common/object_cache/ub_port_health.h"
+#include "datasystem/common/util/raii.h"
 #include "datasystem/protos/cluster_topology.pb.h"
+
+DS_DECLARE_bool(alsologtostderr);
 
 namespace datasystem::ut {
 namespace {
 constexpr int WORKER_PORT_BASE = 20'000;
+using FakeUbPortStatusProvider = ::datasystem::test::FakeUbPortStatusProvider;
 
 ClusterTopologyPb BuildTopology(size_t activeWorkerCount)
 {
@@ -93,6 +104,97 @@ TEST(WorkerUbHealthRegistryTest, PublishesOnlyObservedRoutableWorkersAndPrunesDe
     EXPECT_TRUE(registry.GetRoutingSnapshot()->workers.empty());
     EXPECT_EQ(publishedSnapshot->workers.count(observed.worker), 1u);
     EXPECT_FALSE(registry.GetSummary(observed.worker).has_value());
+}
+
+TEST(WorkerUbHealthRegistryTest, AcceptsMonitorSummaryFromInjectedPortFacts)
+{
+    auto provider = std::make_shared<FakeUbPortStatusProvider>(
+        std::vector<UbPortStatus>{ { 2, UbPortState::BAD }, { 0, UbPortState::GOOD },
+                                   { 1, UbPortState::BAD } });
+    auto monitor = UbPortHealthMonitor::CreateForTest(provider, std::chrono::hours(1));
+    ASSERT_TRUE(monitor->Start().IsOk());
+    ASSERT_TRUE(monitor->EnsureFresh(std::chrono::hours(1)).IsOk());
+    auto portHealth = monitor->GetSummary();
+    ASSERT_TRUE(portHealth.has_value());
+    monitor->Stop();
+
+    client::WorkerUbHealthRegistry registry;
+    registry.ReconcileTopology(BuildTopology(1));
+    ASSERT_TRUE(registry.ApplySummary(BuildSummary(0, *portHealth), "incarnation-0"));
+
+    auto snapshot = registry.GetRoutingSnapshot();
+    const auto &health = snapshot->workers.at(HostPort("127.0.0.1", WORKER_PORT_BASE));
+    EXPECT_TRUE(health.portHealth.valid);
+    EXPECT_EQ(health.portHealth.totalPortCount, 3u);
+    EXPECT_EQ(health.portHealth.badPortCount, 2u);
+    EXPECT_EQ(health.portHealth.healthEpoch, UB_PORT_HEALTH_FIRST_EPOCH);
+}
+
+TEST(WorkerUbHealthRegistryTest, FencesIdentityEpochAndDuplicateUpdates)
+{
+    client::WorkerUbHealthRegistry registry;
+    registry.ReconcileTopology(BuildTopology(1));
+    auto initial = BuildSummary(0, KnownPortHealth(4, 4, 3), 5);
+    ASSERT_TRUE(registry.ApplySummary(initial, initial.incarnation));
+    auto acceptedSnapshot = registry.GetRoutingSnapshot();
+
+    EXPECT_FALSE(registry.ApplySummary(initial, initial.incarnation));
+    EXPECT_EQ(registry.GetRoutingSnapshot(), acceptedSnapshot);
+
+    auto staleSummary = initial;
+    staleSummary.epoch = 4;
+    staleSummary.portHealth = KnownPortHealth(4, 0, 2);
+    EXPECT_FALSE(registry.ApplySummary(staleSummary, staleSummary.incarnation));
+    EXPECT_EQ(registry.GetRoutingSnapshot(), acceptedSnapshot);
+
+    auto wrongIdentity = initial;
+    wrongIdentity.incarnation = "stale-incarnation";
+    wrongIdentity.epoch = 6;
+    EXPECT_FALSE(registry.ApplySummary(wrongIdentity, wrongIdentity.incarnation));
+    EXPECT_EQ(registry.GetRoutingSnapshot(), acceptedSnapshot);
+}
+
+TEST(WorkerUbHealthRegistryTest, LogsOnlyRoutingHealthTransitionsWithSafeIncarnation)
+{
+    const bool oldAlsoLogToStderr = FLAGS_alsologtostderr;
+    Raii restoreFlag([oldAlsoLogToStderr] { FLAGS_alsologtostderr = oldAlsoLogToStderr; });
+    FLAGS_alsologtostderr = true;
+
+    const std::array<char, 16> binaryIncarnationBytes{
+        '\0', '\n', '\r', '\x1f', ' ', '\x7f', static_cast<char>(0x80), static_cast<char>(0xff),
+        '\x01', '\x02', '\x03', '\x04', '\x05', '\x06', '\x07', '\x08'
+    };
+    const std::string incarnation(binaryIncarnationBytes.data(), binaryIncarnationBytes.size());
+    auto topology = BuildTopology(1);
+    topology.mutable_members()->at("127.0.0.1:20000").set_id(incarnation);
+    client::WorkerUbHealthRegistry registry;
+    registry.ReconcileTopology(topology);
+
+    auto partial = BuildSummary(0, KnownPortHealth(4, 1, 1));
+    partial.incarnation = incarnation;
+    testing::internal::CaptureStderr();
+    ASSERT_TRUE(registry.ApplySummary(partial, incarnation));
+    auto logs = testing::internal::GetCapturedStderr();
+    EXPECT_NE(logs.find("UB_ROUTING_HEALTH action=updated"), std::string::npos) << logs;
+    EXPECT_NE(logs.find("source=rpc_response"), std::string::npos) << logs;
+    EXPECT_NE(logs.find("incarnation_prefix=" + FormatUbHealthIncarnationPrefix(incarnation)),
+              std::string::npos) << logs;
+    EXPECT_NE(logs.find("new_bad=1 new_total=4"), std::string::npos) << logs;
+    EXPECT_NE(logs.find("writable=1 routing_visible=true"), std::string::npos) << logs;
+
+    testing::internal::CaptureStderr();
+    EXPECT_FALSE(registry.ApplySummary(partial, incarnation));
+    logs = testing::internal::GetCapturedStderr();
+    EXPECT_EQ(logs.find("UB_ROUTING_HEALTH action=updated"), std::string::npos) << logs;
+
+    auto allDown = BuildSummary(0, KnownPortHealth(4, 4, 2), 2);
+    allDown.incarnation = incarnation;
+    testing::internal::CaptureStderr();
+    ASSERT_TRUE(registry.ApplyVerifiedSummary(allDown, incarnation));
+    logs = testing::internal::GetCapturedStderr();
+    EXPECT_NE(logs.find("source=query_response"), std::string::npos) << logs;
+    EXPECT_NE(logs.find("old_bad=1 old_total=4 new_valid=1 new_bad=4 new_total=4"), std::string::npos) << logs;
+    EXPECT_NE(logs.find("old_writable=1 writable=0"), std::string::npos) << logs;
 }
 
 TEST(WorkerUbHealthRegistryTest, PassiveFactsDoNotChangeVerifiedAdmission)

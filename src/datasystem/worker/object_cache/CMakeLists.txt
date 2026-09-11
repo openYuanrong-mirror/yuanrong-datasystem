@@ -97,6 +97,7 @@ set(WORKER_OBJECT_CACHE_DEPEND_LIBS
         master_object_protos
         cluster_topology_scope
         cluster_topology
+        remote_ub_port_health_verifier
         metadata_route_resolver
         worker_client_manager
         worker_health_check

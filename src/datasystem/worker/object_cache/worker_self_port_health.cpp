@@ -33,7 +33,7 @@ WorkerSelfPortHealth::~WorkerSelfPortHealth()
 void WorkerSelfPortHealth::Attach(std::shared_ptr<PeerUbAdmission> admission, const HostPort &selfWorker)
 {
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<bthread::Mutex> lock(mutex_);
         admission_ = admission;
         selfWorker_ = selfWorker;
     }
@@ -53,7 +53,7 @@ Status WorkerSelfPortHealth::Configure(std::shared_ptr<UbPortHealthMonitor> moni
 {
     CHECK_FAIL_RETURN_STATUS(monitor != nullptr, K_INVALID, "UB port health monitor is null");
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<bthread::Mutex> lock(mutex_);
         if (monitor_ != nullptr) {
             return Status::OK();
         }
@@ -65,13 +65,13 @@ Status WorkerSelfPortHealth::Configure(std::shared_ptr<UbPortHealthMonitor> moni
 
 std::shared_ptr<UbPortHealthMonitor> WorkerSelfPortHealth::GetMonitor() const
 {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<bthread::Mutex> lock(mutex_);
     return monitor_;
 }
 
 void WorkerSelfPortHealth::Stop()
 {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<bthread::Mutex> lock(mutex_);
     monitor_.reset();
     admission_.reset();
     secondaryObserver_.reset();
@@ -93,7 +93,7 @@ std::optional<UbPortHealthSummary> WorkerSelfPortHealth::GetSummary() const
 
 bool WorkerSelfPortHealth::IsEnabled() const
 {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<bthread::Mutex> lock(mutex_);
     return monitor_ != nullptr;
 }
 
@@ -118,7 +118,7 @@ void WorkerSelfPortHealth::OnUbPortHealthChanged(const UbPortHealthSummary &summ
     HostPort selfWorker;
     std::shared_ptr<IUbPortHealthObserver> observer;
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<bthread::Mutex> lock(mutex_);
         admission = admission_.lock();
         selfWorker = selfWorker_;
         observer = secondaryObserver_.lock();

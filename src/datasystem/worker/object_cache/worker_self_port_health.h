@@ -24,6 +24,8 @@
 #include <mutex>
 #include <optional>
 
+#include <bthread/mutex.h>
+
 #include "datasystem/common/object_cache/peer_ub_admission.h"
 #include "datasystem/common/object_cache/ub_port_health.h"
 #include "datasystem/common/util/net_util.h"
@@ -75,7 +77,7 @@ private:
     HostPort selfWorker_;
     std::shared_ptr<UbPortHealthMonitor> monitor_;
     std::weak_ptr<IUbPortHealthObserver> secondaryObserver_;
-    mutable std::mutex mutex_;
+    mutable bthread::Mutex mutex_;
 };
 
 }  // namespace object_cache

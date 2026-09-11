@@ -32,6 +32,11 @@
 #include <utility>
 #include <vector>
 
+#include <bthread/bthread.h>
+#include <bthread/condition_variable.h>
+#include <bthread/countdown_event.h>
+#include <bthread/mutex.h>
+
 #include "datasystem/client/object_cache/routing/ub_health_filter.h"
 #include "datasystem/client/object_cache/transport/common/deadline_retry.h"
 #include "datasystem/client/object_cache/transport/object_buffer_internal.h"
@@ -194,7 +199,7 @@ public:
 
     Status Set(ObjectBuffer &buffer, const TransportSetParam &, TransportSetResult *result = nullptr) override
     {
-        std::unique_lock<std::mutex> lock(setMutex);
+        std::unique_lock<bthread::Mutex> lock(setMutex);
         const int callIndex = ++setCount;
         if (result != nullptr) {
             result->publishAttempted = true;
@@ -202,9 +207,13 @@ public:
         setCv.notify_all();
         if (coordinateConcurrentSets) {
             if (callIndex == 1) {
-                setCv.wait(lock, [this]() { return setCount >= 2; });
+                while (setCount < 2 && !releaseSecondSet) {
+                    setCv.wait(lock);
+                }
             } else if (callIndex == 2) {
-                setCv.wait(lock, [this]() { return releaseSecondSet; });
+                while (!releaseSecondSet) {
+                    setCv.wait(lock);
+                }
             }
         }
         if (!setUbFailureReports.empty()) {
@@ -227,6 +236,34 @@ public:
         Status status = setStatuses.front();
         setStatuses.erase(setStatuses.begin());
         return status;
+    }
+
+    bool WaitForSetCount(int expected, std::chrono::milliseconds timeout)
+    {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        std::unique_lock<bthread::Mutex> lock(setMutex);
+        while (setCount < expected) {
+            const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
+                deadline - std::chrono::steady_clock::now());
+            if (remaining <= std::chrono::microseconds::zero()) {
+                return false;
+            }
+            (void)setCv.wait_for(lock, remaining.count());
+        }
+        return true;
+    }
+
+    void ReleaseBlockedSet()
+    {
+        std::lock_guard<bthread::Mutex> lock(setMutex);
+        releaseSecondSet = true;
+        setCv.notify_all();
+    }
+
+    int GetSetCount()
+    {
+        std::lock_guard<bthread::Mutex> lock(setMutex);
+        return setCount;
     }
 
     Status MCreate(const HostPort &workerAddr, const std::vector<std::string> &keys, const std::vector<uint64_t> &sizes,
@@ -290,8 +327,8 @@ public:
     Status mSetStatus{ Status::OK() };
     bool coordinateConcurrentSets{ false };
     bool releaseSecondSet{ false };
-    std::mutex setMutex;
-    std::condition_variable setCv;
+    bthread::Mutex setMutex;
+    bthread::ConditionVariable setCv;
 };
 
 class FakeDataPlaneManager : public DataPlaneManager {
@@ -1477,29 +1514,74 @@ TEST(TransportLayerAdmissionTest, ShutdownWaitsForAdmittedUbOperationsBeforeClos
     TestTransportLayer layer(manager, std::make_shared<FixedTransportAdvisor>(TransportHint::UB_CANDIDATE));
     std::shared_ptr<ObjectBuffer> first;
     std::shared_ptr<ObjectBuffer> second;
+    std::shared_ptr<ObjectBuffer> rejected;
     ASSERT_TRUE(layer.Create(MakeAddress(54), "first", 4, MakeCreateParam(), first).IsOk());
     ASSERT_TRUE(layer.Create(MakeAddress(54), "second", 4, MakeCreateParam(), second).IsOk());
+    ASSERT_TRUE(layer.Create(MakeAddress(54), "rejected", 4, MakeCreateParam(), rejected).IsOk());
     auto transporter = manager->builtTransporters.front();
     transporter->coordinateConcurrentSets = true;
 
-    auto firstSet = std::async(std::launch::async, [&] { return layer.Set(*first, MakeSetParam()); });
-    auto secondSet = std::async(std::launch::async, [&] { return layer.Set(*second, MakeSetParam()); });
-    {
-        std::unique_lock<std::mutex> lock(transporter->setMutex);
-        ASSERT_TRUE(
-            transporter->setCv.wait_for(lock, std::chrono::seconds(1), [&] { return transporter->setCount >= 2; }));
+    struct SetCall {
+        TestTransportLayer *layer;
+        ObjectBuffer *buffer;
+        Status result;
+    } firstCall{ &layer, first.get(), Status::OK() }, secondCall{ &layer, second.get(), Status::OK() };
+    auto runSet = [](void *arg) -> void * {
+        auto &call = *static_cast<SetCall *>(arg);
+        call.result = call.layer->Set(*call.buffer, MakeSetParam());
+        return nullptr;
+    };
+    bthread_t firstSet;
+    bthread_t secondSet;
+    ASSERT_EQ(bthread_start_background(&firstSet, nullptr, runSet, &firstCall), 0);
+    if (bthread_start_background(&secondSet, nullptr, runSet, &secondCall) != 0) {
+        transporter->ReleaseBlockedSet();
+        EXPECT_EQ(bthread_join(firstSet, nullptr), 0);
+        FAIL() << "Failed to start the second Set bthread";
     }
-    auto shutdown = std::async(std::launch::async, [&] { layer.Shutdown(); });
-    EXPECT_EQ(shutdown.wait_for(std::chrono::milliseconds(50)), std::future_status::timeout);
+    if (!transporter->WaitForSetCount(2, std::chrono::seconds(1))) {
+        transporter->ReleaseBlockedSet();
+        EXPECT_EQ(bthread_join(firstSet, nullptr), 0);
+        EXPECT_EQ(bthread_join(secondSet, nullptr), 0);
+        FAIL() << "Both Set bthreads were not admitted";
+    }
 
-    {
-        std::lock_guard<std::mutex> lock(transporter->setMutex);
-        transporter->releaseSecondSet = true;
+    struct ShutdownCall {
+        TestTransportLayer *layer;
+        bthread::CountdownEvent done{ 1 };
+    } shutdownCall{ &layer };
+    auto runShutdown = [](void *arg) -> void * {
+        auto &call = *static_cast<ShutdownCall *>(arg);
+        call.layer->Shutdown();
+        call.done.signal();
+        return nullptr;
+    };
+    bthread_t shutdown;
+    if (bthread_start_background(&shutdown, nullptr, runShutdown, &shutdownCall) != 0) {
+        transporter->ReleaseBlockedSet();
+        EXPECT_EQ(bthread_join(firstSet, nullptr), 0);
+        EXPECT_EQ(bthread_join(secondSet, nullptr), 0);
+        FAIL() << "Failed to start the Shutdown bthread";
     }
-    transporter->setCv.notify_all();
-    EXPECT_TRUE(firstSet.get().IsOk());
-    EXPECT_TRUE(secondSet.get().IsOk());
-    EXPECT_EQ(shutdown.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    if (!WaitUntil([&] { return layer.CheckLocalUbSenderAdmission().GetCode() == K_SHUTTING_DOWN; },
+                   std::chrono::seconds(1))) {
+        transporter->ReleaseBlockedSet();
+        EXPECT_EQ(bthread_join(firstSet, nullptr), 0);
+        EXPECT_EQ(bthread_join(secondSet, nullptr), 0);
+        EXPECT_EQ(bthread_join(shutdown, nullptr), 0);
+        FAIL() << "Shutdown did not close sender admission";
+    }
+    EXPECT_NE(shutdownCall.done.timed_wait(butil::milliseconds_from_now(50)), 0);
+    EXPECT_EQ(layer.Set(*rejected, MakeSetParam()).GetCode(), K_SHUTTING_DOWN);
+    EXPECT_EQ(transporter->GetSetCount(), 2);
+
+    transporter->ReleaseBlockedSet();
+    EXPECT_EQ(bthread_join(firstSet, nullptr), 0);
+    EXPECT_EQ(bthread_join(secondSet, nullptr), 0);
+    EXPECT_TRUE(firstCall.result.IsOk());
+    EXPECT_TRUE(secondCall.result.IsOk());
+    EXPECT_EQ(shutdownCall.done.timed_wait(butil::seconds_from_now(1)), 0);
+    EXPECT_EQ(bthread_join(shutdown, nullptr), 0);
 }
 
 TEST(TransportLayerAdmissionTest, LateCqe4DoesNotDirectlyCloseAdmission)

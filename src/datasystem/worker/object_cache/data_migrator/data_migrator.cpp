@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <exception>
 #include <thread>
 
 #include "datasystem/cluster/executor/topology_phase_callbacks.h"
@@ -267,6 +268,7 @@ std::future<MigrateDataHandler::MigrateResult> DataMigrator::MigrateToTargetNode
                 return finalResult;
             }
             auto result = handler.MigrateDataToRemote(options.isSlotMigration);
+            ObserveUbHealthSummary(result);
             bool localOperator = false;
             (void)LearnStructuredUbFailure(result, localOperator);
             return result;
@@ -413,6 +415,7 @@ Status DataMigrator::ProcessL2CacheSlotFutures(std::vector<SlotMigrateFuture> &f
             }
             uint32_t slot = fut.first;
             auto result = fut.second.get();
+            ObserveUbHealthSummary(result);
             if (result.failedIds.empty()) {
                 LOG(INFO) << MigrateDataHandler::ResultToString(result);
                 continue;
@@ -537,6 +540,7 @@ Status DataMigrator::HandleMigrateDataResult(const std::unordered_map<std::strin
     bool retryWaitCompleted = false;
     for (auto &fut : futures) {
         auto result = fut.get();
+        ObserveUbHealthSummary(result);
         if (result.failedIds.empty()) {
             LOG(INFO) << MigrateDataHandler::ResultToString(result);
             continue;
@@ -636,6 +640,20 @@ Status DataMigrator::SelectRedirectTarget(const std::string &originAddr, uint64_
         selectionOrigin = std::move(nextWorker);
     }
     return lastRc;
+}
+
+void DataMigrator::ObserveUbHealthSummary(const MigrateDataHandler::MigrateResult &result) const
+{
+    if (!result.ubHealthSummary.has_value() || !ubHealthSummaryObserver_) {
+        return;
+    }
+    try {
+        ubHealthSummaryObserver_(*result.ubHealthSummary);
+    } catch (const std::exception &error) {
+        LOG(ERROR) << "Migration UB health summary observer threw: " << error.what();
+    } catch (...) {
+        LOG(ERROR) << "Migration UB health summary observer threw";
+    }
 }
 
 bool DataMigrator::LearnStructuredUbFailure(const MigrateDataHandler::MigrateResult &result, bool &localOperator)

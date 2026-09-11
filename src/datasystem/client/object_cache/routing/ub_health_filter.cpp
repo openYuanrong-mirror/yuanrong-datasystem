@@ -40,7 +40,7 @@ bool UbHealthFilter::ObserveSummary(const UbHealthSummary &summary,
 {
     std::string expected = expectedIncarnation;
     {
-        std::lock_guard<std::mutex> lock(incarnationMutex_);
+        std::lock_guard<bthread::Mutex> lock(incarnationMutex_);
         if (topologyInitialized_) {
             auto trusted = trustedIncarnations_.find(summary.worker);
             if (trusted == trustedIncarnations_.end()) {
@@ -54,7 +54,7 @@ bool UbHealthFilter::ObserveSummary(const UbHealthSummary &summary,
     if (!accepted.has_value() || accepted->incarnation != expected) {
         return false;
     }
-    std::lock_guard<std::mutex> lock(incarnationMutex_);
+    std::lock_guard<bthread::Mutex> lock(incarnationMutex_);
     auto trusted = trustedIncarnations_.find(summary.worker);
     if (topologyInitialized_
         && (trusted == trustedIncarnations_.end() || trusted->second != summary.incarnation)) {
@@ -71,7 +71,7 @@ bool UbHealthFilter::ApplySummary(const UbHealthSummary &summary, const std::str
 {
     std::string expected = expectedIncarnation;
     {
-        std::lock_guard<std::mutex> lock(incarnationMutex_);
+        std::lock_guard<bthread::Mutex> lock(incarnationMutex_);
         if (topologyInitialized_) {
             auto trusted = trustedIncarnations_.find(summary.worker);
             if (trusted == trustedIncarnations_.end()) {
@@ -90,7 +90,7 @@ bool UbHealthFilter::ApplySummary(const UbHealthSummary &summary, const std::str
     }
     const bool legacyReadRecovery = wasGloballyUnavailable
                                     && !ubHealthRegistry_->IsVerifiedUnavailable(summary.worker);
-    std::lock_guard<std::mutex> lock(incarnationMutex_);
+    std::lock_guard<bthread::Mutex> lock(incarnationMutex_);
     auto trusted = trustedIncarnations_.find(summary.worker);
     if (topologyInitialized_
         && (trusted == trustedIncarnations_.end() || trusted->second != summary.incarnation)) {
@@ -142,7 +142,7 @@ void UbHealthFilter::ApplyTopologyIncarnations(const ::datasystem::ClusterTopolo
         replacement.emplace(std::move(worker), member.id());
     }
 
-    std::lock_guard<std::mutex> lock(incarnationMutex_);
+    std::lock_guard<bthread::Mutex> lock(incarnationMutex_);
     topologyInitialized_ = true;
     for (const auto &[worker, incarnation] : replacement) {
         ReconcileLocalObservationWithTrustedIncarnationLocked(worker, incarnation);
@@ -207,14 +207,14 @@ bool UbHealthFilter::ReportProviderFailure(const HostPort &provider, const Provi
         return false;
     }
     {
-        std::lock_guard<std::mutex> lock(incarnationMutex_);
+        std::lock_guard<bthread::Mutex> lock(incarnationMutex_);
         EnablePortHealthVerificationIfSupportedLocked(outcome->peer);
     }
     localAdmission_.ReportOutcome(*outcome);
     const auto state = localAdmission_.GetState(provider);
     const bool unavailable = state.has_value() && state->state == UbAdmissionState::UNAVAILABLE;
     if (unavailable) {
-        std::lock_guard<std::mutex> lock(incarnationMutex_);
+        std::lock_guard<bthread::Mutex> lock(incarnationMutex_);
         auto incarnation = trustedIncarnations_.find(provider);
         localObservationIncarnations_[provider] =
             incarnation == trustedIncarnations_.end() ? std::string{} : incarnation->second;
@@ -232,14 +232,14 @@ bool UbHealthFilter::ReportWriteTargetFailure(const HostPort &worker, const Stat
     outcome.cqeStatus = cqeStatus;
     outcome.learnedFrom = "client_write_target";
     {
-        std::lock_guard<std::mutex> lock(incarnationMutex_);
+        std::lock_guard<bthread::Mutex> lock(incarnationMutex_);
         EnablePortHealthVerificationIfSupportedLocked(worker);
     }
     writeTargetAdmission_->ReportOutcome(outcome);
     const auto state = writeTargetAdmission_->GetState(worker);
     const bool unavailable = state.has_value() && state->state == UbAdmissionState::UNAVAILABLE;
     if (unavailable) {
-        std::lock_guard<std::mutex> lock(incarnationMutex_);
+        std::lock_guard<bthread::Mutex> lock(incarnationMutex_);
         auto incarnation = trustedIncarnations_.find(worker);
         writeTargetObservationIncarnations_[worker] =
             incarnation == trustedIncarnations_.end() ? std::string{} : incarnation->second;
@@ -256,7 +256,7 @@ uint64_t UbHealthFilter::CaptureWriteTargetCompletionGeneration(const HostPort &
     if (generation != generations->end()) {
         return generation->second;
     }
-    std::lock_guard<std::mutex> lock(incarnationMutex_);
+    std::lock_guard<bthread::Mutex> lock(incarnationMutex_);
     generations = std::atomic_load(&writeTargetCompletionGenerations_);
     generation = generations->find(worker);
     if (generation != generations->end()) {
@@ -306,14 +306,14 @@ void UbHealthFilter::ReportLateWriteTargetFailure(const UrmaLateCompletion &comp
         HostPort worker;
         const bool validWorker = worker.ParseString(completion.remoteAddress).IsOk();
         if (validWorker) {
-            std::lock_guard<std::mutex> lock(incarnationMutex_);
+            std::lock_guard<bthread::Mutex> lock(incarnationMutex_);
             EnablePortHealthVerificationIfSupportedLocked(worker);
         }
         writeTargetAdmission_->OnLateUrmaCompletion(completion, context->ownerToken, peerToken);
         if (validWorker) {
             const auto state = writeTargetAdmission_->GetState(worker);
             if (state.has_value() && state->state == UbAdmissionState::UNAVAILABLE) {
-                std::lock_guard<std::mutex> lock(incarnationMutex_);
+                std::lock_guard<bthread::Mutex> lock(incarnationMutex_);
                 auto incarnation = trustedIncarnations_.find(worker);
                 writeTargetObservationIncarnations_[worker] =
                     incarnation == trustedIncarnations_.end() ? std::string{} : incarnation->second;
@@ -372,7 +372,7 @@ bool UbHealthFilter::IsWriteTargetAvailable(const HostPort &addr) const
 
 bool UbHealthFilter::SupportsPortHealthVerification(const HostPort &addr) const
 {
-    std::lock_guard<std::mutex> lock(incarnationMutex_);
+    std::lock_guard<bthread::Mutex> lock(incarnationMutex_);
     auto summary = ubHealthRegistry_->GetSummary(addr);
     if (!summary.has_value() || !summary->portHealth.has_value()) {
         return false;
@@ -388,7 +388,7 @@ std::vector<HostPort> UbHealthFilter::GetUnavailableWriteTargets() const
     if (writeTargetObservationCount_.load(std::memory_order_acquire) == 0) {
         return unavailable;
     }
-    std::lock_guard<std::mutex> lock(incarnationMutex_);
+    std::lock_guard<bthread::Mutex> lock(incarnationMutex_);
     unavailable.reserve(writeTargetObservationIncarnations_.size());
     for (const auto &[worker, incarnation] : writeTargetObservationIncarnations_) {
         (void)incarnation;
@@ -411,7 +411,7 @@ std::optional<UbPathState> UbHealthFilter::GetLocalObservation(const HostPort &a
 
 bool UbHealthFilter::SeedProviderRecoveryFromGlobalSummary(const HostPort &addr)
 {
-    std::lock_guard<std::mutex> lock(incarnationMutex_);
+    std::lock_guard<bthread::Mutex> lock(incarnationMutex_);
     auto summary = ubHealthRegistry_->GetSummary(addr);
     if (!summary.has_value() || summary->writable) {
         return false;
@@ -427,7 +427,7 @@ bool UbHealthFilter::SeedProviderRecoveryFromGlobalSummary(const HostPort &addr)
 
 std::optional<ProviderUbRecoveryCandidate> UbHealthFilter::TryBeginProviderRecovery(uint64_t nowMs)
 {
-    std::lock_guard<std::mutex> lock(incarnationMutex_);
+    std::lock_guard<bthread::Mutex> lock(incarnationMutex_);
     auto worker = localAdmission_.NextProbeCandidate(nowMs);
     if (!worker.has_value()) {
         return std::nullopt;
@@ -448,7 +448,7 @@ bool UbHealthFilter::CompleteProviderRecovery(const ProviderUbRecoveryCandidate 
     std::optional<std::string> registryExpectedIncarnation;
     Status completion = probeStatus;
     {
-        std::lock_guard<std::mutex> lock(incarnationMutex_);
+        std::lock_guard<bthread::Mutex> lock(incarnationMutex_);
         if (!summary.has_value() || summary->worker != candidate.token.peer || summary->incarnation.empty()
             || (!candidate.expectedIncarnation.empty() && summary->incarnation != candidate.expectedIncarnation)) {
             completion = Status(K_INVALID, "Provider UB recovery response identity does not match probe candidate");
@@ -473,7 +473,7 @@ bool UbHealthFilter::CompleteProviderRecovery(const ProviderUbRecoveryCandidate 
     }
     bool recovered = localAdmission_.CompleteProbe(candidate.token, completion, nowMs, false);
     if (recovered) {
-        std::lock_guard<std::mutex> lock(incarnationMutex_);
+        std::lock_guard<bthread::Mutex> lock(incarnationMutex_);
         recovered = localAdmission_.CheckReadSource(candidate.token.peer).IsOk();
         if (recovered) {
             localObservationIncarnations_.erase(candidate.token.peer);
@@ -491,13 +491,13 @@ bool UbHealthFilter::CompleteProviderRecovery(const ProviderUbRecoveryCandidate 
 
 std::optional<uint64_t> UbHealthFilter::NextProviderRecoveryDeadlineMs() const
 {
-    std::lock_guard<std::mutex> lock(incarnationMutex_);
+    std::lock_guard<bthread::Mutex> lock(incarnationMutex_);
     return localAdmission_.NextProbeDeadlineMs();
 }
 
 std::optional<WriteTargetUbRecoveryCandidate> UbHealthFilter::TryBeginWriteTargetRecovery(uint64_t nowMs)
 {
-    std::lock_guard<std::mutex> lock(incarnationMutex_);
+    std::lock_guard<bthread::Mutex> lock(incarnationMutex_);
     auto worker = writeTargetAdmission_->NextProbeCandidate(nowMs);
     if (!worker.has_value()) {
         return std::nullopt;
@@ -516,7 +516,7 @@ bool UbHealthFilter::CompleteWriteTargetRecovery(const WriteTargetUbRecoveryCand
 {
     Status completion = probeStatus;
     {
-        std::lock_guard<std::mutex> lock(incarnationMutex_);
+        std::lock_guard<bthread::Mutex> lock(incarnationMutex_);
         auto trusted = trustedIncarnations_.find(candidate.token.peer);
         if (topologyInitialized_
             && (trusted == trustedIncarnations_.end()
@@ -527,7 +527,7 @@ bool UbHealthFilter::CompleteWriteTargetRecovery(const WriteTargetUbRecoveryCand
     }
     bool recovered = writeTargetAdmission_->CompleteProbe(candidate.token, completion, nowMs, false);
     if (recovered) {
-        std::lock_guard<std::mutex> lock(incarnationMutex_);
+        std::lock_guard<bthread::Mutex> lock(incarnationMutex_);
         recovered = writeTargetAdmission_->CheckWriteTarget(candidate.token.peer, UbOperationKind::CLIENT_PUT).IsOk();
         if (recovered) {
             writeTargetObservationIncarnations_.erase(candidate.token.peer);
@@ -546,7 +546,7 @@ bool UbHealthFilter::CompleteWriteTargetRecovery(const WriteTargetUbRecoveryCand
 
 std::optional<uint64_t> UbHealthFilter::NextWriteTargetRecoveryDeadlineMs() const
 {
-    std::lock_guard<std::mutex> lock(incarnationMutex_);
+    std::lock_guard<bthread::Mutex> lock(incarnationMutex_);
     return writeTargetAdmission_->NextProbeDeadlineMs();
 }
 }  // namespace datasystem::client

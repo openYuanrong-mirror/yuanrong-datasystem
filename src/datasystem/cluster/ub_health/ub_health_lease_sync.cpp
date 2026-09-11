@@ -14,6 +14,22 @@
 #include "datasystem/protos/share_memory.pb.h"
 
 namespace datasystem::cluster {
+namespace {
+UbHealthSummary ReconcileLeaseSummary(const UbHealthSummary *previous,
+                                      UbHealthSummary incoming)
+{
+    if (previous == nullptr || previous->worker != incoming.worker
+        || previous->incarnation != incoming.incarnation) {
+        return incoming;
+    }
+    UbHealthSummary merged;
+    if (MergeUbHealthSummary(previous, incoming, merged)) {
+        return merged;
+    }
+    return *previous;
+}
+}  // namespace
+
 UbHealthLeaseSync::UbHealthLeaseSync(ICoordinationBackend &backend, Config config)
     : UbHealthLeaseSync(
           [&backend](const std::string &table, const std::string &key, const std::string &value) {
@@ -89,6 +105,22 @@ Status UbHealthLeaseSync::SyncOnce()
 
     std::vector<std::pair<std::string, std::string>> records;
     RETURN_IF_NOT_OK(loader_(tableName_, records));
+    auto nextSummaries = DecodeLeaseSummaries(records);
+
+    std::vector<UbHealthSummary> summaries;
+    summaries.reserve(nextSummaries.size());
+    for (const auto &[key, summary] : nextSummaries) {
+        (void)key;
+        summaries.emplace_back(summary);
+    }
+    lastSummaries_ = std::move(nextSummaries);
+    consumer_(summaries);
+    return Status::OK();
+}
+
+std::unordered_map<std::string, UbHealthSummary> UbHealthLeaseSync::DecodeLeaseSummaries(
+    const std::vector<std::pair<std::string, std::string>> &records) const
+{
     std::unordered_map<std::string, UbHealthSummary> nextSummaries;
     nextSummaries.reserve(records.size());
     for (const auto &[key, value] : records) {
@@ -111,18 +143,11 @@ Status UbHealthLeaseSync::SyncOnce()
             }
             continue;
         }
-        nextSummaries.emplace(key, std::move(summary));
+        auto previous = lastSummaries_.find(key);
+        const auto *previousSummary = previous == lastSummaries_.end() ? nullptr : &previous->second;
+        nextSummaries.emplace(key, ReconcileLeaseSummary(previousSummary, std::move(summary)));
     }
-
-    std::vector<UbHealthSummary> summaries;
-    summaries.reserve(nextSummaries.size());
-    for (const auto &[key, summary] : nextSummaries) {
-        (void)key;
-        summaries.emplace_back(summary);
-    }
-    lastSummaries_ = std::move(nextSummaries);
-    consumer_(summaries);
-    return Status::OK();
+    return nextSummaries;
 }
 
 void UbHealthLeaseSync::Run()

@@ -72,6 +72,13 @@ public:
                           provider ? std::make_shared<const UbHealthSummaryProvider>(std::move(provider)) : nullptr);
     }
 
+    void SetRemoteUbHealthSummaryObserver(UbHealthSummaryApplyHook summaryObserver)
+    {
+        std::atomic_store(&remoteUbHealthSummaryObserver_,
+                          summaryObserver ? std::make_shared<const UbHealthSummaryApplyHook>(std::move(summaryObserver))
+                                          : nullptr);
+    }
+
     /**
      * @brief Acquire a resident local object for a side-effect-free direct read.
      * @param[in] objectKey Object key to look up.
@@ -234,6 +241,9 @@ public:
      * @return K_OK only after the probe CQE succeeds.
      */
     Status ProbeUbConnectionToPeer(const HostPort &peerAddr, UrmaWriteFailure *failure = nullptr);
+
+    Status QueryPeerUbPortHealth(const HostPort &peerAddr, const std::string &expectedIncarnation,
+                                 int32_t timeoutMs, UbHealthSummary &summary);
 
 private:
     using ObjectKeysQueryMetaFailed = std::tuple<std::unordered_set<std::string>, std::unordered_set<std::string>>;
@@ -1265,6 +1275,7 @@ private:
     std::shared_ptr<PeerUbAdmission> ubAdmission_{ nullptr };
 
     std::shared_ptr<const UbHealthSummaryProvider> ubHealthSummaryProvider_;
+    std::shared_ptr<const UbHealthSummaryApplyHook> remoteUbHealthSummaryObserver_;
 
     std::unique_ptr<AsyncUpdateLocationManager> asyncUpdateLocationManager_{ nullptr };
 

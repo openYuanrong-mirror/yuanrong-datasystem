@@ -79,6 +79,7 @@ public:
         std::unordered_set<ImmutableString> skipIds;
         std::shared_ptr<SelectionStrategy> strategy;
         std::optional<ProviderUbFailureDetailPb> ubFailureDetail;
+        std::optional<UbHealthSummary> ubHealthSummary;
         int retryCount = 0;
         // Target's fresh available memory (headroom to high-water) reported by the target in the
         // last batch's MigrateDataRspPb. UINT64_MAX means no batch was sent (e.g. all objects
@@ -181,6 +182,8 @@ private:
      */
     Status SelfHealBusyRate(uint64_t requiredSize);
 
+    bool WaitForBusyHealRetry(uint64_t sleepMs) const;
+
     /**
      * @brief Build the final self-heal status from the probe outcome.
      * @param[in] recovered Whether the refreshed rate can admit the pending batch within the bounded wait.
@@ -190,6 +193,8 @@ private:
      * @return K_OK if rate recovered, the error otherwise (cancelled, K_NOT_READY, or last RPC error).
      */
     Status BuildHealResult(bool recovered, uint64_t rate, int probesMade, const Status &lastErr);
+
+    void CaptureRemoteUbHealth(const UbHealthSummaryPb &encoded);
 
     bool IsRateRecovered(uint64_t rate, uint64_t estimatedWaitMs, uint64_t requiredSize) const;
     uint64_t GetScaleDownMaxLimiterWaitMilliseconds(uint64_t requiredSize) const;
@@ -301,6 +306,7 @@ private:
     std::vector<std::unique_ptr<BaseDataUnit>> datas_;
     std::vector<AsyncResourceReleaser::PreparedTask> preparedReleaseTasks_;
     std::optional<ProviderUbFailureDetailPb> ubFailureDetail_;
+    std::optional<UbHealthSummary> ubHealthSummary_;
     std::function<Status()> sendAdmission_;
     // Last target remain_bytes received from a real batch send (updated in
     // HandleMigrationTransportResponse; spy/probe paths do not touch it). UINT64_MAX means no

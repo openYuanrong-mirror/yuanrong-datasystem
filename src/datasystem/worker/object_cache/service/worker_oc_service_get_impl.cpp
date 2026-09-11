@@ -1730,6 +1730,9 @@ Status WorkerOcServiceGetImpl::CheckRemoteReadAdmission(const std::string &addre
     if (ubAdmission_ == nullptr) {
         return Status::OK();
     }
+    if (IsUrmaEnabled() && !FLAGS_enable_transport_fallback) {
+        RETURN_IF_NOT_OK(ubAdmission_->CheckWriteTarget(localAddress_, UbOperationKind::WORKER_REMOTE_GET_WRITEBACK));
+    }
     HostPort peer;
     RETURN_IF_NOT_OK(peer.ParseString(address));
     auto status = ubAdmission_->CheckReadSource(peer);
@@ -1768,7 +1771,7 @@ void WorkerOcServiceGetImpl::ReportRemoteReadOutcome(const std::string &address,
 void WorkerOcServiceGetImpl::ReportRemoteReadOutcome(const std::string &address, const GetObjectRemoteRspPb &response,
                                                      const std::string &learnedFrom) const
 {
-    if (ubAdmission_ == nullptr || !response.has_provider_ub_failure_detail()) {
+    if (ubAdmission_ == nullptr) {
         return;
     }
     HostPort peer;
@@ -1783,6 +1786,16 @@ void WorkerOcServiceGetImpl::ReportRemoteReadOutcome(const std::string &address,
 void WorkerOcServiceGetImpl::ReportRemoteReadOutcome(const HostPort &peer, const GetObjectRemoteRspPb &response,
                                                      const std::string &learnedFrom) const
 {
+    auto observer = std::atomic_load(&remoteUbHealthSummaryObserver_);
+    if (response.has_ub_health_summary() && observer != nullptr) {
+        UbHealthSummary summary;
+        if (DecodeUbHealthSummary(response.ub_health_summary(), summary).IsOk() && summary.worker == peer) {
+            (*observer)(summary);
+        }
+    }
+    if (!response.has_provider_ub_failure_detail()) {
+        return;
+    }
     auto outcome = DecodeProviderUbFailureDetail(response.provider_ub_failure_detail(), peer,
                                                  UbOperationKind::WORKER_REMOTE_GET_WRITEBACK, learnedFrom);
     if (outcome.has_value()) {
@@ -1802,6 +1815,13 @@ void WorkerOcServiceGetImpl::ReportRemoteReadOutcome(const std::string &address,
     if (rc.IsError()) {
         LOG(WARNING) << FormatString("[Get] Failed to parse remote read peer [%s]: %s", address, rc.ToString());
         return;
+    }
+    auto observer = std::atomic_load(&remoteUbHealthSummaryObserver_);
+    if (response.has_ub_health_summary() && observer != nullptr) {
+        UbHealthSummary summary;
+        if (DecodeUbHealthSummary(response.ub_health_summary(), summary).IsOk() && summary.worker == peer) {
+            (*observer)(summary);
+        }
     }
     for (const auto &item : response.responses()) {
         if (item.has_provider_ub_failure_detail()) {
@@ -4395,5 +4415,23 @@ Status WorkerOcServiceGetImpl::ProbeUbConnectionToPeer(const HostPort &peerAddr,
     return ProbeUbDataPlane(response, failure);
 }
 
+Status WorkerOcServiceGetImpl::QueryPeerUbPortHealth(const HostPort &peerAddr,
+                                                     const std::string &expectedIncarnation,
+                                                     int32_t timeoutMs, UbHealthSummary &summary)
+{
+    summary = UbHealthSummary{};
+    std::shared_ptr<WorkerRemoteWorkerOCApi> workerApi;
+    RETURN_IF_NOT_OK(CreateRemoteWorkerApi(peerAddr.ToString(), localAddress_, akSkManager_, workerApi));
+    QueryUbPortHealthRspPb rsp;
+    RETURN_IF_NOT_OK(workerApi->QueryUbPortHealth(expectedIncarnation, timeoutMs, rsp));
+    CHECK_FAIL_RETURN_STATUS(rsp.has_health_summary(), K_INVALID,
+                             "Worker UB port health query response has no summary");
+    RETURN_IF_NOT_OK(DecodeUbHealthSummary(rsp.health_summary(), summary));
+    CHECK_FAIL_RETURN_STATUS(summary.worker == peerAddr, K_INVALID,
+                             "Worker UB port health query response endpoint mismatch");
+    CHECK_FAIL_RETURN_STATUS(summary.incarnation == expectedIncarnation, K_NOT_READY,
+                             "Worker UB port health query response incarnation mismatch");
+    return Status::OK();
+}
 }  // namespace object_cache
 }  // namespace datasystem

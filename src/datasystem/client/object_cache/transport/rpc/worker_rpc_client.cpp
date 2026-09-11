@@ -568,7 +568,7 @@ Status WorkerRpcClient::QueryUbPortHealth(const std::string &expectedWorkerIncar
 
 void WorkerRpcClient::SetUbHealthSummaryCallback(UbHealthSummaryApplyHook callback)
 {
-    std::lock_guard<std::mutex> lock(ubHealthSummaryMutex_);
+    std::lock_guard<bthread::Mutex> lock(ubHealthSummaryMutex_);
     ubHealthSummaryCallback_ = std::move(callback);
 }
 
@@ -589,7 +589,7 @@ void WorkerRpcClient::ObserveUbHealthSummary(const UbHealthSummaryPb &encoded)
 
     UbHealthSummaryApplyHook callback;
     {
-        std::lock_guard<std::mutex> lock(ubHealthSummaryMutex_);
+        std::lock_guard<bthread::Mutex> lock(ubHealthSummaryMutex_);
         current = std::atomic_load(&lastUbHealthSummary_);
         if (current != nullptr && IsSameUbHealthSummary(*current, summary)) {
             return;

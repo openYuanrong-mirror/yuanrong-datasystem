@@ -123,6 +123,7 @@ Status FastMigrateTransport::MigrateDataToRemote(const Request &req, Response &r
     rspPb.Clear();
     GetRequestContext()->reqTimeoutDuration.InitWithPositiveTime(migrateDirectTimeoutMs);
     Status rc = req.api->MigrateDataDirect(reqPb, rspPb);
+    CollectUbHealthSummary(rspPb, req, rsp);
     point.RecordAndReset(PerfKey::WORKER_MIGRATE_DIRECT_RSP_PROCESS);
     if (rspPb.has_provider_ub_failure_detail()) {
         rsp.ubFailureDetail = rspPb.provider_ub_failure_detail();

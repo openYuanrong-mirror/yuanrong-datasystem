@@ -166,6 +166,32 @@ TEST_F(UrmaMockBackendTest, CreateContextJfrJettyRoundTrip)
     EXPECT_EQ(ds_urma_mock_delete_context(ctx), URMA_SUCCESS);
 }
 
+TEST_F(UrmaMockBackendTest, ModifyJettyToErrorEmitsFlushCompletion)
+{
+    auto *rawDev = datasystem::urma_mock::MockUrmaBackend::Instance().GetDevices()[0]->GetPrivRawDev();
+    urma_context_t *ctx = ds_urma_mock_create_context(rawDev, 0);
+    ASSERT_NE(ctx, nullptr);
+    urma_jfc_t *jfc = ds_urma_mock_create_jfc(ctx, nullptr);
+    ASSERT_NE(jfc, nullptr);
+    urma_jetty_cfg_t jettyCfg{};
+    jettyCfg.jfs_cfg.jfc = jfc;
+    urma_jetty_t *jetty = ds_urma_mock_create_jetty(ctx, &jettyCfg);
+    ASSERT_NE(jetty, nullptr);
+
+    urma_jetty_attr_t attr{};
+    attr.mask = JETTY_STATE;
+    attr.state = URMA_JETTY_STATE_ERROR;
+    ASSERT_EQ(ds_urma_mock_modify_jetty(jetty, &attr), URMA_SUCCESS);
+    urma_cr_t completion{};
+    ASSERT_EQ(ds_urma_mock_poll_jfc(jfc, 1, &completion), 1);
+    EXPECT_EQ(completion.status, URMA_CR_WR_FLUSH_ERR_DONE);
+    EXPECT_EQ(completion.local_id, jetty->jetty_id.id);
+
+    EXPECT_EQ(ds_urma_mock_delete_jetty(jetty), URMA_SUCCESS);
+    EXPECT_EQ(ds_urma_mock_delete_jfc(jfc), URMA_SUCCESS);
+    EXPECT_EQ(ds_urma_mock_delete_context(ctx), URMA_SUCCESS);
+}
+
 TEST_F(UrmaMockBackendTest, ConcurrentNextIdAllocationsAreUnique)
 {
     constexpr size_t kThreadCount = 32;

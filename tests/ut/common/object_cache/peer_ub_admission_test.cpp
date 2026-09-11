@@ -24,6 +24,9 @@
 #include <thread>
 #include <vector>
 
+#include <bthread/bthread.h>
+#include <bthread/countdown_event.h>
+
 #include "datasystem/common/flags/common_flags.h"
 #include "datasystem/common/object_cache/peer_ub_admission.h"
 #include "datasystem/common/util/raii.h"
@@ -37,6 +40,13 @@ namespace {
 const HostPort PEER("127.0.0.1", 31501);
 const HostPort SELF("127.0.0.1", 31502);
 constexpr char GLOBAL_SUMMARY_LOG_MARKER[] = "UB_HEALTH_SUMMARY action=global_summary_applied";
+constexpr char ADMISSION_AVAILABLE_LOG_MARKER[] = "UB admission marked peer AVAILABLE";
+
+struct CapturedProbeCompletion {
+    bool recovered;
+    std::string logs;
+};
+
 UbPortHealthSummary PortSummary(uint32_t totalPortCount, uint32_t badPortCount, uint64_t healthEpoch,
                                 bool verificationPending = false)
 {
@@ -58,6 +68,58 @@ std::string CaptureGlobalSummaryReplace(PeerUbAdmission &admission,
     testing::internal::CaptureStderr();
     admission.ReplaceGlobalSummaries(summaries);
     return testing::internal::GetCapturedStderr();
+}
+
+CapturedProbeCompletion CaptureProbeCompletion(PeerUbAdmission &admission, const UbProbeToken &token,
+                                               const Status &status, uint64_t nowMs,
+                                               bool requireGlobalAvailable)
+{
+    testing::internal::CaptureStderr();
+    const bool recovered = admission.CompleteProbe(token, status, nowMs, requireGlobalAvailable);
+    return { recovered, testing::internal::GetCapturedStderr() };
+}
+
+TEST(PeerUbAdmissionTest, ConcurrentRejectionsPermitVerifiedPartialRecovery)
+{
+    PeerUbAdmission admission(VERIFIED);
+    EnablePeerPortHealth(admission);
+    ASSERT_TRUE(admission.ApplyPortHealth(PEER, PortSummary(4, 4, 1), QUERY));
+    const auto writeError = admission.CheckWriteTarget(PEER, UbOperationKind::CLIENT_PUT);
+    const auto readError = admission.CheckReadSource(PEER);
+    struct Context {
+        PeerUbAdmission *admission;
+        StatusCode writeCode;
+        StatusCode readCode;
+        bthread::CountdownEvent start{ 1 };
+        std::atomic<bool> valid{ true };
+    } context{ &admission, writeError.GetCode(), readError.GetCode() };
+    std::vector<bthread_t> readers;
+    for (size_t i = 0; i < 8; ++i) {
+        bthread_t reader;
+        auto run = [](void *arg) -> void * {
+            auto &shared = *static_cast<Context *>(arg);
+            shared.start.wait();
+            for (size_t j = 0; j < 100; ++j) {
+                const auto write = shared.admission->CheckWriteTarget(PEER, UbOperationKind::CLIENT_PUT);
+                const auto read = shared.admission->CheckReadSource(PEER);
+                if ((write.IsError() && write.GetCode() != shared.writeCode)
+                    || (read.IsError() && read.GetCode() != shared.readCode)) {
+                    shared.valid.store(false, std::memory_order_release);
+                }
+            }
+            return nullptr;
+        };
+        ASSERT_EQ(bthread_start_background(&reader, nullptr, run, &context), 0);
+        readers.emplace_back(reader);
+    }
+    context.start.signal();
+    EXPECT_TRUE(admission.ApplyPortHealth(PEER, PortSummary(4, 3, 2), QUERY));
+    for (const auto reader : readers) {
+        EXPECT_EQ(bthread_join(reader, nullptr), 0);
+    }
+    EXPECT_TRUE(context.valid.load(std::memory_order_acquire));
+    EXPECT_TRUE(admission.CheckWriteTarget(PEER, UbOperationKind::CLIENT_PUT).IsOk());
+    EXPECT_TRUE(admission.CheckReadSource(PEER).IsOk());
 }
 
 TEST(PeerUbAdmissionTest, Error4TriggersVerificationAndAllDownFactBlocksReadSource)
@@ -355,6 +417,116 @@ TEST(PeerUbAdmissionTest, PortHealthEpochRejectsOlderAndConflictingFacts)
     EXPECT_EQ(admission.GetState(PEER)->portHealth->healthEpoch, 3u);
 }
 
+TEST(PeerUbAdmissionTest, TrustedIncarnationReplacementResetsPortHealthEpoch)
+{
+    PeerUbAdmission admission(VERIFIED);
+    UbHealthSummary oldWorker;
+    oldWorker.worker = PEER;
+    oldWorker.incarnation = "worker-old";
+    oldWorker.epoch = 1;
+    admission.ReplaceGlobalSummaries({ oldWorker });
+    ASSERT_TRUE(admission.ApplyPortHealth(PEER, PortSummary(4, 4, 8), QUERY));
+
+    auto restartedWorker = oldWorker;
+    restartedWorker.incarnation = "worker-new";
+    restartedWorker.epoch = 1;
+    admission.ReplaceGlobalSummaries({ restartedWorker });
+
+    EXPECT_FALSE(admission.GetState(PEER).has_value());
+    EXPECT_TRUE(admission.ApplyPortHealth(PEER, PortSummary(4, 4, 1), QUERY));
+    ASSERT_TRUE(admission.GetState(PEER)->portHealth.has_value());
+    EXPECT_EQ(admission.GetState(PEER)->portHealth->healthEpoch, 1u);
+}
+
+TEST(PeerUbAdmissionTest, PartialQuerySettlesSuspectAndAllowsNewFailureVerification)
+{
+    PeerUbAdmission admission(VERIFIED);
+    EnablePeerPortHealth(admission);
+    UbOpOutcome error4(PEER, UbOperationKind::MIGRATION_WRITE, Status(K_URMA_ERROR, "CQE status 4"));
+    error4.cqeStatus = URMA_PORT_UNAVAILABLE_STATUS;
+    admission.ReportOutcome(error4);
+    ASSERT_EQ(admission.GetState(PEER)->state, UbAdmissionState::SUSPECT);
+
+    ASSERT_TRUE(admission.ApplyPortHealth(PEER, PortSummary(4, 3, 1), QUERY));
+    EXPECT_EQ(admission.GetState(PEER)->state, UbAdmissionState::AVAILABLE);
+    EXPECT_FALSE(admission.GetState(PEER)->portHealthGoverned);
+
+    UbOpOutcome timeout(PEER, UbOperationKind::MIGRATION_WRITE,
+                        Status(K_RPC_DEADLINE_EXCEEDED, "path timeout"));
+    admission.ReportOutcome(timeout);
+    EXPECT_EQ(admission.GetState(PEER)->state, UbAdmissionState::SUSPECT);
+    EXPECT_TRUE(admission.ApplyPortHealth(PEER, PortSummary(4, 3, 1), QUERY));
+    EXPECT_EQ(admission.GetState(PEER)->state, UbAdmissionState::AVAILABLE);
+
+    UbOpOutcome error9(PEER, UbOperationKind::MIGRATION_WRITE, Status(K_URMA_ERROR, "CQE status 9"));
+    error9.cqeStatus = URMA_REMOTE_ACK_TIMEOUT_STATUS;
+    admission.ReportOutcome(error9);
+    EXPECT_EQ(admission.GetState(PEER)->state, UbAdmissionState::SUSPECT);
+    EXPECT_FALSE(admission.TryBeginProbe(PEER, std::numeric_limits<uint64_t>::max()).has_value());
+}
+
+TEST(PeerUbAdmissionTest, PortHealthFactTransitionsLogAdmissionState)
+{
+    const bool oldAlsoLogToStderr = FLAGS_alsologtostderr;
+    Raii restoreFlag([oldAlsoLogToStderr] { FLAGS_alsologtostderr = oldAlsoLogToStderr; });
+    FLAGS_alsologtostderr = true;
+
+    PeerUbAdmission admission(VERIFIED);
+    testing::internal::CaptureStderr();
+    EXPECT_TRUE(admission.ApplyPortHealth(PEER, PortSummary(4, 4, 1), QUERY));
+    auto logs = testing::internal::GetCapturedStderr();
+    EXPECT_NE(logs.find("UB admission marked peer UNAVAILABLE"), std::string::npos) << logs;
+    EXPECT_NE(logs.find("peer=" + PEER.ToString()), std::string::npos) << logs;
+    EXPECT_NE(logs.find("previous_state=0, state=2, bad=4, total=4"), std::string::npos) << logs;
+    EXPECT_NE(logs.find("source=query_response"), std::string::npos) << logs;
+
+    testing::internal::CaptureStderr();
+    EXPECT_TRUE(admission.ApplyPortHealth(PEER, PortSummary(4, 1, 2), QUERY));
+    logs = testing::internal::GetCapturedStderr();
+    EXPECT_NE(logs.find("UB admission marked peer AVAILABLE"), std::string::npos) << logs;
+    EXPECT_NE(logs.find("previous_state=2, state=0, previous_bad=4, bad=1, total=4, health_epoch=2"),
+              std::string::npos)
+        << logs;
+    EXPECT_NE(logs.find("source=query_response"), std::string::npos) << logs;
+}
+
+TEST(PeerUbAdmissionTest, AvailableRecoveryLogExcludesSoftAndPortFactTransitions)
+{
+    const bool oldAlsoLogToStderr = FLAGS_alsologtostderr;
+    Raii restoreFlag([oldAlsoLogToStderr] { FLAGS_alsologtostderr = oldAlsoLogToStderr; });
+    FLAGS_alsologtostderr = true;
+
+    PeerUbAdmission softAdmission;
+    UbOpOutcome softFailure(PEER, UbOperationKind::MIGRATION_WRITE,
+                            Status(K_RPC_DEADLINE_EXCEEDED, "soft UB failure"));
+    softAdmission.ReportOutcome(softFailure);
+    auto softState = softAdmission.GetState(PEER);
+    ASSERT_TRUE(softState.has_value());
+    auto softToken = softAdmission.TryBeginProbe(PEER, softState->backoffDeadlineMs);
+    ASSERT_TRUE(softToken.has_value());
+    auto completion = CaptureProbeCompletion(
+        softAdmission, *softToken, Status::OK(), softState->backoffDeadlineMs, false);
+    EXPECT_TRUE(completion.recovered);
+    EXPECT_EQ(completion.logs.find(ADMISSION_AVAILABLE_LOG_MARKER), std::string::npos) << completion.logs;
+
+    PeerUbAdmission portAdmission(VERIFIED);
+    ASSERT_TRUE(portAdmission.ApplyPortHealth(PEER, PortSummary(4, 4, 1), QUERY));
+    EXPECT_FALSE(portAdmission.TryBeginProbe(PEER, std::numeric_limits<uint64_t>::max()).has_value());
+    EXPECT_EQ(portAdmission.CheckWriteTarget(PEER, UbOperationKind::MIGRATION_WRITE).GetCode(),
+              K_URMA_WORKER_UNAVAILABLE);
+
+    PeerUbAdmission staleAdmission;
+    staleAdmission.InitializeVerification(PEER, 10);
+    auto staleToken = staleAdmission.TryBeginProbe(PEER, 10);
+    ASSERT_TRUE(staleToken.has_value());
+    UbOpOutcome newerPortEvidence(PEER, UbOperationKind::MIGRATION_WRITE,
+                                  Status(K_URMA_ERROR, "new CQE status 9"));
+    newerPortEvidence.cqeStatus = URMA_REMOTE_ACK_TIMEOUT_STATUS;
+    staleAdmission.ReportOutcome(newerPortEvidence);
+    completion = CaptureProbeCompletion(staleAdmission, *staleToken, Status::OK(), 20, false);
+    EXPECT_FALSE(completion.recovered);
+    EXPECT_EQ(completion.logs.find(ADMISSION_AVAILABLE_LOG_MARKER), std::string::npos) << completion.logs;
+}
 TEST(PeerUbAdmissionTest, CancelProbeRestoresFailureWithoutQuarantiningProbeSubject)
 {
     PeerUbAdmission admission;
@@ -469,7 +641,8 @@ TEST(PeerUbAdmissionTest, GlobalSummaryLogsOnlyEffectiveOperationalTransitions)
     EXPECT_NE(logs.find("receiver=" + SELF.ToString()), std::string::npos) << logs;
     EXPECT_NE(logs.find("target=" + PEER.ToString()), std::string::npos) << logs;
     EXPECT_NE(logs.find("transition=quarantine_applied"), std::string::npos) << logs;
-    EXPECT_NE(logs.find("incarnation_prefix=000a0d1f-207"), std::string::npos) << logs;
+    EXPECT_NE(logs.find("incarnation_prefix=" + FormatUbHealthIncarnationPrefix(unavailable.incarnation)),
+              std::string::npos) << logs;
     EXPECT_NE(logs.find("epoch=8"), std::string::npos) << logs;
 
     logs = CaptureGlobalSummaryReplace(admission, { unavailable });
@@ -595,45 +768,74 @@ TEST(UbHealthSummaryCacheTest, SupportsConcurrentApplyAndGet)
     ASSERT_TRUE(cache.Apply(summary, summary.incarnation));
     const std::string expectedIncarnation = summary.incarnation;
     const auto duplicate = summary;
-    std::atomic<bool> start{ false };
-    std::atomic<size_t> ready{ 0 };
-    std::atomic<bool> valid{ true };
-    std::vector<std::thread> readers;
+    struct Context {
+        UbHealthSummaryCache *cache;
+        const UbHealthSummary *duplicate;
+        const std::string *incarnation;
+        bthread::CountdownEvent ready{ READER_COUNT };
+        bthread::CountdownEvent start{ 1 };
+        std::atomic<bool> valid{ true };
+    } context{ &cache, &duplicate, &expectedIncarnation };
+    std::vector<bthread_t> readers;
     readers.reserve(READER_COUNT);
     for (size_t i = 0; i < READER_COUNT; ++i) {
-        readers.emplace_back([&] {
-            ready.fetch_add(1, std::memory_order_release);
-            while (!start.load(std::memory_order_acquire)) {
-                std::this_thread::yield();
-            }
+        bthread_t reader;
+        auto run = [](void *arg) -> void * {
+            auto &shared = *static_cast<Context *>(arg);
+            shared.ready.signal();
+            shared.start.wait();
             for (uint64_t read = 0; read < ITERATIONS; ++read) {
-                if (cache.Apply(duplicate, expectedIncarnation)) {
-                    valid.store(false, std::memory_order_release);
+                if (shared.cache->Apply(*shared.duplicate, *shared.incarnation)) {
+                    shared.valid.store(false, std::memory_order_release);
                 }
-                const auto stored = cache.Get(PEER);
-                if (!stored.has_value() || stored->worker != PEER || stored->incarnation != expectedIncarnation) {
-                    valid.store(false, std::memory_order_release);
+                const auto stored = shared.cache->Get(PEER);
+                if (!stored.has_value() || stored->worker != PEER
+                    || stored->incarnation != *shared.incarnation) {
+                    shared.valid.store(false, std::memory_order_release);
                 }
             }
-        });
+            return nullptr;
+        };
+        ASSERT_EQ(bthread_start_background(&reader, nullptr, run, &context), 0);
+        readers.emplace_back(reader);
     }
-    while (ready.load(std::memory_order_acquire) != READER_COUNT) {
-        std::this_thread::yield();
-    }
-    start.store(true, std::memory_order_release);
+    ASSERT_EQ(context.ready.timed_wait(butil::seconds_from_now(2)), 0);
+    context.start.signal();
     for (uint64_t epoch = 1; epoch <= ITERATIONS; ++epoch) {
         summary.epoch = epoch;
         if (!cache.Apply(summary, expectedIncarnation)) {
-            valid.store(false, std::memory_order_release);
+            context.valid.store(false, std::memory_order_release);
         }
     }
-    for (auto &reader : readers) {
-        reader.join();
+    for (const auto reader : readers) {
+        EXPECT_EQ(bthread_join(reader, nullptr), 0);
     }
-    EXPECT_TRUE(valid.load(std::memory_order_acquire));
+    EXPECT_TRUE(context.valid.load(std::memory_order_acquire));
     const auto stored = cache.Get(PEER);
     ASSERT_TRUE(stored.has_value());
     EXPECT_EQ(stored->epoch, ITERATIONS);
+}
+
+TEST(UbHealthSummaryCacheTest, ReturnsSummaryAcceptedBySameUpdate)
+{
+    UbHealthSummaryCache cache;
+    UbHealthSummary summary;
+    summary.worker = PEER;
+    summary.incarnation = "worker-current";
+    summary.epoch = 1;
+    summary.portHealth = PortSummary(4, 4, 1);
+
+    UbHealthSummary accepted;
+    ASSERT_TRUE(cache.Apply(summary, summary.incarnation, accepted));
+    EXPECT_TRUE(IsSameUbHealthSummary(summary, accepted));
+
+    auto portRecovery = summary;
+    portRecovery.portHealth = PortSummary(4, 3, 2);
+    ASSERT_TRUE(cache.Apply(portRecovery, portRecovery.incarnation, accepted));
+    EXPECT_EQ(accepted.epoch, summary.epoch);
+    ASSERT_TRUE(accepted.portHealth.has_value());
+    EXPECT_EQ(accepted.portHealth->badPortCount, 3u);
+    EXPECT_EQ(accepted.portHealth->healthEpoch, 2u);
 }
 
 TEST(PeerUbAdmissionTest, AuthoritativeRemovalBoundsStateAndRejectsOldReplay)

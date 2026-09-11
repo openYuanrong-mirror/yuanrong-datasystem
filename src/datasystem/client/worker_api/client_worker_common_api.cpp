@@ -216,7 +216,7 @@ void ClientWorkerCommonApiAttribute::DispatchUbHealthSummaryCallback(const UbHea
 {
     UbHealthSummaryApplyHook callback;
     {
-        std::lock_guard<std::mutex> lock(ubHealthSummaryCallbackMutex_);
+        std::lock_guard<bthread::Mutex> lock(ubHealthSummaryCallbackMutex_);
         callback = ubHealthSummaryCallback_;
     }
     if (!callback) {
@@ -241,21 +241,18 @@ void ClientWorkerCommonApiAttribute::ConsumeUbHealthSummary(const UbHealthSummar
             << source << ": " << (status.IsError() ? status.ToString() : "Worker endpoint mismatch");
         return;
     }
-    if (!ubHealthSummaryCache_.Apply(summary, summary.incarnation)) {
+    UbHealthSummary accepted;
+    if (!ubHealthSummaryCache_.Apply(summary, summary.incarnation, accepted)) {
         return;
     }
-    auto accepted = ubHealthSummaryCache_.Get(summary.worker);
-    if (!accepted.has_value()) {
-        return;
-    }
-    DispatchUbHealthSummaryCallback(*accepted, "Business");
+    DispatchUbHealthSummaryCallback(accepted, "Business");
 }
 
 void ClientWorkerCommonApiAttribute::SetUbHealthSummaryCallback(UbHealthSummaryApplyHook callback)
 {
     UbHealthSummaryApplyHook installed;
     {
-        std::lock_guard<std::mutex> lock(ubHealthSummaryCallbackMutex_);
+        std::lock_guard<bthread::Mutex> lock(ubHealthSummaryCallbackMutex_);
         ubHealthSummaryCallback_ = std::move(callback);
         installed = ubHealthSummaryCallback_;
     }

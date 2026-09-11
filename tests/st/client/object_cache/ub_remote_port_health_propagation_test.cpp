@@ -18,6 +18,7 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <string>
@@ -37,6 +38,8 @@
 #include "datasystem/common/object_cache/ub_health_summary_codec.h"
 #include "datasystem/common/rdma/fast_transport_manager_wrapper.h"
 #include "datasystem/common/inject/inject_point.h"
+#include "datasystem/worker/object_cache/worker_worker_oc_api.h"
+#include "datasystem/common/rpc/rpc_stub_cache_mgr.h"
 
 namespace datasystem::st {
 #ifdef USE_URMA_MOCK
@@ -139,6 +142,140 @@ TEST_F(UbPortHealthRpcPropagationTest, UserCtlPortMatrixTravelsThroughRpcToWorke
         previouslyIsolated = bad == 4;
         EXPECT_EQ(filter->IsAvailable(worker_), !previouslyIsolated);
     }
+}
+class UbWorkerPeerPortHealthTest : public UbPortHealthRpcPropagationTest {
+public:
+    void SetClusterSetupOptions(ExternalClusterOptions &opts) override
+    {
+        UbPortHealthRpcPropagationTest::SetClusterSetupOptions(opts);
+        opts.numWorkers = 2;
+        opts.workerGflagParams += " -enable_worker_worker_batch_get=false -ipc_through_shared_memory=false"
+                                 " -enable_transport_fallback=false";
+    }
+
+    Status WaitForInjection(uint32_t worker, const std::string &point, uint64_t minimum)
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline) {
+            uint64_t count = 0;
+            RETURN_IF_NOT_OK(cluster_->GetInjectActionExecuteCount(WORKER, worker, point, count));
+            if (count >= minimum) {
+                return Status::OK();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        return Status(K_NOT_READY, "Worker injection was not reached: " + point);
+    }
+
+    void PrepareRemoteObjects(std::shared_ptr<ObjectClient> &requester, std::shared_ptr<ObjectClient> &provider,
+                              std::vector<std::string> &keys, const std::string &data)
+    {
+        const auto initBound = [this](uint32_t index, std::shared_ptr<ObjectClient> &client) {
+            ConnectOptions options;
+            InitConnectOpt(index, options);
+            options.enableLocalCache = true;
+            options.enableCrossNodeConnection = false;
+            options.requestTimeoutMs = 1000;
+            client = std::make_shared<ObjectClient>(options);
+            return client->Init();
+        };
+        DS_ASSERT_OK(initBound(0, requester));
+        DS_ASSERT_OK(initBound(1, provider));
+        constexpr size_t objectCount = 4;
+        for (size_t i = 0; i < objectCount; ++i) {
+            keys.emplace_back("ub-requester-" + GetStringUuid());
+            DS_ASSERT_OK(provider->Put(keys.back(), reinterpret_cast<const uint8_t *>(data.data()), data.size(), {}));
+        }
+    }
+
+    void CheckValue(std::vector<Optional<Buffer>> &buffers, const std::string &data)
+    {
+        ASSERT_EQ(buffers.size(), 1u);
+        ASSERT_TRUE(buffers.front());
+        ASSERT_EQ(buffers.front()->GetSize(), data.size());
+        EXPECT_EQ(std::memcmp(buffers.front()->MutableData(), data.data(), data.size()), 0);
+    }
+};
+
+TEST_F(UbWorkerPeerPortHealthTest, WorkerRpcQueryUsesTheCachedPortHealthContract)
+{
+    GetHashRingRspPb ring;
+    DS_ASSERT_OK(rpc_->InvokeGetHashRing(0, ring));
+    ASSERT_TRUE(ring.has_hash_ring());
+    const auto member = ring.hash_ring().members().find(worker_.ToString());
+    ASSERT_NE(member, ring.hash_ring().members().end());
+    const auto incarnation = member->second.id();
+    ConnectOptions source;
+    InitConnectOpt(1, source);
+    constexpr uint64_t stubCacheSize = 100;
+    DS_ASSERT_OK(RpcStubCacheMgr::Instance().Init(stubCacheSize, HostPort(source.host, source.port)));
+    auto signature = std::make_shared<AkSkManager>();
+    DS_ASSERT_OK(signature->SetClientAkSk(source.accessKey, source.secretKey));
+    std::shared_ptr<object_cache::WorkerRemoteWorkerOCApi> peerRpc;
+    DS_ASSERT_OK(object_cache::CreateRemoteWorkerApi(
+        worker_.ToString(), HostPort(source.host, source.port), signature, peerRpc));
+    for (uint32_t bad : { 4u, 3u, 0u }) {
+        DS_ASSERT_OK(cluster_->SetInjectAction(WORKER, 0, "UrmaMock.QueryPortStatus",
+                                               "call(4," + std::to_string(bad) + ")"));
+        UbHealthSummary cached;
+        DS_ASSERT_OK(WaitForPorts(incarnation, bad, cached));
+        QueryUbPortHealthRspPb response;
+        DS_ASSERT_OK(peerRpc->QueryUbPortHealth(incarnation, 1000, response));
+        UbHealthSummary received;
+        DS_ASSERT_OK(DecodeUbHealthSummary(response.health_summary(), received));
+        ASSERT_TRUE(received.portHealth.has_value());
+        EXPECT_EQ(received.incarnation, incarnation);
+        EXPECT_EQ(received.portHealth->badPortCount, bad);
+        EXPECT_EQ(received.portHealth->totalPortCount, 4u);
+    }
+    QueryUbPortHealthRspPb staleResponse;
+    EXPECT_EQ(peerRpc->QueryUbPortHealth("retired-worker", 1000, staleResponse).GetCode(), K_NOT_READY);
+    EXPECT_FALSE(staleResponse.has_health_summary());
+}
+
+TEST_F(UbWorkerPeerPortHealthTest, Cqe9IsolatesRequesterAndStopsRemoteGetWhenFallbackDisabled)
+{
+    std::shared_ptr<ObjectClient> requester;
+    std::shared_ptr<ObjectClient> provider;
+    const std::string data(1024, 'u');
+    std::vector<std::string> keys;
+    PrepareRemoteObjects(requester, provider, keys, data);
+    ASSERT_EQ(keys.size(), 4u);
+    const std::string beforeRpc =
+        "worker_oc_service_get_impl.pull_object_data_from_remote_worker.before_get_from_remote";
+    const std::string cqePoint = "UrmaManager.CheckCompletionRecordStatus";
+    DS_ASSERT_OK(cluster_->SetInjectAction(WORKER, 0, beforeRpc, "call()"));
+    DS_ASSERT_OK(cluster_->SetInjectAction(WORKER, 0, "UrmaMock.QueryPortStatus", "call(4,4)"));
+    DS_ASSERT_OK(cluster_->SetInjectAction(WORKER, 1, cqePoint, "1*call(0,9)"));
+    std::vector<Optional<Buffer>> buffers;
+    const auto first = requester->Get({ keys.front() }, 0, buffers);
+    if (first.IsOk()) {
+        CheckValue(buffers, data);
+    }
+    DS_ASSERT_OK(WaitForInjection(1, cqePoint, 1));
+    DS_ASSERT_OK(WaitForInjection(0, "UrmaMock.QueryPortStatus", 1));
+    GetHashRingRspPb ring;
+    DS_ASSERT_OK(rpc_->InvokeGetHashRing(0, ring));
+    ASSERT_TRUE(ring.has_hash_ring());
+    const auto incarnation = ring.hash_ring().members().at(worker_.ToString()).id();
+    UbHealthSummary health;
+    DS_ASSERT_OK(WaitForPorts(incarnation, 4, health));
+    uint64_t before = 0;
+    DS_ASSERT_OK(cluster_->GetInjectActionExecuteCount(WORKER, 0, beforeRpc, before));
+    EXPECT_GT(before, 0u);
+    for (size_t i = 1; i < keys.size(); ++i) {
+        buffers.clear();
+        EXPECT_TRUE(requester->Get({ keys[i] }, 0, buffers).IsError());
+    }
+    uint64_t after = 0;
+    DS_ASSERT_OK(cluster_->GetInjectActionExecuteCount(WORKER, 0, beforeRpc, after));
+    EXPECT_EQ(after, before);
+    DS_ASSERT_OK(cluster_->ClearInjectAction(WORKER, 1, cqePoint));
+    DS_ASSERT_OK(cluster_->SetInjectAction(WORKER, 0, "UrmaMock.QueryPortStatus", "call(4,3)"));
+    DS_ASSERT_OK(WaitForPorts(incarnation, 3, health));
+    buffers.clear();
+    DS_ASSERT_OK(requester->Get({ keys.back() }, 0, buffers));
+    CheckValue(buffers, data);
 }
 class UbClientWritebackPortHealthTest : public UbPortHealthRpcPropagationTest {
 public:
