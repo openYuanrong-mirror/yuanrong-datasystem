@@ -26,6 +26,11 @@ public:
     void Start();
     void Stop();
 
+    // Same contract as HttpServer::StopNow: mirror the Stop RPC's immediate
+    // work (drop queued notify tasks + stop cache reader) from main's
+    // shutdown path on the SIGTERM path. Main-thread only (mutex inside).
+    void StopNow() { dispatcher_.StopNow(); }
+
     size_t NotifyQueueSize() { return dispatcher_.QueueSize(); }
 
     void SetCacheReader(CacheReader *reader) { dispatcher_.SetCacheReader(reader); }

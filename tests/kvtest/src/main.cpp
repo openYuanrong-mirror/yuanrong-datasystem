@@ -51,11 +51,17 @@ using ControlServer = HttpServer;
 using namespace datasystem;
 
 static std::atomic<bool> gRunning{ true };
+// Set alongside gRunning when the stop came from SIGTERM/SIGINT (vs the HTTP
+// /stop RPC which applies its own immediate stops). Read by main's shutdown
+// path so the TERM path mirrors /stop's semantics (see the pipeline-mode
+// shutdown sequence); only atomics may be touched in the handler.
+static std::atomic<bool> gStopRequested{ false };
 
 static void SignalHandler(int sig)
 {
     std::cerr << "Received signal " << sig << ", shutting down..." << std::endl;
     gRunning = false;
+    gStopRequested = true;
 }
 
 static int RunBenchmarkMode(Config &cfg, const std::string &configPath)
@@ -498,11 +504,19 @@ static int RunServerMode(const Config &cfg)
 
     std::vector<uint64_t> prevCounts;
     auto prevTime = std::chrono::steady_clock::now();
+    auto lastReport = prevTime;
 
+    // 200ms sleep granularity so a SIGTERM stop is observed promptly (the
+    // /stop RPC path reacts immediately; without this the TERM path would
+    // keep the pipeline running for up to one 3s reporting interval).
+    // Reporting/pool-adjust cadence stays at 3s.
     while (gRunning) {
-        std::this_thread::sleep_for(std::chrono::seconds(3));
-
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
         auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration<double>(now - lastReport).count() < 3.0) {
+            continue;
+        }
+        lastReport = now;
         double elapsedSec = std::chrono::duration<double>(now - prevTime).count();
         prevTime = now;
 
@@ -552,6 +566,20 @@ static int RunServerMode(const Config &cfg)
     }
 
     SLOG_INFO("Shutting down...");
+
+    // SIGTERM stop: apply the same immediate stops the /stop handler would
+    // have done (drop queued notify tasks + flip the writer/cache loop
+    // flags), on the main thread — the signal handler only flips atomics
+    // because StopNow/RequestStop take mutexes and are not
+    // async-signal-safe. Without this the TERM path keeps issuing Set/Get
+    // through the 3s pre-drain window that the /stop path skips.
+    if (gStopRequested) {
+        if (cacheReader)
+            cacheReader->RequestStop();
+        if (worker)
+            worker->RequestStop();
+        server.StopNow();
+    }
 
     // The /stop handler already flipped every stop flag and dropped queued
     // tasks, so no new Set/Get is issued. Two-phase drain:

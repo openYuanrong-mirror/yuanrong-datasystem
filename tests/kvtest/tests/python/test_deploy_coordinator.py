@@ -63,12 +63,12 @@ class TestStartCoordinator(unittest.TestCase):
         cfg = {'coordinator_address': {'value': 'old'}}
         ok = start_coordinator(pod, 'default', cfg, 31511,
                                '/tmp/coordinator.config',
-                               enable_procmon=True, procmon_remote_dir='/tmp',
+                               enable_procmon=True,
                                timeout=10)
         self.assertTrue(ok)
         mock_start.assert_called_once_with(
             pod, 'default', cfg, '/tmp/coordinator.config', 31511,
-            PROCESS_NAME, True, '/tmp',
+            PROCESS_NAME, True,
             numactl_opts=None, timeout=10)
 
     @patch('deploy_coordinator.start_service', return_value=True)
@@ -110,7 +110,7 @@ class TestCmdStart(unittest.TestCase):
     def _args(self, **overrides):
         defaults = dict(namespace='default', port=31511,
                         remote_config='/tmp/coordinator.config',
-                        set=[], enable_procmon=True, procmon_dir=None,
+                        set=[], enable_procmon=True,
                         timeout=10, config=None)
         defaults.update(overrides)
         return SimpleNamespace(**defaults)
@@ -135,8 +135,6 @@ class TestCmdStart(unittest.TestCase):
                              '10.0.0.1:31511')
             self.assertEqual(_pos(c1)[2][ADDRESS_KEY]['value'],
                              '10.0.0.2:31511')
-            # procmon_dir resolved from log_dir in the config
-            self.assertEqual(_kw(c0)['procmon_remote_dir'], '/var/log/ds')
             # each pod gets a distinct deep-copied config
             self.assertIsNot(_pos(c0)[2], _pos(c1)[2])
         finally:
@@ -152,21 +150,6 @@ class TestCmdStart(unittest.TestCase):
             cmd_start(args, [{'name': 'p1', 'ip': '10.0.0.1'}])
             cfg = _pos(mock_start.call_args)[2]
             self.assertEqual(cfg['rpc_thread_num']['value'], 128)
-        finally:
-            os.unlink(cfg_path)
-
-    @patch('deploy_coordinator.start_coordinator', return_value=True)
-    def test_procmon_dir_falls_back_to_remote_config_dir(self, mock_start):
-        # No log_dir in config -> procmon_dir defaults to the remote-config
-        # directory (dirname of /tmp/coordinator.config == /tmp).
-        cfg_path = _write_config({
-            'coordinator_address': {'value': '0.0.0.0:0'},
-        })
-        try:
-            args = self._args(config=cfg_path)
-            cmd_start(args, [{'name': 'p1', 'ip': '10.0.0.1'}])
-            self.assertEqual(_kw(mock_start.call_args)['procmon_remote_dir'],
-                             '/tmp')
         finally:
             os.unlink(cfg_path)
 

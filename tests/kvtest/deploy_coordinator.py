@@ -43,7 +43,6 @@ from deploy_common import (
     log_error,
     log_info,
     read_remote_log_dir,
-    resolve_procmon_dir,
     setup_logging,
     start_service,
     start_service_standalone,
@@ -66,7 +65,7 @@ def _reject_dscli_jemalloc_profile(args):
 
 
 def start_coordinator(pod, namespace, config, coordinator_port, remote_config,
-                      enable_procmon=True, procmon_remote_dir='/tmp',
+                      enable_procmon=True,
                       timeout=DEFAULT_TIMEOUT):
     """Start a coordinator in a single pod.
 
@@ -78,7 +77,7 @@ def start_coordinator(pod, namespace, config, coordinator_port, remote_config,
     """
     return start_service(pod, namespace, config, remote_config,
                          coordinator_port, PROCESS_NAME, enable_procmon,
-                         procmon_remote_dir, numactl_opts=None, timeout=timeout)
+                         numactl_opts=None, timeout=timeout)
 
 
 def _inject_raft_initial_peers(cfg, pods, port):
@@ -112,11 +111,6 @@ def cmd_start(args, pods):
     with open(args.config) as f:
         config_template = json.load(f)
 
-    # Default procmon dir to log_dir from coordinator config, fallback to
-    # --remote-config dir.
-    if args.procmon_dir is None:
-        args.procmon_dir = resolve_procmon_dir(config_template, args.remote_config)
-
     if args.set:
         apply_config_overrides(config_template, args.set)
     else:
@@ -134,7 +128,6 @@ def cmd_start(args, pods):
         return start_coordinator(pod, args.namespace, cfg, args.port,
                                  args.remote_config,
                                  enable_procmon=args.enable_procmon,
-                                 procmon_remote_dir=args.procmon_dir,
                                  timeout=args.timeout)
 
     return do_for_all_pods(pods, do_op, 'Starting coordinators')
@@ -173,11 +166,11 @@ def cmd_start_standalone(args, pods):
             args.jf, args.service, pod_extra,
             config=cfg,
             enable_procmon=args.enable_procmon,
-            procmon_remote_dir=args.procmon_dir or '/tmp',
             port=args.port,
             process_name=binary_name,
             timeout=args.timeout,
-            jemalloc_prof_conf=getattr(args, 'jemalloc_prof_conf', None))
+            jemalloc_prof_conf=getattr(args, 'jemalloc_prof_conf', None),
+            start_timeout=getattr(args, 'start_timeout', 90))
 
     return do_for_all_pods(pods, do_op, 'Starting coordinators (standalone)')
 
@@ -316,9 +309,6 @@ def cmd_deploy(args, pods=None):
         log_info('\n--- Step 3/3: starting coordinators ---')
         with open(args.config) as f:
             config_template = json.load(f)
-        if args.procmon_dir is None:
-            args.procmon_dir = resolve_procmon_dir(config_template,
-                                                   args.remote_config)
         if args.set:
             apply_config_overrides(config_template, args.set)
         else:
@@ -331,7 +321,6 @@ def cmd_deploy(args, pods=None):
             return start_coordinator(pod, args.namespace, cfg, args.port,
                                      args.remote_config,
                                      enable_procmon=args.enable_procmon,
-                                     procmon_remote_dir=args.procmon_dir,
                                      timeout=args.timeout)
 
         rc = do_for_all_pods(pods, do_op, 'Starting coordinators')
@@ -522,8 +511,6 @@ def main():
     parser_start.add_argument('--no-procmon', action='store_false',
                               dest='enable_procmon',
                               help='Disable procmon.py monitoring (default)')
-    parser_start.add_argument('--procmon-dir', default=None,
-                              help='Remote directory for procmon files (default: same as --remote-config dir)')
     parser_start.add_argument('--jemalloc_prof_conf', default=None,
                               type=validate_jemalloc_prof_conf,
                               help='Jemalloc MALLOC_CONF for standalone coordinator_test')
@@ -540,13 +527,29 @@ def main():
                               help='Raft member count for multi-replica (standalone mode only, default: 1)')
     parser_start.add_argument('--remote-dir', default='/tmp/ds_coordinator',
                               help='Remote directory with standalone binary (must match install --remote-dir)')
+    parser_start.add_argument('--start-timeout', type=int, default=90,
+                              help='Max seconds to wait for a coordinator to '
+                                   'become ready after launch (default: 90, '
+                                   'matches dscli start). Standalone mode only.')
 
     # Stop subcommand (graceful stop using dscli)
     parser_stop = subparsers.add_parser('stop', parents=[parent_parser],
                                         help='Stop coordinators gracefully')
     parser_stop.add_argument('--remote-config', default='/tmp/coordinator.config',
                              help='Config file path (default: /tmp/coordinator.config)')
-    parser_stop.add_argument('-S', '--standalone', action='store_true', default=False)
+    parser_stop.add_argument('-S', '--standalone', action='store_true', default=False,
+                             help='Stop coordinator_test via the launcher stop '
+                                  'subcommand (pidfile + in-pod TERM/KILL '
+                                  'escalation). Must match install --remote-dir.')
+    parser_stop.add_argument('--remote-dir', default='/tmp/ds_coordinator',
+                             help='Remote directory holding the standalone binary '
+                                  'and pidfile (default: /tmp/ds_coordinator, must '
+                                  'match install)')
+    parser_stop.add_argument('--stop-timeout', type=int, default=180,
+                             help='Max seconds to wait after SIGTERM before '
+                                  'escalating to SIGKILL (default: 180, '
+                                  'matches dscli stop base_timeout). '
+                                  'Standalone mode only.')
 
     # Kill subcommand (force kill using kill -9)
     parser_kill = subparsers.add_parser('kill', parents=[parent_parser],
@@ -655,8 +658,6 @@ def main():
     parser_deploy.add_argument('--no-procmon', action='store_false',
                                dest='enable_procmon',
                                help='Disable procmon.py monitoring (default)')
-    parser_deploy.add_argument('--procmon-dir', default=None,
-                               help='Remote directory for procmon files (default: same as --remote-config dir)')
     parser_deploy.add_argument('--whl', default=find_default_whl(),
                                help='Path to datasystem whl package (non-standalone mode)')
     parser_deploy.add_argument('-S', '--standalone', action='store_true', default=False,
@@ -698,6 +699,10 @@ def main():
                                help='Local .so directory (standalone mode)')
     parser_deploy.add_argument('--remote-dir', default='/tmp/ds_coordinator',
                                help='Remote directory for standalone binary')
+    parser_deploy.add_argument('--start-timeout', type=int, default=90,
+                               help='Max seconds to wait for a coordinator to '
+                                    'become ready after launch (default: 90, '
+                                    'matches dscli start). Standalone mode only.')
 
     args = parser.parse_args()
 
