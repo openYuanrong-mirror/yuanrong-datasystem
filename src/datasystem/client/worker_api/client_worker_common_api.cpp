@@ -523,6 +523,7 @@ Status ClientWorkerRemoteCommonApi::Connect(RegisterClientReqPb &req, int32_t ti
 #ifdef WITH_TESTS
     INJECT_POINT_NO_RETURN("ClientWorkerCommonApi.Connect.MustUds", [&mustUds] { mustUds = true; });
 #endif
+    shmLocalityProbeFailed_.store(false, std::memory_order_relaxed);
     RETURN_IF_NOT_OK(CreateConnectionForTransferShmFd(timeoutMs, isConnectSuccess, serverFd, socketFd, shmEnableType));
     if (mustUds && !isConnectSuccess) {
         return { StatusCode::K_RPC_UNAVAILABLE,
@@ -666,6 +667,7 @@ Status ClientWorkerRemoteCommonApi::HandShakeConnect(int64_t remainingMs, const 
         isConnectSuccess = true;
         socketFd = sock.GetFd();
     } else {
+        shmLocalityProbeFailed_.store(true, std::memory_order_relaxed);
         LOG(INFO) << "Failed connect to local worker via " << ShmEnableTypeName(shmEnableType)
                   << ", client and worker maybe not in the same node, falling back to TCP";
         shmEnableType = ShmEnableType::NONE;

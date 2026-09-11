@@ -117,6 +117,15 @@ struct ClientWorkerCommonApiAttribute {
         return shmEnableType_ != ShmEnableType::NONE;
     }
 
+    /**
+     * @brief Check whether an attempted SHM fd-transfer locality probe failed.
+     * @return True if the worker exposed an SHM endpoint but the fd-transfer probe failed.
+     */
+    bool DidShmLocalityProbeFail() const
+    {
+        return shmLocalityProbeFailed_.load(std::memory_order_relaxed);
+    }
+
     void SetMayAccessNonBoundWorker(bool mayAccessNonBoundWorker)
     {
         mayAccessNonBoundWorker_ = mayAccessNonBoundWorker;
@@ -236,6 +245,7 @@ struct ClientWorkerCommonApiAttribute {
     std::atomic<int32_t> socketFd_{ -1 };
     std::string clientId_;
     ShmEnableType shmEnableType_{ ShmEnableType::NONE };
+    std::atomic_bool shmLocalityProbeFailed_{ false };
     uint64_t shmThreshold_{ 0 };
     HeartbeatType heartbeatType_;
     // Worker version, increases 1 each time the worker recovers from a disconnection.

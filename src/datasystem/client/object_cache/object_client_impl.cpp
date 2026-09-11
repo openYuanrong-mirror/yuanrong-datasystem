@@ -901,11 +901,10 @@ Status ObjectClientImpl::InitClientWorkerConnect(bool enableHeartbeat, bool init
     int32_t timeoutMs = connectTimeoutMs >= 0 ? connectTimeoutMs : connectTimeoutMs_;
     CHECK_FAIL_RETURN_STATUS(timeoutMs >= 0, K_INVALID, "The connection timeout must be a positive integer.");
     RETURN_IF_NOT_OK(InitClientWorkerConnectAt(LOCAL_WORKER, ipAddress_, enableHeartbeat, initWithWorker, timeoutMs));
-    // isLocalWorker stays true so InitListenWorkerAt recovery wiring is unchanged; routedWorkerIsLocal
-    // carries the real locality of the bound worker so InitRouting does not adopt a cross-node bound
-    // worker's hostId (which would misclassify that whole remote host as same-host and time out Gets
-    // on the SHM/UDS path).
-    return InitClientRuntimeAt(LOCAL_WORKER, initWithWorker, true, routedWorkerIsLocal);
+    // An absent SHM endpoint describes capability, while a failed fd-transfer probe disproves locality.
+    const bool boundWorkerIsLocal =
+        routedWorkerIsLocal && !workerApi_[LOCAL_WORKER]->DidShmLocalityProbeFail();
+    return InitClientRuntimeAt(LOCAL_WORKER, initWithWorker, true, boundWorkerIsLocal);
 }
 
 Status ObjectClientImpl::InitClientWorkerConnectAt(WorkerNode node, const HostPort &address, bool enableHeartbeat,
