@@ -16,11 +16,13 @@
  * Description: Unit tests for Coordinator bootstrap observation convergence.
  */
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <future>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -30,11 +32,15 @@
 #include <variant>
 #include <vector>
 
+#include <brpc/socket.h>
+#include <brpc/socket_map.h>
+#include <butil/endpoint.h>
 #include <gtest/gtest.h>
 
 #define private public
 #include "datasystem/coordinator/raft/coordinator_election_manager.h"
 #undef private
+#include "cluster/test_port_allocator.h"
 #include "datasystem/utils/coordinator_discovery.h"
 #include "ut/common.h"
 
@@ -84,8 +90,12 @@ struct DependencyState {
     size_t createMembershipCalls{ 0 };
     size_t startMembershipCalls{ 0 };
     size_t shutdownMembershipCalls{ 0 };
+    size_t bootstrapExitCalls{ 0 };
     bool nodeAlive{ false };
     bool membershipAlive{ false };
+    bool blockedExchangeStarted{ false };
+    bool releaseBlockedExchange{ false };
+    bool blockedExchangeFinished{ false };
     CoordinatorRaftOptions raftOptions;
 
     bool WaitFor(const std::function<bool()> &predicate)
@@ -176,6 +186,13 @@ CoordinatorElectionManager::Dependencies MakeDependencies(const std::shared_ptr<
     dependencies.now = [state] {
         std::lock_guard<std::mutex> lock(state->mutex);
         return state->now;
+    };
+    dependencies.onBootstrapWorkerExit = [state] {
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            ++state->bootstrapExitCalls;
+        }
+        state->cv.notify_all();
     };
     dependencies.createNode =
         [state](const CoordinatorRaftOptions &options, const CoordinatorRaftEventCallbacks &) {
@@ -280,6 +297,19 @@ void SetNow(const std::shared_ptr<DependencyState> &state, std::chrono::steady_c
     state->now = now;
 }
 
+std::vector<brpc::SocketId> FindSocketMapIds(const butil::EndPoint &endpoint)
+{
+    std::vector<brpc::SocketId> socketIds;
+    brpc::SocketMapList(&socketIds);
+    socketIds.erase(std::remove_if(socketIds.begin(), socketIds.end(), [&endpoint](brpc::SocketId socketId) {
+                        brpc::SocketUniquePtr socket;
+                        return brpc::Socket::AddressFailedAsWell(socketId, &socket) < 0 || socket == nullptr
+                               || socket->remote_side() != endpoint;
+                    }),
+                    socketIds.end());
+    return socketIds;
+}
+
 TEST(CoordinatorElectionManagerTest, IncompleteExpectedViewDoesNotCreateNode)
 {
     auto state = std::make_shared<DependencyState>();
@@ -329,6 +359,171 @@ TEST(CoordinatorElectionManagerTest, CompleteStableViewAndMatchingFrozenPlansSta
         ASSERT_NE(plan, nullptr);
         EXPECT_EQ(plan->initialPeers, peers);
     }
+    DS_ASSERT_OK(manager->Shutdown());
+}
+
+TEST(CoordinatorElectionManagerTest, BootstrapExitCallbackRunsAfterSuccessfulStartup)
+{
+    auto state = std::make_shared<DependencyState>();
+    state->metadataState = RaftMetadataState::VALID;
+    auto manager = MakeManager(state);
+
+    DS_ASSERT_OK(manager->Start());
+    ASSERT_TRUE(state->WaitFor([state] { return state->bootstrapExitCalls == 1; }));
+    std::lock_guard<std::mutex> lock(state->mutex);
+    EXPECT_EQ(state->startMembershipCalls, 1U);
+}
+
+TEST(CoordinatorElectionManagerTest, BootstrapExitCallbackRunsAfterTerminalFailure)
+{
+    auto state = std::make_shared<DependencyState>();
+    state->metadataStatus = Status(K_RUNTIME_ERROR, "metadata probe failed");
+    auto manager = MakeManager(state);
+
+    DS_ASSERT_OK(manager->Start());
+    ASSERT_TRUE(state->WaitFor([state] { return state->bootstrapExitCalls == 1; }));
+    RaftBootstrapState snapshot;
+    DS_ASSERT_OK(manager->GetBootstrapState(snapshot));
+    EXPECT_EQ(snapshot.phase, RaftBootstrapPhase::TERMINAL);
+}
+
+TEST(CoordinatorElectionManagerTest, BootstrapExitCallbackRunsAfterCancellation)
+{
+    auto state = std::make_shared<DependencyState>();
+    state->discoveredPeers = { kPeer1 };
+    auto manager = MakeManager(state);
+
+    DS_ASSERT_OK(manager->Start());
+    ASSERT_TRUE(state->WaitFor([state] { return state->discoveryCalls > 0; }));
+    DS_ASSERT_OK(manager->Shutdown());
+    std::lock_guard<std::mutex> lock(state->mutex);
+    EXPECT_EQ(state->bootstrapExitCalls, 1U);
+}
+
+TEST(CoordinatorElectionManagerTest, BootstrapExitWaitsForAllParallelExchanges)
+{
+    auto state = std::make_shared<DependencyState>();
+    state->discoveredPeers = { kPeer1, kPeer2, kPeer3 };
+    auto manager = MakeManager(state);
+    manager->dependencies_.exchangeObservation =
+        [state](const std::string &peer, int32_t, const RaftBootstrapObservationPb &request,
+                RaftBootstrapObservationPb &response) {
+            if (peer == kPeer2) {
+                response = request;
+                response.set_sender_peer(kPeer3);
+                return Status::OK();
+            }
+            std::unique_lock<std::mutex> lock(state->mutex);
+            state->blockedExchangeStarted = true;
+            state->cv.notify_all();
+            state->cv.wait_until(lock, std::chrono::steady_clock::now() + kWaitTimeout,
+                                 [state] { return state->releaseBlockedExchange; });
+            state->blockedExchangeFinished = true;
+            state->cv.notify_all();
+            return Status(K_RPC_UNAVAILABLE, "blocked exchange released");
+        };
+
+    DS_ASSERT_OK(manager->Start());
+    ASSERT_TRUE(state->WaitFor([state] { return state->blockedExchangeStarted; }));
+    auto shutdown = std::async(std::launch::async, [&manager] { return manager->Shutdown(); });
+    EXPECT_EQ(shutdown.wait_for(kStaleRpcDelay), std::future_status::timeout);
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        EXPECT_EQ(state->bootstrapExitCalls, 0U);
+        state->releaseBlockedExchange = true;
+    }
+    state->cv.notify_all();
+    ASSERT_EQ(shutdown.wait_for(kWaitTimeout), std::future_status::ready);
+    DS_ASSERT_OK(shutdown.get());
+    ASSERT_TRUE(state->WaitFor(
+        [state] { return state->blockedExchangeFinished && state->bootstrapExitCalls == 1; }));
+}
+
+CoordinatorElectionManager::Dependencies MakeChannelCleanupDependencies(
+    const std::shared_ptr<DependencyState> &state, const std::string &idlePeer,
+    const CoordinatorElectionManager::Dependencies &productionDependencies)
+{
+    auto dependencies = MakeDependencies(state);
+    const auto exchangeObservation = productionDependencies.exchangeObservation;
+    const auto releaseChannels = productionDependencies.onBootstrapWorkerExit;
+    dependencies.exchangeObservation =
+        [state, exchangeObservation](const std::string &peer, int32_t timeoutMs,
+                                     const RaftBootstrapObservationPb &request,
+                                     RaftBootstrapObservationPb &response) {
+            auto status = exchangeObservation(peer, timeoutMs, request, response);
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                ++state->exchangeCalls;
+            }
+            state->cv.notify_all();
+            return status;
+        };
+    dependencies.discoverCandidates =
+        [state, idlePeer](const std::shared_ptr<ICoordinatorDiscovery> &, std::vector<std::string> &peers) {
+            std::unique_lock<std::mutex> lock(state->mutex);
+            ++state->discoveryCalls;
+            if (state->discoveryCalls == 1) {
+                peers = { kPeer1, idlePeer };
+            } else {
+                state->cv.wait_until(lock, std::chrono::steady_clock::now() + kWaitTimeout,
+                                     [state] { return state->releaseBlockedExchange; });
+                state->now += kStableViewElapsed;
+                peers = { kPeer1 };
+            }
+            state->cv.notify_all();
+            return Status::OK();
+        };
+    dependencies.onBootstrapWorkerExit = [state, releaseChannels] {
+        if (releaseChannels) {
+            releaseChannels();
+        }
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            ++state->bootstrapExitCalls;
+        }
+        state->cv.notify_all();
+    };
+    return dependencies;
+}
+
+class CoordinatorElectionManagerProductionDependenciesTest : public testing::Test {
+protected:
+    void TearDown() override
+    {
+        datasystem::st::TestPortAllocator::Instance().ReleaseAll();
+    }
+};
+
+TEST_F(CoordinatorElectionManagerProductionDependenciesTest, BootstrapExitReleasesCachedChannel)
+{
+    auto &allocator = datasystem::st::TestPortAllocator::Instance();
+    allocator.SetOwnerInfo("coordinator_election_manager_test", "BootstrapExitReleasesCachedChannel",
+                           kDataDir);
+    datasystem::st::TestPortLease portLease;
+    DS_ASSERT_OK(allocator.Reserve("idle_bootstrap_peer", portLease));
+    const std::string idlePeer = "127.0.0.1:" + std::to_string(portLease.Port());
+    butil::EndPoint idleEndpoint;
+    ASSERT_EQ(butil::str2endpoint(idlePeer.c_str(), &idleEndpoint), 0);
+    EXPECT_TRUE(FindSocketMapIds(idleEndpoint).empty());
+
+    auto state = std::make_shared<DependencyState>();
+    auto productionDependencies = CoordinatorElectionManager::MakeProductionDependencies();
+    auto manager = std::make_unique<CoordinatorElectionManager>(
+        MakeOptions(kPeer1, 1), CoordinatorRaftEventCallbacks{}, std::make_shared<EmptyCoordinatorDiscovery>(),
+        MakeChannelCleanupDependencies(state, idlePeer, productionDependencies));
+
+    DS_ASSERT_OK(manager->Start());
+    const bool exchangeCompleted = state->WaitFor([state] { return state->exchangeCalls == 1; });
+    const auto cachedSocketIds = FindSocketMapIds(idleEndpoint);
+    EXPECT_TRUE(exchangeCompleted);
+    EXPECT_EQ(cachedSocketIds.size(), 1U);
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->releaseBlockedExchange = true;
+    }
+    state->cv.notify_all();
+    ASSERT_TRUE(state->WaitFor([state] { return state->bootstrapExitCalls == 1; }));
+    EXPECT_TRUE(FindSocketMapIds(idleEndpoint).empty());
     DS_ASSERT_OK(manager->Shutdown());
 }
 

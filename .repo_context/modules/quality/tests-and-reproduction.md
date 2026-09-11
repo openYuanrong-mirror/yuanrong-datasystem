@@ -218,6 +218,9 @@ python3 -m unittest
 
 ## Test Binaries Worth Knowing
 
+- Bazel tests needing only the assertions in `tests/ut/common.h` should depend on `//tests/ut:ut_common_headers`.
+  Keep `//tests/ut:ut_common` for tests using the `CommonTest` fixture or functions implemented in `common.cpp`;
+  its fixture initialization pulls in transport and shared-memory dependencies that isolated policy tests do not need.
 - Verified from `tests/ut/CMakeLists.txt`:
   - `ds_ut`: default UT bucket after excluding device, binmock, flags, slot store, stream cache, and object cache files.
     URMA-specific client UTs such as `tests/ut/client/urma_send_lane_test.cpp` are excluded when `BUILD_WITH_URMA` is
