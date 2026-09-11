@@ -2616,31 +2616,25 @@ Coordinator 按该成员列表启动 Raft 选主。启用选主后，<code class
 <td><p>否</p></td>
 <td><p>内存预留阈值（MB），实际取值 min(shared_memory_size_mb × 0.1, eviction_reserve_mem_threshold_mb)；与 eviction_high_watermark_ratio 共同决定驱逐触发线。有效范围 100-102400</p></td>
 </tr>
-<tr class="row-even"><td><p>eviction_pretrigger_margin_mb</p></td>
-<td><p>int</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
-<td><p>否</p></td>
-<td><p>对象缓存 Eviction 相对硬高水位的提前触发量（MiB），<code class="docutils literal notranslate"><span class="pre">0</span></code> 表示关闭。内存分配和 Rebalance 仍使用硬高水位。软触发线须高于 eviction_low_watermark_ratio 对应的低水位，否则自动禁用提前触发</p></td>
-</tr>
-<tr class="row-odd"><td><p>eviction_high_watermark_ratio</p></td>
+<tr class="row-even"><td><p>eviction_high_watermark_ratio</p></td>
 <td><p>double</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">0.9</span></code></p></td>
 <td><p>否</p></td>
 <td><p>内存占用率高水位（比例 0.0-1.0，相对可用共享内存）。当占用内存达到 max(比例 × 共享内存, 共享内存 - eviction_reserve_mem_threshold_mb) 时触发驱逐。有效范围 0.02-1.0，须大于 eviction_low_watermark_ratio</p></td>
 </tr>
-<tr class="row-even"><td><p>eviction_low_watermark_ratio</p></td>
+<tr class="row-odd"><td><p>eviction_low_watermark_ratio</p></td>
 <td><p>double</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">0.8</span></code></p></td>
 <td><p>否</p></td>
 <td><p>内存占用率低水位（比例 0.0-1.0），后台驱逐运行直至占用率降至该比例及以下。有效范围 0.01-0.99，须小于 eviction_high_watermark_ratio</p></td>
 </tr>
-<tr class="row-odd"><td><p>spill_high_watermark_ratio</p></td>
+<tr class="row-even"><td><p>spill_high_watermark_ratio</p></td>
 <td><p>double</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">0.8</span></code></p></td>
 <td><p>否</p></td>
 <td><p>Spill 目录占用率高水位（相对 spill_size_limit 的比例 0.0-1.0）。有效范围 0.02-1.0，须大于 spill_low_watermark_ratio</p></td>
 </tr>
-<tr class="row-even"><td><p>spill_low_watermark_ratio</p></td>
+<tr class="row-odd"><td><p>spill_low_watermark_ratio</p></td>
 <td><p>double</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">0.6</span></code></p></td>
 <td><p>否</p></td>
@@ -2771,7 +2765,7 @@ Coordinator 按该成员列表启动 Raft 选主。启用选主后，<code class
 <td><p>double</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">1.0</span></code></p></td>
 <td><p>是</p></td>
-<td><p>请求日志主采样率（[0.0–1.0]）。1.0=全量保留（所有请求采中→access/diagnostic也强制输出）；0.0=丢弃请求级 INFO/VLOG，请求级 ERROR/WARNING/SLOW_LOG 由 diagnostic补采样率 控制</p></td>
+<td><p>请求日志主采样率（[0.0–1.0]）。仅作用于数据面请求 API（Set/Get/Del/Exist/Create/Put 等）；生命周期/控制面 API（Init/ShutDown/Connect/UpdateToken/UpdateAkSk/Close/DeleteStream 等）不参与采样，日志始终全量输出。1.0=全量保留（所有请求采中→access/diagnostic也强制输出）；0.0=丢弃请求级 INFO/VLOG，请求级 ERROR/WARNING/SLOW_LOG 由 diagnostic补采样率 控制</p></td>
 </tr>
 <tr class="row-odd"><td><p>access_sample_rate</p></td>
 <td><p>double</p></td>
