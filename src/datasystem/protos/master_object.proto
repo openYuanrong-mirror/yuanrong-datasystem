@@ -444,6 +444,7 @@ message PushMetaToMasterReqPb {
   bytes address = 1;
   repeated ObjectMetaPb metas = 2; // Need persisted object metadata.
   repeated string gref_object_keys = 3; // Global reference object key list.
+  bool report_recovery_errors = 4;
 
   // put to the end, the previous data is used to generate AK and SK signatures.
   uint64 timestamp = 100;
@@ -452,6 +453,8 @@ message PushMetaToMasterReqPb {
 }
 
 message PushMetaToMasterRspPb {
+  bool recovery_errors_reported = 1;
+  repeated string failed_object_keys = 2;
 }
 
 message ReconciliationQueryPb {

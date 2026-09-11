@@ -63,6 +63,7 @@ private:
     std::shared_ptr<WorkerRpcClient> rpcClient_;
 #ifdef USE_URMA
     std::shared_ptr<UrmaConnection> clientOwner_;
+    std::string clientOwnerKey_;
 #endif
     std::atomic<bool> urmaReady_{ false };
     std::atomic<bool> supportsPayloadOnlyClientBatchGet_{ false };

@@ -71,7 +71,8 @@ public:
      * @param[in] objectKeys Object keys to recover.
      * @return Summary of the recovery attempt.
      */
-    RecoverySummary RecoverMetadataWithSummary(const std::vector<std::string> &objectKeys, std::string stanbyAddr);
+    RecoverySummary RecoverMetadataWithSummary(const std::vector<std::string> &objectKeys, std::string stanbyAddr,
+                                               bool reportRecoveryErrors = false);
 
     /**
      * @brief Recover metadata for explicit object metas and return aggregated summary.
@@ -143,8 +144,10 @@ private:
                           const std::shared_ptr<worker::WorkerMasterOCApi> &workerMasterApi,
                           master::PushMetaToMasterReqPb &req, std::vector<std::string> &batchObjectKeys,
                           DispatchResult &result) const;
-    DispatchResult SendRecoverRequest(const HostPort &masterAddr,
-                                      const std::vector<std::string> &objectKeys) const;
+    static void ApplyRecoverBatchResponse(bool reportRecoveryErrors, const master::PushMetaToMasterRspPb &rsp,
+                                          const std::vector<std::string> &batchObjectKeys, DispatchResult &result);
+    DispatchResult SendRecoverRequest(const HostPort &masterAddr, const std::vector<std::string> &objectKeys,
+                                      bool reportRecoveryErrors = false) const;
     DispatchResult SendRecoverRequest(const HostPort &masterAddr, const std::vector<ObjectMetaPb> &metas) const;
 
     HostPort localAddress_;

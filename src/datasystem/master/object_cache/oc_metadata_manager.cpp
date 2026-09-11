@@ -4102,13 +4102,17 @@ Status OCMetadataManager::RecoveryMetaFromWorker(const std::string &workerAddr, 
 
 Status OCMetadataManager::ProcessWorkerPushMeta(const PushMetaToMasterReqPb &req, PushMetaToMasterRspPb &rsp)
 {
-    (void)rsp;
+    rsp.Clear();
+    rsp.set_recovery_errors_reported(req.report_recovery_errors());
     LOG(INFO) << "Recv PushMetaToMasterReqPb:" << LogHelper::IgnoreSensitive(req);
     for (auto &meta : req.metas()) {
         Status s = RecoveryMetaFromWorker(req.address(), meta);
         if (s.IsError()) {
             LOG(WARNING) << FormatString("RecoveryMetaFromWorker failed. objectKey:%s, status:%s", meta.object_key(),
                                          s.ToString());
+            if (req.report_recovery_errors()) {
+                rsp.add_failed_object_keys(meta.object_key());
+            }
         }
     }
     std::vector<std::string> objectKeys = { req.gref_object_keys().begin(), req.gref_object_keys().end() };

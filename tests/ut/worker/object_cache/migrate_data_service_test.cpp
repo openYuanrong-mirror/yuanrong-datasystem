@@ -1411,6 +1411,22 @@ protected:
         placement_.SetOwner(objectKey, masterAddress);
     }
 
+    void PublishTopologyMember(const HostPort &address)
+    {
+        cluster::TopologyState topology;
+        topology.version = 2;
+        topology.members = {
+            cluster::Member{ { std::string(16, 'l'), localAddress_.ToString() }, cluster::MemberState::ACTIVE, { 1 } },
+            cluster::Member{
+                { std::string(16, 'p'), leavingWorkerAddress_.ToString() }, cluster::MemberState::ACTIVE, { 2 } },
+            cluster::Member{ { std::string(16, 'r'), address.ToString() }, cluster::MemberState::ACTIVE, { 3 } }
+        };
+        std::shared_ptr<const cluster::TopologySnapshot> snapshot;
+        DS_ASSERT_OK(cluster::TopologySnapshot::Create(std::move(topology), 2, std::string(64, 'b'), snapshot));
+        cluster::SnapshotUpdateOutcome outcome;
+        DS_ASSERT_OK(snapshots_.Publish(std::move(snapshot), outcome));
+    }
+
     master::QueryMetaInfoPb MakeQueryMeta(uint64_t dataSize = 1)
     {
         master::QueryMetaInfoPb queryMeta;
@@ -1418,6 +1434,36 @@ protected:
         queryMeta.mutable_meta()->set_data_size(dataSize);
         queryMeta.mutable_meta()->mutable_config()->set_data_format(static_cast<uint32_t>(DataFormat::BINARY));
         return queryMeta;
+    }
+
+    std::shared_ptr<SafeObjType> AddCompleteMigrationObject(const std::string &objectKey, uint64_t version = 1)
+    {
+        auto object = std::make_unique<ObjCacheShmUnit>();
+        object->SetShmUnit(std::make_shared<ShmUnit>());
+        object->SetDataSize(1);
+        object->SetCreateTime(version);
+        object->SetLifeState(ObjectLifeState::OBJECT_SEALED);
+        object->stateInfo.SetDataFormat(DataFormat::BINARY);
+        object->stateInfo.SetNeedToDelete(true);
+        DS_EXPECT_OK(objectTable_->Insert(objectKey, std::move(object)));
+        std::shared_ptr<SafeObjType> entry;
+        DS_EXPECT_OK(objectTable_->Get(objectKey, entry));
+        return entry;
+    }
+
+    static Status ReplaceCompleteMigrationObject(const std::shared_ptr<SafeObjType> &entry, uint64_t version)
+    {
+        auto replacement = std::make_unique<ObjCacheShmUnit>();
+        replacement->SetShmUnit(std::make_shared<ShmUnit>());
+        replacement->SetDataSize(1);
+        replacement->SetCreateTime(version);
+        replacement->SetLifeState(ObjectLifeState::OBJECT_SEALED);
+        replacement->stateInfo.SetDataFormat(DataFormat::BINARY);
+        replacement->stateInfo.SetNeedToDelete(true);
+        RETURN_IF_NOT_OK(entry->WLock());
+        entry->SetRealObject(std::move(replacement));
+        entry->WUnlock();
+        return Status::OK();
     }
 
     struct RemoteGetCleanupState {
@@ -2067,7 +2113,7 @@ TEST_F(NotifyRemoteGetMigrationTest, PostProcessRemoteGetInNotificationClearsDel
     untouchedEntry->WUnlock();
 }
 
-TEST_F(NotifyRemoteGetMigrationTest, ReplacePrimaryFailureMarksOnlyMigratedPayloadUnconfirmed)
+TEST_F(NotifyRemoteGetMigrationTest, ReplacePrimaryFailureMarksPayloadAndSuccessfulRetryConverges)
 {
     constexpr uint64_t version = 1;
     constexpr uint64_t dataSize = 1;
@@ -2092,11 +2138,15 @@ TEST_F(NotifyRemoteGetMigrationTest, ReplacePrimaryFailureMarksOnlyMigratedPaylo
     DS_ASSERT_OK(objectTable_->Insert(objectKey, std::move(object)));
     std::shared_ptr<SafeObjType> entry;
     DS_ASSERT_OK(objectTable_->Get(objectKey, entry));
-    api->replacePrimary_ = [&replacePrimaryCalls, &entry](master::ReplacePrimaryReqPb &,
-                                                          master::ReplacePrimaryRspPb &) {
+    api->replacePrimary_ = [&replacePrimaryCalls, &entry, &objectKey](master::ReplacePrimaryReqPb &,
+                                                                      master::ReplacePrimaryRspPb &rsp) {
         ++replacePrimaryCalls;
         EXPECT_FALSE(entry->IsWLockedByCurrentThread());
-        return Status(K_RPC_UNAVAILABLE, "metadata owner unavailable");
+        if (replacePrimaryCalls == 1) {
+            return Status(K_RPC_UNAVAILABLE, "metadata owner unavailable");
+        }
+        rsp.add_success_ids(objectKey);
+        return Status::OK();
     };
     DS_ASSERT_OK(entry->WLock());
     std::map<ReadKey, WorkerOcServiceGetImpl::LockedEntity> lockedEntries;
@@ -2119,9 +2169,6 @@ TEST_F(NotifyRemoteGetMigrationTest, ReplacePrimaryFailureMarksOnlyMigratedPaylo
     EXPECT_THAT(rsp.failed_object_keys(), Contains(objectKey));
     EXPECT_TRUE(entry->Get()->stateInfo.IsNeedToDelete());
     EXPECT_TRUE(entry->Get()->stateInfo.IsMigrationUnconfirmed());
-    impl_->ClearNeedDeleteForMigratedObjects({ objectKey }, lockedEntries, objectIdentities, queryMetas, false);
-    EXPECT_TRUE(entry->Get()->stateInfo.IsNeedToDelete());
-    EXPECT_FALSE(entry->Get()->stateInfo.IsPrimaryCopy());
     EXPECT_EQ(replacePrimaryCalls, 1U);
     auto newerMeta = queryMetas.at(objectKey).meta();
     newerMeta.set_version(version + 1);
@@ -2144,11 +2191,62 @@ TEST_F(NotifyRemoteGetMigrationTest, ReplacePrimaryFailureMarksOnlyMigratedPaylo
     DS_ASSERT_OK(impl_->ProcessRemoteGetInNotification(retryReq, { ReadKey(objectKey, 0, dataSize) }, queryMetas,
                                                        retryRsp, migratedBytes));
     EXPECT_EQ(replacePrimaryCalls, 2U);
-    EXPECT_THAT(retryRsp.failed_object_keys(), Contains(objectKey));
+    EXPECT_TRUE(retryRsp.failed_object_keys().empty());
     EXPECT_EQ(entry->Get(), payloadBeforeRetry);
     EXPECT_EQ(entry->Get()->GetShmUnit(), shmUnit);
-    EXPECT_TRUE(entry->Get()->stateInfo.IsMigrationUnconfirmed());
+    EXPECT_FALSE(entry->Get()->stateInfo.IsMigrationUnconfirmed());
+    EXPECT_FALSE(entry->Get()->stateInfo.IsNeedToDelete());
+    EXPECT_TRUE(entry->Get()->stateInfo.IsPrimaryCopy());
     EXPECT_EQ(migratedBytes, 0U);
+}
+
+TEST_F(NotifyRemoteGetMigrationTest, FailedPrimaryConfirmationProtectsSameGenerationReplacement)
+{
+    const bool oldEnableDataReplication = FLAGS_enable_data_replication;
+    Raii restoreFlag([oldEnableDataReplication]() { FLAGS_enable_data_replication = oldEnableDataReplication; });
+    FLAGS_enable_data_replication = false;
+    const HostPort masterAddress("127.0.0.1", 18890);
+    const std::string sameGeneration = "same-generation-replacement";
+    const std::string newerGeneration = "newer-generation-replacement";
+    const std::vector<std::string> objectKeys{ sameGeneration, newerGeneration };
+    std::map<ReadKey, WorkerOcServiceGetImpl::LockedEntity> lockedEntries;
+    WorkerOcServiceGetImpl::MigratedObjectIdentities identities;
+    QueryMetaMap queryMetas;
+    std::unordered_map<std::string, std::shared_ptr<SafeObjType>> entries;
+    for (const auto &objectKey : objectKeys) {
+        RouteObjectToMaster(objectKey, masterAddress);
+        entries[objectKey] = AddCompleteMigrationObject(objectKey);
+        lockedEntries.emplace(ReadKey(objectKey, 0, 1),
+                              WorkerOcServiceGetImpl::LockedEntity{ entries[objectKey], false });
+        identities.emplace(objectKey, entries[objectKey]->Get());
+        auto meta = MakeQueryMeta();
+        meta.mutable_meta()->set_object_key(objectKey);
+        meta.set_address(leavingWorkerAddress_.ToString());
+        queryMetas.emplace(objectKey, std::move(meta));
+    }
+    auto api = std::make_shared<MigrateTestWorkerMasterOCApi>(masterAddress, localAddress_);
+    api->replacePrimary_ = [&](master::ReplacePrimaryReqPb &, master::ReplacePrimaryRspPb &) {
+        for (const auto &[objectKey, entry] : entries) {
+            RETURN_IF_NOT_OK(ReplaceCompleteMigrationObject(entry, objectKey == sameGeneration ? 1 : 2));
+        }
+        return Status(K_RPC_UNAVAILABLE, "metadata owner unavailable");
+    };
+    workerMasterApiManager_->SetDefaultApi(api);
+    std::vector<std::string> successIds = objectKeys;
+    NotifyRemoteGetRspPb rsp;
+    ScopedRequestContext requestContext;
+    GetRequestContext()->reqTimeoutDuration.Init(10'000);
+
+    impl_->ReplacePrimaryAndPruneFailed(successIds, queryMetas, rsp, lockedEntries, identities, false);
+
+    EXPECT_TRUE(successIds.empty());
+    EXPECT_THAT(rsp.failed_object_keys(), UnorderedElementsAre(sameGeneration, newerGeneration));
+    EXPECT_NE(entries[sameGeneration]->Get(), identities[sameGeneration]);
+    EXPECT_EQ(entries[sameGeneration]->Get()->GetCreateTime(), 1U);
+    EXPECT_EQ(entries[sameGeneration]->Get()->GetDataSize(), 1U);
+    EXPECT_TRUE(entries[sameGeneration]->Get()->HasCompleteMigrationPayload());
+    EXPECT_TRUE(entries[sameGeneration]->Get()->stateInfo.IsMigrationUnconfirmed());
+    EXPECT_FALSE(entries[newerGeneration]->Get()->stateInfo.IsMigrationUnconfirmed());
 }
 
 TEST_F(NotifyRemoteGetMigrationTest, UnconfirmedNotifyRemoteGetObjectIsFreedAndErasedBeforeUnlock)
@@ -2404,6 +2502,7 @@ TEST_F(NotifyRemoteGetMigrationTest, NotifyRemoteGetFollowsReplacePrimaryRedirec
     const HostPort oldMasterAddress("127.0.0.1", 18891);
     const HostPort newMasterAddress("127.0.0.1", 18892);
     RouteObjectToMaster(objectKey, oldMasterAddress);
+    PublishTopologyMember(newMasterAddress);
 
     auto oldMasterApi = std::make_shared<MigrateTestWorkerMasterOCApi>(oldMasterAddress, localAddress_);
     auto newMasterApi = std::make_shared<MigrateTestWorkerMasterOCApi>(newMasterAddress, localAddress_);
@@ -2448,6 +2547,42 @@ TEST_F(NotifyRemoteGetMigrationTest, NotifyRemoteGetFollowsReplacePrimaryRedirec
     EXPECT_EQ(rsp.failed_object_keys_size(), 0);
     EXPECT_THAT(outcome.confirmedIds, Contains(objectKey));
     EXPECT_TRUE(outcome.expiredIds.empty());
+}
+
+TEST_F(NotifyRemoteGetMigrationTest, NotifyRemoteGetRejectsReplacePrimaryRedirectOutsideTopology)
+{
+    const std::string objectKey = "notify_remote_get_rejected_replace_primary_redirect";
+    const HostPort oldMasterAddress("127.0.0.1", 18891);
+    const HostPort rejectedMasterAddress("127.0.0.1", 18893);
+    RouteObjectToMaster(objectKey, oldMasterAddress);
+    auto oldMasterApi = std::make_shared<MigrateTestWorkerMasterOCApi>(oldMasterAddress, localAddress_);
+    auto rejectedMasterApi = std::make_shared<MigrateTestWorkerMasterOCApi>(rejectedMasterAddress, localAddress_);
+    size_t rejectedMasterCalls = 0;
+    oldMasterApi->replacePrimary_ = [&](master::ReplacePrimaryReqPb &, master::ReplacePrimaryRspPb &rsp) {
+        auto *redirect = rsp.add_info();
+        redirect->set_redirect_meta_address(rejectedMasterAddress.ToString());
+        redirect->add_change_meta_ids(objectKey);
+        return Status::OK();
+    };
+    rejectedMasterApi->replacePrimary_ = [&](master::ReplacePrimaryReqPb &, master::ReplacePrimaryRspPb &) {
+        ++rejectedMasterCalls;
+        return Status::OK();
+    };
+    workerMasterApiManager_->SetApi(oldMasterAddress, oldMasterApi);
+    workerMasterApiManager_->SetApi(rejectedMasterAddress, rejectedMasterApi);
+    auto queryMeta = MakeQueryMeta();
+    queryMeta.set_address(leavingWorkerAddress_.ToString());
+    QueryMetaMap queryMetas{ { objectKey, std::move(queryMeta) } };
+    NotifyRemoteGetRspPb rsp;
+    ScopedRequestContext requestContext;
+    GetRequestContext()->reqTimeoutDuration.Init(10'000);
+
+    auto outcome = impl_->ReplacePrimaryForNotifyRemoteGet({ objectKey }, queryMetas, rsp);
+
+    EXPECT_EQ(rejectedMasterCalls, 0U);
+    EXPECT_TRUE(outcome.confirmedIds.empty());
+    EXPECT_THAT(outcome.failedIds, Contains(objectKey));
+    EXPECT_THAT(rsp.failed_object_keys(), Contains(objectKey));
 }
 
 TEST_F(NotifyRemoteGetMigrationTest, ExpiredPrimarySwitchRemainsDeletableAndCannotRecoverMetadata)

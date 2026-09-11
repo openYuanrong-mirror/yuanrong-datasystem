@@ -190,8 +190,43 @@ TEST_F(UrmaClientOwnershipTest, ReplacementSharesPeerBudgetButNotClientOwnership
     replacement->OnTransferFinished(true);
     replacement->ReleaseInflightSlot();
     EXPECT_EQ(replacement->peerState_->retired, 0U);
+    std::weak_ptr<UrmaConnection> oldLifetime = oldOwner;
     manager.ReleaseClientConnection(info.localAddress.ToString(), oldOwner);
+    oldOwner.reset();
+    EXPECT_TRUE(oldLifetime.expired());
+    ASSERT_TRUE(replacement->AcquireInflightSlot(1000).IsOk());
+    replacement->ReleaseInflightSlot();
     EXPECT_EQ(manager.urmaConnectionMap_.count(info.localAddress.ToString()), 1U);
+    manager.ReleaseClientConnection(info.localAddress.ToString(), replacement);
+    EXPECT_EQ(manager.urmaConnectionMap_.count(info.localAddress.ToString()), 0U);
+}
+
+TEST_F(UrmaClientOwnershipTest, ClientReplacementDoesNotInheritWorkerOwnership)
+{
+    ASSERT_TRUE(manager.FinalizeOutboundConnection(response, UrmaManager::ConnectionOwnership::WORKER_OWNED).IsOk());
+    TbbUrmaConnectionMap::const_accessor current;
+    ASSERT_TRUE(manager.urmaConnectionMap_.find(current, info.localAddress.ToString()));
+    auto previous = current->second;
+    current.release();
+    previous->RequireReconnect();
+    {
+        std::lock_guard<bthread::Mutex> lock(previous->peerState_->mutex);
+        previous->peerState_->retryAfter = std::chrono::steady_clock::time_point::min();
+    }
+    BINEXPECT_CALL(&UrmaManager::InitializeOutboundConnection, (testing::_, testing::_, testing::_))
+        .WillOnce(testing::Invoke(
+            [](const UrmaHandshakeReqPb &, const UrmaJfrInfo &remote, std::shared_ptr<UrmaConnection> &connection) {
+                connection = std::make_shared<UrmaConnection>(nullptr, remote);
+                return Status::OK();
+            }));
+    Raii releaseStubs([] { RELEASE_STUBS });
+    std::shared_ptr<UrmaConnection> replacement;
+
+    ASSERT_TRUE(manager.FinalizeOutboundConnection(response, UrmaManager::ConnectionOwnership::CLIENT_REF, &replacement)
+                    .IsOk());
+
+    EXPECT_FALSE(replacement->workerOwned_.load());
+    EXPECT_EQ(replacement->clientOwners_.load(), 1U);
     manager.ReleaseClientConnection(info.localAddress.ToString(), replacement);
     EXPECT_EQ(manager.urmaConnectionMap_.count(info.localAddress.ToString()), 0U);
 }
