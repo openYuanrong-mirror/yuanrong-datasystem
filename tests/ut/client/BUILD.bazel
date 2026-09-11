@@ -95,12 +95,16 @@ ds_cc_test(
 
 ds_cc_test(
     name = "transport_test",
-    srcs = ["transport_test.cpp"],
+    srcs = [
+        "object_cache/data_plane_ub_health_verifier_test.cpp",
+        "transport_test.cpp",
+    ],
     deps = [
         "//include/datasystem:headers",
         "//src/datasystem/client:datasystem",
         "//src/datasystem/client/object_cache/transport:client_transport",
         "//src/datasystem/common/ak_sk:signature",
+        "//src/datasystem/common/flags:dynamic_flag_config",
         "//src/datasystem/common/inject:common_inject",
         "//src/datasystem/common/object_cache:object_base",
         "//src/datasystem/common/object_cache:object_buffer",
@@ -134,6 +138,7 @@ ds_cc_test(
         "//conditions:default": [],
     }),
     deps = [
+        "//tests:ub_port_test_support",
         "//include/datasystem:headers",
         "//src/datasystem/client/object_cache/transport:client_transport",
         "//src/datasystem/common/ak_sk:signature",

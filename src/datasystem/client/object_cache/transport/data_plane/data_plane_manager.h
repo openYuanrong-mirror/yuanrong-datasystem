@@ -19,6 +19,8 @@
 #define DATASYSTEM_CLIENT_TRANSPORT_DATA_PLANE_MANAGER_H
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -39,6 +41,7 @@
 #include "datasystem/client/object_cache/transport/transport_kind.h"
 #include "datasystem/client/object_cache/transport/transport_phase_latency_recorder.h"
 #include "datasystem/client/object_cache/transport/worker_snapshot.h"
+#include "datasystem/cluster/ub_health/remote_ub_port_health_verifier.h"
 #include "datasystem/common/ak_sk/signature.h"
 #include "datasystem/common/object_cache/peer_ub_admission.h"
 #include "datasystem/common/util/net_util.h"
@@ -55,6 +58,22 @@ class ObjectMetadataClient;
 class DataPlaneManager {
 private:
     struct WorkerTransportEntry;
+    class UbHealthCallbackState {
+    public:
+        explicit UbHealthCallbackState(DataPlaneManager *manager);
+        ~UbHealthCallbackState() = default;
+
+        void Detach();
+        void ObserveSummary(const UbHealthSummary &summary);
+
+    private:
+        void FinishObservation();
+
+        std::mutex mutex_;
+        std::condition_variable drained_;
+        DataPlaneManager *manager_;
+        size_t activeObservers_{ 0 };
+    };
 
 public:
     class DataPlaneLease {
@@ -82,7 +101,11 @@ public:
                               bool enableClientDirectPipelineH2D = false, int32_t pipelineThreadNum = 64,
                               std::shared_ptr<ThreadPool> releasePool = nullptr, bool initializeUbRuntime = true,
                               bool allowUbRuntimeFailure = false,
-                              std::shared_ptr<HostMemoryPinManager> hostMemoryPinManager = nullptr);
+                              std::shared_ptr<HostMemoryPinManager> hostMemoryPinManager = nullptr,
+                              UbHealthSummaryApplyHook ubHealthSummaryHook = {},
+                              UbHealthSummaryApplyHook verifiedUbHealthSummaryHook = {},
+                              std::function<void()> ubHealthWakeHook = {},
+                              std::function<bool(const HostPort &)> ubPortHealthCapabilityCheck = {});
     virtual ~DataPlaneManager();
 
     /** @brief Initialize manager lifecycle and, when requested, process-level UB resources. */
@@ -148,6 +171,15 @@ public:
     virtual Status ProbeProviderUbRecovery(const HostPort &workerAddr, const std::string &expectedIncarnation,
                                            int32_t timeoutMs, UbHealthSummary &summary);
 
+    /** @brief Query one Worker's cached UB port health without establishing or probing a data plane. */
+    virtual Status QueryUbPortHealth(const HostPort &workerAddr, const std::string &expectedIncarnation,
+                                     int32_t timeoutMs, UbHealthSummary &summary);
+
+    bool RequestUbPortHealthVerification(const HostPort &workerAddr);
+    void ObserveUbHealthSummary(const UbHealthSummary &summary);
+    void RunDueUbPortHealthVerification();
+    std::optional<std::chrono::steady_clock::time_point> GetUbPortHealthQueryDeadline() const;
+
     /** @brief Drop every data-plane transporter while retaining the shared RPC connection. */
     void ResetDataPlane(const HostPort &workerAddr);
 
@@ -198,9 +230,10 @@ private:
 
     struct EndpointAdmissionSnapshot {
         EndpointAdmissionSnapshot(uint64_t version, std::shared_ptr<const std::unordered_set<std::string>> workers,
-                                  bool isProvisional, int64_t confirmedMs)
+                                  bool isProvisional, int64_t confirmedMs,
+                                  std::shared_ptr<const std::unordered_map<HostPort, std::string>> incarnations = {})
             : ringVersion(version), liveWorkers(std::move(workers)), provisional(isProvisional),
-              lastConfirmedMs(confirmedMs)
+              lastConfirmedMs(confirmedMs), workerIncarnations(std::move(incarnations))
         {
         }
 
@@ -210,6 +243,7 @@ private:
         int64_t lastConfirmedMs{ 0 };
         // One grace window per confirmed-refresh generation; readers never rearm an expired window.
         mutable std::atomic<int64_t> degradedDeadlineMs{ 0 };
+        std::shared_ptr<const std::unordered_map<HostPort, std::string>> workerIncarnations;
     };
 
     struct WorkerTransportEntry {
@@ -274,6 +308,11 @@ private:
                                    const std::shared_ptr<WorkerTransportEntry> &entry,
                                    bool &cachedFallbackAlongsideShm);
 
+    void CompleteUbPortHealthVerification(const cluster::RemoteUbQueryTicket &ticket) noexcept;
+    void FailUbPortHealthQueryDispatch(const cluster::RemoteUbQueryTicket &ticket,
+                                       const std::string &message) noexcept;
+    void ApplyUbPortHealthCapabilityCheck(const cluster::RemoteUbQueryTicket &ticket, Status &rc) const;
+
     Status BuildUbTransporter(const HostPort &workerAddr, const std::shared_ptr<WorkerRpcClient> &rpcClient,
                               TransportPhaseLatencyRecorder *recorder, std::shared_ptr<IDataTransporter> &out);
 
@@ -293,6 +332,17 @@ private:
     uint64_t fastTransportMemSize_ = 0;
     bool initializeUbRuntime_ = true;
     bool allowUbRuntimeFailure_ = false;
+    UbHealthSummaryApplyHook ubHealthSummaryHook_;
+    UbHealthSummaryApplyHook verifiedUbHealthSummaryHook_;
+    std::function<void()> ubHealthWakeHook_;
+    std::function<bool(const HostPort &)> ubPortHealthCapabilityCheck_;
+    std::shared_ptr<UbHealthCallbackState> ubHealthCallbackState_;
+    cluster::RemoteUbPortHealthVerifier ubPortHealthVerifier_;
+    std::shared_ptr<ThreadPool> ubPortHealthQueryPool_{ std::make_shared<ThreadPool>(
+        0, cluster::REMOTE_UB_PORT_HEALTH_MAX_CONCURRENT_QUERIES, "client-ub-health") };
+    // Counts submitted tasks, including RPCs whose topology ticket has been retired.
+    std::atomic<size_t> ubPortHealthQueriesInFlight_{ 0 };
+    UbHealthSummaryCache observedUbHealthSummaries_;
     bool enableClientDirectPipelineH2D_ = false;
     int32_t pipelineThreadNum_ = 64;
     bthread::Mutex lifecycleMutex_;

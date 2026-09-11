@@ -14,6 +14,18 @@ ds_cc_test(
 )
 
 ds_cc_test(
+    name = "worker_ub_health_registry_test",
+    srcs = ["worker_ub_health_registry_test.cpp"],
+    deps = [
+        "//tests:ub_port_test_support",
+        "//src/datasystem/client/object_cache/routing:routing",
+        "//src/datasystem/common/object_cache:common_object_cache",
+        "//src/datasystem/protos:cluster_topology_cc_proto",
+        "//tests/ut:ut_common",
+    ],
+)
+
+ds_cc_test(
     name = "routing_test",
     srcs = ["routing_test.cpp"],
     deps = [

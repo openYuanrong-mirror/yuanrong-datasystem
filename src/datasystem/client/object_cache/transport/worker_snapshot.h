@@ -47,6 +47,7 @@ struct WorkerSnapshot {
     // Ring accepted after a version-epoch reset (cross-confirmed lower version); publishing it may
     // regress the snapshot version.
     bool epochResetConfirmed = false;
+    std::unordered_map<HostPort, std::string> workerIncarnations;
 };
 
 /**

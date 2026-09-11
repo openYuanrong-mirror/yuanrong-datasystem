@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <iterator>
+#include <stdexcept>
 #include <unordered_set>
 #include <utility>
 
@@ -36,8 +37,17 @@ constexpr size_t MAX_ROUTING_TOKENS = 640'000;
 }  // namespace
 
 WorkerRouter::WorkerRouter(std::string myHostId, std::vector<std::shared_ptr<IWorkerFilter>> additionalFilters)
-    : myHostId_(std::move(myHostId))
+    : WorkerRouter(std::move(myHostId), std::make_shared<WorkerUbHealthRegistry>(), std::move(additionalFilters))
 {
+}
+
+WorkerRouter::WorkerRouter(std::string myHostId, std::shared_ptr<WorkerUbHealthRegistry> ubHealthRegistry,
+                           std::vector<std::shared_ptr<IWorkerFilter>> additionalFilters)
+    : myHostId_(std::move(myHostId)), ubHealthRegistry_(std::move(ubHealthRegistry))
+{
+    if (ubHealthRegistry_ == nullptr) {
+        throw std::invalid_argument("Worker UB health registry must not be null");
+    }
     filters_.reserve(additionalFilters.size() + DEFAULT_FILTER_COUNT);
     filters_.emplace_back(std::make_shared<StateFilter>(this));
     filters_.emplace_back(std::make_shared<BrokenFilter>());
@@ -257,6 +267,11 @@ std::vector<HostPort> WorkerRouter::GetAvailableWorkers() const
     return result;
 }
 
+std::shared_ptr<const UbRoutingHealthSnapshot> WorkerRouter::GetUbRoutingHealthSnapshot() const
+{
+    return ubHealthRegistry_->GetRoutingSnapshot();
+}
+
 void WorkerRouter::UpdateHashRing(const PreparedClusterTopology &prepared,
                                   const std::unordered_map<std::string, std::string> &hostIdMap)
 {
@@ -287,6 +302,7 @@ void WorkerRouter::UpdateHashRing(const PreparedClusterTopology &prepared,
 
     // Single atomic store — all readers see the new view atomically
     std::atomic_store(&ringView_, std::shared_ptr<const RingView>(std::move(newView)));
+    ubHealthRegistry_->ReconcileTopology(*ring);
 
     // Notify filters
     for (auto &f : filters_) {

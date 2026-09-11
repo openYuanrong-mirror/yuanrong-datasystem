@@ -132,22 +132,6 @@ void InvokeRemoteVerificationTrigger(
     }
 }
 
-void InvokeRemoteSummaryObserver(
-    const std::shared_ptr<const PeerUbAdmission::RemotePortHealthSummaryObserver> &observer,
-    const UbHealthSummary &summary)
-{
-    if (observer == nullptr) {
-        return;
-    }
-    try {
-        (*observer)(summary);
-    } catch (const std::exception &e) {
-        LOG(ERROR) << "UB remote port-health summary observer threw: " << e.what();
-    } catch (...) {
-        LOG(ERROR) << "UB remote port-health summary observer threw an unknown exception";
-    }
-}
-
 struct PortHealthApplyResult {
     bool applied = false;
     bool isolated = false;
@@ -304,22 +288,6 @@ void PeerUbAdmission::SetRemotePortHealthVerificationTrigger(RemotePortHealthVer
     auto callback = trigger ? std::make_shared<const RemotePortHealthVerificationTrigger>(std::move(trigger))
                             : nullptr;
     std::atomic_store(&remotePortHealthVerificationTrigger_, std::move(callback));
-}
-
-void PeerUbAdmission::SetRemotePortHealthSummaryObserver(RemotePortHealthSummaryObserver observer)
-{
-    auto callback = observer ? std::make_shared<const RemotePortHealthSummaryObserver>(std::move(observer))
-                             : nullptr;
-    std::atomic_store(&remotePortHealthSummaryObserver_, std::move(callback));
-}
-
-void PeerUbAdmission::ObserveRemotePortHealthSummary(const UbHealthSummary &summary)
-{
-    if (summary.worker.Empty() || summary.incarnation.empty() || !summary.portHealth.has_value()) {
-        return;
-    }
-    auto callback = std::atomic_load(&remotePortHealthSummaryObserver_);
-    InvokeRemoteSummaryObserver(callback, summary);
 }
 
 void PeerUbAdmission::ReportOutcomeImpl(const UbOpOutcome &outcome, std::optional<LateCompletionFence> fence)
@@ -1109,6 +1077,13 @@ bool UbHealthSummaryCache::Apply(const UbHealthSummary &summary, const std::stri
         }
     }
     std::lock_guard<std::shared_mutex> lock(mutex_);
+    const auto *current = state_.Find(summary.worker);
+    // Standalone cache admission updates require a newer epoch; passive Registry/RPC observations do not.
+    if (current != nullptr && current->incarnation == summary.incarnation && current->epoch == summary.epoch) {
+        auto retainedAdmission = *current;
+        retainedAdmission.portHealth = summary.portHealth;
+        return state_.Apply(retainedAdmission, expectedIncarnation);
+    }
     return state_.Apply(summary, expectedIncarnation);
 }
 

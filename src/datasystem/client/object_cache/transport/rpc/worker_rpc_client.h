@@ -21,11 +21,13 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include "datasystem/client/object_cache/transport/rpc/set_request_builder.h"
 #include "datasystem/common/ak_sk/signature.h"
 #include "datasystem/common/object_cache/object_base.h"
+#include "datasystem/common/object_cache/ub_health_summary_codec.h"
 #include "datasystem/common/rpc/brpc_factory.h"
 #include "datasystem/common/rpc/mem_view.h"
 #include "datasystem/common/rpc/rpc_message.h"
@@ -100,6 +102,12 @@ public:
     virtual Status ProbeProviderUbRecovery(const std::string &expectedWorkerIncarnation,
                                            int32_t timeoutMs, ProviderUbRecoveryProbeRspPb &response);
 
+    /** @brief Query the Worker's cached UB port-health summary without touching the data plane. */
+    virtual Status QueryUbPortHealth(const std::string &expectedWorkerIncarnation,
+                                     int32_t timeoutMs, QueryUbPortHealthRspPb &response);
+
+    void SetUbHealthSummaryCallback(UbHealthSummaryApplyHook callback);
+
     /** @brief Fetch the versioned routing hash ring through the cached worker channel. */
     virtual Status InvokeGetHashRing(uint64_t currentVersion, GetHashRingRspPb &response);
 
@@ -173,6 +181,8 @@ protected:
     /** @brief Release the channel and stubs during object destruction. */
     virtual void Close();
 
+    void ObserveUbHealthSummary(const UbHealthSummaryPb &encoded);
+
 private:
     HostPort workerAddress_;
     std::shared_ptr<Signature> signature_;
@@ -182,6 +192,9 @@ private:
     std::shared_ptr<WorkerOCService_BrpcGenericStub> controlStub_;
     std::shared_ptr<WorkerWorkerTransportService_BrpcGenericStub> transportStub_;
     std::shared_ptr<WorkerWorkerOCService_BrpcGenericStub> dataStub_;
+    std::mutex ubHealthSummaryMutex_;
+    std::shared_ptr<const UbHealthSummary> lastUbHealthSummary_;
+    UbHealthSummaryApplyHook ubHealthSummaryCallback_;
     std::atomic<bool> alive_{ false };
     std::atomic<uint32_t> connectionGeneration_{ 0 };
     static std::atomic<uint32_t> nextConnectionGeneration_;

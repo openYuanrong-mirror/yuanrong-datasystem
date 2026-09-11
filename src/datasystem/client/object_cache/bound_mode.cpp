@@ -910,6 +910,13 @@ static void ClearUBPayloadPlaceholders(GetRspPb &rsp, std::vector<RpcMessage> &p
 }
 #endif
 
+void BoundMode::ObserveGetProviderUbFailure(const std::shared_ptr<IClientWorkerApi> &workerApi, const GetRspPb &rsp)
+{
+    if (transportLayer_ != nullptr && workerApi != nullptr && rsp.has_provider_ub_failure_detail()) {
+        transportLayer_->ReportClientGetWritebackFailure(workerApi->hostPort_, rsp.provider_ub_failure_detail());
+    }
+}
+
 Status BoundMode::GetBuffersFromWorker(std::shared_ptr<IClientWorkerApi> workerApi, GetParam &getParam,
                                        std::vector<std::shared_ptr<Buffer>> &buffers)
 {
@@ -1011,6 +1018,7 @@ Status BoundMode::GetBuffersFromWorker(std::shared_ptr<IClientWorkerApi> workerA
         Trace::Instance().AddLatencyTick(LatencyTickKey::CLIENT_GET_RPC_START);
     }
     Status getRc = workerApi->Get(getParam, version, rsp, payloads);
+    ObserveGetProviderUbFailure(workerApi, rsp);
     if (traceEnabled) {
         Trace::Instance().AddLatencyTick(LatencyTickKey::CLIENT_GET_RPC_END);
     }
@@ -1149,6 +1157,7 @@ Status BoundMode::GetBuffersFromWorkerBatched(std::shared_ptr<IClientWorkerApi> 
 
         PerfPoint stagePoint(PerfKey::CLIENT_GET_BUFFERS_FROM_WORKER_RPC);
         Status rc = workerApi->Get(subGetParam, version, rsp, payloads);
+        ObserveGetProviderUbFailure(workerApi, rsp);
         if (requestTransportKind != nullptr) {
             *requestTransportKind = MergeTransportKind(*requestTransportKind, batchTransportKind);
         }
@@ -1261,7 +1270,9 @@ Status BoundMode::GetOversizedBufferChunk(std::shared_ptr<IClientWorkerApi> work
                           .requestTimeoutMs = getParam.requestTimeoutMs };
     GetRspPb rsp;
     std::vector<RpcMessage> payloads;
-    RETURN_IF_NOT_OK(workerApi->Get(subGetParam, version, rsp, payloads));
+    Status getRc = workerApi->Get(subGetParam, version, rsp, payloads);
+    ObserveGetProviderUbFailure(workerApi, rsp);
+    RETURN_IF_NOT_OK(getRc);
     if (requestTransportKind != nullptr) {
         *requestTransportKind = MergeTransportKind(*requestTransportKind, chunkTransportKind);
     }

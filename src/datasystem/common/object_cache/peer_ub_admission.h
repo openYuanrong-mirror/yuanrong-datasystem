@@ -177,7 +177,6 @@ class PeerUbAdmission : public UrmaLateCompletionObserver,
                         public std::enable_shared_from_this<PeerUbAdmission> {
 public:
     using RemotePortHealthVerificationTrigger = std::function<void(const HostPort &)>;
-    using RemotePortHealthSummaryObserver = std::function<void(const UbHealthSummary &)>;
 
     explicit PeerUbAdmission(
         UbPortHealthVerificationMode verificationMode = UbPortHealthVerificationMode::LEGACY)
@@ -195,8 +194,6 @@ public:
     void ReconcileRemotePortHealthCapabilities(
         const std::unordered_map<HostPort, std::string> &incarnations);
     void SetRemotePortHealthVerificationTrigger(RemotePortHealthVerificationTrigger trigger);
-    void SetRemotePortHealthSummaryObserver(RemotePortHealthSummaryObserver observer);
-    void ObserveRemotePortHealthSummary(const UbHealthSummary &summary);
 
     /**
      * Apply one valid aggregate port-health fact. Self admission accepts local monitor facts; remote admission accepts
@@ -297,7 +294,6 @@ private:
     std::atomic<uint64_t> lateCompletionGeneration_{ 0 };
     std::unordered_map<HostPort, std::string> remotePortHealthPeers_;
     std::shared_ptr<const RemotePortHealthVerificationTrigger> remotePortHealthVerificationTrigger_;
-    std::shared_ptr<const RemotePortHealthSummaryObserver> remotePortHealthSummaryObserver_;
     std::unordered_map<HostPort, uint64_t> peerCompletionGenerations_;
     uint64_t nextPeerCompletionGeneration_{ 0 };
 };

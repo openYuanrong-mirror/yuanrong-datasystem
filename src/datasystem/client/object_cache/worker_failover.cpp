@@ -79,22 +79,27 @@ void WorkerFailover::ConfigureUrmaDataPlaneFailureCallback(WorkerNode node,
     if (workerApi == nullptr) {
         return;
     }
-    if (owner_.ubHealthFilter_ == nullptr) {
-        owner_.ubHealthFilter_ = std::make_shared<client::UbHealthFilter>();
+    if (owner_.ubHealthRegistry_ == nullptr) {
+        owner_.ubHealthRegistry_ = std::make_shared<client::WorkerUbHealthRegistry>();
     }
-    std::weak_ptr<client::UbHealthFilter> weakUbHealthFilter(owner_.ubHealthFilter_);
-    auto recoverProvider = owner_.transportLayer_ == nullptr
-                               ? std::function<void(const HostPort &)>{}
-                               : owner_.transportLayer_->MakeProviderRecoveryCallback();
-    workerApi->SetUbHealthSummaryCallback([weakUbHealthFilter, recoverProvider](const UbHealthSummary &summary) {
-        auto filter = weakUbHealthFilter.lock();
-        if (filter == nullptr || !filter->ApplySummary(summary, summary.incarnation)) {
-            return;
-        }
-        if (!summary.writable && recoverProvider != nullptr) {
-            recoverProvider(summary.worker);
-        }
-    });
+    if (owner_.ubHealthFilter_ == nullptr) {
+        owner_.ubHealthFilter_ = std::make_shared<client::UbHealthFilter>(owner_.ubHealthRegistry_);
+    }
+    if (owner_.transportLayer_ != nullptr) {
+        workerApi->SetUbHealthSummaryCallback(owner_.transportLayer_->GetUbHealthSummaryApplyHook());
+    } else {
+        std::weak_ptr<client::UbHealthFilter> weakUbHealthFilter(owner_.ubHealthFilter_);
+        workerApi->SetUbHealthSummaryCallback([weakUbHealthFilter](const UbHealthSummary &summary) {
+            auto filter = weakUbHealthFilter.lock();
+            if (filter != nullptr) {
+                if (summary.portHealth.has_value()) {
+                    (void)filter->ObserveSummary(summary, summary.incarnation);
+                } else {
+                    (void)filter->ApplySummary(summary, summary.incarnation);
+                }
+            }
+        });
+    }
     if (!owner_.enableCrossNodeConnection_) {
         return;
     }

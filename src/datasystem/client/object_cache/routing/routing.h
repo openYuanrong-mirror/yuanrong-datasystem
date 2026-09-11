@@ -50,6 +50,12 @@ public:
             std::vector<std::shared_ptr<IWorkerFilter>> additionalFilters = {},
             int64_t refreshIntervalMs = DEFAULT_REFRESH_INTERVAL_MS,
             std::function<void(uint64_t)> refreshConfirmedHook = {});
+    Routing(BrpcChannelConfig channelConfig, std::shared_ptr<Signature> signature,
+            HashRingRefresher::RingUpdateHook ringUpdateHook,
+            std::shared_ptr<WorkerUbHealthRegistry> ubHealthRegistry,
+            std::vector<std::shared_ptr<IWorkerFilter>> additionalFilters = {},
+            int64_t refreshIntervalMs = DEFAULT_REFRESH_INTERVAL_MS,
+            std::function<void(uint64_t)> refreshConfirmedHook = {});
 
     // Dependency-injection seam used by focused routing tests.
     Routing(std::shared_ptr<WorkerRouter> router, std::shared_ptr<HashRingRefresher> refresher,

@@ -7,6 +7,7 @@
 #include "datasystem/client/object_cache/routing/ub_health_filter.h"
 
 #include <exception>
+#include <stdexcept>
 #include <unordered_set>
 #include <utility>
 
@@ -15,17 +16,31 @@
 #include "datasystem/common/util/timer.h"
 
 namespace datasystem::client {
+namespace {
+constexpr int UB_RECOVERY_REJECT_LOG_EVERY_N = 100;
+}  // namespace
+
 UbHealthFilter::UbHealthFilter()
-    : writeTargetAdmission_(std::make_shared<PeerUbAdmission>()),
-      writeTargetCompletionGenerations_(std::make_shared<const WriteTargetCompletionGenerations>())
+    : UbHealthFilter(std::make_shared<WorkerUbHealthRegistry>())
 {
 }
 
-bool UbHealthFilter::ApplySummary(const UbHealthSummary &summary, const std::string &expectedIncarnation)
+UbHealthFilter::UbHealthFilter(std::shared_ptr<WorkerUbHealthRegistry> ubHealthRegistry)
+    : ubHealthRegistry_(std::move(ubHealthRegistry)),
+      writeTargetAdmission_(std::make_shared<PeerUbAdmission>()),
+      writeTargetCompletionGenerations_(std::make_shared<const WriteTargetCompletionGenerations>())
 {
+    if (ubHealthRegistry_ == nullptr) {
+        throw std::invalid_argument("Worker UB health registry must not be null");
+    }
+}
+
+bool UbHealthFilter::ObserveSummary(const UbHealthSummary &summary,
+                                    const std::string &expectedIncarnation)
+{
+    std::string expected = expectedIncarnation;
     {
         std::lock_guard<std::mutex> lock(incarnationMutex_);
-        auto expected = expectedIncarnation;
         if (topologyInitialized_) {
             auto trusted = trustedIncarnations_.find(summary.worker);
             if (trusted == trustedIncarnations_.end()) {
@@ -33,28 +48,83 @@ bool UbHealthFilter::ApplySummary(const UbHealthSummary &summary, const std::str
             }
             expected = trusted->second;
         }
-        const auto previous = cache_.Get(summary.worker);
-        const bool sameIncarnationRecovery = previous.has_value() && previous->incarnation == summary.incarnation
-                                             && !previous->writable && summary.writable;
-        if (!cache_.Apply(summary, expected)) {
-            return false;
-        }
-        if (sameIncarnationRecovery) {
-            // A trusted writable summary marks recovery of the same worker
-            // incarnation. Drop the client-local quarantine learned from the
-            // earlier global-unavailable epoch; otherwise the client remains
-            // blocked forever even though the worker has recovered.
-            localAdmission_.ClearLocalState(summary.worker);
-            localObservationIncarnations_.erase(summary.worker);
-        } else {
-            ReconcileLocalObservationWithTrustedIncarnationLocked(summary.worker, summary.incarnation);
-        }
-        trustedIncarnations_[summary.worker] = summary.incarnation;
     }
-    if (!summary.writable) {
+    const bool updated = ubHealthRegistry_->ApplySummary(summary, expected);
+    auto accepted = ubHealthRegistry_->GetSummary(summary.worker);
+    if (!accepted.has_value() || accepted->incarnation != expected) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(incarnationMutex_);
+    auto trusted = trustedIncarnations_.find(summary.worker);
+    if (topologyInitialized_
+        && (trusted == trustedIncarnations_.end() || trusted->second != summary.incarnation)) {
+        return false;
+    }
+    if (accepted->portHealth.has_value()) {
+        localAdmission_.SetRemotePortHealthCapability(summary.worker, true, accepted->incarnation);
+        writeTargetAdmission_->SetRemotePortHealthCapability(summary.worker, true, accepted->incarnation);
+    }
+    return updated;
+}
+
+bool UbHealthFilter::ApplySummary(const UbHealthSummary &summary, const std::string &expectedIncarnation)
+{
+    std::string expected = expectedIncarnation;
+    {
+        std::lock_guard<std::mutex> lock(incarnationMutex_);
+        if (topologyInitialized_) {
+            auto trusted = trustedIncarnations_.find(summary.worker);
+            if (trusted == trustedIncarnations_.end()) {
+                return false;
+            }
+            expected = trusted->second;
+        }
+    }
+
+    const bool wasGloballyUnavailable = ubHealthRegistry_->IsVerifiedUnavailable(summary.worker);
+    const bool verifiedRecovery = summary.portHealth.has_value()
+                                      ? ShouldRecoverFromUbIsolation(*summary.portHealth)
+                                      : summary.writable;
+    if (!ubHealthRegistry_->ApplyVerifiedSummary(summary, expected)) {
+        return false;
+    }
+    const bool legacyReadRecovery = wasGloballyUnavailable
+                                    && !ubHealthRegistry_->IsVerifiedUnavailable(summary.worker);
+    std::lock_guard<std::mutex> lock(incarnationMutex_);
+    auto trusted = trustedIncarnations_.find(summary.worker);
+    if (topologyInitialized_
+        && (trusted == trustedIncarnations_.end() || trusted->second != summary.incarnation)) {
+        return false;
+    }
+    if (summary.portHealth.has_value()) {
+        localAdmission_.SetRemotePortHealthCapability(summary.worker, true, summary.incarnation);
+        writeTargetAdmission_->SetRemotePortHealthCapability(summary.worker, true, summary.incarnation);
+    }
+
+    if (verifiedRecovery && (summary.portHealth.has_value() || legacyReadRecovery)) {
+        localAdmission_.ClearLocalState(summary.worker);
+        localObservationIncarnations_.erase(summary.worker);
+        if (summary.portHealth.has_value()) {
+            writeTargetAdmission_->ClearLocalState(summary.worker);
+            writeTargetObservationIncarnations_.erase(summary.worker);
+            writeTargetObservationCount_.store(writeTargetObservationIncarnations_.size(), std::memory_order_release);
+            RefreshWriteTargetCompletionGenerationLocked(summary.worker);
+        }
+    } else {
+        ReconcileLocalObservationWithTrustedIncarnationLocked(summary.worker, summary.incarnation);
+    }
+    trustedIncarnations_[summary.worker] = summary.incarnation;
+    if (ubHealthRegistry_->IsVerifiedUnavailable(summary.worker)) {
         INJECT_POINT_NO_RETURN("client.ub_health_filter.global_unavailable_applied");
     }
     return true;
+}
+
+void UbHealthFilter::SetRemotePortHealthVerificationTrigger(
+    PeerUbAdmission::RemotePortHealthVerificationTrigger trigger)
+{
+    localAdmission_.SetRemotePortHealthVerificationTrigger(trigger);
+    writeTargetAdmission_->SetRemotePortHealthVerificationTrigger(std::move(trigger));
 }
 
 void UbHealthFilter::ApplyTopologyIncarnations(const ::datasystem::ClusterTopologyPb &ring)
@@ -74,21 +144,42 @@ void UbHealthFilter::ApplyTopologyIncarnations(const ::datasystem::ClusterTopolo
 
     std::lock_guard<std::mutex> lock(incarnationMutex_);
     topologyInitialized_ = true;
-    cache_.ReconcileWorkers(workers);
     for (const auto &[worker, incarnation] : replacement) {
         ReconcileLocalObservationWithTrustedIncarnationLocked(worker, incarnation);
-        const auto trusted = trustedIncarnations_.find(worker);
-        auto observation = writeTargetObservationIncarnations_.find(worker);
-        const bool incarnationChanged = trusted != trustedIncarnations_.end() && trusted->second != incarnation;
-        const bool observationStale = observation != writeTargetObservationIncarnations_.end()
-                                      && (observation->second.empty() || observation->second != incarnation);
-        if (incarnationChanged || observationStale) {
-            writeTargetAdmission_->ClearLocalState(worker);
-            if (observation != writeTargetObservationIncarnations_.end()) {
-                writeTargetObservationIncarnations_.erase(observation);
-            }
-        }
+        ReconcileWriteTargetObservationLocked(worker, incarnation);
     }
+    DropRemovedObservationsLocked(workers);
+    const auto nowMs = GetSteadyClockTimeStampMs();
+    localAdmission_.ReconcileRemotePortHealthCapabilities(replacement);
+    writeTargetAdmission_->ReconcileRemotePortHealthCapabilities(replacement);
+    localAdmission_.ReconcileTopologyWorkers(workers, nowMs, 0);
+    writeTargetAdmission_->ReconcileTopologyWorkers(workers, nowMs, 0);
+    trustedIncarnations_ = std::move(replacement);
+    writeTargetObservationCount_.store(writeTargetObservationIncarnations_.size(), std::memory_order_release);
+    PublishWriteTargetCompletionGenerationsLocked(workers);
+}
+
+void UbHealthFilter::ReconcileWriteTargetObservationLocked(const HostPort &worker,
+                                                           const std::string &incarnation)
+{
+    const auto trusted = trustedIncarnations_.find(worker);
+    auto observation = writeTargetObservationIncarnations_.find(worker);
+    const bool incarnationChanged = trusted != trustedIncarnations_.end() && trusted->second != incarnation;
+    const bool observationStale = observation != writeTargetObservationIncarnations_.end()
+                                  && (observation->second.empty() || observation->second != incarnation);
+    if (!incarnationChanged && !observationStale) {
+        return;
+    }
+    localAdmission_.SetRemotePortHealthCapability(worker, false);
+    writeTargetAdmission_->SetRemotePortHealthCapability(worker, false);
+    writeTargetAdmission_->ClearLocalState(worker);
+    if (observation != writeTargetObservationIncarnations_.end()) {
+        writeTargetObservationIncarnations_.erase(observation);
+    }
+}
+
+void UbHealthFilter::DropRemovedObservationsLocked(const std::unordered_set<HostPort> &workers)
+{
     for (auto iter = writeTargetObservationIncarnations_.begin();
          iter != writeTargetObservationIncarnations_.end();) {
         if (workers.count(iter->first) == 0) {
@@ -106,10 +197,6 @@ void UbHealthFilter::ApplyTopologyIncarnations(const ::datasystem::ClusterTopolo
             ++iter;
         }
     }
-    writeTargetAdmission_->ReconcileTopologyWorkers(workers, GetSteadyClockTimeStampMs(), 0);
-    trustedIncarnations_ = std::move(replacement);
-    writeTargetObservationCount_.store(writeTargetObservationIncarnations_.size(), std::memory_order_release);
-    PublishWriteTargetCompletionGenerationsLocked(workers);
 }
 
 bool UbHealthFilter::ReportProviderFailure(const HostPort &provider, const ProviderUbFailureDetailPb &detail)
@@ -119,11 +206,15 @@ bool UbHealthFilter::ReportProviderFailure(const HostPort &provider, const Provi
     if (!outcome.has_value()) {
         return false;
     }
-    std::lock_guard<std::mutex> lock(incarnationMutex_);
+    {
+        std::lock_guard<std::mutex> lock(incarnationMutex_);
+        EnablePortHealthVerificationIfSupportedLocked(outcome->peer);
+    }
     localAdmission_.ReportOutcome(*outcome);
     const auto state = localAdmission_.GetState(provider);
     const bool unavailable = state.has_value() && state->state == UbAdmissionState::UNAVAILABLE;
     if (unavailable) {
+        std::lock_guard<std::mutex> lock(incarnationMutex_);
         auto incarnation = trustedIncarnations_.find(provider);
         localObservationIncarnations_[provider] =
             incarnation == trustedIncarnations_.end() ? std::string{} : incarnation->second;
@@ -140,11 +231,15 @@ bool UbHealthFilter::ReportWriteTargetFailure(const HostPort &worker, const Stat
     outcome.providerStatus = providerStatus;
     outcome.cqeStatus = cqeStatus;
     outcome.learnedFrom = "client_write_target";
-    std::lock_guard<std::mutex> lock(incarnationMutex_);
+    {
+        std::lock_guard<std::mutex> lock(incarnationMutex_);
+        EnablePortHealthVerificationIfSupportedLocked(worker);
+    }
     writeTargetAdmission_->ReportOutcome(outcome);
     const auto state = writeTargetAdmission_->GetState(worker);
     const bool unavailable = state.has_value() && state->state == UbAdmissionState::UNAVAILABLE;
     if (unavailable) {
+        std::lock_guard<std::mutex> lock(incarnationMutex_);
         auto incarnation = trustedIncarnations_.find(worker);
         writeTargetObservationIncarnations_[worker] =
             incarnation == trustedIncarnations_.end() ? std::string{} : incarnation->second;
@@ -204,16 +299,21 @@ void UbHealthFilter::RefreshWriteTargetCompletionGenerationLocked(const HostPort
 void UbHealthFilter::ReportLateWriteTargetFailure(const UrmaLateCompletion &completion, uint64_t peerToken) noexcept
 {
     try {
-        std::lock_guard<std::mutex> lock(incarnationMutex_);
         auto context = writeTargetAdmission_->BuildLateCompletionContext(UbOperationKind::CLIENT_PUT);
         if (!context.has_value()) {
             return;
         }
-        writeTargetAdmission_->OnLateUrmaCompletion(completion, context->ownerToken, peerToken);
         HostPort worker;
-        if (worker.ParseString(completion.remoteAddress).IsOk()) {
+        const bool validWorker = worker.ParseString(completion.remoteAddress).IsOk();
+        if (validWorker) {
+            std::lock_guard<std::mutex> lock(incarnationMutex_);
+            EnablePortHealthVerificationIfSupportedLocked(worker);
+        }
+        writeTargetAdmission_->OnLateUrmaCompletion(completion, context->ownerToken, peerToken);
+        if (validWorker) {
             const auto state = writeTargetAdmission_->GetState(worker);
             if (state.has_value() && state->state == UbAdmissionState::UNAVAILABLE) {
+                std::lock_guard<std::mutex> lock(incarnationMutex_);
                 auto incarnation = trustedIncarnations_.find(worker);
                 writeTargetObservationIncarnations_[worker] =
                     incarnation == trustedIncarnations_.end() ? std::string{} : incarnation->second;
@@ -240,14 +340,24 @@ void UbHealthFilter::ReconcileLocalObservationWithTrustedIncarnationLocked(const
     localObservationIncarnations_.erase(observation);
 }
 
+void UbHealthFilter::EnablePortHealthVerificationIfSupportedLocked(const HostPort &worker)
+{
+    auto summary = ubHealthRegistry_->GetSummary(worker);
+    auto trusted = trustedIncarnations_.find(worker);
+    if (summary.has_value() && summary->portHealth.has_value()
+        && (trusted == trustedIncarnations_.end() || summary->incarnation == trusted->second)) {
+        localAdmission_.SetRemotePortHealthCapability(worker, true, summary->incarnation);
+        writeTargetAdmission_->SetRemotePortHealthCapability(worker, true, summary->incarnation);
+    }
+}
+
 bool UbHealthFilter::IsAvailable(const HostPort &addr) const
 {
     if (localAdmission_.CheckReadSource(addr).IsError()) {
         INJECT_POINT_NO_RETURN("client.ub_health_filter.local_read_denied");
         return false;
     }
-    auto summary = cache_.Get(addr);
-    if (summary.has_value() && !summary->writable) {
+    if (ubHealthRegistry_->IsVerifiedUnavailable(addr)) {
         INJECT_POINT_NO_RETURN("client.ub_health_filter.global_read_denied");
         return false;
     }
@@ -256,7 +366,20 @@ bool UbHealthFilter::IsAvailable(const HostPort &addr) const
 
 bool UbHealthFilter::IsWriteTargetAvailable(const HostPort &addr) const
 {
-    return writeTargetAdmission_->CheckWriteTarget(addr, UbOperationKind::CLIENT_PUT).IsOk();
+    return !ubHealthRegistry_->IsVerifiedUnavailable(addr)
+           && writeTargetAdmission_->CheckWriteTarget(addr, UbOperationKind::CLIENT_PUT).IsOk();
+}
+
+bool UbHealthFilter::SupportsPortHealthVerification(const HostPort &addr) const
+{
+    std::lock_guard<std::mutex> lock(incarnationMutex_);
+    auto summary = ubHealthRegistry_->GetSummary(addr);
+    if (!summary.has_value() || !summary->portHealth.has_value()) {
+        return false;
+    }
+    auto trusted = trustedIncarnations_.find(addr);
+    return !topologyInitialized_
+           || (trusted != trustedIncarnations_.end() && trusted->second == summary->incarnation);
 }
 
 std::vector<HostPort> UbHealthFilter::GetUnavailableWriteTargets() const
@@ -289,7 +412,7 @@ std::optional<UbPathState> UbHealthFilter::GetLocalObservation(const HostPort &a
 bool UbHealthFilter::SeedProviderRecoveryFromGlobalSummary(const HostPort &addr)
 {
     std::lock_guard<std::mutex> lock(incarnationMutex_);
-    auto summary = cache_.Get(addr);
+    auto summary = ubHealthRegistry_->GetSummary(addr);
     if (!summary.has_value() || summary->writable) {
         return false;
     }
@@ -322,28 +445,46 @@ bool UbHealthFilter::CompleteProviderRecovery(const ProviderUbRecoveryCandidate 
                                               const std::optional<UbHealthSummary> &summary,
                                               const Status &probeStatus, uint64_t nowMs)
 {
-    std::lock_guard<std::mutex> lock(incarnationMutex_);
+    std::optional<std::string> registryExpectedIncarnation;
     Status completion = probeStatus;
-    if (!summary.has_value() || summary->worker != candidate.token.peer || summary->incarnation.empty()
-        || (!candidate.expectedIncarnation.empty() && summary->incarnation != candidate.expectedIncarnation)) {
-        completion = Status(K_INVALID, "Provider UB recovery response identity does not match probe candidate");
-    } else {
-        auto trusted = trustedIncarnations_.find(candidate.token.peer);
-        if (topologyInitialized_
-            && (trusted == trustedIncarnations_.end() || trusted->second != summary->incarnation)) {
-            completion = Status(K_NOT_READY, "Provider UB recovery response does not match current topology");
-        } else if (!summary->writable) {
-            completion = Status(K_NOT_READY, "Provider UB admission is not writable");
-        }
-        if (!topologyInitialized_ || trusted != trustedIncarnations_.end()) {
-            const std::string &expected = topologyInitialized_ ? trusted->second : summary->incarnation;
-            (void)cache_.Apply(*summary, expected);
+    {
+        std::lock_guard<std::mutex> lock(incarnationMutex_);
+        if (!summary.has_value() || summary->worker != candidate.token.peer || summary->incarnation.empty()
+            || (!candidate.expectedIncarnation.empty() && summary->incarnation != candidate.expectedIncarnation)) {
+            completion = Status(K_INVALID, "Provider UB recovery response identity does not match probe candidate");
+        } else {
+            auto trusted = trustedIncarnations_.find(candidate.token.peer);
+            if (topologyInitialized_
+                && (trusted == trustedIncarnations_.end() || trusted->second != summary->incarnation)) {
+                completion = Status(K_INVALID,
+                                    "Discard Provider UB recovery response from a retired Worker incarnation");
+            } else if (!summary->writable) {
+                completion = Status(K_URMA_WORKER_UNAVAILABLE,
+                                    "Provider UB recovery response still reports the Worker unavailable");
+            }
+            if (!topologyInitialized_ || trusted != trustedIncarnations_.end()) {
+                registryExpectedIncarnation = topologyInitialized_ ? trusted->second : summary->incarnation;
+            }
         }
     }
-    const bool recovered = localAdmission_.CompleteProbe(candidate.token, completion, nowMs, false);
+    if (completion.IsOk() && summary.has_value() && registryExpectedIncarnation.has_value()
+        && !ubHealthRegistry_->ApplyVerifiedSummary(*summary, *registryExpectedIncarnation)) {
+        completion = Status(K_INVALID, "Provider UB recovery response was rejected by the health registry");
+    }
+    bool recovered = localAdmission_.CompleteProbe(candidate.token, completion, nowMs, false);
     if (recovered) {
-        localObservationIncarnations_.erase(candidate.token.peer);
+        std::lock_guard<std::mutex> lock(incarnationMutex_);
+        recovered = localAdmission_.CheckReadSource(candidate.token.peer).IsOk();
+        if (recovered) {
+            localObservationIncarnations_.erase(candidate.token.peer);
+        }
+    }
+    if (recovered) {
         INJECT_POINT_NO_RETURN("client.ub_health_filter.provider_probe_recovered");
+    } else if (completion.IsError()) {
+        LOG_FIRST_EVERY_N(WARNING, UB_RECOVERY_REJECT_LOG_EVERY_N)
+            << "Provider UB recovery rejected for " << candidate.token.peer.ToString()
+            << ": " << completion.ToString();
     }
     return recovered;
 }
@@ -373,20 +514,32 @@ std::optional<WriteTargetUbRecoveryCandidate> UbHealthFilter::TryBeginWriteTarge
 bool UbHealthFilter::CompleteWriteTargetRecovery(const WriteTargetUbRecoveryCandidate &candidate,
                                                  const Status &probeStatus, uint64_t nowMs)
 {
-    std::lock_guard<std::mutex> lock(incarnationMutex_);
     Status completion = probeStatus;
-    auto trusted = trustedIncarnations_.find(candidate.token.peer);
-    if (topologyInitialized_
-        && (trusted == trustedIncarnations_.end()
-            || (!candidate.expectedIncarnation.empty() && trusted->second != candidate.expectedIncarnation))) {
-        completion = Status(K_NOT_READY, "Write target recovery does not match current topology");
+    {
+        std::lock_guard<std::mutex> lock(incarnationMutex_);
+        auto trusted = trustedIncarnations_.find(candidate.token.peer);
+        if (topologyInitialized_
+            && (trusted == trustedIncarnations_.end()
+                || (!candidate.expectedIncarnation.empty() && trusted->second != candidate.expectedIncarnation))) {
+            completion = Status(K_INVALID,
+                                "Discard write-target UB recovery for a retired Worker incarnation");
+        }
     }
-    const bool recovered = writeTargetAdmission_->CompleteProbe(candidate.token, completion, nowMs, false);
+    bool recovered = writeTargetAdmission_->CompleteProbe(candidate.token, completion, nowMs, false);
     if (recovered) {
-        writeTargetObservationIncarnations_.erase(candidate.token.peer);
-        writeTargetObservationCount_.store(writeTargetObservationIncarnations_.size(), std::memory_order_release);
-        RefreshWriteTargetCompletionGenerationLocked(candidate.token.peer);
-        INJECT_POINT_NO_RETURN("client.ub_health_filter.write_target_recovered");
+        std::lock_guard<std::mutex> lock(incarnationMutex_);
+        recovered = writeTargetAdmission_->CheckWriteTarget(candidate.token.peer, UbOperationKind::CLIENT_PUT).IsOk();
+        if (recovered) {
+            writeTargetObservationIncarnations_.erase(candidate.token.peer);
+            writeTargetObservationCount_.store(writeTargetObservationIncarnations_.size(), std::memory_order_release);
+            RefreshWriteTargetCompletionGenerationLocked(candidate.token.peer);
+            INJECT_POINT_NO_RETURN("client.ub_health_filter.write_target_recovered");
+        }
+    }
+    if (!recovered && completion.IsError()) {
+        LOG_FIRST_EVERY_N(WARNING, UB_RECOVERY_REJECT_LOG_EVERY_N)
+            << "Write-target UB recovery rejected for " << candidate.token.peer.ToString()
+            << ": " << completion.ToString();
     }
     return recovered;
 }

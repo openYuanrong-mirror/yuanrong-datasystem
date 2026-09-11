@@ -19,6 +19,7 @@
 #include <gtest/gtest.h>
 #include <cstdlib>
 #include <utility>
+#include <vector>
 
 #include "datasystem/client/worker_api/listen_worker.h"
 #include "datasystem/common/rdma/fast_transport_manager_wrapper.h"

@@ -38,12 +38,16 @@ Status BuildWorkerSnapshot(uint64_t ringVersion, const ::datasystem::ClusterTopo
     WorkerSnapshot updated;
     updated.ringVersion = ringVersion;
     updated.remoteTransportAddrs.reserve(ring.members_size());
+    updated.workerIncarnations.reserve(ring.members_size());
     const bool canPartition = !sdkHostId.empty() && !hostIdMap.empty();
     for (const auto &member : ring.members()) {
         HostPort worker;
         Status rc = worker.ParseString(member.first);
         if (rc.IsError()) {
             return Status(K_INVALID, "Invalid worker endpoint in cluster topology: " + member.first);
+        }
+        if (!member.second.id().empty()) {
+            updated.workerIncarnations.emplace(worker, member.second.id());
         }
         bool sameHost = false;
         if (canPartition) {

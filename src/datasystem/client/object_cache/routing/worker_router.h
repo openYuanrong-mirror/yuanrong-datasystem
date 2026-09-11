@@ -31,6 +31,7 @@
 
 #include "datasystem/client/object_cache/routing/data_placement_policy.h"
 #include "datasystem/client/object_cache/routing/i_worker_filter.h"
+#include "datasystem/client/object_cache/routing/worker_ub_health_registry.h"
 #include "datasystem/common/util/hash_algorithm.h"
 #include "datasystem/common/util/net_util.h"
 #include "datasystem/protos/cluster_topology.pb.h"
@@ -86,6 +87,8 @@ class WorkerRouter {
 public:
     explicit WorkerRouter(std::string myHostId,
                           std::vector<std::shared_ptr<IWorkerFilter>> additionalFilters = {});
+    WorkerRouter(std::string myHostId, std::shared_ptr<WorkerUbHealthRegistry> ubHealthRegistry,
+                 std::vector<std::shared_ptr<IWorkerFilter>> additionalFilters = {});
     ~WorkerRouter() = default;
 
     void SetHostId(std::string hostId);
@@ -103,6 +106,9 @@ public:
 
     std::vector<HostPort> GetAvailableWorkers() const;
 
+    // The returned immutable snapshot remains valid independently of later health updates.
+    std::shared_ptr<const UbRoutingHealthSnapshot> GetUbRoutingHealthSnapshot() const;
+
     // Called by Refresher to update hash ring data.
     void UpdateHashRing(const PreparedClusterTopology &prepared,
                         const std::unordered_map<std::string, std::string> &hostIdMap);
@@ -115,6 +121,7 @@ public:
 
 private:
     std::string myHostId_;
+    std::shared_ptr<WorkerUbHealthRegistry> ubHealthRegistry_;
     std::vector<std::shared_ptr<IWorkerFilter>> filters_;
 
     // Single atomic snapshot — all readers see consistent ring + index + sameNode.
