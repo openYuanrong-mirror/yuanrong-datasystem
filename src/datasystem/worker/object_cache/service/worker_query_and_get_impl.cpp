@@ -36,6 +36,7 @@
 #include "datasystem/common/util/status_helper.h"
 #include "datasystem/common/util/validator.h"
 #include "datasystem/worker/client_manager/client_manager.h"
+#include "datasystem/common/scheduling/worker_read_bandwidth_tracker.h"
 
 namespace datasystem {
 namespace object_cache {
@@ -407,9 +408,12 @@ Status WorkerQueryAndGetImpl::EncodeUb(const QueryAndGetUbDataReqPb &request, si
         ubAdmission_ == nullptr
             ? std::nullopt
             : ubAdmission_->BuildLateCompletionContext(UbOperationKind::CLIENT_GET_WRITEBACK);
+    auto &readBwTracker = scheduling::WorkerReadBandwidthTracker::Instance();
+    auto readBwToken = readBwTracker.BeginRead();
     Status rc = UrmaWritePayload(remote, segmentAddress, segmentSize, base, 0, params.dataSize, params.metaSize,
                                  srcChipId, dstChipId, true, eventKeys, nullptr, &failure,
                                  std::move(lateCompletionContext));
+    readBwTracker.CompleteRead(readBwToken, params.dataSize, rc.IsOk());
     if (rc.IsError()) {
         const auto &address = remote.request_address();
         const HostPort failedEndpoint(address.host(), address.port());

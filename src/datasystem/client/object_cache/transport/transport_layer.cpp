@@ -932,10 +932,11 @@ void TransportLayer::LogSetResult(const HostPort &workerAddr, TransportHint hint
 Status TransportLayer::Set(ObjectBuffer &buffer, const TransportSetParam &param)
 {
     TransportSetResult result;
-    return Set(buffer, param, result);
+    PublishRspPb rsp;
+    return Set(buffer, param, result, rsp);
 }
 
-Status TransportLayer::Set(ObjectBuffer &buffer, const TransportSetParam &param, TransportSetResult &result)
+Status TransportLayer::Set(ObjectBuffer &buffer, const TransportSetParam &param, TransportSetResult &result, PublishRspPb &rsp)
 {
     result = TransportSetResult{};
     RETURN_IF_NOT_OK(CheckLocalNodeAdmission());
@@ -958,7 +959,7 @@ Status TransportLayer::Set(ObjectBuffer &buffer, const TransportSetParam &param,
     mutableBufferInfo.ubProviderStatus.reset();
     mutableBufferInfo.ubCqeStatus.reset();
     PrepareLocalUbLateCompletion(mutableBufferInfo, transporter->Kind());
-    Status rc = transporter->Set(buffer, param, &result);
+    Status rc = transporter->Set(buffer, param, rsp, &result);
     return FinalizeSetPublish(workerAddr, buffer, param, hint, transporter, rc, result, setStart);
 }
 
@@ -1028,7 +1029,8 @@ Status TransportLayer::RetrySet(const HostPort &workerAddr, ObjectBuffer &buffer
     mutableBufferInfo.ubCqeStatus.reset();
     PrepareLocalUbLateCompletion(mutableBufferInfo, transporter->Kind());
     result = TransportSetResult{};
-    Status rc = transporter->Set(buffer, retryParam, &result);
+    PublishRspPb rsp;
+    Status rc = transporter->Set(buffer, retryParam, rsp, &result);
     const auto &bufferInfo = ObjectBufferInternal::GetInfo(buffer);
     (void)ReportLocalUbSenderFailure(
         { workerAddr, transporter->Kind(), bufferInfo.ubFailureReportRc, bufferInfo.ubProviderStatus,

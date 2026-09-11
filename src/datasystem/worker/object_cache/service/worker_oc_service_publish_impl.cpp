@@ -39,6 +39,7 @@
 #include "datasystem/common/util/status_helper.h"
 #include "datasystem/common/util/strings_util.h"
 #include "datasystem/common/util/request_context.h"
+#include "datasystem/common/scheduling/worker_read_bandwidth_tracker.h"
 #include "datasystem/common/util/thread_local.h"
 #include "datasystem/protos/master_object.pb.h"
 #include "datasystem/utils/status.h"
@@ -706,6 +707,15 @@ Status WorkerOcServicePublishImpl::Publish(const PublishReqPb &req, PublishRspPb
         .Existence(req.existence())
         .CacheType(req.cache_type());
     Status rc = PublishImpl(req, resp, payloads);
+
+    // READ_BW_WRH_P2C_PUBLISH_FEEDBACK
+    if (rc.IsOk()) {
+        const auto bw = scheduling::WorkerReadBandwidthTracker::Instance().GetSnapshot();
+        resp.set_read_load_p50(bw.p50Ns);
+        resp.set_read_load_p99(bw.p99Ns);
+        resp.set_read_load_sample_version(bw.latencyVersion);
+    }
+
     if (traceEnabled) {
         Trace::Instance().AddLatencyTick(LatencyTickKey::WORKER_PUBLISH_END);
     }

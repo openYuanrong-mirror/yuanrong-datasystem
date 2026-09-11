@@ -70,3 +70,14 @@ ds_cc_test(
         "//tests/ut:ut_common",
     ],
 )
+
+ds_cc_test(
+    name = "read_bandwidth_scheduler_test",
+    srcs = ["read_bandwidth_scheduler_test.cpp"],
+    deps = [
+        "//src/datasystem/client/object_cache/routing:routing",
+        "//src/datasystem/common/object_cache:common_object_cache",
+        "//src/datasystem/common/util:net_util",
+        "//tests/ut:ut_common",
+    ],
+)

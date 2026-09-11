@@ -197,7 +197,8 @@ public:
         return ObjectBufferInternal::Create(std::move(info), buffer);
     }
 
-    Status Set(ObjectBuffer &buffer, const TransportSetParam &, TransportSetResult *result = nullptr) override
+    Status Set(ObjectBuffer &buffer, const TransportSetParam &, PublishRspPb &,
+               TransportSetResult *result = nullptr) override
     {
         std::unique_lock<bthread::Mutex> lock(setMutex);
         const int callIndex = ++setCount;
@@ -1648,7 +1649,8 @@ TEST(TransportLayerAdmissionTest, SynchronousCqe9ReportsSafeWriteTargetReplay)
     transporter->setStatuses = { Status(K_URMA_ERROR, "fallback was not sent") };
 
     TransportSetResult result;
-    EXPECT_EQ(layer.Set(*buffer, MakeSetParam(), result).GetCode(), K_URMA_ERROR);
+    PublishRspPb rsp;
+    EXPECT_EQ(layer.Set(*buffer, MakeSetParam(), result, rsp).GetCode(), K_URMA_ERROR);
     EXPECT_TRUE(result.writeTargetQuarantined);
     EXPECT_FALSE(result.publishAttempted);
     EXPECT_FALSE(filter->IsWriteTargetAvailable(worker));

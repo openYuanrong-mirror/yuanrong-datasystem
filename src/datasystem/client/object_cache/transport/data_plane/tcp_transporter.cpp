@@ -146,7 +146,7 @@ Status TcpTransporter::CreateBuffer(const HostPort &workerAddr, const std::strin
     return ObjectBufferInternal::Create(info, buffer);
 }
 
-Status TcpTransporter::Set(ObjectBuffer &buffer, const TransportSetParam &param, TransportSetResult *result)
+Status TcpTransporter::Set(ObjectBuffer &buffer, const TransportSetParam &param, PublishRspPb &rsp, TransportSetResult *result)
 {
     RETURN_RUNTIME_ERROR_IF_NULL(rpcClient_);
 
@@ -162,7 +162,6 @@ Status TcpTransporter::Set(ObjectBuffer &buffer, const TransportSetParam &param,
     MemView payload(info.pointer + info.metadataSize, info.dataSize);
     std::vector<MemView> payloads{ payload };
 
-    PublishRspPb rsp;
     uint32_t workerVersion = 0;
     if (result != nullptr) {
         result->publishAttempted = true;

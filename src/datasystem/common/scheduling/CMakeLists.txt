@@ -1,0 +1,2 @@
+add_library(worker_read_bandwidth_tracker STATIC worker_read_bandwidth_tracker.cpp)
+target_link_libraries(worker_read_bandwidth_tracker PRIVATE common_log dynamic_flag_config)

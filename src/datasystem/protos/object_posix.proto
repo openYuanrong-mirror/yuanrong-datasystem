@@ -137,6 +137,9 @@ message PublishReqPb {
 }
 
 message PublishRspPb {
+  uint32  read_load_p50 = 10; //4 MB-normalized P50 latency, reflecting bandwidth performance per 4 MB of data
+  uint32  read_load_p99 = 11; //4 MB-normalized P99 latency, reflecting bandwidth performance per 4 MB of data
+  uint64  read_load_sample_version = 12; //Version used to collect 4 MB-normalized latency metrics.
   repeated uint32 latency_phase_us = 20;
   uint32 latency_tick_dropped_count = 21; // Stores total dropped tick+phase count. See FormatLatencySummary for breakdown.
   UbHealthSummaryPb ub_health_summary = 22;

@@ -11,6 +11,7 @@ ds_cc_library(
     name = "routing",
     srcs = [
         "broken_filter.cpp",
+        "client_read_bandwidth_scheduler.cpp",
         "hash_ring_refresher.cpp",
         "routing.cpp",
         "routing_rpc_client.cpp",
@@ -21,6 +22,7 @@ ds_cc_library(
     ],
     hdrs = [
         "broken_filter.h",
+        "client_read_bandwidth_scheduler.h",
         "hash_ring_refresher.h",
         "i_worker_filter.h",
         "routing.h",
@@ -36,6 +38,7 @@ ds_cc_library(
         "//include/datasystem/utils:utils_headers",
         "//src/datasystem/common/ak_sk:hasher",
         "//src/datasystem/common/ak_sk:signature",
+        "//src/datasystem/common/flags:dynamic_flag_config",
         "//src/datasystem/common/inject:common_inject",
         "//src/datasystem/common/log:common_log",
         "//src/datasystem/common/object_cache:common_object_cache",

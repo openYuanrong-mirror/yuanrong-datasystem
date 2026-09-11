@@ -42,7 +42,9 @@ Routing::Routing(BrpcChannelConfig channelConfig, std::shared_ptr<Signature> sig
                  std::shared_ptr<WorkerUbHealthRegistry> ubHealthRegistry,
                  std::vector<std::shared_ptr<IWorkerFilter>> additionalFilters, int64_t refreshIntervalMs,
                  std::function<void(uint64_t)> refreshConfirmedHook)
-    : router_(std::make_shared<WorkerRouter>("", std::move(ubHealthRegistry), std::move(additionalFilters))),
+    : router_(std::make_shared<WorkerRouter>(
+          "", std::move(ubHealthRegistry), std::move(additionalFilters),
+          std::make_shared<ClientReadBandwidthScheduler>(ClientReadBandwidthScheduler::Config::FromFlags()))),
       rpcClient_(std::make_shared<RoutingRpcClient>(std::move(channelConfig), std::move(signature))),
       refreshIntervalMs_(refreshIntervalMs),
       refreshConfirmedHook_(std::move(refreshConfirmedHook))

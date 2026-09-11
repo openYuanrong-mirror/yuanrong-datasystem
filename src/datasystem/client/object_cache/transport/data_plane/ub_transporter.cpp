@@ -953,7 +953,7 @@ Status UbTransporter::WritePayloads(const std::vector<ObjectBufferInfo *> &infos
     return Status::OK();
 }
 
-Status UbTransporter::Set(ObjectBuffer &buffer, const TransportSetParam &param, TransportSetResult *result)
+Status UbTransporter::Set(ObjectBuffer &buffer, const TransportSetParam &param, PublishRspPb &rsp, TransportSetResult *result)
 {
     // Keep the per-transporter lifecycle lock while the operation is in flight so CloseDataPlane cannot tear down
     // the UB connection between the liveness check and the write/publish sequence.
@@ -992,7 +992,6 @@ Status UbTransporter::Set(ObjectBuffer &buffer, const TransportSetParam &param, 
         }
     }
 
-    PublishRspPb rsp;
     uint32_t workerVersion = 0;
     RETURN_IF_NOT_OK(PublishSetPayload(info, pubReq, param, rpcClient, rsp, workerVersion, result, writeRc));
 

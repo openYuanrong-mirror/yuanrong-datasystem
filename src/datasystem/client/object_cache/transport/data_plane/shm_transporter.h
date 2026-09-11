@@ -220,7 +220,7 @@ public:
         return rc;
     }
 
-    Status Set(ObjectBuffer &buffer, const TransportSetParam &param, TransportSetResult *result = nullptr) override
+    Status Set(ObjectBuffer &buffer, const TransportSetParam &param, PublishRspPb &rsp, TransportSetResult *result = nullptr) override
     {
         RETURN_RUNTIME_ERROR_IF_NULL(rpcClient_);
         const ObjectBufferInfo &info = ObjectBufferInternal::GetInfo(buffer);
@@ -244,7 +244,6 @@ public:
             MemView payload(info.pointer + info.metadataSize, info.dataSize);
             payloads = { payload };
         }
-        PublishRspPb rsp;
         uint32_t workerVersion = 0;
         if (result != nullptr) {
             result->publishAttempted = true;
