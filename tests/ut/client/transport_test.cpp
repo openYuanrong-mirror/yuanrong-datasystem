@@ -55,6 +55,7 @@ extern char **environ;
 #include "datasystem/client/object_cache/routed_mode.h"
 #include "datasystem/client/object_cache/worker_failover.h"
 #include "datasystem/client/object_cache/transport/data_plane/data_plane_manager.h"
+#include "datasystem/client/worker_api/client_worker_common_api.h"
 #include "datasystem/client/worker_api/listen_worker.h"
 #include "datasystem/client/object_cache/transport/data_plane/shm_transporter.h"
 #include "datasystem/client/object_cache/transport/data_plane/tcp_transporter.h"
@@ -129,6 +130,47 @@ std::shared_ptr<Signature> MakeSignature()
 {
     return std::make_shared<Signature>();
 }
+
+class FakeServiceDiscovery : public IServiceDiscovery {
+public:
+    Status Init() override
+    {
+        return Status::OK();
+    }
+
+    Status SelectWorker(std::string &workerIp, int &workerPort, bool *, bool *) override
+    {
+        workerIp = selectedIp_;
+        workerPort = selectedPort_;
+        return Status::OK();
+    }
+
+    Status SelectSameNodeWorker(std::string &workerIp, int &workerPort) override
+    {
+        workerIp = selectedIp_;
+        workerPort = selectedPort_;
+        return Status::OK();
+    }
+
+    Status GetAllWorkers(std::vector<std::string> &sameHostAddrs, std::vector<std::string> &) override
+    {
+        sameHostAddrs.emplace_back(selectedIp_ + ":" + std::to_string(selectedPort_));
+        return Status::OK();
+    }
+
+    ServiceAffinityPolicy GetAffinityPolicy() const override
+    {
+        return ServiceAffinityPolicy::PREFERRED_SAME_NODE;
+    }
+
+    bool HasHostAffinity() const override
+    {
+        return true;
+    }
+
+    std::string selectedIp_ = "127.0.0.1";
+    int selectedPort_ = 31502;
+};
 
 class FakeMmapTableEntry : public IMmapTableEntry {
 public:
@@ -1168,8 +1210,30 @@ public:
         return Status::OK();
     }
 
+    void ResetStaleUbDataPlane(const HostPort &address, const std::shared_ptr<IDataTransporter> &stale) override
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            ++resetStaleUbCount;
+            lastStaleUbTransporter = stale;
+        }
+        DataPlaneManager::ResetStaleUbDataPlane(address, stale);
+    }
+
+    void MarkUbRebuildCooldown(const HostPort &address) override
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            ++ubCooldownMarkCount;
+        }
+        DataPlaneManager::MarkUbRebuildCooldown(address);
+    }
+
     int rpcBuildCount = 0;
     int transportBuildCount = 0;
+    int resetStaleUbCount = 0;
+    int ubCooldownMarkCount = 0;
+    std::shared_ptr<IDataTransporter> lastStaleUbTransporter;
     std::shared_ptr<FakeWorkerRpcClient> lastRpcClient;
     std::shared_ptr<FakeTransporter> lastTransporter;
     std::vector<std::shared_ptr<WorkerRpcClient>> rpcClientsSeen;
@@ -3696,6 +3760,10 @@ TEST(ObjectMetadataClientTest, UbConnectionFailureFallsBackToTcp)
     EXPECT_EQ(manager->rpcBuildCount, 1);
     EXPECT_EQ(manager->transportBuildCount, 1);
     EXPECT_EQ(bufferProvider->allocateCount, 0);
+    // A failed handshake is not a K_URMA_NEED_CONNECT response, so the read path must still bound its
+    // handshake attempts via the read-path-private cooldown (otherwise every request re-attempts the
+    // handshake against a peer that keeps rejecting it).
+    EXPECT_EQ(manager->ubCooldownMarkCount, 1);
     EXPECT_FALSE(results[0].inlineData.has_value());
     EXPECT_TRUE(bufferProvider->lastOwner.expired());
 }
@@ -3729,6 +3797,494 @@ TEST(ObjectMetadataClientTest, DispatchedUbReconnectFallsBackToTcp)
     ASSERT_EQ(manager->builtTransporters.size(), 1u);
     EXPECT_EQ(manager->builtTransporters.front()->closeCount, 1);
     EXPECT_TRUE(bufferProvider->lastOwner.expired());
+}
+
+// Sampling interval of DataPlaneManager::MarkDataPlaneUse (DATA_PLANE_USE_REFRESH_INTERVAL_MS), mirrored here
+// so the quiet-gate assertions can name the ages they rely on.
+constexpr int64_t kSamplingIntervalMs = 100;
+// Deliberately shorter than the sampling interval: that combination is what the gate has to compensate for.
+constexpr uint64_t kQuietWindowMs = 50;
+constexpr int64_t kRecordedAgeLagsSample = 70;
+constexpr int64_t kRecordedAgeNearBoundary = 120;
+constexpr int64_t kRecordedAgeAtBoundary = static_cast<int64_t>(kQuietWindowMs) + kSamplingIntervalMs;
+constexpr uint64_t kDefaultQuietWindowMs = 30'000;
+constexpr int64_t kDefaultQuietWindowAge = static_cast<int64_t>(kDefaultQuietWindowMs) + kSamplingIntervalMs;
+
+int64_t SteadyNowMsForTest()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+// Grants deterministic control over the recorded "last data plane use" timestamp: the sample is only
+// refreshed once per DATA_PLANE_USE_REFRESH_INTERVAL_MS, so reproducing a specific age with real sleeps would
+// race the sampling interval and make the boundary assertions flaky.
+class DataPlaneManagerQuietTestPeer {
+public:
+    DataPlaneManagerQuietTestPeer() = delete;
+    ~DataPlaneManagerQuietTestPeer() = delete;
+
+    static bool SetLastDataPlaneUseMs(DataPlaneManager &manager, const HostPort &address, int64_t ms)
+    {
+        DataPlaneManager::EntryMap::const_accessor accessor;
+        if (!manager.entries_.find(accessor, address.ToString())) {
+            return false;
+        }
+        accessor->second->lastDataPlaneUseMs.store(ms, std::memory_order_relaxed);
+        return true;
+    }
+
+    // Expire (or re-arm) the read-path rebuild cooldown without waiting FLAGS_ub_rebuild_cooldown_ms, so the
+    // "UB resumes once the cooldown elapses" path can be asserted deterministically.
+    static bool SetUbRebuildAllowedAfterMs(DataPlaneManager &manager, const HostPort &address, int64_t ms)
+    {
+        DataPlaneManager::EntryMap::const_accessor accessor;
+        if (!manager.entries_.find(accessor, address.ToString())) {
+            return false;
+        }
+        accessor->second->ubRebuildAllowedAfterMs.store(ms, std::memory_order_relaxed);
+        return true;
+    }
+};
+
+TEST(DataPlaneManagerTest, EndpointQuietWindow)
+{
+    auto manager = std::make_shared<FakeDataPlaneManager>();
+    const auto address = MakeAddress(41);
+    // No entry at all: treat as quiet so a standby without a data plane is not blocked.
+    EXPECT_TRUE(manager->IsEndpointDataPlaneQuiet(address, 1));
+    // quietMs == 0 disables the check entirely.
+    EXPECT_TRUE(manager->IsEndpointDataPlaneQuiet(address, 0));
+
+    std::shared_ptr<IDataTransporter> transporter;
+    ASSERT_TRUE(manager->GetOrCreate(address, TransportHint::UB_CANDIDATE, transporter).IsOk());
+    EXPECT_TRUE(manager->IsEndpointDataPlaneQuiet(address, 0));
+    EXPECT_FALSE(manager->IsEndpointDataPlaneQuiet(address, std::numeric_limits<uint64_t>::max()));
+}
+
+TEST(DataPlaneManagerTest, EndpointQuietWindowCompensatesDataPlaneUseSampling)
+{
+    auto manager = std::make_shared<FakeDataPlaneManager>();
+    const auto address = MakeAddress(41);
+    std::shared_ptr<IDataTransporter> transporter;
+    ASSERT_TRUE(manager->GetOrCreate(address, TransportHint::UB_CANDIDATE, transporter).IsOk());
+    const int64_t now = SteadyNowMsForTest();
+
+    // The recorded timestamp lags the true last use by up to one sampling interval: kRecordedAgeLagsSample of
+    // recorded age can mean the endpoint served a read 10 ms ago (used at 1000 ms, sampled away at 1040/1060
+    // ms, checked at 1070 ms). A kQuietWindowMs window must not call that quiet — without the sampling
+    // compensation it would, and the standby would be torn down while still carrying traffic.
+    ASSERT_TRUE(DataPlaneManagerQuietTestPeer::SetLastDataPlaneUseMs(*manager, address, now - kRecordedAgeLagsSample));
+    EXPECT_FALSE(manager->IsEndpointDataPlaneQuiet(address, kQuietWindowMs));
+    ASSERT_TRUE(
+        DataPlaneManagerQuietTestPeer::SetLastDataPlaneUseMs(*manager, address, now - kRecordedAgeNearBoundary));
+    EXPECT_FALSE(manager->IsEndpointDataPlaneQuiet(address, kQuietWindowMs));
+    // Recorded age of kQuietWindowMs + kSamplingIntervalMs leaves at least kQuietWindowMs of proven idleness.
+    ASSERT_TRUE(DataPlaneManagerQuietTestPeer::SetLastDataPlaneUseMs(*manager, address, now - kRecordedAgeAtBoundary));
+    EXPECT_TRUE(manager->IsEndpointDataPlaneQuiet(address, kQuietWindowMs));
+
+    // The default window keeps its meaning: an endpoint used right now is never quiet, and one idle for the
+    // window plus the sampling bound is.
+    ASSERT_TRUE(DataPlaneManagerQuietTestPeer::SetLastDataPlaneUseMs(*manager, address, now));
+    EXPECT_FALSE(manager->IsEndpointDataPlaneQuiet(address, kDefaultQuietWindowMs));
+    ASSERT_TRUE(DataPlaneManagerQuietTestPeer::SetLastDataPlaneUseMs(*manager, address, now - kDefaultQuietWindowAge));
+    EXPECT_TRUE(manager->IsEndpointDataPlaneQuiet(address, kDefaultQuietWindowMs));
+
+    // quietMs == 0 stays a rollback switch that bypasses the gate entirely.
+    ASSERT_TRUE(DataPlaneManagerQuietTestPeer::SetLastDataPlaneUseMs(*manager, address, now));
+    EXPECT_TRUE(manager->IsEndpointDataPlaneQuiet(address, 0));
+}
+
+TEST(DataPlaneManagerTest, TcpOnlyEndpointIsAlwaysQuiet)
+{
+    auto manager = std::make_shared<FakeDataPlaneManager>();
+    const auto address = MakeAddress(41);
+    std::shared_ptr<IDataTransporter> transporter;
+    ASSERT_TRUE(manager->GetOrCreate(address, TransportHint::TCP_ONLY, transporter).IsOk());
+    // TCP-only endpoints carry no data plane that a worker-side teardown can invalidate, so they must not
+    // hold back a standby drain.
+    EXPECT_TRUE(manager->IsEndpointDataPlaneQuiet(address, std::numeric_limits<uint64_t>::max()));
+}
+
+TEST(ListenWorkerDrainTest, CanDisconnectStandbyGatesOnDataPlane)
+{
+    auto workerApi =
+        std::make_shared<ClientWorkerRemoteCommonApi>(MakeAddress(41), HeartbeatType::RPC_HEARTBEAT, "", nullptr);
+    auto listenWorker = std::make_shared<ListenWorker>(workerApi, HeartbeatType::RPC_HEARTBEAT, 1, nullptr);
+    listenWorker->SetIsLocalWorker(false);
+
+    // No handle registered: keep the legacy behaviour so a missing registration never blocks a drain.
+    EXPECT_TRUE(listenWorker->CanDisconnectStandby());
+
+    bool quiet = false;
+    int resetCount = 0;
+    listenWorker->SetDataPlaneDrainHandle({ [&quiet](uint64_t) { return quiet; }, [&resetCount]() { ++resetCount; } });
+    quiet = false;
+    EXPECT_FALSE(listenWorker->CanDisconnectStandby()) << "Active data plane must defer the standby drain";
+    quiet = true;
+    EXPECT_TRUE(listenWorker->CanDisconnectStandby());
+    // Evaluating the gate is a query: neither answer may touch the data plane. Without this assertion a
+    // regression that reset the plane from the predicate would keep the case green.
+    EXPECT_EQ(resetCount, 0) << "Evaluating the drain gate must not reset the data plane";
+}
+
+TEST(ListenWorkerDrainTest, CanDisconnectStandbyPropagatesQuietWindowFlag)
+{
+    auto workerApi =
+        std::make_shared<ClientWorkerRemoteCommonApi>(MakeAddress(41), HeartbeatType::RPC_HEARTBEAT, "", nullptr);
+    auto listenWorker = std::make_shared<ListenWorker>(workerApi, HeartbeatType::RPC_HEARTBEAT, 1, nullptr);
+    listenWorker->SetIsLocalWorker(false);
+
+    uint64_t requestedQuietMs = 0;
+    // Mirror the real handle: a zero window means "do not check", i.e. the legacy drain behaviour.
+    listenWorker->SetDataPlaneDrainHandle({ [&requestedQuietMs](uint64_t quietMs) {
+                                               requestedQuietMs = quietMs;
+                                               return quietMs == 0;
+                                           },
+                                            []() {} });
+    ASSERT_FALSE(listenWorker->CanDisconnectStandby());
+    EXPECT_EQ(requestedQuietMs, static_cast<uint64_t>(FLAGS_standby_drain_data_plane_quiet_ms));
+
+    // Zero is the online rollback switch: it must let the standby drain immediately.
+    uint32_t originalQuietMs = FLAGS_standby_drain_data_plane_quiet_ms;
+    FLAGS_standby_drain_data_plane_quiet_ms = 0;
+    EXPECT_TRUE(listenWorker->CanDisconnectStandby());
+    FLAGS_standby_drain_data_plane_quiet_ms = originalQuietMs;
+}
+
+TEST(ListenWorkerDrainTest, TeardownReChecksQuietGateBeforeDisconnect)
+{
+    auto workerApi =
+        std::make_shared<ClientWorkerRemoteCommonApi>(MakeAddress(41), HeartbeatType::RPC_HEARTBEAT, "", nullptr);
+    auto listenWorker = std::make_shared<ListenWorker>(workerApi, HeartbeatType::RPC_HEARTBEAT, 1, nullptr);
+    listenWorker->SetIsLocalWorker(false);
+
+    bool quiet = true;
+    int resetCount = 0;
+    listenWorker->SetDataPlaneDrainHandle({ [&quiet](uint64_t) { return quiet; }, [&resetCount]() { ++resetCount; } });
+    ASSERT_TRUE(listenWorker->CanDisconnectStandby());
+    // The teardown is queued onto the shared async-switch pool, which also runs switch-back work, so the gate
+    // decision can be seconds old by the time it executes. Read traffic that resumed in that window must abort
+    // the teardown rather than drop a data plane that is in use again.
+    quiet = false;
+    listenWorker->ShutdownStandbyConnection();
+    EXPECT_EQ(resetCount, 0) << "A data plane that became active again must not be reset and disconnected";
+
+    quiet = true;
+    listenWorker->ShutdownStandbyConnection();
+    EXPECT_EQ(resetCount, 1);
+}
+
+TEST(ObjectClientImplTest, SwitchBackGatesOnDataPlaneManagerPublication)
+{
+    ConnectOptions options;
+    options.host = "127.0.0.1";
+    options.port = 31501;
+    options.serviceDiscovery = std::make_shared<FakeServiceDiscovery>();
+    object_cache::ObjectClientImpl client(options);
+
+    // Simulate the remote-fallback state: currentNode_ is a standby node backed by a worker API.
+    client.currentNode_.store(object_cache::STANDBY1_WORKER);
+    client.workerApi_.resize(object_cache::STANDBY2_WORKER + 1);
+    client.workerApi_[object_cache::STANDBY1_WORKER] =
+        std::make_shared<object_cache::ClientWorkerRemoteApi>(MakeAddress(41));
+
+    object_cache::WorkerNode oldNode = object_cache::LOCAL_WORKER;
+    HostPort localAddress;
+    HeartbeatType heartbeatType = HeartbeatType::NO_HEARTBEAT;
+
+    // Before the data-plane manager is published, switch-back must be deferred: reading the un-published weak_ptr
+    // would race on the member and permanently capture an empty manager in the drain handle.
+    client.dataPlaneManagerPublished_.store(false, std::memory_order_release);
+    EXPECT_FALSE(client.failover_->GetPreferredLocalWorkerToRecover(oldNode, localAddress, heartbeatType));
+
+    // Once published, the gate opens and switch-back proceeds to select the same-node worker.
+    client.dataPlaneManagerPublished_.store(true, std::memory_order_release);
+    EXPECT_TRUE(client.failover_->GetPreferredLocalWorkerToRecover(oldNode, localAddress, heartbeatType));
+    EXPECT_EQ(oldNode, object_cache::STANDBY1_WORKER);
+    EXPECT_EQ(localAddress.Host(), "127.0.0.1");
+    EXPECT_EQ(localAddress.Port(), 31502);
+}
+
+TEST(DataPlaneManagerTest, UbRebuildCooldownDoesNotBlockDataPlaneBuild)
+{
+    auto manager = std::make_shared<FakeDataPlaneManager>();
+    manager->MarkUbRebuildCooldown(MakeAddress(41));
+    ASSERT_TRUE(manager->IsUbRebuildCoolingDown(MakeAddress(41)));
+    // The cooldown must stay private to the read path: writers, direct leases and replica reads have no
+    // fallback for K_NOT_READY, so a shared-entry gate would turn them into hard failures.
+    std::shared_ptr<IDataTransporter> transporter;
+    EXPECT_TRUE(manager->GetOrCreate(MakeAddress(41), TransportHint::UB_CANDIDATE, transporter).IsOk());
+    EXPECT_TRUE(manager->GetOrCreate(MakeAddress(41), TransportHint::TCP_ONLY, transporter).IsOk());
+}
+
+TEST(DataPlaneManagerTest, ResetStaleUbDataPlaneKeepsConcurrentlyRebuiltTransporter)
+{
+    auto manager = std::make_shared<FakeDataPlaneManager>();
+    std::shared_ptr<IDataTransporter> first;
+    ASSERT_TRUE(manager->GetOrCreate(MakeAddress(41), TransportHint::UB_CANDIDATE, first).IsOk());
+    manager->ResetDataPlane(MakeAddress(41));
+    std::shared_ptr<IDataTransporter> second;
+    ASSERT_TRUE(manager->GetOrCreate(MakeAddress(41), TransportHint::UB_CANDIDATE, second).IsOk());
+    ASSERT_NE(first, second);
+
+    // A request that failed on the first transporter must not discard the one a writer just rebuilt.
+    manager->ResetStaleUbDataPlane(MakeAddress(41), first);
+    std::shared_ptr<IDataTransporter> afterStaleIdentity;
+    ASSERT_TRUE(manager->GetOrCreate(MakeAddress(41), TransportHint::UB_CANDIDATE, afterStaleIdentity).IsOk());
+    EXPECT_EQ(afterStaleIdentity, second);
+    EXPECT_EQ(manager->transportBuildCount, 2);
+
+    manager->ResetStaleUbDataPlane(MakeAddress(41), second);
+    std::shared_ptr<IDataTransporter> afterDrop;
+    ASSERT_TRUE(manager->GetOrCreate(MakeAddress(41), TransportHint::UB_CANDIDATE, afterDrop).IsOk());
+    EXPECT_NE(afterDrop, second);
+    EXPECT_EQ(manager->transportBuildCount, 3);
+}
+
+TEST(ObjectMetadataClientTest, RetriesOverTcpAfterUrmaNeedConnect)
+{
+    ApiDeadlineGuard deadline(1000);
+    auto manager = std::make_shared<FakeDataPlaneManager>();
+    auto bufferProvider = std::make_shared<FakeUbBufferProvider>();
+    bufferProvider->maxGetSize = 32;
+    int queryCount = 0;
+    bool firstAttemptUsedUb = false;
+    bool retryUsedTcp = false;
+    manager->queryAndGetHandler = [&](const HostPort &, const QueryAndGetReqPb &request, QueryAndGetRspPb &response,
+                                      std::vector<RpcMessage> &) {
+        ++queryCount;
+        if (queryCount == 1) {
+            firstAttemptUsedUb = request.has_data_request() && request.data_request().has_ub();
+            return Status(K_URMA_NEED_CONNECT, "worker does not recognize the client UB connection");
+        }
+        retryUsedTcp = request.has_data_request() && request.data_request().has_tcp();
+        AddLocation(response, "key", MakeAddress(51), 6);
+        return Status::OK();
+    };
+    ObjectMetadataClient metadata(manager, std::make_shared<DeadlineRetry>(),
+                                  std::make_shared<FixedTransportAdvisor>(TransportHint::UB_CANDIDATE), bufferProvider,
+                                  16);
+    auto results = MakeMetadataItems({ { 0, "key", MakeAddress(41) } });
+    auto batch = MakeMetadataBatch(results);
+
+    ASSERT_TRUE(metadata.QueryAndGet(MakeAddress(41), batch, nullptr).IsOk());
+    EXPECT_TRUE(firstAttemptUsedUb);
+    EXPECT_TRUE(retryUsedTcp);
+    EXPECT_EQ(queryCount, 2);
+    EXPECT_EQ(manager->resetStaleUbCount, 1);
+    // The identity guard must receive the transporter this request actually used. Passing nullptr would mean
+    // "drop unconditionally", which destroys the "never discard a concurrently rebuilt data plane" defence
+    // while still incrementing the counter, so assert the identity rather than just the call count.
+    EXPECT_EQ(manager->lastStaleUbTransporter, manager->lastTransporter);
+    EXPECT_NE(manager->lastStaleUbTransporter, nullptr);
+    EXPECT_EQ(manager->ubCooldownMarkCount, 1);
+    ASSERT_EQ(results.size(), 1u);
+    EXPECT_TRUE(results[0].status.IsOk());
+    EXPECT_EQ(results[0].location.object_locations(0), MakeAddress(51).ToString());
+}
+
+TEST(ObjectMetadataClientTest, SkipsUbWhileRebuildCoolingDown)
+{
+    ApiDeadlineGuard deadline(1000);
+    auto manager = std::make_shared<FakeDataPlaneManager>();
+    auto bufferProvider = std::make_shared<FakeUbBufferProvider>();
+    bufferProvider->maxGetSize = 32;
+    manager->MarkUbRebuildCooldown(MakeAddress(41));
+    ASSERT_TRUE(manager->IsUbRebuildCoolingDown(MakeAddress(41)));
+    bool usedTcp = false;
+    manager->queryAndGetHandler = [&](const HostPort &, const QueryAndGetReqPb &request, QueryAndGetRspPb &response,
+                                      std::vector<RpcMessage> &) {
+        usedTcp = request.has_data_request() && request.data_request().has_tcp();
+        AddLocation(response, "key", MakeAddress(51), 6);
+        return Status::OK();
+    };
+    ObjectMetadataClient metadata(manager, std::make_shared<DeadlineRetry>(),
+                                  std::make_shared<FixedTransportAdvisor>(TransportHint::UB_CANDIDATE), bufferProvider,
+                                  16);
+    auto results = MakeMetadataItems({ { 0, "key", MakeAddress(41) } });
+    auto batch = MakeMetadataBatch(results);
+
+    ASSERT_TRUE(metadata.QueryAndGet(MakeAddress(41), batch, nullptr).IsOk());
+    EXPECT_TRUE(usedTcp);
+    EXPECT_EQ(bufferProvider->allocateCount, 0);
+    EXPECT_EQ(manager->transportBuildCount, 0);
+    EXPECT_TRUE(results[0].status.IsOk());
+}
+
+TEST(ObjectMetadataClientTest, ResumesUbAfterRebuildCooldownExpires)
+{
+    ApiDeadlineGuard deadline(5000);
+    auto manager = std::make_shared<FakeDataPlaneManager>();
+    auto bufferProvider = std::make_shared<FakeUbBufferProvider>();
+    bufferProvider->maxGetSize = 32;
+    // Start inside the cooldown, i.e. right after a rejected handshake: the first request must skip UB.
+    manager->MarkUbRebuildCooldown(MakeAddress(41));
+    ASSERT_TRUE(manager->IsUbRebuildCoolingDown(MakeAddress(41)));
+    int queryCount = 0;
+    bool firstUsedUb = false;
+    bool secondUsedUb = false;
+    manager->queryAndGetHandler = [&](const HostPort &, const QueryAndGetReqPb &request, QueryAndGetRspPb &response,
+                                      std::vector<RpcMessage> &) {
+        ++queryCount;
+        if (queryCount == 1) {
+            firstUsedUb = request.has_data_request() && request.data_request().has_ub();
+        } else {
+            secondUsedUb = request.has_data_request() && request.data_request().has_ub();
+        }
+        AddLocation(response, "key", MakeAddress(51), 6);
+        return Status::OK();
+    };
+    ObjectMetadataClient metadata(manager, std::make_shared<DeadlineRetry>(),
+                                  std::make_shared<FixedTransportAdvisor>(TransportHint::UB_CANDIDATE), bufferProvider,
+                                  16);
+    auto firstResults = MakeMetadataItems({ { 0, "key", MakeAddress(41) } });
+    auto firstBatch = MakeMetadataBatch(firstResults);
+
+    ASSERT_TRUE(metadata.QueryAndGet(MakeAddress(41), firstBatch, nullptr).IsOk());
+    EXPECT_FALSE(firstUsedUb) << "A request inside the cooldown must finish over TCP inline";
+    EXPECT_EQ(manager->transportBuildCount, 0);
+    EXPECT_TRUE(firstResults[0].status.IsOk());
+
+    // Once the cooldown elapses the read path must go back to UB. "The lower bound is that the read does not
+    // fail" is only half the contract of the cooldown; the other half is that UB is not given up permanently.
+    ASSERT_TRUE(
+        DataPlaneManagerQuietTestPeer::SetUbRebuildAllowedAfterMs(*manager, MakeAddress(41), SteadyNowMsForTest() - 1));
+    EXPECT_FALSE(manager->IsUbRebuildCoolingDown(MakeAddress(41)));
+    auto secondResults = MakeMetadataItems({ { 0, "key", MakeAddress(41) } });
+    auto secondBatch = MakeMetadataBatch(secondResults);
+
+    ASSERT_TRUE(metadata.QueryAndGet(MakeAddress(41), secondBatch, nullptr).IsOk());
+    EXPECT_TRUE(secondUsedUb) << "After the cooldown expires the next request must carry UB again";
+    EXPECT_GT(manager->transportBuildCount, 0);
+    EXPECT_TRUE(secondResults[0].status.IsOk());
+}
+
+TEST(DataPlaneManagerTest, UbRebuildSlotIsExclusivePerEndpoint)
+{
+    auto manager = std::make_shared<FakeDataPlaneManager>();
+    const HostPort address = MakeAddress(41);
+    const HostPort other = MakeAddress(42);
+
+    // No data plane yet: the first request owns the rebuild slot and every other reader degrades.
+    uint64_t owner = 0;
+    ASSERT_EQ(manager->AdmitUbRead(address, owner), DataPlaneManager::UbReadAdmission::REBUILD);
+    EXPECT_NE(owner, 0u);
+    uint64_t waiterOwner = 0;
+    EXPECT_EQ(manager->AdmitUbRead(address, waiterOwner), DataPlaneManager::UbReadAdmission::DEGRADE);
+    EXPECT_EQ(waiterOwner, 0u);
+    // A different endpoint coordinates independently.
+    uint64_t otherOwner = 0;
+    EXPECT_EQ(manager->AdmitUbRead(other, otherOwner), DataPlaneManager::UbReadAdmission::REBUILD);
+    EXPECT_NE(otherOwner, owner);
+
+    std::shared_ptr<IDataTransporter> transporter;
+    ASSERT_TRUE(manager->GetOrCreate(address, TransportHint::UB_CANDIDATE, transporter).IsOk());
+    manager->ReleaseUbRebuildSlot(address, owner);
+    // Steady state: a usable data plane needs no slot, so readers never contend with each other.
+    uint64_t steadyOwner = 0;
+    EXPECT_EQ(manager->AdmitUbRead(address, steadyOwner), DataPlaneManager::UbReadAdmission::PROCEED);
+    EXPECT_EQ(steadyOwner, 0u);
+
+    // A stale release must not clear a slot that a later request owns.
+    manager->ResetDataPlane(address);
+    uint64_t nextOwner = 0;
+    ASSERT_EQ(manager->AdmitUbRead(address, nextOwner), DataPlaneManager::UbReadAdmission::REBUILD);
+    EXPECT_NE(nextOwner, owner);
+    manager->ReleaseUbRebuildSlot(address, owner);
+    uint64_t thirdOwner = 0;
+    EXPECT_EQ(manager->AdmitUbRead(address, thirdOwner), DataPlaneManager::UbReadAdmission::DEGRADE);
+    manager->ReleaseUbRebuildSlot(address, nextOwner);
+}
+
+TEST(DataPlaneManagerTest, ConcurrentUbRebuildRunsExactlyOneHandshake)
+{
+    auto manager = std::make_shared<FakeDataPlaneManager>();
+    const HostPort address = MakeAddress(41);
+    std::shared_ptr<IDataTransporter> transporter;
+    ASSERT_TRUE(manager->GetOrCreate(address, TransportHint::UB_CANDIDATE, transporter).IsOk());
+    // Drop the data plane and make the rebuild attempt fail, so every reader that reaches the handshake
+    // pays for a doomed one. Without per-endpoint coordination that is one handshake per reader.
+    manager->ResetDataPlane(address);
+    manager->transportBuildStatuses.push_back(Status(K_URMA_NEED_CONNECT, "worker rejected the handshake"));
+
+    constexpr int kThreads = 32;
+    std::atomic<int> readyCount{ 0 };
+    std::atomic<bool> start{ false };
+    std::atomic<int> rebuildCount{ 0 };
+    std::atomic<int> degradeCount{ 0 };
+    std::vector<std::thread> threads;
+    for (int i = 0; i < kThreads; ++i) {
+        threads.emplace_back([&] {
+            ++readyCount;
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            uint64_t slotOwner = 0;
+            switch (manager->AdmitUbRead(address, slotOwner)) {
+                case DataPlaneManager::UbReadAdmission::REBUILD:
+                    ++rebuildCount;
+                    // Hold the slot until every other reader has been admitted, so the waiters
+                    // deterministically observe an in-flight rebuild rather than a finished one.
+                    while (degradeCount.load(std::memory_order_acquire) < kThreads - 1) {
+                        std::this_thread::yield();
+                    }
+                    {
+                        std::shared_ptr<IDataTransporter> rebuilt;
+                        (void)manager->GetOrCreate(address, TransportHint::UB_CANDIDATE, rebuilt);
+                    }
+                    manager->ReleaseUbRebuildSlot(address, slotOwner);
+                    break;
+                case DataPlaneManager::UbReadAdmission::DEGRADE:
+                    ++degradeCount;
+                    break;
+                case DataPlaneManager::UbReadAdmission::PROCEED:
+                    break;
+            }
+        });
+    }
+    while (readyCount.load(std::memory_order_acquire) < kThreads) {
+        std::this_thread::yield();
+    }
+    start.store(true, std::memory_order_release);
+    for (auto &thread : threads) {
+        thread.join();
+    }
+    EXPECT_EQ(rebuildCount.load(), 1);
+    EXPECT_EQ(degradeCount.load(), kThreads - 1);
+    // One build for the data plane created above plus exactly one doomed rebuild attempt.
+    EXPECT_EQ(manager->transportBuildCount, 2);
+}
+
+TEST(ObjectMetadataClientTest, DegradesToTcpWhileAnotherReaderOwnsTheRebuildSlot)
+{
+    ApiDeadlineGuard deadline(1000);
+    auto manager = std::make_shared<FakeDataPlaneManager>();
+    auto bufferProvider = std::make_shared<FakeUbBufferProvider>();
+    bufferProvider->maxGetSize = 32;
+    // Hold the slot the way a concurrent reader's in-flight rebuild would.
+    uint64_t owner = 0;
+    ASSERT_EQ(manager->AdmitUbRead(MakeAddress(41), owner), DataPlaneManager::UbReadAdmission::REBUILD);
+    bool usedTcp = false;
+    manager->queryAndGetHandler = [&](const HostPort &, const QueryAndGetReqPb &request, QueryAndGetRspPb &response,
+                                      std::vector<RpcMessage> &) {
+        usedTcp = request.has_data_request() && request.data_request().has_tcp();
+        AddLocation(response, "key", MakeAddress(51), 6);
+        return Status::OK();
+    };
+    ObjectMetadataClient metadata(manager, std::make_shared<DeadlineRetry>(),
+                                  std::make_shared<FixedTransportAdvisor>(TransportHint::UB_CANDIDATE), bufferProvider,
+                                  16);
+    auto results = MakeMetadataItems({ { 0, "key", MakeAddress(41) } });
+    auto batch = MakeMetadataBatch(results);
+
+    ASSERT_TRUE(metadata.QueryAndGet(MakeAddress(41), batch, nullptr).IsOk());
+    // The waiter neither handshakes nor arms a cooldown of its own: it simply serves over TCP inline.
+    EXPECT_TRUE(usedTcp);
+    EXPECT_EQ(manager->transportBuildCount, 0);
+    EXPECT_EQ(manager->ubCooldownMarkCount, 0);
+    EXPECT_TRUE(results[0].status.IsOk());
+    manager->ReleaseUbRebuildSlot(MakeAddress(41), owner);
 }
 
 TEST(ObjectReadFlowTest, BatchReadyItemsOnceOnCallerAndPreservesMetadataErrorPosition)

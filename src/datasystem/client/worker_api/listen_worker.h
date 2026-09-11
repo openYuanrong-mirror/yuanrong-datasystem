@@ -87,6 +87,18 @@ private:
 
 class ListenWorker : public std::enable_shared_from_this<ListenWorker> {
 public:
+    /**
+     * @brief Data-plane hooks used to decide whether a standby connection may be disconnected.
+     * The metadata-owner read path keeps an endpoint data plane alive independently of the
+     * control-plane switch, so an idle control connection does not imply an idle data plane.
+     */
+    struct DataPlaneDrainHandle {
+        // Returns true when the endpoint data plane has been unused for quietMs.
+        std::function<bool(uint64_t quietMs)> isQuiet;
+        // Drops the cached data plane for the endpoint while keeping the RPC connection.
+        std::function<void()> reset;
+    };
+
     ListenWorker(std::shared_ptr<IClientWorkerCommonApi> clientCommonWorker, HeartbeatType type, uint32_t index = 0,
                  ThreadPool *pool = nullptr);
     virtual ~ListenWorker();
@@ -198,6 +210,19 @@ public:
     void SetWorkerTimeoutHandle(std::function<void()> callback);
 
     /**
+     * @brief Set the standby data-plane drain handle.
+     * Must be called before the connection is marked switched. Without a handle the listener keeps the
+     * legacy behaviour of draining as soon as the control connection looks idle.
+     * May be re-registered when a node is switched back to standby again (see dataPlaneDrainMutex_).
+     * @param[in] handle Data-plane hooks for this endpoint.
+     */
+    void SetDataPlaneDrainHandle(DataPlaneDrainHandle handle)
+    {
+        std::lock_guard<SharedMutex> l(dataPlaneDrainMutex_);
+        dataPlaneDrain_ = std::move(handle);
+    }
+
+    /**
      * @brief Set standby worker is switched, it would happen when local worker is recover.
      */
     void SetSwitched()
@@ -209,6 +234,34 @@ public:
      * @brief Shutdown standby connection
      */
     void ShutdownStandbyConnection();
+
+    /**
+     * @brief Check whether a switched standby connection can be disconnected without breaking data traffic.
+     * The metadata-owner read path keeps an endpoint's data plane alive independently of the control-plane
+     * switch, so an idle control connection does not imply an idle data plane.
+     * @return True when the standby connection may be shut down.
+     */
+    bool CanDisconnectStandby()
+    {
+        // Worker is leaving: drain immediately, the legacy behaviour.
+        if (isWorkerVoluntaryScaleDown_.load(std::memory_order_relaxed)) {
+            return true;
+        }
+        // IsStandbyDataPlaneQuiet() copies the hook under the shared lock itself, so a concurrent
+        // re-registration (the node switched back to standby again) cannot tear the std::function while it is
+        // being invoked. This is the single definition of "a standby may be torn down": the teardown path
+        // calls back into it instead of restating the conjunction, so the invariant cannot drift.
+        return IsStandbyDataPlaneQuiet();
+    }
+
+    /**
+     * @brief Check whether this endpoint's data plane has been unused for the configured quiet window.
+     * Shared by the gate that decides to schedule a standby teardown and by the teardown itself, so both
+     * read the same hook with the same window.
+     * @return True when the data plane is quiet enough to tear down, or when no data-plane owner is
+     *         registered (SHM-only client or a client that is going away: keep the legacy behaviour).
+     */
+    bool IsStandbyDataPlaneQuiet();
 
     /**
      * @brief Notify the connected worker that this client no longer blocks worker exit.
@@ -372,6 +425,12 @@ private:
     std::atomic<int64_t> lastLocalRecoveryAttemptMs_{ 0 };
     std::function<void()> workerTimeoutHandle_;
     SharedMutex workerTimeoutHandleMutex_;  // Protect 'workerTimeoutHandle_'.
+    // Registered by the client before the connection is marked switched; the heartbeat thread only
+    // invokes it, so it must not capture any ObjectClientImpl state (see M1 in the fix design).
+    // A node can be switched back to standby multiple times, so SetDataPlaneDrainHandle may be re-invoked
+    // on a live listener while the heartbeat thread is reading it (drain deferred) — hence the mutex.
+    DataPlaneDrainHandle dataPlaneDrain_;
+    SharedMutex dataPlaneDrainMutex_;  // Protect 'dataPlaneDrain_'.
     ThreadPool *asyncSwitchWorkerPool_;
     const uint32_t index_;
 };

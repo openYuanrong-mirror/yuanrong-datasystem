@@ -1121,6 +1121,21 @@ private:
 
     Status InitListenWorkerAt(WorkerNode node, bool isLocalWorker);
 
+    /**
+     * @brief Build the data-plane hooks that let a standby listener check whether its endpoint is still
+     * carrying data traffic before it shuts the control connection down.
+     * @param[in] workerAddr Address of the worker the standby listener is connected to.
+     * @return Handle whose callbacks only reference the data-plane manager by weak pointer.
+     */
+    client::ListenWorker::DataPlaneDrainHandle MakeDataPlaneDrainHandle(const HostPort &workerAddr) const;
+
+    /**
+     * @brief Arm the standby drain gate on node's listener so it is not shut down while its data plane
+     * still serves metadata-owner reads.
+     * @param[in] node Worker node slot whose listener is becoming a standby.
+     */
+    void ArmStandbyDataPlaneDrain(WorkerNode node);
+
     Status InitPreferredRemoteFallback(const HostPort &remoteAddress, bool enableHeartbeat, int32_t connectTimeoutMs);
 
     Status InitWorkerClientAtCurrentAddress(bool enableHeartbeat, bool isSameNode, int32_t connectTimeoutMs = -1);
@@ -1350,6 +1365,18 @@ private:
     std::shared_ptr<Signature> transportSignature_;
     std::shared_ptr<const SensitiveValue> transportToken_;
     std::unique_ptr<client::TransportLayer> transportLayer_;
+    // Cached once in InitTransportLayer() (after transportLayer_ is built) and only read afterwards by the
+    // async-switch threads via MakeDataPlaneDrainHandle(). ShutDown() resets transportLayer_ before draining
+    // those threads, so those threads must never dereference transportLayer_ directly; a cached weak_ptr is
+    // safe to read and turns into "expired" (allow drain) once the transport layer is gone.
+    std::weak_ptr<client::DataPlaneManager> dataPlaneManagerWeak_;
+    // Published at the end of InitClientRuntimeAt() (release) once the data-plane setup is final: either
+    // InitTransportLayer() has built the manager (late-init path) or the client legitimately has no transport
+    // layer (SHM-only). The async switch-back path (WorkerFailover::GetPreferredLocalWorkerToRecover) gates on
+    // this flag (acquire), so ArmStandbyDataPlaneDrain() never reads dataPlaneManagerWeak_ before it is
+    // written — reading it during the early-init window would both be a data race and permanently capture an
+    // empty manager in the drain handle.
+    std::atomic<bool> dataPlaneManagerPublished_{ false };
     std::shared_ptr<client::Routing> routing_;
     std::shared_ptr<client::WorkerUbHealthRegistry> ubHealthRegistry_;
     std::shared_ptr<client::UbHealthFilter> ubHealthFilter_;

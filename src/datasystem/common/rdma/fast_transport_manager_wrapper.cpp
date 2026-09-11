@@ -468,13 +468,15 @@ Status UcpGatherPut(const UcpRemoteInfoPb &ucpInfo, uint64_t metaDataSize, const
     return Status::OK();
 }
 
-Status CheckTransportConnectionStable(const std::string &hostAddress, const std::string &instanceId)
+Status CheckTransportConnectionStable(const std::string &hostAddress, const std::string &instanceId,
+                                      const std::string &fallbackAddress)
 {
     (void)hostAddress;
     (void)instanceId;
+    (void)fallbackAddress;
 #ifdef USE_URMA
     if (UrmaManager::IsUrmaEnabled()) {
-        RETURN_IF_NOT_OK(UrmaManager::Instance().CheckUrmaConnectionStable(hostAddress, instanceId));
+        RETURN_IF_NOT_OK(UrmaManager::Instance().CheckUrmaConnectionStable(hostAddress, instanceId, fallbackAddress));
     }
 #elif defined(USE_RDMA)
     if (UcpManager::IsUcpEnabled()) {

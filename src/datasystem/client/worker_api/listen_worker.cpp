@@ -20,6 +20,7 @@
 #include <memory>
 #include <sys/socket.h>
 
+#include "datasystem/common/flags/common_flags.h"
 #include "datasystem/common/log/log.h"
 #include "datasystem/common/log/trace.h"
 #include "datasystem/common/util/format.h"
@@ -295,7 +296,17 @@ bool ListenWorker::HandleScaleDownOrIdle(bool isWorkerVoluntaryScaleDown)
     // Idle means remote connection request is 0 and switched.
     if (IsIdle()) {
         // If we are standby connection and idle, try shutdown ourselves.
-        TryShutdownStandbyConnection();
+        if (CanDisconnectStandby()) {
+            TryShutdownStandbyConnection();
+        } else {
+            // LOG_EVERY_T keeps its "last emitted" timestamp in a non-atomic static, which races across the
+            // multiple listener threads that reach this branch. LOG_FIRST_AND_EVERY_N keeps thread-safe
+            // atomic throttle state and additionally guarantees the first deferral is visible.
+            constexpr int drainDeferLogRate = 10;
+            LOG_FIRST_AND_EVERY_N(INFO, drainDeferLogRate)
+                << "[Switch] Standby drain deferred, data plane still active, worker: "
+                << clientCommonWorker_->hostPort_.ToString() << ", client id: " << clientId_;
+        }
         // If we are local connection and idle, we can tell local worker that we can be removed safely.
         if (IsVoluntarySwitchable() && !clientCommonWorker_->removable_.exchange(true, std::memory_order_relaxed)) {
             LOG(INFO) << "[Switch] Client " << clientId_ << " is removable now";
@@ -608,9 +619,58 @@ bool ListenWorker::IsWorkerVoluntaryScaleDown()
     return isWorkerVoluntaryScaleDown_;
 }
 
+bool ListenWorker::IsStandbyDataPlaneQuiet()
+{
+    // Copy the hook under the shared lock so a concurrent re-registration (the node switched back to
+    // standby again) cannot tear the std::function while it is being invoked.
+    std::function<bool(uint64_t)> isQuiet;
+    {
+        std::shared_lock<SharedMutex> l(dataPlaneDrainMutex_);
+        isQuiet = dataPlaneDrain_.isQuiet;
+    }
+    if (isQuiet == nullptr) {
+        // No data-plane owner registered: keep the legacy behaviour.
+        return true;
+    }
+    return isQuiet(FLAGS_standby_drain_data_plane_quiet_ms);
+}
+
 void ListenWorker::ShutdownStandbyConnection()
 {
+    // Re-check the gate on the thread that actually tears the connection down. CanDisconnectStandby() decides
+    // on the heartbeat thread, but the teardown is queued onto the single shared async-switch thread, which
+    // also runs switch-back work (worker API init, WaitStandbyWorkerReady up to min(2 x heartbeat, 10s)); the
+    // gap between the decision and this line can therefore be seconds, not microseconds. Metadata-owner read
+    // traffic can resume on the endpoint in that window, and tearing down then would drop an in-use data plane
+    // and make the worker delete this client's URMA connection — the exact failure this gate exists to prevent,
+    // just with a narrower window. Defer instead: the heartbeat loop re-evaluates on its next round.
+    // Reuse the decision predicate rather than restating its conjunction, so "when may a standby be torn
+    // down" keeps one definition: a condition added to CanDisconnectStandby() would otherwise silently not
+    // apply here and reopen the check-then-act window. This single read also governs both the reset below and
+    // the Disconnect, so the two cannot straddle the queueing delay.
+    if (!CanDisconnectStandby()) {
+        // LOG_EVERY_T keeps its "last emitted" timestamp in a non-atomic static, which races across the
+        // multiple listener threads that reach this branch. LOG_FIRST_AND_EVERY_N keeps thread-safe atomic
+        // throttle state and additionally guarantees the first deferral is visible.
+        constexpr int drainDeferLogRate = 10;
+        LOG_FIRST_AND_EVERY_N(INFO, drainDeferLogRate)
+            << "[Switch] Standby teardown deferred, endpoint data plane became active before disconnect, worker: "
+            << clientCommonWorker_->hostPort_.ToString() << ", client id: " << clientId_;
+        return;
+    }
     LOG(INFO) << "[Switch] Try to shutdown idle standby client: " << clientId_;
+    // The worker drops this client's URMA connection when it processes the Disconnect below, so drop the
+    // local data plane first: otherwise the client keeps a transporter the peer no longer recognizes.
+    // Copy the reset hook under the shared lock (same race as CanDisconnectStandby: a node can be switched
+    // back to standby and re-register the handle while this runs on the async-switch pool).
+    std::function<void()> reset;
+    {
+        std::shared_lock<SharedMutex> l(dataPlaneDrainMutex_);
+        reset = dataPlaneDrain_.reset;
+    }
+    if (reset != nullptr) {
+        reset();
+    }
     StopListenWorker(true);
     LOG_IF_ERROR(clientCommonWorker_->Disconnect(false), "[Switch] Disconnect idle client failed");
 }

@@ -18,6 +18,7 @@
 #ifndef DATASYSTEM_CLIENT_TRANSPORT_METADATA_OBJECT_METADATA_CLIENT_H
 #define DATASYSTEM_CLIENT_TRANSPORT_METADATA_OBJECT_METADATA_CLIENT_H
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -78,6 +79,8 @@ private:
         std::string transportInstanceId;
         std::shared_ptr<ShmTransporter> shmTransporter;
         std::shared_ptr<ShmSession> shmSession;
+        // Transporter that served this request; used to avoid discarding a concurrently rebuilt one.
+        std::shared_ptr<IDataTransporter> ubTransporter;
         std::shared_ptr<const TransportReadContext> readContext;
 
         /** @brief Disable inline transfer and release prepared receive buffers. */
@@ -88,6 +91,7 @@ private:
             transportInstanceId.clear();
             shmTransporter.reset();
             shmSession.reset();
+            ubTransporter.reset();
             readContext.reset();
         }
     };
@@ -224,6 +228,9 @@ private:
     std::shared_ptr<IUbReceiveBufferProvider> ubBufferProvider_;
     uint64_t ubBufferSize_ = 0;
     std::function<void(const HostPort &, const Status &)> metadataFailureHandler_;
+    // Total K_URMA_NEED_CONNECT responses seen by this client; surfaced in throttled logs so operators
+    // can size an incident from the first emitted line.
+    std::atomic<uint64_t> urmaNeedConnectTotal_{ 0 };
 };
 }  // namespace client
 }  // namespace datasystem

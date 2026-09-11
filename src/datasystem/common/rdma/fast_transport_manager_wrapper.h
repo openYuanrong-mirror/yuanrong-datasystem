@@ -285,9 +285,12 @@ Status ImportRecoveryProbeHandshake(const UrmaHandshakeReqPb &req);
  * @brief Check if the connection is stable.
  * @param[in] hostAddress The dst port address.
  * @param[in] instanceId The unqiue instance uuid from dst port.
+ * @param[in] fallbackAddress Optional peer address used only when hostAddress has no connection at all
+ *                            (URMA only; see UrmaManager::CheckUrmaConnectionStable).
  * @return Status of the connection.
  */
-Status CheckTransportConnectionStable(const std::string &hostAddress, const std::string &instanceId);
+Status CheckTransportConnectionStable(const std::string &hostAddress, const std::string &instanceId,
+                                      const std::string &fallbackAddress = "");
 
 /**
  * @brief Get local transport unique instance id.
