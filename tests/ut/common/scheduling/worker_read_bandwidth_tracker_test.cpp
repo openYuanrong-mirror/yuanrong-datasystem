@@ -96,16 +96,25 @@ void ExpectWithin(uint32_t value, const LatencyBounds &bounds)
 }
 }  // namespace
 
+// The tracker's constructor is protected (production callers must use Instance());
+// tests reach it through a subclass wrapper.
+class TrackerHandle : public WorkerReadBandwidthTracker {
+public:
+    explicit TrackerHandle(WorkerReadBandwidthTrackerConfig config) : WorkerReadBandwidthTracker(std::move(config))
+    {
+    }
+};
+
 class WorkerReadBandwidthTrackerTest : public ::testing::Test {
 protected:
     void SetUp() override
     {
-        tracker_.reset(new WorkerReadBandwidthTracker(WorkerConfig()));
+        tracker_.reset(new TrackerHandle(WorkerConfig()));
     }
 
-    static WorkerReadBandwidthTracker CreateTracker(WorkerReadBandwidthTrackerConfig config)
+    static TrackerHandle CreateTracker(WorkerReadBandwidthTrackerConfig config)
     {
-        return WorkerReadBandwidthTracker(std::move(config));
+        return TrackerHandle(std::move(config));
     }
 
     void CheckSingleSample(uint64_t bytes)

@@ -150,7 +150,7 @@ public:
      * @return K_OK on success; the error code otherwise.
      */
     Status Set(ObjectBuffer &buffer, const TransportSetParam &param);
-    Status Set(ObjectBuffer &buffer, const TransportSetParam &param, TransportSetResult &result, PublishRspPb &rsp);
+    Status Set(ObjectBuffer &buffer, const TransportSetParam &param, TransportSetResult &result);
 
     /** @brief Create transport-native buffers for a same-worker MSet batch. */
     Status MCreate(const HostPort &workerAddr, const std::vector<std::string> &objectKeys,

@@ -33,13 +33,13 @@ namespace datasystem {
 namespace scheduling {
 namespace {
 
-constexpr uint64_t kNanosecondsPerMicrosecond = 1000ULL;
-constexpr uint64_t kNanosecondsPerMillisecond = 1000000ULL;
+constexpr uint64_t NANOSECONDS_PER_MICROSECOND = 1000ULL;
+constexpr uint64_t NANOSECONDS_PER_MILLISECOND = 1000000ULL;
 // Limits the background wait so tracker shutdown normally completes within 10 ms.
-constexpr uint64_t kMaximumRefreshPollNs = 10ULL * kNanosecondsPerMillisecond;
-constexpr uint64_t kSampleCountMask = 0xFFFFULL;
-constexpr uint32_t kSampleCountBits = 16;
-constexpr uint64_t maxSampleBits = 256ULL * 1024ULL;
+constexpr uint64_t MAXIMUM_REFRESH_POLL_NS = 10ULL * NANOSECONDS_PER_MILLISECOND;
+constexpr uint64_t SAMPLE_COUNT_MASK = 0xFFFFULL;
+constexpr uint32_t SAMPLE_COUNT_BITS = 16;
+constexpr uint64_t MAX_SAMPLE_BYTES = 256ULL * 1024ULL;
 
 uint64_t SaturatingMultiply(uint64_t lhs, uint64_t rhs) noexcept
 {
@@ -83,7 +83,7 @@ private:
 WorkerReadBandwidthTrackerConfig WorkerReadBandwidthTrackerConfig::FromFlags()
 {
     WorkerReadBandwidthTrackerConfig config;
-    config.enabled = FLAGS_load_aware_scheduler_enabled;
+    config.enabled = FLAGS_enable_load_aware_scheduler;
     return config;
 }
 
@@ -143,18 +143,18 @@ private:
 WorkerReadBandwidthTracker::Impl::Impl(WorkerReadBandwidthTrackerConfig config)
     : config_(std::move(config)),
       historyCapacity_(std::max<uint32_t>(1, config_.latencyHistorySamples)),
-      sampleLimit_(std::min<uint32_t>(static_cast<uint32_t>(kSampleCountMask),
+      sampleLimit_(std::min<uint32_t>(static_cast<uint32_t>(SAMPLE_COUNT_MASK),
                                       std::max<uint32_t>(1, config_.latencySamplesPerPeriod))),
       samplePeriodNs_(
-          SaturatingMultiply(std::max<uint64_t>(1, config_.latencySamplePeriodMs), kNanosecondsPerMillisecond)),
-      refreshPollIntervalNs_(std::min(samplePeriodNs_, kMaximumRefreshPollNs)),
+          SaturatingMultiply(std::max<uint64_t>(1, config_.latencySamplePeriodMs), NANOSECONDS_PER_MILLISECOND)),
+      refreshPollIntervalNs_(std::min(samplePeriodNs_, MAXIMUM_REFRESH_POLL_NS)),
       baseDataSizeBytes_(std::max<uint64_t>(1, config_.latencyBaseDataSizeBytes)),
-      minColDataSizeBytes_(maxSampleBits),
+      minColDataSizeBytes_(MAX_SAMPLE_BYTES),
       samples_(new SampleSlot[historyCapacity_]),
       scratch_(new uint64_t[historyCapacity_])
 {
-    const uint64_t initialP50Ns = SaturatingMultiply(config_.initialP50Us, kNanosecondsPerMicrosecond);
-    const uint64_t initialP99Ns = SaturatingMultiply(config_.initialP99Us, kNanosecondsPerMicrosecond);
+    const uint64_t initialP50Ns = SaturatingMultiply(config_.initialP50Us, NANOSECONDS_PER_MICROSECOND);
+    const uint64_t initialP99Ns = SaturatingMultiply(config_.initialP99Us, NANOSECONDS_PER_MICROSECOND);
     packedPercentiles_.store(PackPercentiles(initialP50Ns, initialP99Ns), std::memory_order_relaxed);
     if (Enabled()) {
         refreshThread_ = std::thread(&Impl::PercentileRefreshLoop, this);
@@ -237,9 +237,10 @@ bool WorkerReadBandwidthTracker::Impl::TryAcquireSampleQuota(uint64_t nowNs, uin
 {
     const uint64_t currentPeriod = nowNs / samplePeriodNs_;
     uint64_t packed = packedSampleGate_.load(std::memory_order_relaxed);
-    while (true) {
-        const uint64_t period = packed >> kSampleCountBits;
-        const uint32_t count = static_cast<uint32_t>(packed & kSampleCountMask);
+    bool exchanged = false;
+    while (!exchanged) {
+        const uint64_t period = packed >> SAMPLE_COUNT_BITS;
+        const uint32_t count = static_cast<uint32_t>(packed & SAMPLE_COUNT_MASK);
         if (period > currentPeriod) {
             return false;
         }
@@ -247,13 +248,12 @@ bool WorkerReadBandwidthTracker::Impl::TryAcquireSampleQuota(uint64_t nowNs, uin
             return false;
         }
         const uint32_t nextCount = period == currentPeriod ? count + 1 : 1;
-        const uint64_t desired = (currentPeriod << kSampleCountBits) | nextCount;
-        if (packedSampleGate_.compare_exchange_weak(packed, desired, std::memory_order_relaxed,
-                                                    std::memory_order_relaxed)) {
-            samplePeriod = currentPeriod;
-            return true;
-        }
+        const uint64_t desired = (currentPeriod << SAMPLE_COUNT_BITS) | nextCount;
+        exchanged = packedSampleGate_.compare_exchange_weak(packed, desired, std::memory_order_relaxed,
+                                                            std::memory_order_relaxed);
     }
+    samplePeriod = currentPeriod;
+    return true;
 }
 
 // @brief Mark one sample as successfully stored and check whether this period reaches full sample limit.
@@ -268,9 +268,11 @@ bool WorkerReadBandwidthTracker::Impl::MarkSampleStoredAndCheckPeriodFull(uint64
 {
     uint64_t packed = packedStoredGate_.load(std::memory_order_relaxed);
 
-    while (true) {
-        const uint64_t storedPeriod = packed >> kSampleCountBits;
-        const uint32_t storedCount = static_cast<uint32_t>(packed & kSampleCountMask);
+    bool exchanged = false;
+    bool periodFull = false;
+    while (!exchanged) {
+        const uint64_t storedPeriod = packed >> SAMPLE_COUNT_BITS;
+        const uint32_t storedCount = static_cast<uint32_t>(packed & SAMPLE_COUNT_MASK);
 
         // Ignore a delayed sample belonging to an older period.
         if (storedPeriod > samplePeriod) {
@@ -282,13 +284,12 @@ bool WorkerReadBandwidthTracker::Impl::MarkSampleStoredAndCheckPeriodFull(uint64
         }
 
         const uint32_t nextCount = storedPeriod == samplePeriod ? storedCount + 1U : 1U;
-        const uint64_t desired = (samplePeriod << kSampleCountBits) | nextCount;
-
-        if (packedStoredGate_.compare_exchange_weak(packed, desired, std::memory_order_relaxed,
-                                                    std::memory_order_relaxed)) {
-            return nextCount == sampleLimit_;
-        }
+        const uint64_t desired = (samplePeriod << SAMPLE_COUNT_BITS) | nextCount;
+        exchanged = packedStoredGate_.compare_exchange_weak(packed, desired, std::memory_order_relaxed,
+                                                            std::memory_order_relaxed);
+        periodFull = nextCount == sampleLimit_;
     }
+    return periodFull;
 }
 
 uint64_t WorkerReadBandwidthTracker::Impl::NormalizeLatency(uint64_t latencyNs, uint64_t dataSizeBytes) const noexcept

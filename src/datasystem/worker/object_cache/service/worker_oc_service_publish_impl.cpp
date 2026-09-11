@@ -125,6 +125,17 @@ Status RetryMetadataRequestWithRouteRefresh(std::shared_ptr<WorkerMasterOCApi> &
     }
     return rc;
 }
+
+void FillReadLoadFeedback(const Status &rc, PublishRspPb &resp)
+{
+    // READ_BW_WRH_P2C_PUBLISH_FEEDBACK
+    if (rc.IsOk()) {
+        const auto bw = scheduling::WorkerReadBandwidthTracker::Instance().GetSnapshot();
+        resp.set_read_load_p50(bw.p50Ns);
+        resp.set_read_load_p99(bw.p99Ns);
+        resp.set_read_load_sample_version(bw.latencyVersion);
+    }
+}
 }  // namespace
 
 WorkerOcServicePublishImpl::WorkerOcServicePublishImpl(WorkerOcServiceCrudParam &initParam,
@@ -707,15 +718,7 @@ Status WorkerOcServicePublishImpl::Publish(const PublishReqPb &req, PublishRspPb
         .Existence(req.existence())
         .CacheType(req.cache_type());
     Status rc = PublishImpl(req, resp, payloads);
-
-    // READ_BW_WRH_P2C_PUBLISH_FEEDBACK
-    if (rc.IsOk()) {
-        const auto bw = scheduling::WorkerReadBandwidthTracker::Instance().GetSnapshot();
-        resp.set_read_load_p50(bw.p50Ns);
-        resp.set_read_load_p99(bw.p99Ns);
-        resp.set_read_load_sample_version(bw.latencyVersion);
-    }
-
+    FillReadLoadFeedback(rc, resp);
     if (traceEnabled) {
         Trace::Instance().AddLatencyTick(LatencyTickKey::WORKER_PUBLISH_END);
     }

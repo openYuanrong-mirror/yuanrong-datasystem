@@ -972,8 +972,7 @@ public:
         return ObjectBufferInternal::Create(info, buffer);
     }
 
-    Status Set(ObjectBuffer &buffer, const TransportSetParam &param, PublishRspPb &,
-               TransportSetResult *result = nullptr) override
+    Status Set(ObjectBuffer &buffer, const TransportSetParam &param, TransportSetResult *result = nullptr) override
     {
         ++setCount;
         if (result != nullptr) {
@@ -6768,8 +6767,7 @@ TEST(ShmTransporterTest, SetSendsPayloadInlineForFallbackBuffer)
     std::shared_ptr<ObjectBuffer> buffer;
     ASSERT_TRUE(transporter.Create(MakeAddress(9101), "k2", 64, MakeCreateParam(), buffer).IsOk());
     TransportSetParam sp = MakeSetParam();
-    PublishRspPb rsp;
-    ASSERT_TRUE(transporter.Set(*buffer, sp, rsp).IsOk());
+    ASSERT_TRUE(transporter.Set(*buffer, sp).IsOk());
     ASSERT_EQ(rpc->setInvokeCount, 1);
     ASSERT_FALSE(rpc->invokedSetPayloadSizes.empty());
     EXPECT_EQ(rpc->invokedSetPayloadSizes.back(), 1u);  // one MemView payload inline
@@ -8335,8 +8333,7 @@ TEST(TcpTransporterTest, SetCallsInvokeSet)
     TransportSetParam setParam = MakeSetParam();
     setParam.subTimeoutMs = 500;
     setParam.ttlSecond = 60;
-    PublishRspPb rsp;
-    Status rc = transporter.Set(*buffer, setParam, rsp);
+    Status rc = transporter.Set(*buffer, setParam);
     ASSERT_TRUE(rc.IsOk()) << rc.ToString();
     EXPECT_EQ(rpcClient->setInvokeCount, 1);
     EXPECT_EQ(rpcClient->invokedSetPayloadSizes.size(), 1u);
@@ -8358,8 +8355,7 @@ TEST(TcpTransporterTest, SetPropagatesRpcError)
     ASSERT_TRUE(transporter.Create(MakeAddress(9000), "err-key", 64, createParam, buffer).IsOk());
 
     TransportSetParam setParam = MakeSetParam();
-    PublishRspPb rsp;
-    EXPECT_EQ(transporter.Set(*buffer, setParam, rsp).GetCode(), K_RPC_DEADLINE_EXCEEDED);
+    EXPECT_EQ(transporter.Set(*buffer, setParam).GetCode(), K_RPC_DEADLINE_EXCEEDED);
     EXPECT_EQ(rpcClient->setInvokeCount, 1);
 }
 
@@ -8543,8 +8539,7 @@ TEST(UbTransporterTest, SetUrmaSuccessPublishesWithoutTcpPayload)
     ASSERT_TRUE(ObjectBufferInternal::Create(info, buffer).IsOk());
     ASSERT_TRUE(buffer->MemoryCopy("data", 4).IsOk());
 
-    PublishRspPb rsp;
-    ASSERT_TRUE(transporter.Set(*buffer, MakeSetParam(), rsp).IsOk());
+    ASSERT_TRUE(transporter.Set(*buffer, MakeSetParam()).IsOk());
     EXPECT_EQ(transporter.writeCount, 1);
     ASSERT_EQ(rpcClient->invokedSetPayloadSizes.size(), 1u);
     EXPECT_EQ(rpcClient->invokedSetPayloadSizes[0], 0u);
@@ -8585,8 +8580,7 @@ TEST(UbTransporterTest, SetUrmaFailureFallsBackToCorrectTcpPayload)
     ASSERT_TRUE(ObjectBufferInternal::Create(info, buffer).IsOk());
     ASSERT_TRUE(buffer->MemoryCopy("data", 4).IsOk());
 
-    PublishRspPb rsp;
-    ASSERT_TRUE(transporter.Set(*buffer, MakeSetParam(), rsp).IsOk());
+    ASSERT_TRUE(transporter.Set(*buffer, MakeSetParam()).IsOk());
     EXPECT_EQ(transporter.writeCount, 1);
     ASSERT_EQ(rpcClient->invokedSetPayloadData.size(), 1u);
     ASSERT_EQ(rpcClient->invokedSetPayloadData[0].size(), 1u);
@@ -8607,8 +8601,7 @@ TEST(UbTransporterTest, RejectedFallbackPreservesReconnectStatus)
     std::shared_ptr<ObjectBuffer> buffer;
     ASSERT_TRUE(ObjectBufferInternal::Create(info, buffer).IsOk());
 
-    PublishRspPb rsp;
-    EXPECT_EQ(transporter.Set(*buffer, MakeSetParam(), rsp).GetCode(), K_URMA_NEED_CONNECT);
+    EXPECT_EQ(transporter.Set(*buffer, MakeSetParam()).GetCode(), K_URMA_NEED_CONNECT);
     EXPECT_EQ(rpcClient->setInvokeCount, 0);
 }
 
@@ -8841,8 +8834,7 @@ TEST(UbTransporterTest, CloseDataPlaneWaitsForInflightSet)
     ASSERT_TRUE(ObjectBufferInternal::Create(info, buffer).IsOk());
 
     Status setStatus;
-    PublishRspPb rsp;
-    std::thread setThread([&]() { setStatus = transporter.Set(*buffer, MakeSetParam(), rsp); });
+    std::thread setThread([&]() { setStatus = transporter.Set(*buffer, MakeSetParam()); });
     invokeStartedFuture.wait();
     std::thread closeThread([&]() { transporter.CloseDataPlane(); });
     allowInvoke.set_value();

@@ -151,6 +151,7 @@ public:
 
 private:
     std::shared_ptr<client::TransportReadContext> CreateTransportReadContext(int64_t subTimeoutMs, bool queryL2Cache);
+    void ObserveReadLoadFeedback(const SetRouteContext &routeContext, const PublishRspPb &rsp);
     std::unique_ptr<client::TransportLayer> &transportLayer_;
     std::shared_ptr<client::Routing> &routing_;
     const int32_t &requestTimeoutMs_;

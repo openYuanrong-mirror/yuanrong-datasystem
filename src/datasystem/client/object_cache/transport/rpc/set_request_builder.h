@@ -63,6 +63,7 @@ struct TransportSetResult {
     bool publishAttempted = false;
     bool publishDefinitelyNotSent = false;
     bool writeTargetQuarantined = false;
+    PublishRspPb rsp;
 };
 
 Status ValidateCreateRequest(const std::string &key, uint64_t size, const TransportCreateParam &param);
