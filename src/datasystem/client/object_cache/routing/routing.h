@@ -68,6 +68,9 @@ public:
     Status SelectWorker(const std::string &key, DataPlacementPolicy policy, HostPort &worker,
                         const std::vector<HostPort> &exclude = {});
 
+    Status SelectWorkerFromCandidates(const std::vector<HostPort> &candidates, DataPlacementPolicy policy,
+                                      HostPort &worker, const std::vector<HostPort> &exclude = {});
+
     Status SelectWorkers(const std::vector<std::string> &keys, DataPlacementPolicy policy,
                          std::unordered_map<HostPort, std::vector<std::string>> &groups,
                          const std::vector<HostPort> &exclude = {});

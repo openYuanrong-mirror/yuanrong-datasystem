@@ -121,6 +121,31 @@ TEST_F(RoutingTest, TestSelectWorkerConsistency)
     EXPECT_EQ(w1.ToString(), w2.ToString());
 }
 
+TEST_F(RoutingTest, RedirectCandidatesPreservePlacementExclusionsAndHealth)
+{
+    auto router = CreateRouter();
+    DS_ASSERT_OK(UpdateHashRing(router, BuildRing(), BuildHostIdMap()));
+    const HostPort sameNode("127.0.0.1", 1000);
+    const HostPort remote("127.0.0.1", 2000);
+    const std::vector<HostPort> candidates{ remote, sameNode };
+    HostPort selected;
+    DS_ASSERT_OK(router->SelectWorkerFromCandidates(
+        candidates, client::DataPlacementPolicy::PREFERRED_META_OWNER, selected));
+    EXPECT_EQ(selected, remote);
+    DS_ASSERT_OK(router->SelectWorkerFromCandidates(
+        candidates, client::DataPlacementPolicy::PREFERRED_SAME_NODE, selected));
+    EXPECT_EQ(selected, sameNode);
+    EXPECT_EQ(router
+                  ->SelectWorkerFromCandidates(candidates, client::DataPlacementPolicy::REQUIRED_SAME_NODE,
+                                               selected, { sameNode })
+                  .GetCode(),
+              K_NO_AVAILABLE_WORKER);
+    router->UpdateState(remote, K_SCALE_DOWN);
+    DS_ASSERT_OK(router->SelectWorkerFromCandidates(
+        candidates, client::DataPlacementPolicy::PREFERRED_META_OWNER, selected));
+    EXPECT_EQ(selected, sameNode);
+}
+
 TEST_F(RoutingTest, InvalidSeedOverrideDoesNotReplaceLastGoodRing)
 {
     auto router = CreateRouter();
@@ -527,6 +552,16 @@ TEST_F(RoutingTest, U7RoutesWithFiveThousandWorkerSnapshot)
     auto router = CreateRouter();
     DS_ASSERT_OK(UpdateHashRing(router, ring, hostIdMap));
     ASSERT_EQ(router->GetAvailableWorkers().size(), workerCount);
+    const std::vector<HostPort> redirectCandidates{
+        HostPort("127.0.0.1", portBase + static_cast<int>(workerCount) - 3),
+        HostPort("127.0.0.1", portBase + static_cast<int>(workerCount) - 2),
+        HostPort("127.0.0.1", portBase + static_cast<int>(workerCount) - 1)
+    };
+    HostPort redirectWorker;
+    DS_ASSERT_OK(router->SelectWorkerFromCandidates(
+        redirectCandidates, client::DataPlacementPolicy::PREFERRED_META_OWNER, redirectWorker));
+    EXPECT_NE(std::find(redirectCandidates.begin(), redirectCandidates.end(), redirectWorker),
+              redirectCandidates.end());
 
     std::vector<std::string> keys;
     keys.reserve(keyCount);
