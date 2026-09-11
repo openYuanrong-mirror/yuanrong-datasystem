@@ -154,6 +154,13 @@ Status Routing::SelectWorker(const std::string &key, DataPlacementPolicy policy,
     return router_->SelectWorker(key, policy, worker, exclude);
 }
 
+Status Routing::SelectWorkerFromCandidates(const std::vector<HostPort> &candidates, DataPlacementPolicy policy,
+                                           HostPort &worker, const std::vector<HostPort> &exclude)
+{
+    CHECK_FAIL_RETURN_STATUS(initialized_.load(), K_NOT_READY, "Routing is not initialized");
+    return router_->SelectWorkerFromCandidates(candidates, policy, worker, exclude);
+}
+
 Status Routing::SelectWorkers(const std::vector<std::string> &keys, DataPlacementPolicy policy,
                               std::unordered_map<HostPort, std::vector<std::string>> &groups,
                               const std::vector<HostPort> &exclude)

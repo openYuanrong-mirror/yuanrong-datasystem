@@ -2419,16 +2419,9 @@ Status ObjectClientImpl::SelectSetRoute(const std::string &objectKey,
     };
     auto routing = std::atomic_load(&routing_);
     RETURN_RUNTIME_ERROR_IF_NULL(routing);
-    auto preferredExclusions = excludedWorkers;
-    const std::unordered_set<HostPort> preferred(preferredWorkers.begin(), preferredWorkers.end());
-    for (const auto &worker : routing->GetAvailableWorkers()) {
-        if (preferred.count(worker) == 0) {
-            preferredExclusions.emplace_back(worker);
-        }
-    }
     HostPort selected;
-    auto rc = routing->SelectWorker(objectKey, dataPlacementPolicy_, selected,
-                                    MergeWriteTargetExclusions(preferredExclusions));
+    auto rc = routing->SelectWorkerFromCandidates(preferredWorkers, dataPlacementPolicy_, selected,
+                                                  MergeWriteTargetExclusions(excludedWorkers));
     if (rc.IsOk()) {
         return BuildSetRouteContext(selected, routeContext);
     }

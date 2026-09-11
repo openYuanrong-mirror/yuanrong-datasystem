@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <iterator>
+#include <optional>
 #include <stdexcept>
 #include <unordered_set>
 #include <utility>
@@ -202,6 +203,39 @@ Status WorkerRouter::SelectWorker(const std::string &key, DataPlacementPolicy po
     }
     auto view = std::atomic_load(&ringView_);
     return SelectWorkerFromView(key, policy, worker, exclude, view);
+}
+
+Status WorkerRouter::SelectWorkerFromCandidates(const std::vector<HostPort> &candidates,
+                                                DataPlacementPolicy policy, HostPort &worker,
+                                                const std::vector<HostPort> &exclude) const
+{
+    CHECK_FAIL_RETURN_STATUS(initialized_.load(std::memory_order_acquire), K_NOT_READY, "Routing is not initialized");
+    auto view = std::atomic_load(&ringView_);
+    const auto &sameNodeWorkers = *view->sameNodeWorkers;
+    std::optional<HostPort> fallback;
+    for (const auto &candidate : candidates) {
+        const auto ringMember = view->ring->members().find(candidate.ToString());
+        const bool routable = ringMember != view->ring->members().end()
+                              && (ringMember->second.state() == ::datasystem::MembershipPb::ACTIVE
+                                  || ringMember->second.state() == ::datasystem::MembershipPb::LEAVING);
+        if (!routable || IsExcluded(candidate, exclude) || !IsWorkerAvailable(candidate)) {
+            continue;
+        }
+        const bool sameNode = std::find(sameNodeWorkers.begin(), sameNodeWorkers.end(), candidate)
+                              != sameNodeWorkers.end();
+        if (policy != DataPlacementPolicy::PREFERRED_META_OWNER && sameNode) {
+            worker = candidate;
+            return Status::OK();
+        }
+        if (policy != DataPlacementPolicy::REQUIRED_SAME_NODE && !fallback.has_value()) {
+            fallback = candidate;
+        }
+    }
+    if (fallback.has_value()) {
+        worker = std::move(*fallback);
+        return Status::OK();
+    }
+    return Status(K_NO_AVAILABLE_WORKER, "No redirect candidate satisfies routing policy");
 }
 
 Status WorkerRouter::SelectWorkerFromView(const std::string &key, DataPlacementPolicy policy, HostPort &worker,
