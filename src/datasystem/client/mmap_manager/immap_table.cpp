@@ -53,6 +53,9 @@ bool IMmapTable::FindFd(const int &workerFd)
 void IMmapTable::Clear()
 {
     bthread::RWLockWrGuard l(mutex_);
+    for (const auto &entry : mmapTable_) {
+        entry.second->MarkRetired();
+    }
     mmapTable_.clear();
     shmIdToWorkerFd_.clear();
 }
@@ -60,6 +63,9 @@ void IMmapTable::Clear()
 void IMmapTable::CleanInvalidMmapTable()
 {
     bthread::RWLockWrGuard l(mutex_);
+    for (const auto &entry : mmapTable_) {
+        entry.second->MarkRetired();
+    }
     mmapTable_.clear();
     shmIdToWorkerFd_.clear();
 }
@@ -76,7 +82,11 @@ void IMmapTable::ClearExpiredFds(const std::vector<int64_t> &fds)
                 break;
             }
         }
-        mmapTable_.erase(fd);
+        auto entry = mmapTable_.find(fd);
+        if (entry != mmapTable_.end()) {
+            entry->second->MarkRetired();
+            mmapTable_.erase(entry);
+        }
     }
 }
 
@@ -138,7 +148,11 @@ void IMmapTable::ClearExpiredByShmId(const std::string &shmId, const std::vector
     int workerFd = it->second;
     for (auto fd : fds) {
         if (fd == workerFd) {
-            mmapTable_.erase(fd);
+            auto entry = mmapTable_.find(fd);
+            if (entry != mmapTable_.end()) {
+                entry->second->MarkRetired();
+                mmapTable_.erase(entry);
+            }
         }
     }
 }
@@ -154,7 +168,11 @@ void IMmapTable::ClearByShmId(const std::string &shmId)
         return; // idempotent: nothing associated with this shm_id.
     }
     int workerFd = it->second;
-    mmapTable_.erase(workerFd);
+    auto entry = mmapTable_.find(workerFd);
+    if (entry != mmapTable_.end()) {
+        entry->second->MarkRetired();
+        mmapTable_.erase(entry);
+    }
     shmIdToWorkerFd_.erase(it);
 }
 }  // namespace client

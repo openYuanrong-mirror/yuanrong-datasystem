@@ -37,15 +37,18 @@ public:
     Status GetMemcpySegmentSizes(const void *hostPointer, size_t size, std::vector<size_t> &segmentSizes);
 
 private:
-    std::shared_ptr<std::mutex> hostMemoryOperationMutex_{ std::make_shared<std::mutex>() };
+    using EntryRegistry = std::vector<std::weak_ptr<ShmMmapTableEntry>>;
+
+    std::shared_ptr<std::timed_mutex> hostMemoryOperationMutex_{ std::make_shared<std::timed_mutex>() };
     // Shared with mmap entries so delayed Buffer destruction still observes Client shutdown.
     std::shared_ptr<std::atomic<bool>> clientExiting_{ std::make_shared<std::atomic<bool>>(false) };
     // Entry deleters retain this pool so delayed Buffer destruction can still complete unpin and munmap.
     std::shared_ptr<ThreadPool> unmapThread_;
     // Declared after unmapThread_ so destruction drains pending pin tasks before closing the unmap worker.
     ThreadPool pinThread_;
-    std::mutex entriesMutex_;
-    std::vector<std::weak_ptr<ShmMmapTableEntry>> entries_;
+    std::mutex registryWriteMutex_;
+    // Readers retain an immutable generation while Submit publishes the next one.
+    std::shared_ptr<const EntryRegistry> registrySnapshot_{ std::make_shared<const EntryRegistry>() };
 };
 
 }  // namespace client

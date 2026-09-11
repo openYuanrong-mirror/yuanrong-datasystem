@@ -8,6 +8,8 @@ ds_cc_test(
     deps = [
         "//src/datasystem/client/mmap_manager:mmap_table",
         "//src/datasystem/common/device/nvidia:cuda_host_memory",
+        "//src/datasystem/common/inject:common_inject",
+        "//src/datasystem/common/util:common_util_impl",
     ],
 )
 

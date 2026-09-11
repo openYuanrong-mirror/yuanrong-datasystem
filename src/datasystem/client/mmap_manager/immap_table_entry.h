@@ -79,6 +79,10 @@ public:
         return true;
     }
 
+    virtual void MarkRetired() noexcept
+    {
+    }
+
 protected:
     friend class IMmapTable;
 
