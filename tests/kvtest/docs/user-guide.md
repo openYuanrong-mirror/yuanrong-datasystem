@@ -381,6 +381,43 @@ CSV 默认包含 CPU、RSS、匿名/共享内存、文件描述符、TCP 失败�
 allocated、active、resident、metadata、mapped、retained、dirty 和 muzzy 指标。读取失败时
 jemalloc 内存列留空，`jemalloc_stats_available` 与 `jemalloc_stats_read_failures` 用于判断缺口原因。
 
+启用 `brpc_enable_builtin_services=true` 后，同一轮 HTTP `/vars` 采样还记录：
+
+| CSV 列 | 含义 |
+| --- | --- |
+| `bthread_keytable_count` / `bthread_keytable_memory` | 存活 keytable 数及表结构内存（字节，包含缓存的表，不包含表指针指向的业务对象） |
+| `bthread_count` | 已创建、尚未结束的 bthread 数，包含内部任务，不等于活跃请求数 |
+| `bthread_worker_count` / `bthread_worker_usage` | 实际调度 worker 线程数 / CPU 时间折算的 worker 使用量 |
+| `bthread_group_status` / `bthread_local_runqueue_count` | 非空本地运行队列 JSON（从 0 开始的组索引到长度）/ 所有组长度之和 |
+| `brpc_active_requests` / `brpc_method_concurrency` | 目标端口各业务 RPC 方法 concurrency 的合计 / 仅非零方法的紧凑 JSON 明细 |
+| `brpc_stats_available` / `brpc_stats_read_failures` | 本轮是否读到 `bthread_count` / 累计缺失次数；其他字段缺失时各自留空 |
+
+这些统计不依赖 jemalloc profiling 或 `jemalloc_stats`。RSS 已由 `rss_mb` 记录。
+`bthread_concurrency` 是配置值，不采集。bRPC 1.15 的 `bthread_group_status` 只统计本地运行队列，
+不包含 remote/priority 队列，也不包含挂起等待的 bthread，因此不导出未经证实的 pending/suspended 总数。
+精确的全局 pending/suspended 计数需要在 bRPC 调度状态转换处增加统计。
+活跃请求数只覆盖已经进入各业务 RPC 方法统计生命周期的请求，不含 SDK 的整个 Set/Get 生命周期、
+入站解析队列或独立后台任务；各计数依次读取，并非原子快照。合计不使用可能因关闭限流而恒为零的
+server 级 concurrency，也不累加 `max_concurrency`。HTML 分别展示 bthread/keytable 数量、keytable 结构内存（字节）、worker 使用量、活跃 RPC 与本地队列、采集状态图表。
+图表沿用同步时间滑块和采样点提示；缺失值显示为缺口，全空指标不生成曲线。
+`brpc_method_concurrency` 去掉重复的 `rpc_server_<port>_` 前缀和 `_concurrency` 后缀，保留服务及方法名，避免同名方法混淆。
+`bthread_group_status` 仅保存非空队列的组索引和长度；组索引不是线程 TID。
+这两列成功采集且全部为零时写 `{}`，不可用时留空；总量指标仍统计全部项。
+新版明细格式为稀疏 JSON，升级采集器时应另起 CSV，避免与旧版完整名称/空格列表混用。
+明细保留在 CSV，不转换为数值曲线。
+
+手工采集示例（在目标 Worker 容器中，填写实际 PID、监听 IP 和 bRPC 端口）：
+
+```bash
+python3 tests/kvtest/tools/procmon.py --pid <worker-pid> -i 1 \
+  --brpc-bvar-host <worker-ip> --brpc-bvar-port <worker-port> \
+  --output /tmp/runtime-capture/resource_monitor.csv
+```
+
+先创建输出目录。内置服务已启用时，无需重启 Worker，只需使用新版 procmon 启动采集。
+部署脚本的 `--enable-procmon` 会沿用原有端口配置自动采集。升级采集器前归档原 CSV；
+新版拒绝向不同表头的旧 CSV 追加，以免新列与旧表头错位。回退脚本时也应使用新的输出文件。
+
 ### 4.4 采集 Worker jemalloc heap profile
 
 先使用仓库根目录的 `build.sh -x on` 构建带 jemalloc profiling 能力的 Worker 包。使用

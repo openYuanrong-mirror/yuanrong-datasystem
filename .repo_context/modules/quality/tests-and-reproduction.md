@@ -593,3 +593,17 @@ python -m unittest test_multi_key_prefetch.TestDeviceOcClientMethods.test_device
 
 - The most representative smoke-test subsets for quick local iteration are not yet curated per production module.
 - The Bazel test target taxonomy under nested `BUILD.bazel` files should be deepened in a later pass.
+
+## KVTest BRPC runtime capture
+
+- With BRPC builtin services enabled, the same HTTP sample also captures keytable count/bytes, live bthreads,
+  actual worker count/usage, local runqueue lengths, and per-method RPC concurrency (JSON detail and sum for the
+  selected numeric server port). These do not depend on jemalloc statistics/profiling. Server-level concurrency
+  is not used because BRPC may not increment it with unlimited concurrency. Local runqueues exclude remote/priority
+  queues and suspended tasks; no global pending/suspended count is inferred. Missing metrics stay empty. The
+  configuration flag `bthread_concurrency` is not collected. Existing output headers must match before appending;
+  archive old CSVs on collector upgrade/downgrade. `parse_resource.py` charts the numeric runtime columns with synchronized time ranges and gaps for missing
+  samples. Per-method JSON omits zero values and strips the server prefix/concurrency suffix, preserving service identity.
+  Group details use sparse JSON from zero-based group index to nonzero queue length. Both details use `{}` for an
+  observed all-zero sample and empty cells for unavailable data; totals still cover all entries. Start a fresh CSV
+  when upgrading from the older dense detail encoding. Details remain CSV inputs.
