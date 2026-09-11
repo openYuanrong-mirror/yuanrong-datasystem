@@ -29,6 +29,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "datasystem/client/object_cache/routing/client_read_bandwidth_scheduler.h"
 #include "datasystem/client/object_cache/routing/data_placement_policy.h"
 #include "datasystem/client/object_cache/routing/i_worker_filter.h"
 #include "datasystem/client/object_cache/routing/worker_ub_health_registry.h"
@@ -86,9 +87,11 @@ private:
 class WorkerRouter {
 public:
     explicit WorkerRouter(std::string myHostId,
-                          std::vector<std::shared_ptr<IWorkerFilter>> additionalFilters = {});
+                          std::vector<std::shared_ptr<IWorkerFilter>> additionalFilters = {},
+                          std::shared_ptr<ClientReadBandwidthScheduler> bandwidthScheduler = nullptr);
     WorkerRouter(std::string myHostId, std::shared_ptr<WorkerUbHealthRegistry> ubHealthRegistry,
-                 std::vector<std::shared_ptr<IWorkerFilter>> additionalFilters = {});
+                 std::vector<std::shared_ptr<IWorkerFilter>> additionalFilters = {},
+                 std::shared_ptr<ClientReadBandwidthScheduler> bandwidthScheduler = nullptr);
     ~WorkerRouter() = default;
 
     void SetHostId(std::string hostId);
@@ -101,6 +104,9 @@ public:
     Status SelectWorkers(const std::vector<std::string> &keys, DataPlacementPolicy policy,
                          std::unordered_map<HostPort, std::vector<std::string>> &groups,
                          const std::vector<HostPort> &exclude = {}) const;
+
+    Status SelectWorkerByScheduling(const std::string &key, DataPlacementPolicy policy, HostPort &worker,
+                                    const std::vector<HostPort> &exclude = {}) const;
 
     std::vector<HostPort> GetAvailableSameNodeWorkers() const;
 
@@ -119,10 +125,17 @@ public:
     // Query ring state for a worker (used by StateFilter).
     WorkerRingState GetRingState(const HostPort &addr) const;
 
+    std::shared_ptr<ClientReadBandwidthScheduler> GetBandwidthScheduler() const
+    {
+        return bandwidthScheduler_;
+    }
+
 private:
     std::string myHostId_;
     std::shared_ptr<WorkerUbHealthRegistry> ubHealthRegistry_;
     std::vector<std::shared_ptr<IWorkerFilter>> filters_;
+    std::atomic<bool> initialized_{ false };
+    std::shared_ptr<ClientReadBandwidthScheduler> bandwidthScheduler_;
 
     // Single atomic snapshot — all readers see consistent ring + index + sameNode.
     struct RingView {

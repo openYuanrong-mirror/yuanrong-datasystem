@@ -62,6 +62,7 @@ list(APPEND CLIENT_SRCS
         object_cache/transport/rpc/set_request_builder.cpp
         object_cache/transport/rpc/worker_rpc_client.cpp
         object_cache/routing/broken_filter.cpp
+        object_cache/routing/client_read_bandwidth_scheduler.cpp
         object_cache/routing/hash_ring_refresher.cpp
         object_cache/routing/routing.cpp
         object_cache/routing/routing_rpc_client.cpp

@@ -113,4 +113,5 @@ DS_DECLARE_bool(brpc_drop_expired_request);
 DS_DECLARE_string(brpc_connection_type);
 DS_DECLARE_int32(brpc_max_connection_pool_size);
 DS_DECLARE_int32(brpc_event_dispatcher_num);
+DS_DECLARE_bool(load_aware_scheduler_enabled);
 #endif  // DATASYSTEM_COMMON_FLAGS_COMMON_FLAGS_H

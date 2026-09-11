@@ -36,14 +36,18 @@ constexpr size_t DEFAULT_FILTER_COUNT = 2;
 constexpr size_t MAX_ROUTING_TOKENS = 640'000;
 }  // namespace
 
-WorkerRouter::WorkerRouter(std::string myHostId, std::vector<std::shared_ptr<IWorkerFilter>> additionalFilters)
-    : WorkerRouter(std::move(myHostId), std::make_shared<WorkerUbHealthRegistry>(), std::move(additionalFilters))
+WorkerRouter::WorkerRouter(std::string myHostId, std::vector<std::shared_ptr<IWorkerFilter>> additionalFilters,
+                           std::shared_ptr<ClientReadBandwidthScheduler> bandwidthScheduler)
+    : WorkerRouter(std::move(myHostId), std::make_shared<WorkerUbHealthRegistry>(), std::move(additionalFilters),
+                   std::move(bandwidthScheduler))
 {
 }
 
 WorkerRouter::WorkerRouter(std::string myHostId, std::shared_ptr<WorkerUbHealthRegistry> ubHealthRegistry,
-                           std::vector<std::shared_ptr<IWorkerFilter>> additionalFilters)
-    : myHostId_(std::move(myHostId)), ubHealthRegistry_(std::move(ubHealthRegistry))
+                           std::vector<std::shared_ptr<IWorkerFilter>> additionalFilters,
+                           std::shared_ptr<ClientReadBandwidthScheduler> bandwidthScheduler)
+    : myHostId_(std::move(myHostId)), ubHealthRegistry_(std::move(ubHealthRegistry)),
+      bandwidthScheduler_(std::move(bandwidthScheduler))
 {
     if (ubHealthRegistry_ == nullptr) {
         throw std::invalid_argument("Worker UB health registry must not be null");
@@ -161,9 +165,41 @@ bool WorkerRouter::IsExcluded(const HostPort &addr, const std::vector<HostPort> 
         [&](const HostPort &e) { return e == addr; });
 }
 
+Status WorkerRouter::SelectWorkerByScheduling(const std::string &key, DataPlacementPolicy policy, HostPort &worker,
+                                              const std::vector<HostPort> &exclude) const
+{
+    CHECK_FAIL_RETURN_STATUS(initialized_.load(std::memory_order_acquire), K_NOT_READY, "Routing is not initialized");
+
+    auto view = std::atomic_load(&ringView_);
+    auto status = SelectWorkerFromView(key, policy, worker, exclude, view);
+    if (!bandwidthScheduler_ || !bandwidthScheduler_->Enabled()) {
+        return status;
+    }
+
+    // The scheduler reads live UB port faults from the registry snapshot; a null snapshot
+    // would make every worker's health unknown and permanently keep affinity.
+    std::shared_ptr<const UbRoutingHealthSnapshot> healthSnapshot = ubHealthRegistry_->GetRoutingSnapshot();
+    uint64_t taskId = 0;
+    if (bandwidthScheduler_->ShouldKeepAffinity(worker, key, healthSnapshot, taskId)) {
+        return status;
+    }
+
+    HostPort selected;
+    if (bandwidthScheduler_->SelectWorker(key, filters_, exclude, worker, healthSnapshot, taskId, selected)) {
+        if (selected != worker) {
+            worker = std::move(selected);
+        }
+        return Status::OK();
+    }
+    return status;
+}
+
 Status WorkerRouter::SelectWorker(const std::string &key, DataPlacementPolicy policy, HostPort &worker,
                                   const std::vector<HostPort> &exclude) const
 {
+    if (policy == DataPlacementPolicy::PREFERRED_META_OWNER) {
+        return SelectWorkerByScheduling(key, policy, worker, exclude);
+    }
     auto view = std::atomic_load(&ringView_);
     return SelectWorkerFromView(key, policy, worker, exclude, view);
 }
@@ -303,10 +339,14 @@ void WorkerRouter::UpdateHashRing(const PreparedClusterTopology &prepared,
     // Single atomic store — all readers see the new view atomically
     std::atomic_store(&ringView_, std::shared_ptr<const RingView>(std::move(newView)));
     ubHealthRegistry_->ReconcileTopology(*ring);
+    initialized_.store(true, std::memory_order_release);
 
     // Notify filters
     for (auto &f : filters_) {
         f->OnHashRingUpdated(*ring);
+    }
+    if (bandwidthScheduler_) {
+        bandwidthScheduler_->RefreshCandidates(prepared.tokenIndex_->workers);
     }
 }
 

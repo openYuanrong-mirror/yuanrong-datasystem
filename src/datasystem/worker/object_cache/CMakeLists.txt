@@ -101,6 +101,7 @@ set(WORKER_OBJECT_CACHE_DEPEND_LIBS
         metadata_route_resolver
         worker_client_manager
         worker_health_check
+        worker_read_bandwidth_tracker
         nlohmann_json::nlohmann_json
         ${BRPC_LIBRARIES}
         ${ZeroMQ_LIBRARY}

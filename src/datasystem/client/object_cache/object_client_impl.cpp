@@ -867,6 +867,10 @@ Status ObjectClientImpl::InitRouting(const HostPort &initialWorker, bool initial
                 transportLayer_->RecordRoutingRefresh(version);
             }
         });
+    auto scheduler = routing->GetBandwidthScheduler();
+    if (scheduler) {
+        scheduler->SetCutInGuardNs(requestTimeoutMs_);
+    }
     RETURN_IF_NOT_OK(routing->Init(*sdkHostIdCache, initialWorker, initialWorkerIsLocal));
     std::atomic_store(&routing_, std::move(routing));
     LOG(INFO) << "[Routing] Object client routing initialized from worker " << initialWorker.ToString();

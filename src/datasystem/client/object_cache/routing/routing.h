@@ -78,6 +78,11 @@ public:
 
     bool ForceRefresh();
 
+    std::shared_ptr<ClientReadBandwidthScheduler> GetBandwidthScheduler() const
+    {
+        return router_ ? router_->GetBandwidthScheduler() : nullptr;
+    }
+
     void Shutdown();
 
 private:

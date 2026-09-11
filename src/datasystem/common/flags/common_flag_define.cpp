@@ -311,3 +311,12 @@ DS_DEFINE_int32(fd_pool_prewarm_size, GetInt32FromEnv("DATASYSTEM_FD_POOL_PREWAR
                 "Number of fds to briefly open then close during SDK Init and worker startup to pre-expand the "
                 "kernel fdtable and warm the file slab. Default 5000. 0 disables. The soft RLIMIT_NOFILE is raised "
                 "(up to the hard limit) when needed; any failure is non-fatal.");
+
+// ============================================================================
+// Load-aware scheduling switches
+// ============================================================================
+DS_DEFINE_bool(load_aware_scheduler_enabled, GetBoolFromEnv("DATASYSTEM_LOAD_AWARE_SCHEDULER_ENABLED", false),
+               "Enable load-aware read bandwidth scheduling. When enabled, workers sample read latency and publish "
+               "P50/P99 feedback, and clients use that feedback to select workers for object-cache SET requests. "
+               "Default false. Read when the tracker and scheduler are constructed; runtime changes do not "
+               "reconfigure existing instances.");
