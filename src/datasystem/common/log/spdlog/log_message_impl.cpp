@@ -33,7 +33,7 @@
 #include "datasystem/common/perf/perf_manager.h"
 #include "datasystem/common/log/spdlog/provider.h"
 
-DS_DEFINE_int32_dynamic(v, 0, "Show all VLOG(m) messages for m <= this.");
+DS_DEFINE_int32_dynamic(v, 0, "Show all VLOG(m) messages for m <= this. Valid range is [0, 3].");
 DS_DECLARE_string(cluster_name);
 
 namespace datasystem {

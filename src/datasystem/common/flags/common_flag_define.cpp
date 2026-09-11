@@ -52,7 +52,7 @@ DS_DEFINE_string(
     "allowing different clusters to be distinguished by the cluster_name.");
 DS_DEFINE_string(
     log_monitor_exporter, "harddisk",
-    "Specify the type of exporter, either harddisk or backend. Only takes effect when log_monitor is true.");
+    "Specify the type of exporter. Only 'harddisk' is supported. Only takes effect when log_monitor is true.");
 DS_DEFINE_bool(rdma_register_whole_arena, true,
                "Register the whole arena as segment during init, otherwise, register each object as a segment.");
 DS_DEFINE_bool(enable_rdma, false, "Option to turn on rdma for OC worker to worker data transfer, default false.");
@@ -237,9 +237,11 @@ DS_DEFINE_string(coordinator_address, "",
                  "Address of datasystem coordinator service. Empty means coordinator mode is disabled.");
 DS_DEFINE_string(kv_events_config, "", "KV event publisher JSON config. Empty means disabled.");
 DS_DEFINE_int32(oc_worker_worker_direct_port, 0,
-                "Direct tcp/ip port for WorkerWorkerOCService. 0 -- disable this direction connection");
+                "Direct tcp/ip port for WorkerWorkerOCService. 0 -- disable this direction connection."
+                "Valid range is [0, 65535].");
 DS_DEFINE_int32(sc_worker_worker_direct_port, 0,
-                "Direct tcp/ip port for WorkerWorkerSCService. 0 -- disable this direction connection");
+                "Direct tcp/ip port for WorkerWorkerSCService. 0 -- disable this direction connection."
+                "Valid range is [0, 65535].");
 DS_DEFINE_bool(enable_pipeline_h2d, false, "Enable pipeline H2D. Default is false");
 DS_DEFINE_int32(pipeline_h2d_thread_num, 64, "Pipeline H2D worker thread number. Default value 64");
 DS_DEFINE_uint64_dynamic(slow_log_process_slower_than, 2000,

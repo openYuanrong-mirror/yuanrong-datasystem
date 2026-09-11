@@ -38,3 +38,15 @@ ds_cc_test(
         "//tests/ut:ut_common",
     ],
 )
+
+# Worker 启动参数校验测试
+ds_cc_test(
+    name = "worker_param_flag_validate_test",
+    srcs = ["worker_param_flag_validate_test.cpp"],
+    deps = [
+        "//src/datasystem/common/flags:dynamic_flag_config",
+        "//src/datasystem/common/kvstore/rocksdb:rocks_store",
+        "//src/datasystem/common/log:common_log",
+        "//tests/ut:ut_common",
+    ],
+)

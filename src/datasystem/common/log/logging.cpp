@@ -82,7 +82,7 @@ DS_DEFINE_uint32(log_retention_day, DEFAULT_LOG_RETENTION_DAY,
 DS_DEFINE_int32(logbufsecs, DEFAULT_LOG_BUF_SECS, "Buffer log messages for at most this many seconds.");
 DS_DEFINE_int32(logfile_mode, 0640, "Log file mode/permissions.");
 DS_DEFINE_uint32(max_log_size, DEFAULT_MAX_LOG_SIZE_MB,
-                 "approx. maximum log file size (in MB). A value of 0 will be silently overridden to 1.");
+                 "approx. maximum log file size (in MB). Valid range is [1, 4095].");
 DS_DEFINE_bool(logtostderr, false,
                "log messages go to stderr instead of logfiles.  This flag obsoletes");
 DS_DEFINE_bool(alsologtostderr, false,
@@ -104,6 +104,35 @@ static bool ValidateMinLogLevel(const char *flagName, int32_t value)
 }
 
 DS_DEFINE_validator(minloglevel, &ValidateMinLogLevel);
+
+static bool ValidateVLogLevel(const char *flagName, int32_t value)
+{
+    constexpr int32_t kMinVLogLevel = 0;
+    constexpr int32_t kMaxVLogLevel = 3;
+    if (value < kMinVLogLevel || value > kMaxVLogLevel) {
+        LOG(ERROR) << FormatString("The %s flag is %d, which must be in [%d, %d].", flagName, value,
+                                   kMinVLogLevel, kMaxVLogLevel);
+        return false;
+    }
+    return true;
+}
+
+DS_DEFINE_validator(v, &ValidateVLogLevel);
+
+static bool ValidateMaxLogSize(const char *flagName, uint32_t value)
+{
+    constexpr uint32_t kMinLogSizeMb = 1;
+    constexpr uint32_t kMaxLogSizeMb = 4095;
+    if (value < kMinLogSizeMb || value > kMaxLogSizeMb) {
+        LOG(ERROR) << FormatString("The %s flag is %u MB, which must be in [%u, %u] MB.", flagName, value,
+                                   kMinLogSizeMb, kMaxLogSizeMb);
+        return false;
+    }
+    return true;
+}
+
+DS_DEFINE_validator(max_log_size, &ValidateMaxLogSize);
+
 DS_DEFINE_uint32(log_async_queue_size, DEFAULT_LOG_ASYNC_QUEUE_SIZE, "Size of async logger's message queue.");
 DS_DEFINE_bool(log_only_write_info_file, DEFAULT_LOG_ONLY_WRITE_INFO_FILE,
                "The INFO log file always receives all severities. When true, do not create additional WARNING/ERROR "
@@ -132,6 +161,7 @@ DS_DECLARE_bool(log_only_write_info_file);
 DS_DECLARE_string(cluster_name);
 DS_DECLARE_string(log_dir);
 DS_DECLARE_string(log_filename);
+DS_DECLARE_uint32(max_log_size);
 
 using namespace std::chrono;
 
