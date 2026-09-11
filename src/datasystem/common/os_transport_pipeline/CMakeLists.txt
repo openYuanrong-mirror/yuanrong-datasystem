@@ -23,10 +23,15 @@ if (BUILD_PIPLN_H2D)
     target_link_libraries(os_transport_pipeline PUBLIC
         mlcachedirect_os_transport_static
         common_cuda_host_memory
+        common_rdma
         common_log
         common_perf
         common_util
     )
+    # api_impl.cpp calls common_rdma symbols while common_rdma's urma sources call back into the
+    # OsXprtPipln hooks (only when BUILD_PIPLN_H2D is globally defined). Static-archive cycle:
+    # CMake resolves it by repeating both archives on link lines of every consumer.
+    target_link_libraries(common_rdma PUBLIC os_transport_pipeline)
     add_dependencies(os_transport_pipeline
         worker_object_cache
         mlcachedirect_os_transport_static
