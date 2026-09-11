@@ -45,8 +45,10 @@ inline void SetClientPipelineRH2DEnabled()
 
 static inline bool SupportPipelineRH2D()
 {
+    // FLAGS live in namespace datasystem since the DS_DECLARE refactor; keep qualified because this
+    // header is included at global scope.
     return ClientPipelineRH2DEnabled().load(std::memory_order_acquire)
-           || (FLAGS_enable_urma && FLAGS_enable_pipeline_h2d);
+           || (datasystem::FLAGS_enable_urma && datasystem::FLAGS_enable_pipeline_h2d);
 }
 #define RETURN_IF_NOT_SUPPORT_PIPLN_H2D() \
     if (!SupportPipelineRH2D())           \
