@@ -67,6 +67,7 @@ constexpr char PUBLISH_INJECT[] = "WorkerRpcClient.InvokeSet.beforeRpc";
 constexpr char MULTI_CREATE_INJECT[] = "TransportLayer.MCreate.beforeTransport";
 constexpr char MULTI_PUBLISH_INJECT[] = "WorkerRpcClient.InvokeMultiSet.beforeRpc";
 constexpr char MULTI_PUBLISH_METADATA_INJECT[] = "worker.before_CreateMultiMetaToMaster";
+constexpr char SHM_PROBE_INJECT[] = "ClientWorkerCommonApi.CreateHandShakeFunc";
 constexpr char HOST_ID_ENV_NAME[] = "routing_transport_set_host_id";
 constexpr char HOST_ID_VALUE[] = "routing-transport-set-host";
 constexpr char REMOTE_HOST_ID_ENV_PREFIX[] = "routing_transport_set_remote_host_id_";
@@ -1045,6 +1046,28 @@ TEST_F(KVClientTransportSetWithShmTest, RoutedSetUsesShmZeroCopy)
     const std::string value(VALUE_SIZE, 's');
     DS_ASSERT_OK(routedClient_->Set(key, value));
     ASSERT_EQ(AccessTransportTracker::ToString(), "SHM");
+    AssertValue(key, value);
+}
+
+class KVClientTransportSetShmProbeFallbackTest : public KVClientTransportSetWithShmTest {
+protected:
+    void InitRoutedClient() override
+    {
+        DS_ASSERT_OK(inject::Set(SHM_PROBE_INJECT, "return(K_RUNTIME_ERROR)"));
+        Raii clearInject([] { (void)inject::Clear(SHM_PROBE_INJECT); });
+        KVClientTransportSetWithShmTest::InitRoutedClient();
+    }
+};
+
+TEST_F(KVClientTransportSetShmProbeFallbackTest, FailedInitialShmProbeUsesRemoteTransport)
+{
+    std::string key;
+    DS_ASSERT_OK(FindRouteKeyToWorker(READER_WORKER_INDEX, "transport_set_shm_probe_fallback_", key));
+    const std::string value(VALUE_SIZE, 'f');
+
+    DS_ASSERT_OK(routedClient_->Set(key, value));
+
+    ASSERT_EQ(AccessTransportTracker::ToString(), ExpectedTransport());
     AssertValue(key, value);
 }
 
