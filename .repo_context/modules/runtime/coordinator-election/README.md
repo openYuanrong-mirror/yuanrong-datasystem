@@ -179,11 +179,12 @@ Missing-data startup diagnostics are emitted before braft Node creation:
 - `COORDINATOR_RAFT_METADATA_ABSENT` (INFO) records the endpoint and configured data directory once per empty-data
   startup, including static bootstrap and bootstrap waiting for quorum. Absence alone cannot distinguish a fresh
   instance from a lost or incorrectly mounted volume.
-- `COORDINATOR_RAFT_EXISTING_MEMBER_WITHOUT_LOCAL_DATA` (WARNING) is emitted when observation bootstrap selects a
-  quorum-confirmed committed configuration that already contains the empty-data local endpoint. It records that
-  configuration, the endpoint and data directory, warns that in-place recovery is unsupported and catch-up may stall,
-  and directs operators to check the original volume or isolate and replace the instance using a new endpoint while
-  quorum remains available. The successful plan selection leaves the retry loop, so the warning is not periodic.
+- `COORDINATOR_RAFT_EXISTING_MEMBER_WITHOUT_LOCAL_DATA` (WARNING) is emitted once per Manager when an active member
+  reports a committed configuration containing the empty-data local endpoint, even without quorum. It records the
+  reported configuration, confirmation count, required quorum, endpoint and data directory. This is suspected data
+  loss, not quorum-confirmed membership. Check the original volume; in-place recovery is unsupported and catch-up
+  may stall. Replacement with a new endpoint requires quorum. Deduplication is protected by `bootstrapMutex_`;
+  startup-plan selection still requires the same configuration quorum.
 - Static bootstrap does not exchange committed configurations and therefore emits only the absence diagnostic.
   Neither diagnostic proves that files were deleted or that replication is already stalled; neither changes startup,
   election, membership, or serving behavior.
