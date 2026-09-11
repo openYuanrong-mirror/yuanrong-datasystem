@@ -99,6 +99,12 @@ public:
     const std::string &MembershipTable() const noexcept;
 
     /**
+     * @brief Return the logical per-address UB health lease collection.
+     * @return Stable table-name reference.
+     */
+    const std::string &UbHealthTable() const noexcept;
+
+    /**
      * @brief Return the legacy-compatible physical ETCD membership table prefix.
      * @return Stable physical prefix without a trailing slash or member address.
      */
@@ -197,6 +203,7 @@ private:
     std::string notifyTable_;
     std::string probeTable_;
     std::string membershipTable_;
+    std::string ubHealthTable_;
     std::string etcdMembershipTablePrefix_;
     std::string scaleInMetadataDoneTable_;
     std::string rolloutTable_;

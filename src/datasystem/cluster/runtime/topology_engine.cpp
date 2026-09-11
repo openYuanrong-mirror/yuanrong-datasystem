@@ -1173,6 +1173,11 @@ const std::string &TopologyEngine::GetMembershipTableName() const noexcept
     return keys_->MembershipTable();
 }
 
+const std::string &TopologyEngine::GetUbHealthTableName() const noexcept
+{
+    return keys_->UbHealthTable();
+}
+
 Status TopologyEngine::PutWithMembershipLease(const std::string &tableName, const std::string &key,
                                               const std::string &value)
 {

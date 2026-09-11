@@ -45,6 +45,7 @@ enum class TopologyCoordinationKeyKind : uint8_t {
     NOTIFY,
     PROBE,
     MEMBERSHIP,
+    UB_HEALTH,
     SCALE_IN_METADATA_DONE,
     EVICTION_POLICY_ROLLOUT,
     MASTER_ADDRESS

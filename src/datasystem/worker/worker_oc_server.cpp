@@ -236,12 +236,6 @@ constexpr auto LOSSLESS_EXIT_GRACE = std::chrono::seconds(120);
 static const std::string WORKER_OC_SERVER = "WorkerOcServer";
 static const std::string URMA_WARMUP_KEY_PREFIX = "_urma_";
 constexpr char TOPOLOGY_READINESS_PROBE_KEY[] = "topology-readiness-probe";
-constexpr char UB_HEALTH_SIDECAR_ROOT[] = "/datasystem_ub_health";
-
-std::string BuildUbHealthSidecarTable(const std::string &membershipTable)
-{
-    return std::string(UB_HEALTH_SIDECAR_ROOT).append(membershipTable);
-}
 
 namespace {
 std::string EvictionPolicyControlTable()
@@ -2093,7 +2087,7 @@ Status WorkerOCServer::ResolveCentralMetadataAddress(std::string &address)
 
 Status WorkerOCServer::InitUbHealthSidecar()
 {
-    ubHealthTable_ = BuildUbHealthSidecarTable(topologyEngine_->GetMembershipTableName());
+    ubHealthTable_ = topologyEngine_->GetUbHealthTableName();
     if (etcdStore_ == nullptr) {
         return Status::OK();
     }

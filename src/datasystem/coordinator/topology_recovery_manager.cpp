@@ -35,7 +35,7 @@ namespace {
 constexpr size_t SHA256_HEX_SIZE = 64;
 constexpr size_t DIGEST_LOG_PREFIX_SIZE = 8;
 constexpr size_t COORDINATOR_ID_LOG_PREFIX_SIZE = 8;
-constexpr size_t TOPOLOGY_KEYSPACE_KIND_COUNT = 8;
+constexpr size_t TOPOLOGY_KEYSPACE_KIND_COUNT = 9;
 constexpr size_t MAX_ENCODED_SCALE_IN_SOURCE_SIZE = 256;
 constexpr uint64_t MEMBER_LIMIT_LOG_INTERVAL = 1'024;
 constexpr auto FAST_RECOVERY_WINDOW = std::chrono::seconds(3);
@@ -160,6 +160,8 @@ Status ValidateRelativeKey(TopologyCoordinationKeyKind kind, const std::string &
         RETURN_IF_NOT_OK(cluster::TopologyKeyHelper::ProbeKey(relative, canonical));
     } else if (kind == TopologyCoordinationKeyKind::MEMBERSHIP && !relative.empty()) {
         RETURN_IF_NOT_OK(cluster::TopologyKeyHelper::MembershipKey(relative, canonical));
+    } else if (kind == TopologyCoordinationKeyKind::UB_HEALTH && !relative.empty()) {
+        RETURN_IF_NOT_OK(cluster::TopologyKeyHelper::MembershipKey(relative, canonical));
     } else if (kind == TopologyCoordinationKeyKind::SCALE_IN_METADATA_DONE && !relative.empty()) {
         RETURN_IF_NOT_OK(ValidateScaleInMetadataDoneKey(relative));
     } else if (kind == TopologyCoordinationKeyKind::EVICTION_POLICY_ROLLOUT) {
@@ -192,6 +194,7 @@ Status MatchKeyspace(const cluster::TopologyKeyHelper &keys, const std::string &
         std::make_pair(&keys.NotifyTable(), TopologyCoordinationKeyKind::NOTIFY),
         std::make_pair(&keys.ProbeTable(), TopologyCoordinationKeyKind::PROBE),
         std::make_pair(&keys.MembershipTable(), TopologyCoordinationKeyKind::MEMBERSHIP),
+        std::make_pair(&keys.UbHealthTable(), TopologyCoordinationKeyKind::UB_HEALTH),
         std::make_pair(&keys.ScaleInMetadataDoneTable(), TopologyCoordinationKeyKind::SCALE_IN_METADATA_DONE),
         std::make_pair(&keys.RolloutTable(), TopologyCoordinationKeyKind::EVICTION_POLICY_ROLLOUT),
     };

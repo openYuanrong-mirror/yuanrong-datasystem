@@ -133,7 +133,8 @@ Important nuance:
 3. `CreateTableWithExactPrefix` registers already validated absolute prefixes without applying the legacy
    `cluster_name` rewrite a second time. Runtime topology tables use their logical absolute prefixes, while the
    membership logical table maps to the legacy ETCD physical prefix: `/datasystem/cluster` without a cluster name and
-   `/<cluster_name>/datasystem/cluster` with one.
+   `/<cluster_name>/datasystem/cluster` with one. The UB health sidecar uses the same logical and physical prefix:
+   `/datasystem/ub_health` by default or `/datasystem/<cluster_name>/ub_health` for a named cluster.
 4. `Put`, `Get`, `Delete`, `PrefixSearch`, and `RangeSearch` compose `realKey = tablePrefix + "/" + key`.
 5. `GetAll` and prefix/range queries strip table prefixes before returning caller-facing keys.
 

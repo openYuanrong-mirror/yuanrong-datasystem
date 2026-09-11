@@ -39,8 +39,9 @@ constexpr size_t HEX_HIGH_NIBBLE_SHIFT = 4;
 constexpr unsigned char HEX_LOW_NIBBLE_MASK = 0x0f;
 constexpr char LOWER_HEX[] = "0123456789abcdef";
 constexpr char ROOT_PREFIX[] = "/datasystem";
-constexpr std::array<const char *, 7> RESERVED_CLUSTER_NAMES = {
-    "topology", "tasks", "notify", "probe", "cluster", "scale-in-metadata-done", COORDINATION_CONTROL_TABLE
+constexpr std::array<const char *, 8> RESERVED_CLUSTER_NAMES = {
+    "topology", "tasks", "notify", "probe", "cluster", "ub_health", "scale-in-metadata-done",
+    COORDINATION_CONTROL_TABLE
 };
 const std::string EMPTY_KEY;
 
@@ -162,6 +163,7 @@ TopologyKeyHelper::TopologyKeyHelper(std::string clusterName) : clusterName_(std
     notifyTable_ = root + "/notify";
     probeTable_ = root + "/probe";
     membershipTable_ = root + "/cluster";
+    ubHealthTable_ = root + "/ub_health";
     const std::string legacyMembershipTable = "/" + std::string(COORDINATION_CLUSTER_TABLE);
     etcdMembershipTablePrefix_ =
         clusterName_.empty() ? legacyMembershipTable : "/" + clusterName_ + legacyMembershipTable;
@@ -202,6 +204,11 @@ const std::string &TopologyKeyHelper::ProbeTable() const noexcept
 const std::string &TopologyKeyHelper::MembershipTable() const noexcept
 {
     return membershipTable_;
+}
+
+const std::string &TopologyKeyHelper::UbHealthTable() const noexcept
+{
+    return ubHealthTable_;
 }
 
 const std::string &TopologyKeyHelper::EtcdMembershipTablePrefix() const noexcept
