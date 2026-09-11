@@ -106,7 +106,9 @@ remain active for 1 second, and a complete consistent view must remain unchanged
 frozen. Discovery only supplies probe targets: an unreachable stale Discovery endpoint does not invalidate an Exchange
 round or enter the active view. Each round prioritizes active peers and probes at most `N` targets concurrently, rotating
 through other Discovery targets so stale entries cannot extend the round linearly. Per-peer BRPC channels are reused for
-the Manager lifetime. Successful responses are validated and recorded exactly like inbound requests.
+the bootstrap worker lifetime. After outstanding exchanges drain, the worker's exit hook releases cached channels outside
+the cache mutex on success, failure, or cancellation, so bootstrap references cannot keep removed peers' sockets alive.
+Successful responses are validated and recorded exactly like inbound requests.
 `coordinator_discovery_retry_interval_ms` continues to govern Membership Discovery after Node startup.
 
 The repository's braft patch initializes the follower election timer with the sum of the configured election timeout and braft's clock-drift margin, while the Leader stepdown timer retains the configured election timeout. Each accepted current-Leader `AppendEntries` renews the follower lease and resets the election timer from the same observation, keeping the lease and election timer aligned.

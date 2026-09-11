@@ -431,6 +431,7 @@ target_link_libraries(coordinator_server_options_test PRIVATE
         common_util
         coordinator_protos)
 target_link_libraries(coordinator_election_manager_test PRIVATE
+        test_port_allocator
         coordinator_election_manager
         GTest::gtest
         GTest::gmock

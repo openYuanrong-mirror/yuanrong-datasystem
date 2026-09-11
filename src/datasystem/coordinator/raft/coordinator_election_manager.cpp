@@ -442,6 +442,13 @@ CoordinatorElectionManager::Dependencies CoordinatorElectionManager::MakeProduct
         CoordinatorService_BrpcGenericStub stub(channel.get(), timeoutMs);
         return stub.ExchangeBootstrapObservation(request, response);
     };
+    dependencies.onBootstrapWorkerExit = [bootstrapChannels] {
+        decltype(bootstrapChannels->byPeer) channels;
+        {
+            std::lock_guard<std::mutex> lock(bootstrapChannels->mutex);
+            channels.swap(bootstrapChannels->byPeer);
+        }
+    };
     dependencies.now = [] { return std::chrono::steady_clock::now(); };
     dependencies.createNode = [](const CoordinatorRaftOptions &options,
                                  const CoordinatorRaftEventCallbacks &callbacks) {

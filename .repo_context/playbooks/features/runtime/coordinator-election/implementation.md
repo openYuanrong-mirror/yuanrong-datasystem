@@ -53,7 +53,9 @@ braft successfully initializes a non-empty `BootstrapPlan`, the Node publishes l
 configuration callbacks publish committed membership. For local `ABSENT` in `DISCOVERY_OBSERVATION` mode, normalized
 Discovery-visible endpoints are best-effort Exchange targets. Each round concurrently probes at most `N` endpoints,
 prioritizes peers with active observations, rotates through remaining targets, and reuses a per-peer BRPC channel for
-the Manager lifetime. Individual timeout, unavailable, or connection failures do not fail the round because Discovery
+the bootstrap worker lifetime. On worker exit, drain exchanges before releasing cached channels outside the cache mutex;
+cover successful startup, terminal failure, and cancellation without waiting for Manager destruction.
+Individual timeout, unavailable, or connection failures do not fail the round because Discovery
 can retain stale endpoints. Valid successful responses are recorded under the same validation path as inbound requests.
 The active set is derived from observations received within the one-second TTL plus the local endpoint. Fresh bootstrap
 requires exactly `N` active members, the same complete view stable for one second, and the same frozen Plan reported by
