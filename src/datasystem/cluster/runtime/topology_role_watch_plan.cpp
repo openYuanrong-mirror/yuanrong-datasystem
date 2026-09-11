@@ -28,6 +28,7 @@ Status BuildTopologyRoleWatchPlan(TopologyRuntimeRole role, const std::string &l
         std::string probeKey;
         RETURN_IF_NOT_OK(TopologyKeyHelper::ProbeKey(localAddress, probeKey));
         built.emplace_back(WatchKey{ keys.ProbeTable(), std::move(probeKey), startRevision });
+        built.emplace_back(WatchKey{ keys.MembershipTable(), "", startRevision });
     }
     if (role == TopologyRuntimeRole::CONTROLLER || role == TopologyRuntimeRole::UNIFIED_ETCD) {
         if (role == TopologyRuntimeRole::CONTROLLER) {

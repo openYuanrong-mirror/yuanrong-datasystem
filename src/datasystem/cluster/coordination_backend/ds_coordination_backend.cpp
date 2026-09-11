@@ -1712,12 +1712,13 @@ bool DsCoordinationBackend::IsWatchRegistrationInProgress() const
     return !watchStopping_ && watchRegistrationInProgress_;
 }
 
-void DsCoordinationBackend::InvalidateWatches()
+void DsCoordinationBackend::InvalidateWatches(const std::string &coordinatorId, int64_t watchId)
 {
     bool invalidated = false;
     {
         std::lock_guard<std::mutex> lock(watchMutex_);
-        invalidated = !watchStopping_ && !watchPlan_.empty() && !rewatchRequired_;
+        invalidated = !watchStopping_ && !watchPlan_.empty() && !rewatchRequired_
+                      && (watchId == 0 || OwnsWatchIdentityLocked(coordinatorId, watchId));
         if (invalidated) {
             rewatchRequired_ = true;
         }

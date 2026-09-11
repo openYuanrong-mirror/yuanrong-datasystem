@@ -884,6 +884,16 @@ Status WorkerOCServiceImpl::VerifyClientWriteAdmission(bool isRouted)
     });
 }
 
+void WorkerOCServiceImpl::FillWorkerRedirect(const std::string &selectionKey, WorkerRedirectPb &redirect) const
+{
+    constexpr size_t REDIRECT_CANDIDATE_LIMIT = 3;
+    redirect.set_request_not_executed(true);
+    for (auto &address :
+         membership_.GetWriteCandidates(localAddress_.ToString(), selectionKey, REDIRECT_CANDIDATE_LIMIT)) {
+        redirect.add_candidate_addresses(std::move(address));
+    }
+}
+
 Status WorkerOCServiceImpl::IncNestedRef(const std::vector<std::string> &nestedObjectKeys)
 {
     return gRefProc_->IncNestedRef(nestedObjectKeys);
@@ -926,7 +936,15 @@ Status WorkerOCServiceImpl::Publish(const PublishReqPb &req, PublishRspPb &resp,
     CHECK_FAIL_RETURN_STATUS_PRINT_ERROR(
         remainingUs > 0, K_RPC_DEADLINE_EXCEEDED,
         FormatString("RPC deadline exceeded before Publish dispatch, remaining %ld us.", remainingUs));
-    RETURN_IF_NOT_OK(VerifyClientWriteAdmission(req.is_routed()));
+    auto admission = VerifyClientWriteAdmission(req.is_routed());
+    if (admission.GetCode() == K_SCALE_DOWN && membership_.SupportsWriteRedirect()) {
+        std::string tenantId;
+        RETURN_IF_NOT_OK(req.is_routed() ? worker::AuthenticateRequest(akSkManager_, req, req.tenant_id(), tenantId)
+                                        : worker::Authenticate(akSkManager_, req, tenantId));
+        FillWorkerRedirect(req.object_key(), *resp.mutable_worker_redirect());
+        return Status::OK();
+    }
+    RETURN_IF_NOT_OK(admission);
     BthreadReadGuard noRecon;
     RETURN_IF_NOT_OK_PRINT_ERROR_MSG(
         ValidateWorkerState(noRecon, GetRequestContext()->reqTimeoutDuration.CalcRemainingTime()),
@@ -1738,7 +1756,15 @@ Status WorkerOCServiceImpl::Create(const CreateReqPb &req, CreateRspPb &resp)
 {
     ScopedRequestContext ctx;
     METRIC_TIMER(metrics::KvMetricId::WORKER_PROCESS_CREATE_LATENCY);
-    RETURN_IF_NOT_OK(VerifyClientWriteAdmission(req.is_routed()));
+    auto admission = VerifyClientWriteAdmission(req.is_routed());
+    if (admission.GetCode() == K_SCALE_DOWN && membership_.SupportsWriteRedirect()) {
+        std::string tenantId;
+        RETURN_IF_NOT_OK(req.is_routed() ? worker::AuthenticateRequest(akSkManager_, req, req.tenant_id(), tenantId)
+                                        : worker::Authenticate(akSkManager_, req, tenantId));
+        FillWorkerRedirect(req.object_key(), *resp.mutable_worker_redirect());
+        return Status::OK();
+    }
+    RETURN_IF_NOT_OK(admission);
     BthreadReadGuard noRecon;
     RETURN_IF_NOT_OK_PRINT_ERROR_MSG(
         ValidateWorkerState(noRecon, GetRequestContext()->reqTimeoutDuration.CalcRemainingTime()),

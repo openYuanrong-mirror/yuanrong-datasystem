@@ -16,6 +16,8 @@
  */
 #include "datasystem/cluster/membership/membership_endpoint_view.h"
 
+#include <algorithm>
+#include <functional>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -25,8 +27,107 @@
 
 namespace datasystem::cluster {
 
-MembershipEndpointView::MembershipEndpointView(const TopologySnapshotState &snapshots) : snapshots_(snapshots)
+MembershipEndpointView::MembershipEndpointView(const TopologySnapshotState &snapshots, bool enableWriteRedirect)
+    : snapshots_(snapshots), writeRedirectEnabled_(enableWriteRedirect)
 {
+}
+
+bool MembershipEndpointView::SupportsWriteRedirect() const noexcept
+{
+    return writeRedirectEnabled_;
+}
+
+Status MembershipEndpointView::UpdateWriteCandidate(const std::string &address, bool ready, int64_t revision)
+{
+    CHECK_FAIL_RETURN_STATUS(revision > 0, K_INVALID, "Membership candidate revision must be positive");
+    std::lock_guard<std::shared_mutex> lock(writeCandidatesMutex_);
+    const auto found = writeCandidates_.find(address);
+    if (found != writeCandidates_.end() && found->second.revision >= revision) {
+        return Status::OK();
+    }
+    constexpr size_t MAX_WRITE_CANDIDATES = 20'000;
+    CHECK_FAIL_RETURN_STATUS(found != writeCandidates_.end() || writeCandidates_.size() < MAX_WRITE_CANDIDATES,
+                             K_TRY_AGAIN, "Membership candidate view requires a new snapshot");
+    auto [current, inserted] = writeCandidates_.try_emplace(address);
+    (void)inserted;
+    auto &state = current->second;
+    if (state.ready != ready) {
+        if (ready) {
+            state.readyIndex = readyCandidateAddresses_.size();
+            readyCandidateAddresses_.emplace_back(address);
+        } else {
+            const auto lastIndex = readyCandidateAddresses_.size() - 1;
+            if (state.readyIndex != lastIndex) {
+                auto moved = writeCandidates_.find(readyCandidateAddresses_.back());
+                CHECK_FAIL_RETURN_STATUS(moved != writeCandidates_.end(), K_RUNTIME_ERROR,
+                                         "Membership ready candidate index is inconsistent");
+                readyCandidateAddresses_[state.readyIndex] = std::move(readyCandidateAddresses_.back());
+                moved->second.readyIndex = state.readyIndex;
+            }
+            readyCandidateAddresses_.pop_back();
+        }
+        state.ready = ready;
+    }
+    state.revision = revision;
+    return Status::OK();
+}
+
+void MembershipEndpointView::ClearWriteCandidates()
+{
+    std::lock_guard<std::shared_mutex> lock(writeCandidatesMutex_);
+    writeCandidates_.clear();
+    readyCandidateAddresses_.clear();
+}
+
+std::vector<std::string> MembershipEndpointView::GetWriteCandidates(
+    const std::string &excludedAddress, const std::string &selectionKey, size_t maxCandidates) const
+{
+    if (maxCandidates == 0) {
+        return {};
+    }
+    std::shared_ptr<const TopologySnapshot> snapshot;
+    if (snapshots_.Load(snapshot).IsError()) {
+        return {};
+    }
+    std::shared_lock<std::shared_mutex> observationLock;
+    if (hasObservations_.load(std::memory_order_acquire)) {
+        observationLock = std::shared_lock<std::shared_mutex>(mutex_);
+    }
+    std::vector<std::string> candidates;
+    candidates.reserve(maxCandidates);
+    std::shared_lock<std::shared_mutex> candidateLock(writeCandidatesMutex_);
+    if (readyCandidateAddresses_.empty()) {
+        return {};
+    }
+    constexpr size_t CANDIDATE_SCAN_FACTOR = 4;
+    const size_t scanLimit = std::min(readyCandidateAddresses_.size(), maxCandidates * CANDIDATE_SCAN_FACTOR);
+    const auto hash = std::hash<std::string>{};
+    size_t seed = hash(selectionKey);
+    seed ^= hash(excludedAddress) + 0x9e3779b97f4a7c15ULL + (seed << 6U) + (seed >> 2U);
+    const size_t start = seed % readyCandidateAddresses_.size();
+    for (size_t scanned = 0; scanned < scanLimit; ++scanned) {
+        const auto &address = readyCandidateAddresses_[(start + scanned) % readyCandidateAddresses_.size()];
+        if (address == excludedAddress) {
+            continue;
+        }
+        const Member *member = nullptr;
+        if (snapshot->FindMemberByAddress(address, member).IsError() || member->state != MemberState::ACTIVE) {
+            continue;
+        }
+        if (observationLock.owns_lock()) {
+            const auto observed = observationsByAddress_.find(address);
+            if (observed != observationsByAddress_.end() && observed->second.identity == member->identity
+                && observed->second.topologyVersion == snapshot->Version()
+                && observed->second.availability == EndpointAvailability::UNREACHABLE) {
+                continue;
+            }
+        }
+        candidates.emplace_back(address);
+        if (candidates.size() == maxCandidates) {
+            break;
+        }
+    }
+    return candidates;
 }
 
 Status MembershipEndpointView::UpdateObservation(const EndpointObservation &observation)

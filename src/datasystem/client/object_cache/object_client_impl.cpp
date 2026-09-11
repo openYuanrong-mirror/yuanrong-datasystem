@@ -2323,7 +2323,7 @@ Status ObjectClientImpl::PublishRoutedBuffer(const std::shared_ptr<ObjectBufferI
     setParam.subTimeoutMs = requestTimeoutMs_;
     auto setRc = transportLayer_->Set(*objBuf, setParam);
     if (setRc.GetCode() == K_SCALE_DOWN) {
-        setRc = ReplayRoutedBuffer(bufferInfo, nestedObjectKeys, isSeal);
+        setRc = ReplayRoutedBuffer(bufferInfo, nestedObjectKeys, isSeal, setRc);
     }
     if (setRc.IsOk()) {
         bufferInfo->isSeal = isSeal;  // mark sealed only after a successful Set (avoid stuck-sealed on retry)
@@ -2332,7 +2332,8 @@ Status ObjectClientImpl::PublishRoutedBuffer(const std::shared_ptr<ObjectBufferI
 }
 
 Status ObjectClientImpl::ReplayRoutedBuffer(const std::shared_ptr<ObjectBufferInfo> &bufferInfo,
-                                            const std::unordered_set<std::string> &nestedObjectKeys, bool isSeal)
+                                            const std::unordered_set<std::string> &nestedObjectKeys, bool isSeal,
+                                            const Status &rejection)
 {
     bufferInfo->routedWriteSourceDraining = true;
     CHECK_FAIL_RETURN_STATUS(bufferInfo->pointer != nullptr, K_RUNTIME_ERROR,
@@ -2347,7 +2348,7 @@ Status ObjectClientImpl::ReplayRoutedBuffer(const std::shared_ptr<ObjectBufferIn
     std::vector<HostPort> excludedWorkers{ bufferInfo->workerAddr };
     return ExecuteSetFlow(bufferInfo->objectKey, data, bufferInfo->dataSize, param, nestedObjectKeys,
                           bufferInfo->ttlSecond, bufferInfo->existence, requestTimeoutMs_, isSeal,
-                          std::move(excludedWorkers));
+                          std::move(excludedWorkers), rejection);
 }
 
 Status ObjectClientImpl::Get(const std::vector<std::string> &objKeys, int32_t subTimeoutMs,
@@ -2407,7 +2408,35 @@ Status ObjectClientImpl::Publish(const std::vector<std::shared_ptr<DeviceBuffer>
 
 Status ObjectClientImpl::SelectSetRoute(const std::string &objectKey,
                                         const std::vector<HostPort> &excludedWorkers,
-                                        SetRouteContext &routeContext)
+                                        SetRouteContext &routeContext,
+                                        const std::vector<HostPort> &preferredWorkers)
+{
+    if (preferredWorkers.empty()) {
+        return SelectSetRouteWithoutHints(objectKey, excludedWorkers, routeContext);
+    }
+    auto noCandidate = [](const Status &status) {
+        return status.GetCode() == K_NO_AVAILABLE_WORKER || status.GetCode() == K_NOT_FOUND;
+    };
+    auto routing = std::atomic_load(&routing_);
+    RETURN_RUNTIME_ERROR_IF_NULL(routing);
+    auto preferredExclusions = excludedWorkers;
+    const std::unordered_set<HostPort> preferred(preferredWorkers.begin(), preferredWorkers.end());
+    for (const auto &worker : routing->GetAvailableWorkers()) {
+        if (preferred.count(worker) == 0) {
+            preferredExclusions.emplace_back(worker);
+        }
+    }
+    HostPort selected;
+    auto rc = routing->SelectWorker(objectKey, dataPlacementPolicy_, selected,
+                                    MergeWriteTargetExclusions(preferredExclusions));
+    if (rc.IsOk()) {
+        return BuildSetRouteContext(selected, routeContext);
+    }
+    return noCandidate(rc) ? SelectSetRouteWithoutHints(objectKey, excludedWorkers, routeContext) : rc;
+}
+
+Status ObjectClientImpl::SelectSetRouteWithoutHints(
+    const std::string &objectKey, const std::vector<HostPort> &excludedWorkers, SetRouteContext &routeContext)
 {
     const auto effectiveExclusions = MergeWriteTargetExclusions(excludedWorkers);
     SetRouteContext selected;
@@ -2551,16 +2580,65 @@ bool ObjectClientImpl::HandleSetRouteFailure(const Status &status, SetFailureSta
     return retry;
 }
 
+namespace {
+bool ParseWorkerRedirectCandidates(const Status &status, std::vector<HostPort> &candidates)
+{
+    candidates.clear();
+    if (status.GetCode() != K_SCALE_DOWN || !status.HasExtra()) {
+        return false;
+    }
+    WorkerRedirectPb redirect;
+    if (!redirect.ParseFromString(status.GetExtra()) || !redirect.request_not_executed()) {
+        return false;
+    }
+    for (const auto &address : redirect.candidate_addresses()) {
+        HostPort candidate;
+        if (candidate.ParseString(address).IsOk()) {
+            candidates.emplace_back(std::move(candidate));
+        }
+    }
+    return true;
+}
+}  // namespace
+
+Status ObjectClientImpl::ExpandSetRedirectBudget(
+    const std::vector<HostPort> &excludedWorkers, size_t &maxAttempts, bool &initialized)
+{
+    if (initialized) {
+        return Status::OK();
+    }
+    auto routing = std::atomic_load(&routing_);
+    RETURN_RUNTIME_ERROR_IF_NULL(routing);
+    auto available = routing->GetAvailableWorkers();
+    std::unordered_set<HostPort> budgetWorkers(available.begin(), available.end());
+    budgetWorkers.insert(excludedWorkers.begin(), excludedWorkers.end());
+    maxAttempts = std::max(maxAttempts, budgetWorkers.size());
+    initialized = true;
+    return Status::OK();
+}
+
 Status ObjectClientImpl::ExecuteSetFlow(
     const std::string &objectKey, const uint8_t *data, uint64_t size, const FullParam &param,
     const std::unordered_set<std::string> &nestedObjectKeys, uint32_t ttlSecond, int existence,
-    int32_t requestTimeoutMs, bool isSeal, std::vector<HostPort> excludedWorkers)
+    int32_t requestTimeoutMs, bool isSeal, std::vector<HostPort> excludedWorkers,
+    const Status &initialRejection)
 {
     Status rc(K_RUNTIME_ERROR, "Set route attempts exhausted");
-    for (size_t attempt = 0; attempt < SET_ROUTE_MAX_ATTEMPTS; ++attempt) {
+    size_t maxAttempts = SET_ROUTE_MAX_ATTEMPTS;
+    size_t ordinaryFailures = 0;
+    bool redirectBudgetInitialized = false;
+    std::vector<HostPort> preferredWorkers;
+    if (ParseWorkerRedirectCandidates(initialRejection, preferredWorkers)) {
+        auto routing = std::atomic_load(&routing_);
+        RETURN_RUNTIME_ERROR_IF_NULL(routing);
+        for (const auto &worker : excludedWorkers) {
+            routing->UpdateState(worker, K_SCALE_DOWN);
+        }
+    }
+    for (size_t attempt = 0; attempt < maxAttempts; ++attempt) {
         RETURN_IF_NOT_OK(ApiDeadline::Instance().CheckApiDeadline());
         SetRouteContext routeContext;
-        RETURN_IF_NOT_OK(SelectSetRoute(objectKey, excludedWorkers, routeContext));
+        RETURN_IF_NOT_OK(SelectSetRoute(objectKey, excludedWorkers, routeContext, preferredWorkers));
         VLOG(1) << FormatString("[Set] attempt: %zu, objectKey: %s, clientId: %s, worker: %s", attempt + 1,
                                 objectKey, routeContext.clientApi->clientId_, routeContext.worker.ToString());
         SetFailureStage failureStage = SetFailureStage::CREATE;
@@ -2577,20 +2655,28 @@ Status ObjectClientImpl::ExecuteSetFlow(
             if (rc.IsOk() || !HandleSetRouteFailure(rc, failureStage, routeContext.worker, excludedWorkers)) {
                 return rc;
             }
-            continue;
-        }
-        if (!isSeal && routeContext.directWorkerApi != nullptr && transportLayer_ == nullptr) {
+        } else if (!isSeal && routeContext.directWorkerApi != nullptr && transportLayer_ == nullptr) {
             return boundMode_->ProcessDirectSetWithoutTransport(objectKey, data, size, param, nestedObjectKeys,
                                                                 ttlSecond, existence, routeContext, failureStage,
                                                                 excludedWorkers, requestTimeoutMs);
+        } else {
+            rc = routedMode_->ProcessTransportPut(objectKey, data, size, param, nestedObjectKeys, ttlSecond, existence,
+                                                  routeContext, failureStage, transportResult,
+                                                  requestTimeoutMs, isSeal);
+            if (rc.IsOk()
+                || !HandleSetRouteFailure(rc, failureStage, routeContext.worker, excludedWorkers,
+                                          transportResult.writeTargetQuarantined
+                                              && (!transportResult.publishAttempted
+                                                  || transportResult.publishDefinitelyNotSent))) {
+                return rc;
+            }
         }
-        rc = routedMode_->ProcessTransportPut(objectKey, data, size, param, nestedObjectKeys, ttlSecond, existence,
-                                              routeContext, failureStage, transportResult, requestTimeoutMs, isSeal);
-        if (rc.IsOk()
-            || !HandleSetRouteFailure(rc, failureStage, routeContext.worker, excludedWorkers,
-                                      transportResult.writeTargetQuarantined
-                                          && (!transportResult.publishAttempted
-                                              || transportResult.publishDefinitelyNotSent))) {
+        if (ParseWorkerRedirectCandidates(rc, preferredWorkers)) {
+            auto routing = std::atomic_load(&routing_);
+            RETURN_RUNTIME_ERROR_IF_NULL(routing);
+            routing->UpdateState(routeContext.worker, K_SCALE_DOWN);
+            RETURN_IF_NOT_OK(ExpandSetRedirectBudget(excludedWorkers, maxAttempts, redirectBudgetInitialized));
+        } else if (++ordinaryFailures >= SET_ROUTE_MAX_ATTEMPTS) {
             return rc;
         }
     }

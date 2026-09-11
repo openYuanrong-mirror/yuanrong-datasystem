@@ -128,6 +128,74 @@ TEST(MembershipContractTest, SeparatesLeaseStateFromTopologyState)
     EXPECT_EQ(record.state, MemberLifecycleState::READY);
 }
 
+TEST(MembershipEndpointViewTest, CoordinatorWriteCandidatesRequireReadyActiveReachablePeer)
+{
+    TopologyState topology;
+    topology.version = 1;
+    topology.members = {
+        Member{ { std::string(16, 'a'), "127.0.0.1:1" }, MemberState::ACTIVE, { 1 } },
+        Member{ { std::string(16, 'b'), "127.0.0.1:2" }, MemberState::ACTIVE, { 2 } }
+    };
+    std::shared_ptr<const TopologySnapshot> snapshot;
+    DS_ASSERT_OK(TopologySnapshot::Create(topology, 1, std::string(64, 'a'), snapshot));
+    TopologySnapshotState snapshots;
+    SnapshotUpdateOutcome outcome;
+    DS_ASSERT_OK(snapshots.Publish(snapshot, outcome));
+    MembershipEndpointView disabled(snapshots);
+    EXPECT_FALSE(disabled.SupportsWriteRedirect());
+    MembershipEndpointView view(snapshots, true);
+    EXPECT_TRUE(view.SupportsWriteRedirect());
+    EXPECT_TRUE(view.GetWriteCandidates("127.0.0.1:1", "key", 3).empty());
+    EXPECT_EQ(view.UpdateWriteCandidate("127.0.0.1:1", true, 0).GetCode(), K_INVALID);
+    DS_ASSERT_OK(view.UpdateWriteCandidate("127.0.0.1:1", true, 1));
+    DS_ASSERT_OK(view.UpdateWriteCandidate("127.0.0.1:2", true, 1));
+    DS_ASSERT_OK(view.UpdateWriteCandidate("127.0.0.1:3", true, 1));
+    EXPECT_EQ(view.GetWriteCandidates("127.0.0.1:1", "key", 3),
+              std::vector<std::string>({ "127.0.0.1:2" }));
+    DS_ASSERT_OK(view.UpdateWriteCandidate("127.0.0.1:2", false, 2));
+    EXPECT_TRUE(view.GetWriteCandidates("127.0.0.1:1", "key", 3).empty());
+    DS_ASSERT_OK(view.UpdateWriteCandidate("127.0.0.1:2", true, 1));
+    EXPECT_TRUE(view.GetWriteCandidates("127.0.0.1:1", "key", 3).empty());
+    DS_ASSERT_OK(view.UpdateWriteCandidate("127.0.0.1:2", true, 3));
+    DS_ASSERT_OK(view.UpdateObservation({ topology.members[1].identity, 1, EndpointAvailability::UNREACHABLE }));
+    EXPECT_TRUE(view.GetWriteCandidates("127.0.0.1:1", "key", 3).empty());
+    view.ClearWriteCandidates();
+    EXPECT_TRUE(view.GetWriteCandidates("", "key", 3).empty());
+}
+
+TEST(MembershipEndpointViewTest, BoundsAndDistributesCoordinatorWriteCandidates)
+{
+    TopologyState topology;
+    topology.version = 1;
+    for (size_t i = 0; i < 8; ++i) {
+        auto id = std::string(15, 'a') + static_cast<char>('a' + i);
+        topology.members.emplace_back(Member{ { std::move(id), "127.0.0.1:" + std::to_string(10000 + i) },
+                                              MemberState::ACTIVE, { static_cast<uint32_t>(i + 1) } });
+    }
+    std::shared_ptr<const TopologySnapshot> snapshot;
+    DS_ASSERT_OK(TopologySnapshot::Create(topology, 1, std::string(64, 'a'), snapshot));
+    TopologySnapshotState snapshots;
+    SnapshotUpdateOutcome outcome;
+    DS_ASSERT_OK(snapshots.Publish(snapshot, outcome));
+    MembershipEndpointView view(snapshots, true);
+    for (const auto &member : topology.members) {
+        DS_ASSERT_OK(view.UpdateWriteCandidate(member.identity.address, true, 1));
+    }
+    const auto selected = view.GetWriteCandidates("127.0.0.1:10000", "object-a", 3);
+    EXPECT_EQ(selected.size(), 3U);
+    EXPECT_EQ(view.GetWriteCandidates("127.0.0.1:10000", "object-a", 3), selected);
+    bool distributed = false;
+    for (size_t i = 0; i < topology.members.size(); ++i) {
+        distributed = distributed
+                      || view.GetWriteCandidates("127.0.0.1:10000", "object-" + std::to_string(i), 3) != selected;
+    }
+    EXPECT_TRUE(distributed);
+    DS_ASSERT_OK(view.UpdateWriteCandidate(selected.front(), false, 2));
+    const auto afterRemoval = view.GetWriteCandidates("127.0.0.1:10000", "object-a", 3);
+    EXPECT_EQ(afterRemoval.size(), 3U);
+    EXPECT_EQ(std::find(afterRemoval.begin(), afterRemoval.end(), selected.front()), afterRemoval.end());
+}
+
 TEST(MembershipEndpointViewTest, FencesLocalObservationByTopologyVersionAndIdentity)
 {
     TopologyState topology;

@@ -33,15 +33,20 @@
 #include <vector>
 
 #include "common.h"
+#include "common_distributed_ext.h"
 #include "cluster/external_cluster.h"
 #include "cluster/topology_token_helper.h"
 #include "oc_client_common.h"
 #include "datasystem/cluster/membership/membership_value_codec.h"
+#include "datasystem/client/object_cache/routing/routing.h"
+#include "datasystem/client/object_cache/transport/rpc/worker_rpc_client.h"
 #include "datasystem/cluster/repository/topology_key_helper.h"
 #include "datasystem/common/coordinator/coordinator_service_proxy.h"
 #include "datasystem/common/coordinator/key_value_entry.h"
 #include "datasystem/common/coordinator/static_coordinator_discovery.h"
 #include "datasystem/common/flags/common_flags.h"
+#include "datasystem/common/rpc/api_deadline.h"
+#include "datasystem/common/util/request_context.h"
 #include "datasystem/common/rpc/rpc_stub_cache_mgr.h"
 #include "datasystem/common/util/hash_algorithm.h"
 #include "datasystem/common/util/status_helper.h"
@@ -1538,6 +1543,121 @@ TEST_F(CoordinatorBackendClusterThreeWorkerTest, GracefulWorkerExitKeepsExisting
               << std::chrono::duration_cast<std::chrono::milliseconds>(t6 - t5).count() << "ms";
     LOG(INFO) << "[TIMING] GracefulWorkerExitKeepsExistingKeysReadable total test time: "
               << std::chrono::duration_cast<std::chrono::milliseconds>(t6 - t0).count() << "ms";
+}
+
+class CoordinatorWriteRedirectTest : public CoordinatorBackendClusterTest, public CommonDistributedExt {
+public:
+    void SetClusterSetupOptions(ExternalClusterOptions &opts) override
+    {
+        CoordinatorBackendClusterTest::SetClusterSetupOptions(opts);
+        opts.numWorkers = 4;
+        opts.workerGflagParams += " -enable_urma=false -ipc_through_shared_memory=false";
+        opts.coordinatorGflagParams += " -scale_in_collect_window_ms=5000";
+    }
+
+    BaseCluster *GetCluster() override
+    {
+        return cluster_.get();
+    }
+};
+
+TEST_F(CoordinatorWriteRedirectTest, ThreeExitingWorkersReturnLiveCandidateAndSetSucceeds)
+{
+    ConnectOptions options;
+    InitConnectOpt(3, options);
+    options.enableLocalCache = false;
+    options.dataPlacementPolicy = DataPlacementPolicy::PREFERRED_META_OWNER;
+    options.requestTimeoutMs = 1000;
+    KVClient kvClient(options);
+    DS_ASSERT_OK(kvClient.Init());
+    HostPort leaving;
+    HostPort remaining;
+    DS_ASSERT_OK(cluster_->GetWorkerAddr(0, leaving));
+    DS_ASSERT_OK(cluster_->GetWorkerAddr(3, remaining));
+    auto signature = std::make_shared<Signature>(options.accessKey, options.secretKey);
+    BrpcChannelConfig config;
+    config.timeout_ms = 1000;
+    config.connect_timeout_ms = 1000;
+    config.max_retry = 0;
+    client::Routing routing(config, signature);
+    DS_ASSERT_OK(routing.Init("", leaving));
+    std::string key;
+    for (size_t i = 0; i < 10000; ++i) {
+        HostPort selected;
+        auto candidate = "coordinator-write-redirect-" + std::to_string(i);
+        DS_ASSERT_OK(routing.SelectWorker(candidate, client::DataPlacementPolicy::PREFERRED_META_OWNER, selected));
+        if (selected == leaving) {
+            key = std::move(candidate);
+            break;
+        }
+    }
+    ASSERT_FALSE(key.empty());
+    DS_ASSERT_OK(kvClient.Set(key, "warmup"));
+    client::WorkerRpcClient rpc(leaving, signature, config);
+    DS_ASSERT_OK(rpc.Init());
+    for (int i = 0; i < 3; ++i) {
+        VoluntaryScaleDownInject(i);
+    }
+    CreateReqPb request;
+    request.set_client_id("redirect-rpc-test");
+    request.set_object_key(key + "-admission");
+    request.set_is_routed(true);
+    uint32_t version = 0;
+    WorkerRedirectPb redirect;
+    DS_ASSERT_OK(cluster_->WaitForExpectedResult([&] {
+        ScopedRequestContext context;
+        ApiDeadlineGuard deadline(1000);
+        CreateRspPb response;
+        auto rc = rpc.InvokeCreate(1000, request, response, version);
+        if (rc.GetCode() != K_SCALE_DOWN || !rc.HasExtra() || !redirect.ParseFromString(rc.GetExtra())
+            || !redirect.request_not_executed() || redirect.candidate_addresses_size() != 1
+            || redirect.candidate_addresses(0) != remaining.ToString()) {
+            return Status(K_TRY_AGAIN, "Waiting for membership write redirect");
+        }
+        return Status::OK();
+    }, 10, K_OK));
+    PublishReqPb publish;
+    publish.set_client_id("redirect-rpc-test");
+    publish.set_object_key(key + "-admission");
+    publish.set_is_routed(true);
+    PublishRspPb response;
+    {
+        ScopedRequestContext context;
+        ApiDeadlineGuard deadline(1000);
+        auto rejected = rpc.InvokeSet(1000, publish, {}, response, version);
+        EXPECT_EQ(rejected.GetCode(), K_SCALE_DOWN);
+        ASSERT_TRUE(rejected.HasExtra());
+        ASSERT_TRUE(redirect.ParseFromString(rejected.GetExtra()));
+        EXPECT_TRUE(redirect.request_not_executed());
+    }
+    ClusterTopologyPb topology;
+    DS_ASSERT_OK(cluster_->ReadClusterTopology(topology));
+    ASSERT_EQ(topology.members_size(), 4);
+    for (const auto &member : topology.members()) {
+        ASSERT_EQ(member.second.state(), MembershipPb::ACTIVE);
+    }
+    const std::string value(1024 * 1024, 'r');
+    for (int i = 0; i < 10; ++i) {
+        DS_ASSERT_OK(kvClient.Set(key, value));
+        std::string actual;
+        DS_ASSERT_OK(kvClient.Get(key, actual));
+        ASSERT_EQ(actual, value);
+        if (i == 0) {
+            DS_ASSERT_OK(cluster_->ReadClusterTopology(topology));
+            ASSERT_EQ(topology.members_size(), 4);
+            for (const auto &member : topology.members()) {
+                ASSERT_EQ(member.second.state(), MembershipPb::ACTIVE);
+            }
+        }
+    }
+    DS_ASSERT_OK(cluster_->WaitForExpectedResult([&] {
+        RETURN_IF_NOT_OK(cluster_->ReadClusterTopology(topology));
+        return topology.members_size() == 1 && topology.members().count(remaining.ToString()) == 1
+                   ? Status::OK() : Status(K_TRY_AGAIN, "Waiting for scale-in completion");
+    }, 30, K_OK));
+    std::string actual;
+    DS_ASSERT_OK(kvClient.Get(key, actual));
+    ASSERT_EQ(actual, value);
 }
 
 TEST_F(CoordinatorBackendClusterThreeWorkerTest, KilledWorkerScaleDownAllowsNewWritesReadableFromOtherWorker)

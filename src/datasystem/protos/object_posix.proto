@@ -66,7 +66,13 @@ message CreateReqPb {
   string allocation_id = 103;
 }
 
+message WorkerRedirectPb {
+  bool request_not_executed = 1;
+  repeated string candidate_addresses = 2;
+}
+
 message CreateRspPb {
+  WorkerRedirectPb worker_redirect = 7;
   // not set for noshm
   int64 store_fd = 1;
   uint64 mmap_size = 2;
@@ -137,6 +143,7 @@ message PublishReqPb {
 }
 
 message PublishRspPb {
+  WorkerRedirectPb worker_redirect = 1;
   uint32  read_load_p50 = 10; //4 MB-normalized P50 latency, reflecting bandwidth performance per 4 MB of data
   uint32  read_load_p99 = 11; //4 MB-normalized P99 latency, reflecting bandwidth performance per 4 MB of data
   uint64  read_load_sample_version = 12; //Version used to collect 4 MB-normalized latency metrics.

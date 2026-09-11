@@ -390,6 +390,10 @@ Status WorkerRpcClient::InvokeCreate(int64_t subTimeoutMs, CreateReqPb &request,
     if (rc.IsError()) {
         return WithRpcDiag(rc, "Create", workerAddress_);
     }
+    if (response.has_worker_redirect()) {
+        return Status(K_SCALE_DOWN, "Worker rejected write before execution")
+            .WithExtra(response.worker_redirect().SerializeAsString());
+    }
     workerVersion = connectionGeneration_;
     perfPoint.Record();
     return Status::OK();
@@ -422,6 +426,10 @@ Status WorkerRpcClient::InvokeSet(int64_t subTimeoutMs, PublishReqPb &request,
             return Status::OK();
         }
         return WithRpcDiag(rc, "Publish", workerAddress_);
+    }
+    if (response.has_worker_redirect()) {
+        return Status(K_SCALE_DOWN, "Worker rejected write before execution")
+            .WithExtra(response.worker_redirect().SerializeAsString());
     }
     workerVersion = connectionGeneration_;
     perfPoint.Record();

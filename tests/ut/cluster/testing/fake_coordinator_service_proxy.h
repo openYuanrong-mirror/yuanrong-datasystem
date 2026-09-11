@@ -167,6 +167,12 @@ public:
         return DeleteRangeLocked(key, "", deleted, revision, expectedModRevision);
     }
 
+    void ReturnEmptyWatchSnapshotForKey(const std::string &key)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        emptyWatchSnapshotKey_ = key;
+    }
+
     Status WatchRange(const std::string &key, const std::string &rangeEnd, const std::string &watcherAddr,
                       const std::string &, int64_t &watchId, std::vector<KeyValueEntry> &initialKvs, int32_t,
                       std::string *coordinatorId) override
@@ -181,6 +187,9 @@ public:
         watchId = nextWatchId_++;
         initialKvs.clear();
         AppendRange(key, rangeEnd, initialKvs);
+        if (key == emptyWatchSnapshotKey_) {
+            initialKvs.clear();
+        }
         watchCalls_.push_back({ key, rangeEnd, watcherAddr, watchId });
         ObserveCoordinatorId(coordinatorId);
         return Status::OK();
@@ -446,6 +455,7 @@ private:
     bool blockNextPut_{ false };
     bool putBlocked_{ false };
     bool releasePut_{ false };
+    std::string emptyWatchSnapshotKey_;
     std::string nextWatchFailureKey_;
     StatusCode nextWatchFailureCode_{ K_OK };
     bool requireRecoveryPayload_{ false };

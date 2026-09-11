@@ -1030,6 +1030,8 @@ private:
     Status InitThreadResources();
     Status InitRecoveryServices();
     Status VerifyClientWriteAdmission(bool isRouted);
+
+    void FillWorkerRedirect(const std::string &selectionKey, WorkerRedirectPb &redirect) const;
     void ObserveMetadataRpc(const HostPort &target, const Status &status);
 
     struct PreparedScaleInCleanupState {

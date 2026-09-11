@@ -15,10 +15,9 @@
  */
 
 /**
- * Description: BrokenFilter - counts consecutive K_CLIENT_WORKER_DISCONNECT signals per worker;
- * only after EVICT_CONSECUTIVE_FAILURES (within FAILURE_BURST_WINDOW) is it marked broken for
- * BROKEN_TTL. A single blip no longer evicts (prevents code=37); a dead peer reaches the
- * threshold quickly. Recovery is lazy TTL.
+ * Description: BrokenFilter - isolates workers after repeated connection failures or an explicit
+ * ScaleDown admission rejection. Connection failures recover by TTL; ScaleDown isolation lasts
+ * until the next hash-ring update.
  */
 #ifndef DATASYSTEM_CLIENT_ROUTING_BROKEN_FILTER_H
 #define DATASYSTEM_CLIENT_ROUTING_BROKEN_FILTER_H
@@ -46,7 +45,7 @@ public:
     void OnHashRingUpdated(const ::datasystem::ClusterTopologyPb &ring) override;
 
 private:
-    // Per-worker consecutive-failure count (within FAILURE_BURST_WINDOW) and broken-until (TTL).
+    // Per-worker consecutive-failure count and isolation deadline.
     struct WorkerHealth {
         uint32_t consecutiveFailures{ 0 };
         std::chrono::steady_clock::time_point windowStart{};

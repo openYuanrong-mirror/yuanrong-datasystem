@@ -85,6 +85,18 @@ TEST_F(BrokenFilterTest, WorkerBecomesAvailableAfterTtl)
     EXPECT_TRUE(filter.IsAvailable(worker_));
 }
 
+TEST_F(BrokenFilterTest, ScaleDownIsolatesUntilHashRingUpdate)
+{
+    client::BrokenFilter filter;
+
+    filter.OnWorkerStateChange(worker_, K_SCALE_DOWN);
+    EXPECT_FALSE(filter.IsAvailable(worker_));
+
+    ClusterTopologyPb ring;
+    filter.OnHashRingUpdated(ring);
+    EXPECT_TRUE(filter.IsAvailable(worker_));
+}
+
 TEST_F(BrokenFilterTest, ConcurrentUpdatesAreNotLost)
 {
     client::BrokenFilter filter;

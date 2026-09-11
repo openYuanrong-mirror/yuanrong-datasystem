@@ -563,6 +563,12 @@ private:
      */
     Status ApplyCoordinatorTopologyEvent(const CoordinationEvent &event);
 
+    Status ApplyCoordinatorMembershipEvent(const CoordinationEvent &event);
+
+    void ClearMembershipCandidatesLocked();
+
+    void ClearStaleMembershipCandidates();
+
     Status FinalizeTopologyPublication(std::shared_ptr<const TopologySnapshot> previous, bool newlyPublished);
 
     /**
@@ -675,6 +681,10 @@ private:
     TopologySnapshotState snapshots_;
     CoordinationEventDispatcher dispatcher_;
     MembershipEndpointView membershipView_;
+    // Lock order: backend watch mutex, membership events mutex, then the candidate-view mutex.
+    std::mutex membershipEventsMutex_;
+    std::string membershipWatchAuthority_;
+    int64_t membershipWatchId_{ 0 };
     PlacementFacade placement_;
     TopologyTaskExecutor executor_;
     std::unique_ptr<TopologyControllerRuntime> controllerRuntime_;

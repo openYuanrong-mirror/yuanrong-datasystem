@@ -162,6 +162,11 @@ Status Routing::SelectWorkers(const std::vector<std::string> &keys, DataPlacemen
     return router_->SelectWorkers(keys, policy, groups, exclude);
 }
 
+std::vector<HostPort> Routing::GetAvailableWorkers() const
+{
+    return router_->GetAvailableWorkers();
+}
+
 std::vector<HostPort> Routing::GetAvailableSameNodeWorkers() const
 {
     return router_->GetAvailableSameNodeWorkers();
