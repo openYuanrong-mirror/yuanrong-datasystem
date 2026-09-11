@@ -458,28 +458,31 @@ Status RoutedMode::ProcessTransportPut(
     setParam.isSeal = isSeal;
     setParam.subTimeoutMs = subTimeoutMs;
     failureStage = SetFailureStage::PUBLISH;
-    PublishRspPb rsp;
-    Status setRc = transportLayer_->Set(*buffer, setParam, transportResult, rsp);
-
+    Status setRc = transportLayer_->Set(*buffer, setParam, transportResult);
     if (setRc.GetCode() == K_URMA_NEED_CONNECT) {
         // TransportLayer returns this only after same-worker UB reconnect failed, before Publish was sent.
         failureStage = SetFailureStage::TRANSFER;
     }
     if (setRc.IsOk()) {
-        auto routing = std::atomic_load(&routing_);
-        if (routing) {
-            auto scheduler = routing->GetBandwidthScheduler();
-            if (scheduler && scheduler->Enabled()) {
-                const auto &worker = routeContext.worker;
-                scheduler->Observe(worker,
-                                   static_cast<uint32_t>(rsp.read_load_p50()),
-                                   static_cast<uint32_t>(rsp.read_load_p99()),
-                                   rsp.read_load_sample_version(),
-                                   "set_rpc");
-            }
-        }
+        ObserveReadLoadFeedback(routeContext, transportResult.rsp);
     }
     return setRc;
+}
+
+void RoutedMode::ObserveReadLoadFeedback(const SetRouteContext &routeContext, const PublishRspPb &rsp)
+{
+    auto routing = std::atomic_load(&routing_);
+    if (routing) {
+        auto scheduler = routing->GetBandwidthScheduler();
+        if (scheduler && scheduler->Enabled()) {
+            const auto &worker = routeContext.worker;
+            scheduler->Observe(worker,
+                               static_cast<uint32_t>(rsp.read_load_p50()),
+                               static_cast<uint32_t>(rsp.read_load_p99()),
+                               rsp.read_load_sample_version(),
+                               "set_rpc");
+        }
+    }
 }
 
 std::shared_ptr<client::TransportReadContext> RoutedMode::CreateTransportReadContext(

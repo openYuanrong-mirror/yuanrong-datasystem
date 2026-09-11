@@ -23,10 +23,6 @@
 #include <memory>
 
 namespace datasystem {
-namespace ut {
-class WorkerReadBandwidthTrackerTest;
-}
-
 namespace scheduling {
 
 struct WorkerReadBandwidthTrackerConfig {
@@ -74,9 +70,9 @@ public:
 
     Snapshot GetSnapshot() const noexcept;
 
-private:
-    friend class ut::WorkerReadBandwidthTrackerTest;
-
+protected:
+    // Protected instead of private so focused unit tests can build tracker instances with
+    // custom configs; production callers must use Instance().
     explicit WorkerReadBandwidthTracker(WorkerReadBandwidthTrackerConfig config);
 
     class Impl;

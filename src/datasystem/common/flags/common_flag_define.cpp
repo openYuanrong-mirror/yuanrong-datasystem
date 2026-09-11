@@ -315,7 +315,7 @@ DS_DEFINE_int32(fd_pool_prewarm_size, GetInt32FromEnv("DATASYSTEM_FD_POOL_PREWAR
 // ============================================================================
 // Load-aware scheduling switches
 // ============================================================================
-DS_DEFINE_bool(load_aware_scheduler_enabled, GetBoolFromEnv("DATASYSTEM_LOAD_AWARE_SCHEDULER_ENABLED", false),
+DS_DEFINE_bool(enable_load_aware_scheduler, GetBoolFromEnv("DATASYSTEM_ENABLE_LOAD_AWARE_SCHEDULER", false),
                "Enable load-aware read bandwidth scheduling. When enabled, workers sample read latency and publish "
                "P50/P99 feedback, and clients use that feedback to select workers for object-cache SET requests. "
                "Default false. Read when the tracker and scheduler are constructed; runtime changes do not "

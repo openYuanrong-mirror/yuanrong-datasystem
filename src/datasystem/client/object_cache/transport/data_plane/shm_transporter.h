@@ -220,10 +220,12 @@ public:
         return rc;
     }
 
-    Status Set(ObjectBuffer &buffer, const TransportSetParam &param, PublishRspPb &rsp, TransportSetResult *result = nullptr) override
+    Status Set(ObjectBuffer &buffer, const TransportSetParam &param, TransportSetResult *result = nullptr) override
     {
         RETURN_RUNTIME_ERROR_IF_NULL(rpcClient_);
         const ObjectBufferInfo &info = ObjectBufferInternal::GetInfo(buffer);
+        PublishRspPb localRsp;
+        PublishRspPb &rsp = result != nullptr ? result->rsp : localRsp;
         if (result != nullptr) {
             result->publishAttempted = false;
             result->publishDefinitelyNotSent = false;

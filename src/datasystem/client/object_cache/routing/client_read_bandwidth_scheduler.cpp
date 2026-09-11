@@ -41,12 +41,13 @@ namespace datasystem {
 namespace client {
 namespace {
 
-constexpr uint64_t kNanosecondsPerMicrosecond = 1000ULL;
-constexpr uint64_t kNanosecondsPerMillisecond = 1000000ULL;
-constexpr uint64_t kHashGoldenRatio = 0x9e3779b97f4a7c15ULL;
-constexpr uint64_t kCandidateStream = 0x243f6a8885a308d3ULL;
-constexpr uint64_t kAcceptanceStream = 0x13198a2e03707344ULL;
-constexpr uint32_t kAcceptanceRandomBits = 32U;
+constexpr uint64_t NANOSECONDS_PER_MICROSECOND = 1000ULL;
+constexpr uint64_t NANOSECONDS_PER_MILLISECOND = 1000000ULL;
+constexpr uint64_t HASH_GOLDEN_RATIO = 0x9e3779b97f4a7c15ULL;
+constexpr uint64_t CANDIDATE_STREAM = 0x243f6a8885a308d3ULL;
+constexpr uint64_t ACCEPTANCE_STREAM = 0x13198a2e03707344ULL;
+constexpr uint32_t ACCEPTANCE_RANDOM_BITS = 32U;
+constexpr uint64_t HASH_WARNING_TOMBSTONE_SCALE = 4ULL;
 
 uint64_t SteadyNowNs() noexcept
 {
@@ -118,13 +119,14 @@ private:
 ClientReadBandwidthScheduler::Config ClientReadBandwidthScheduler::Config::FromFlags()
 {
     Config config;
-    config.enabled = FLAGS_load_aware_scheduler_enabled;
+    config.enabled = FLAGS_enable_load_aware_scheduler;
     return config;
 }
 
 class ClientReadBandwidthScheduler::Impl {
 public:
     explicit Impl(Config config);
+    ~Impl() = default;
 
     bool Enabled() const noexcept;
     void Observe(const HostPort &worker, uint32_t p50Ns, uint32_t p99Ns, uint64_t latencyVersion,
@@ -142,10 +144,10 @@ public:
     {
         if (latencyHardLimitMs > 0) {
             uint64_t hardLimitNs = 0;
-            if (latencyHardLimitMs > std::numeric_limits<uint64_t>::max() / kNanosecondsPerMillisecond) {
+            if (latencyHardLimitMs > std::numeric_limits<uint64_t>::max() / NANOSECONDS_PER_MILLISECOND) {
                 hardLimitNs = std::numeric_limits<uint64_t>::max();
             } else {
-                hardLimitNs = latencyHardLimitMs * kNanosecondsPerMillisecond;
+                hardLimitNs = latencyHardLimitMs * NANOSECONDS_PER_MILLISECOND;
             }
             cutInGuardNs_ = hardLimitNs / 1000ULL * config_.latencyCutInGuardPermille;
         }
@@ -162,7 +164,7 @@ private:
     static constexpr uint32_t kMaxWeightedDrawAttempts = 100;
     static constexpr size_t kRejectedSlotCapacity = 16;
     static constexpr size_t kLongProbeThreshold = 64;
-    static constexpr uint64_t kWarningIntervalNs = 5ULL * 1000ULL * kNanosecondsPerMillisecond;
+    static constexpr uint64_t kWarningIntervalNs = 5ULL * 1000ULL * NANOSECONDS_PER_MILLISECOND;
 
     struct WorkerSlot {
         HostPort worker{};
@@ -217,8 +219,12 @@ private:
     };
 
     struct CandidateTable {
-        explicit CandidateTable(size_t capacity) : entries(new CandidateEntry[capacity])
+        explicit CandidateTable(size_t capacity)
         {
+            if (capacity == 0) {
+                capacity = 1;
+            }
+            entries.reset(new CandidateEntry[capacity]);
         }
 
         // Sequential consistency closes the active-index pinning race.
@@ -399,14 +405,14 @@ private:
 
 ClientReadBandwidthScheduler::Impl::Impl(Config config)
     : config_(std::move(config)),
-      initialP50Ns_(SaturatingMultiply(config_.initialP50Us, kNanosecondsPerMicrosecond)),
-      initialP99Ns_(SaturatingMultiply(config_.initialP99Us, kNanosecondsPerMicrosecond)),
-      nonAffinityPenaltyNs_(SaturatingMultiply(config_.latencyNonAffinityPenaltyUs, kNanosecondsPerMicrosecond)),
+      initialP50Ns_(SaturatingMultiply(config_.initialP50Us, NANOSECONDS_PER_MICROSECOND)),
+      initialP99Ns_(SaturatingMultiply(config_.initialP99Us, NANOSECONDS_PER_MICROSECOND)),
+      nonAffinityPenaltyNs_(SaturatingMultiply(config_.latencyNonAffinityPenaltyUs, NANOSECONDS_PER_MICROSECOND)),
       referenceLatencyNs_(
-          SaturatingMultiply(std::max<uint64_t>(1, config_.latencyWeightReferenceUs), kNanosecondsPerMicrosecond)),
+          SaturatingMultiply(std::max<uint64_t>(1, config_.latencyWeightReferenceUs), NANOSECONDS_PER_MICROSECOND)),
       maxSelectionWeight_(std::max<uint32_t>(1, config_.latencyWeightScale)),
-      staleNs_(SaturatingMultiply(config_.latencyClientStaleMs, kNanosecondsPerMillisecond)),
-      starvationNs_(SaturatingMultiply(config_.latencyStarvationProtectMs, kNanosecondsPerMillisecond)),
+      staleNs_(SaturatingMultiply(config_.latencyClientStaleMs, NANOSECONDS_PER_MILLISECOND)),
+      starvationNs_(SaturatingMultiply(config_.latencyStarvationProtectMs, NANOSECONDS_PER_MILLISECOND)),
       clientSaltHash_(Fnv1a64(config_.clientSalt)),
       workerSlotCapacity_(std::max<size_t>(1, config_.latencyClientTableSize)),
       clientIp_("client ip"),
@@ -519,7 +525,7 @@ uint64_t ClientReadBandwidthScheduler::Impl::NormalizeWorkerHash(const HostPort 
 {
     uint64_t hash = Fnv1a64(worker.Host());
     const uint64_t port = static_cast<uint64_t>(static_cast<uint32_t>(worker.Port()));
-    hash ^= Mix64(port + kHashGoldenRatio);
+    hash ^= Mix64(port + HASH_GOLDEN_RATIO);
     hash = Mix64(hash);
     return hash < kFirstValidWorkerHash ? hash + kFirstValidWorkerHash : hash;
 }
@@ -532,8 +538,11 @@ bool ClientReadBandwidthScheduler::Impl::IsExcluded(const HostPort &worker, cons
 void ClientReadBandwidthScheduler::Impl::AtomicMax(std::atomic<uint64_t> &value, uint64_t newValue) noexcept
 {
     uint64_t oldValue = value.load(std::memory_order_relaxed);
-    while (oldValue < newValue
-           && !value.compare_exchange_weak(oldValue, newValue, std::memory_order_relaxed, std::memory_order_relaxed)) {
+    bool keepTrying = oldValue < newValue;
+    while (keepTrying) {
+        const bool stored =
+            value.compare_exchange_weak(oldValue, newValue, std::memory_order_relaxed, std::memory_order_relaxed);
+        keepTrying = !stored && oldValue < newValue;
     }
 }
 
@@ -749,7 +758,7 @@ void ClientReadBandwidthScheduler::Impl::ResetRecycledSlot(WorkerSlot &slot) noe
 void ClientReadBandwidthScheduler::Impl::MaybeRecycleInactiveSlots(uint64_t nowNs, uint64_t currentEpoch)
 {
     const uint64_t intervalNs =
-        SaturatingMultiply(std::max<uint64_t>(1, config_.latencyWorkerRecycleCheckMs), kNanosecondsPerMillisecond);
+        SaturatingMultiply(std::max<uint64_t>(1, config_.latencyWorkerRecycleCheckMs), NANOSECONDS_PER_MILLISECOND);
     uint64_t lastNs = lastWorkerRecycleCheckNs_.load(std::memory_order_relaxed);
     if (lastNs != 0 && nowNs - lastNs < intervalNs) {
         return;
@@ -759,7 +768,7 @@ void ClientReadBandwidthScheduler::Impl::MaybeRecycleInactiveSlots(uint64_t nowN
         return;
     }
     const uint64_t inactiveNs =
-        SaturatingMultiply(std::max<uint64_t>(1, config_.latencyWorkerInactiveRecycleMs), kNanosecondsPerMillisecond);
+        SaturatingMultiply(std::max<uint64_t>(1, config_.latencyWorkerInactiveRecycleMs), NANOSECONDS_PER_MILLISECOND);
     for (size_t index = 0; index < workerSlotCapacity_; ++index) {
         TryRecycleSlot(workerSlots_[index], nowNs, currentEpoch, inactiveNs);
     }
@@ -769,9 +778,12 @@ void ClientReadBandwidthScheduler::Impl::MaybeRecycleInactiveSlots(uint64_t nowN
 void ClientReadBandwidthScheduler::Impl::ConsumeTombstone() noexcept
 {
     uint64_t count = tombstoneCount_.load(std::memory_order_relaxed);
-    while (count != 0
-           && !tombstoneCount_.compare_exchange_weak(count, count - 1, std::memory_order_relaxed,
-                                                     std::memory_order_relaxed)) {
+    bool keepTrying = count != 0;
+    while (keepTrying) {
+        const bool consumed =
+            tombstoneCount_.compare_exchange_weak(count, count - 1, std::memory_order_relaxed,
+                                                  std::memory_order_relaxed);
+        keepTrying = !consumed && count != 0;
     }
 }
 
@@ -785,7 +797,7 @@ void ClientReadBandwidthScheduler::Impl::RecordProbeLength(size_t probes) const 
 bool ClientReadBandwidthScheduler::Impl::CandidateRefreshDue(uint64_t nowNs) const noexcept
 {
     const uint64_t intervalNs =
-        SaturatingMultiply(std::max<uint64_t>(1, config_.latencyCandidateRefreshMs), kNanosecondsPerMillisecond);
+        SaturatingMultiply(std::max<uint64_t>(1, config_.latencyCandidateRefreshMs), NANOSECONDS_PER_MILLISECOND);
     const uint64_t lastNs = lastCandidateRefreshNs_.load(std::memory_order_acquire);
     return lastNs == 0 || nowNs - lastNs >= intervalNs;
 }
@@ -955,7 +967,6 @@ uint64_t ClientReadBandwidthScheduler::Impl::CalculateLiveWeight(uint64_t latenc
     return std::max<uint64_t>(1, weight);
 #else
     const uint64_t smoothedCost = SaturatingAdd(referenceLatencyNs_, latencyCostNs);
-
     if (smoothedCost > std::numeric_limits<uint64_t>::max() / totalPorts) {
         return 1;
     }
@@ -1015,14 +1026,14 @@ bool ClientReadBandwidthScheduler::Impl::AcceptWeightedProbe(const WeightedProbe
     }
 
     // Extreme-value fallback. Using 32 random bits prevents 128-bit overflow.
-    const uint32_t draw = static_cast<uint32_t>(randomValue >> kAcceptanceRandomBits);
-    return static_cast<__uint128_t>(draw) * denominator < (numerator << kAcceptanceRandomBits);
+    const uint32_t draw = static_cast<uint32_t>(randomValue >> ACCEPTANCE_RANDOM_BITS);
+    return static_cast<__uint128_t>(draw) * denominator < (numerator << ACCEPTANCE_RANDOM_BITS);
 #else
     // Compatibility path for compilers without 128-bit integer support.
-    const uint32_t draw = static_cast<uint32_t>(randomValue >> kAcceptanceRandomBits);
+    const uint32_t draw = static_cast<uint32_t>(randomValue >> ACCEPTANCE_RANDOM_BITS);
     const uint64_t weight = CalculateLiveWeight(probe.latencyCostNs, probe.ports);
 
-    return weight != 0 && static_cast<uint64_t>(draw) * maxSelectionWeight_ < (weight << kAcceptanceRandomBits);
+    return weight != 0 && static_cast<uint64_t>(draw) * maxSelectionWeight_ < (weight << ACCEPTANCE_RANDOM_BITS);
 #endif
 }
 
@@ -1161,7 +1172,7 @@ ClientReadBandwidthScheduler::Impl::CandidateEntry *ClientReadBandwidthScheduler
     const uint64_t seed = GenerateSelectionSeed(requestKey);
 
     for (uint32_t attempt = 0; attempt < kMaxWeightedDrawAttempts; ++attempt) {
-        const uint64_t candidateValue = GenerateAttemptValue(seed, attempt, kCandidateStream);
+        const uint64_t candidateValue = GenerateAttemptValue(seed, attempt, CANDIDATE_STREAM);
         const size_t candidateIndex = MapRandomToIndex(candidateValue, table.count);
         CandidateEntry &entry = table.entries[candidateIndex];
 
@@ -1171,7 +1182,7 @@ ClientReadBandwidthScheduler::Impl::CandidateEntry *ClientReadBandwidthScheduler
             continue;
         }
 
-        const uint64_t acceptanceValue = GenerateAttemptValue(seed, attempt, kAcceptanceStream);
+        const uint64_t acceptanceValue = GenerateAttemptValue(seed, attempt, ACCEPTANCE_STREAM);
         if (!AcceptWeightedProbe(probe, acceptanceValue)) {
             continue;
         }
@@ -1219,7 +1230,7 @@ uint64_t ClientReadBandwidthScheduler::Impl::GenerateSelectionSeed(const std::st
 {
     const uint64_t sequence = selectionSequence_.fetch_add(1, std::memory_order_relaxed);
     uint64_t value = Fnv1a64(requestKey) ^ clientSaltHash_;
-    value ^= sequence * kHashGoldenRatio;
+    value ^= sequence * HASH_GOLDEN_RATIO;
     return Mix64(value);
 }
 
@@ -1227,7 +1238,7 @@ uint64_t ClientReadBandwidthScheduler::Impl::GenerateAttemptValue(uint64_t seed,
                                                                   uint64_t streamSalt) noexcept
 {
     uint64_t value = seed ^ streamSalt;
-    value += (static_cast<uint64_t>(attempt) + 1ULL) * kHashGoldenRatio;
+    value += (static_cast<uint64_t>(attempt) + 1ULL) * HASH_GOLDEN_RATIO;
     return Mix64(value);
 }
 
@@ -1246,7 +1257,6 @@ void ClientReadBandwidthScheduler::Impl::Observe(const HostPort &worker, uint32_
     bool refreshed = false;
     const uint64_t newPacked = (static_cast<uint64_t>(p50Ns) << 32U) | static_cast<uint64_t>(p99Ns);
     const uint64_t oldPacked = slot->packedLatency.load(std::memory_order_acquire);
-
     if (newPacked != oldPacked) {
         uint8_t expected = 0;
         if (!slot->updateBusy.compare_exchange_strong(expected, 1, std::memory_order_acq_rel,
@@ -1354,7 +1364,7 @@ void ClientReadBandwidthScheduler::Impl::MaybeWarnHashTable(uint64_t nowNs) cons
 {
     const uint64_t tombstones = tombstoneCount_.load(std::memory_order_relaxed);
     const uint64_t longProbes = longProbeCount_.exchange(0, std::memory_order_relaxed);
-    if (tombstones * 4 < workerSlotCapacity_ && longProbes == 0) {
+    if (tombstones * HASH_WARNING_TOMBSTONE_SCALE < workerSlotCapacity_ && longProbes == 0) {
         return;
     }
     uint64_t lastNs = lastHashWarningNs_.load(std::memory_order_relaxed);

@@ -953,7 +953,7 @@ Status UbTransporter::WritePayloads(const std::vector<ObjectBufferInfo *> &infos
     return Status::OK();
 }
 
-Status UbTransporter::Set(ObjectBuffer &buffer, const TransportSetParam &param, PublishRspPb &rsp, TransportSetResult *result)
+Status UbTransporter::Set(ObjectBuffer &buffer, const TransportSetParam &param, TransportSetResult *result)
 {
     // Keep the per-transporter lifecycle lock while the operation is in flight so CloseDataPlane cannot tear down
     // the UB connection between the liveness check and the write/publish sequence.
@@ -965,6 +965,8 @@ Status UbTransporter::Set(ObjectBuffer &buffer, const TransportSetParam &param, 
         return Status(K_URMA_NEED_CONNECT, "UB Set: UB connection not alive");
     }
     auto rpcClient = rpcClient_;
+    PublishRspPb localRsp;
+    PublishRspPb &rsp = result != nullptr ? result->rsp : localRsp;
 
     ObjectBufferInfo &info = ObjectBufferInternal::GetMutableInfo(buffer);
     info.ubFailureReportRc = Status::OK();
