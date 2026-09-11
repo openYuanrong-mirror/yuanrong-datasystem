@@ -265,6 +265,15 @@ bool ReplicaReader::IsRetryableLocationError(const Status &status) const
     if (IsTransportSnapshotStaleLocation(status) || IsWorkerDrainingForScaleIn(status)) {
         return true;
     }
+    // A URMA wait timeout means the provider is slow but likely alive: the original WR is still
+    // inflight and the timed-out event is retained for a late completion. Retrying another
+    // replica (or another round on the same sole replica) within a short deadline only posts
+    // duplicate inflight traffic on an already congested path and almost surely misses the
+    // deadline too. Surface the error to the caller instead. K_URMA_ERROR is a hard CQE/post
+    // failure and equally pointless to retry at read-location level.
+    if (status.GetCode() == K_URMA_WAIT_TIMEOUT || status.GetCode() == K_URMA_ERROR) {
+        return false;
+    }
     if (retry_->IsRetryableRpcError(status)) {
         return true;
     }

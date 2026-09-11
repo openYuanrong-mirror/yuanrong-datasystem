@@ -285,3 +285,28 @@ ds_cc_test(
         "//conditions:default": [],
     }),
 )
+
+# URMA mock-backed coverage of the UrmaWriteImpl chunking contract: a payload above the configured
+# max write size must split into the minimum number of even-sized chunks. Runs entirely against the
+# mock backend (imported peer jetty/segment + memcpy post), so it needs no configured device.
+ds_cc_test(
+    name = "urma_write_chunk_split_test",
+    srcs = ["urma_write_chunk_split_test.cpp"],
+    defines = select({
+        "//:enable_urma": ["USE_URMA"],
+        "//:enable_urma_mock": ["USE_URMA", "USE_URMA_MOCK"],
+        "//conditions:default": [],
+    }),
+    tags = ["manual", "urma"],
+    deps = [
+        "//src/datasystem/common/rdma:common_rdma",
+        "//src/datasystem/common/rdma:urma_manager",
+        "//src/datasystem/common/rdma:urma_resource_header",
+        "//src/datasystem/common/object_cache:buffer",
+        "//src/datasystem/worker:add_miss_libs_fixme",
+    ] + select({
+        # urma_dlopen_util discovers this provider through a weak symbol in mock builds.
+        "//:enable_urma_mock": ["//tests/support/datasystem/common/urma_mock:urma_mock_backend"],
+        "//conditions:default": [],
+    }),
+)

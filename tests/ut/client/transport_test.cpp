@@ -6565,6 +6565,54 @@ TEST(ReplicaReaderTest, PeerDeadReplicaReturnsForMetadataRefreshAfterAllReplicas
     EXPECT_EQ(manager->transportBuildCount, 1);
 }
 
+TEST(ReplicaReaderTest, TerminalUrmaErrorsDoNotRetryReplicaOrRound)
+{
+    for (const auto code : { K_URMA_WAIT_TIMEOUT, K_URMA_ERROR }) {
+        ApiDeadlineGuard deadline(1000);
+        auto manager = std::make_shared<FakeDataPlaneManager>();
+        manager->transporterGetStatuses = { { Status(code, "terminal URMA error"), Status::OK() } };
+        auto executor = std::make_shared<DataPlaneExecutor>(manager, std::make_shared<TransportAdvisor>());
+        ReplicaReader reader(executor, std::make_shared<DeadlineRetry>(), std::make_shared<ThreadPool>(1));
+        auto location = MakeReplicaLocation("key", 4, { MakeAddress(88), MakeAddress(89) });
+        ObjectReadItemResult result;
+
+        Status rc = reader.Read(location, result, MakeReadContext());
+        EXPECT_EQ(rc.GetCode(), code) << rc.ToString();
+        ASSERT_EQ(manager->builtTransporters.size(), 1u);
+        EXPECT_EQ(manager->builtTransporters.front()->getCount, 1);
+        EXPECT_EQ(manager->transportBuildCount, 1);
+    }
+}
+
+TEST(ReplicaReaderTest, BatchUrmaWaitTimeoutDoesNotRetryReplicaOrRound)
+{
+    InitBatchGetMetrics();
+    ApiDeadlineGuard deadline(1000);
+    auto manager = std::make_shared<FakeDataPlaneManager>();
+    manager->configureTransporter = [&](const HostPort &address, FakeTransporter &transporter) {
+        if (address.ToString() == MakeAddress(92).ToString()) {
+            transporter.batchGetStatuses = { Status(K_URMA_WAIT_TIMEOUT, "urma wait timeout"), Status::OK() };
+        }
+    };
+    auto executor = std::make_shared<DataPlaneExecutor>(manager, std::make_shared<TransportAdvisor>());
+    ReplicaReader reader(executor, std::make_shared<DeadlineRetry>(), std::make_shared<ThreadPool>(1));
+    auto firstLocation = MakeReplicaLocation("first", 4, { MakeAddress(92), MakeAddress(93) });
+    auto secondLocation = MakeReplicaLocation("second", 4, { MakeAddress(92), MakeAddress(93) });
+    ObjectReadItemResult firstResult;
+    ObjectReadItemResult secondResult;
+
+    Status rc = reader.ReadBatch({ MakeReplicaReadRequest(&firstLocation, &firstResult),
+                                   MakeReplicaReadRequest(&secondLocation, &secondResult) });
+    EXPECT_EQ(rc.GetCode(), K_URMA_WAIT_TIMEOUT) << rc.ToString();
+    EXPECT_EQ(firstResult.status.GetCode(), K_URMA_WAIT_TIMEOUT);
+    EXPECT_EQ(secondResult.status.GetCode(), K_URMA_WAIT_TIMEOUT);
+    ASSERT_EQ(manager->builtTransporters.size(), 1u);
+    EXPECT_EQ(manager->builtTransporters.front()->batchGetCount, 1);
+    EXPECT_EQ(manager->builtTransporters.front()->getCount, 0);
+    EXPECT_EQ(manager->transportBuildCount, 1);
+    ExpectMetricAbsent("client_direct_batch_get_replica_retry_total");
+}
+
 TEST(ReplicaReaderTest, StaleTransportSnapshotTriesNextReplica)
 {
     ApiDeadlineGuard deadline(1000);

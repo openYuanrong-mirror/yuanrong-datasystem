@@ -2354,6 +2354,11 @@ Status UrmaManager::UrmaWriteImpl(const UrmaWriteArgs &args, std::vector<uint64_
     const uint64_t maxWriteSize = urmaResource_->GetMaxWriteSize();
     CHECK_FAIL_RETURN_STATUS_PRINT_ERROR(maxWriteSize > 0, K_RUNTIME_ERROR, "URMA max write size is zero");
     const uint64_t writeChunkCount = args.size / maxWriteSize + (args.size % maxWriteSize == 0 ? 0 : 1);
+    // Split evenly within the minimum chunk count instead of greedy max-size chunks: e.g. 8MB data
+    // with a 5MB limit becomes 4+4 (not 5+3), keeping per-post sizes balanced. ceil-division by
+    // writeChunkCount can never exceed maxWriteSize, and the hardware cap inside GetMaxWriteSize()
+    // remains the hard upper bound for every chunk.
+    const uint64_t balancedWriteChunkSize = (args.size + writeChunkCount - 1) / writeChunkCount;
     uint64_t writeChunkIndex = 0;
     Timer timer;
     std::shared_ptr<UrmaJetty> jetty;
@@ -2415,7 +2420,7 @@ Status UrmaManager::UrmaWriteImpl(const UrmaWriteArgs &args, std::vector<uint64_
         srcChipId = numaConfig.srcChipId;
         const bool useNumaAffinity = numaConfig.enabled;
         auto *srcChipInflightCounter = numaConfig.inflightCounter;
-        const uint64_t writeSize = std::min(remainSize, maxWriteSize);
+        const uint64_t writeSize = std::min(remainSize, balancedWriteChunkSize);
         ++writeChunkIndex;
         const uint64_t key = GenerateReqId();
         const uint64_t remoteAddress = args.remoteDataAddress + writtenSize;
