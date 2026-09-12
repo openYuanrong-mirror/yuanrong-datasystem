@@ -340,22 +340,6 @@ def start_procmon(pod, namespace, target_pid, remote_dir='/tmp',
         return None
 
 
-def resolve_procmon_dir(config_template, remote_config):
-    """Resolve procmon output dir from config log_dir, fallback to remote_config dir.
-
-    log_dir may be a {"value": ...} dict (dscli config style) or a plain
-    string; empty/missing falls back to the directory holding remote_config.
-    """
-    log_dir_entry = config_template.get('log_dir', {})
-    if isinstance(log_dir_entry, dict):
-        procmon_dir = log_dir_entry.get('value', None)
-    else:
-        procmon_dir = log_dir_entry or None
-    if not procmon_dir:
-        procmon_dir = os.path.dirname(remote_config)
-    return procmon_dir
-
-
 def _config_enabled(config, key):
     value = config.get(key, False)
     if isinstance(value, dict):
@@ -513,7 +497,7 @@ def install_whl(pod, namespace, whl_path, timeout=DEFAULT_TIMEOUT):
 
 
 def start_service(pod, namespace, config, remote_config, port, process_name,
-                  enable_procmon=True, procmon_remote_dir='/tmp',
+                  enable_procmon=True,
                   numactl_opts=None, jemalloc_prof_conf=None,
                   timeout=DEFAULT_TIMEOUT):
     """Start a datasystem service in a single pod.
@@ -573,12 +557,17 @@ def start_service(pod, namespace, config, remote_config, port, process_name,
         log_info(f'  {pod_name} ({pod_ip}) -> started')
 
         if enable_procmon:
-            if upload_procmon(pod, namespace, procmon_remote_dir, timeout):
+            # procmon.py lives next to the config file (same directory); its
+            # --output csv is written relative to its CWD, which start_procmon
+            # sets to this dir. For dscli mode there is no remote_dir (no
+            # binary upload), so the config dir is the natural location.
+            procmon_dir = os.path.dirname(remote_config)
+            if upload_procmon(pod, namespace, procmon_dir, timeout):
                 time.sleep(1)
                 pid = find_pid_by_port(pod, namespace, port, process_name, timeout)
                 if pid:
                     procmon_pid = start_procmon(pod, namespace, pid,
-                                                procmon_remote_dir,
+                                                procmon_dir,
                                                 port=port,
                                                 brpc_bvar_port=(
                                                     port if _config_enabled(
@@ -682,6 +671,26 @@ def collect_logs_from_pod(pod, namespace, log_dir, local_dir,
             if ls_remote.returncode == 0:
                 stdout_remote = f'{remote_dir}/stdout.log'
 
+        # Existence check for the optional extras (legacy procmon csv path +
+        # stdout.log). tar aborts with rc!=0 when ANY listed file is missing,
+        # which used to fail the whole stream on pods where /tmp/
+        # resource_monitor.csv (legacy dual-path compat) or stdout.log
+        # (binary crashed before redirect) did not exist. One merged `ls -d`
+        # filters the tar list to files that actually exist; log_files came
+        # from a glob ls so they already exist.
+        candidates = list(extra_csvs)
+        if stdout_remote:
+            candidates.append(stdout_remote)
+        if candidates:
+            ls_opt = kubectl_exec(pod_name, namespace,
+                                  'ls -d ' + ' '.join(candidates) + ' 2>/dev/null',
+                                  check=False, timeout=timeout)
+            existing = {f.strip() for f in (ls_opt.stdout or '').splitlines()
+                        if f.strip()}
+            extra_csvs = [f for f in extra_csvs if f in existing]
+            if stdout_remote and stdout_remote not in existing:
+                stdout_remote = None
+
         # --- Primary: tar stream ---
         # One kubectl exec pipes tar stdout to local tar extraction.
         # Binary-safe, gzip-compressed, 1 round-trip for all files.
@@ -747,20 +756,40 @@ def _collect_via_tar_stream(pod_name, namespace, tar_file_list, local_dir,
     """Stream ``tar czf - {files}`` from a pod to local extraction.
 
     One ``kubectl exec`` pipes the remote ``tar`` stdout through a local
-    ``tarfile`` reader. Returns True on success, False on any failure
-    (caller falls back to per-file base64). Gzip-compresses the stream
-    so text logs shrink 3-5x in transit.
+    ``tarfile`` reader. A nonzero tar rc with a non-empty stream (e.g. a
+    file vanished between the existence check and tar) still attempts
+    extraction of the bytes received -- partial data beats a full fallback.
+    Returns True on success, False on any failure (caller falls back to
+    per-file base64). Gzip-compresses the stream so text logs shrink 3-5x.
+
+    Files are extracted by basename (no directory prefix) so the local
+    layout matches the base64 fallback path which uses os.path.basename --
+    ``{local_dir}/worker.log`` not ``{local_dir}/home/kvcache/logs/worker.log``.
     """
     cmd_str = f'tar czf - {tar_file_list} 2>/dev/null'
     try:
         r = subprocess.run(
             ['kubectl', 'exec', '-n', namespace, pod_name, '--', 'sh', '-c', cmd_str],
             capture_output=True, timeout=timeout)
-        if r.returncode != 0 or not r.stdout:
+        if not r.stdout:
             return False
         import io
         with tarfile.open(fileobj=io.BytesIO(r.stdout), mode='r:gz') as tar:
-            tar.extractall(path=local_dir)
+            for member in tar.getmembers():
+                if not member.isfile():
+                    continue
+                # Strip directory prefix: extract by basename into local_dir,
+                # matching the base64 fallback's os.path.basename layout.
+                basename = os.path.basename(member.name)
+                if not basename:
+                    continue
+                local_path = os.path.join(local_dir, basename)
+                with tar.extractfile(member) as src, open(local_path, 'wb') as dst:
+                    import shutil
+                    shutil.copyfileobj(src, dst)
+        if r.returncode != 0:
+            log_info(f'    {pod_name} -> tar rc={r.returncode}, '
+                     f'extracted partial stream')
         return True
     except Exception:
         return False
@@ -1237,9 +1266,10 @@ def install_binary(pod, namespace, local_binary, local_lib_dir, remote_dir,
 def start_service_standalone(pod, namespace, binary_name, remote_dir, config_path,
                              jf_addr, service_name, extra_args='',
                              config=None,
-                             enable_procmon=True, procmon_remote_dir='/tmp',
+                             enable_procmon=True,
                              port=None, process_name=None,
-                             timeout=DEFAULT_TIMEOUT, jemalloc_prof_conf=None):
+                             timeout=DEFAULT_TIMEOUT, jemalloc_prof_conf=None,
+                             start_timeout=90):
     """Start a standalone test binary in a pod.
 
     Uses ``standalone_launcher.py`` (uploaded alongside procmon) to fork +
@@ -1317,8 +1347,11 @@ def start_service_standalone(pod, namespace, binary_name, remote_dir, config_pat
     # Coordinators have no ready_check_path; they fall through to --port.
     ready_file = _extract_ready_check_path(config)
 
+    # Upload the launcher to the same directory as the binary (remote_dir), so
+    # start and stop both find it at {remote_dir}/standalone_launcher.py and
+    # the pidfile at {remote_dir}/{binary_name}.pid.
     launcher_remote = upload_launcher({'name': name}, namespace,
-                                      procmon_remote_dir, timeout=timeout)
+                                      remote_dir, timeout=timeout)
     import time
     t_start = time.monotonic()
     pid = None
@@ -1330,8 +1363,8 @@ def start_service_standalone(pod, namespace, binary_name, remote_dir, config_pat
                 binary_path, remote_dir, log_path, lib_path, binary_argv,
                 port=port, host=pod_ip,
                 ready_file=ready_file,
-                ready_timeout=min(timeout, 60),
-                subprocess_timeout=timeout, env=env)
+                ready_timeout=start_timeout,
+                subprocess_timeout=start_timeout + 60, env=env)
         else:
             log_error(f'  {name} ({pod_ip}) -> launcher upload failed, '
                       f'falling back to nohup path')
@@ -1378,11 +1411,13 @@ def start_service_standalone(pod, namespace, binary_name, remote_dir, config_pat
                  f'after launch (pid={pid} no longer found)')
         return False
     log_info(f'  {name} ({pod_ip}) -> started (pid={pid})')
-    # Attach procmon (same logic as start_service dscli path)
+    # Attach procmon (same logic as start_service dscli path). procmon.py is
+    # uploaded to remote_dir (same as the binary), and its --output csv is
+    # written relative to the CWD set by start_procmon.
     if enable_procmon:
-        if upload_procmon(pod, namespace, procmon_remote_dir, timeout):
+        if upload_procmon(pod, namespace, remote_dir, timeout):
             procmon_pid = start_procmon(
-                pod, namespace, pid, procmon_remote_dir, port=port,
+                pod, namespace, pid, remote_dir, port=port,
                 brpc_bvar_port=(
                     port if config and _config_enabled(
                         config, 'brpc_enable_builtin_services') else None),
@@ -1446,6 +1481,7 @@ def _launch_via_launcher(name, namespace, launcher_remote, binary_path,
            '--cwd', cwd,
            '--log', log_path,
            '--lib-path', lib_path,
+           '--pidfile', f'{binary_path}.pid',
            '--ready-timeout', str(ready_timeout)])
     if ready_file:
         cmd.extend(['--ready-file', ready_file])
@@ -1540,28 +1576,114 @@ def _launch_via_nohup(name, namespace, binary_name, remote_dir, log_path,
     return None
 
 
-def stop_service_standalone(pod, namespace, process_name, timeout=DEFAULT_TIMEOUT):
-    """Stop a standalone test binary via SIGTERM.
+def stop_service_standalone(pod, namespace, process_name, remote_dir=None,
+                            grace=180, timeout=DEFAULT_TIMEOUT):
+    """Stop a standalone test binary via the launcher's stop subcommand.
 
-    Returns True if the process is gone after SIGTERM (whether it was
-    running and exited, or was already absent). Returns False only if
-    SIGTERM was sent but the process refused to exit within the grace
-    period (verified via ``pgrep``). ``pkill`` rc=1 (no match) is treated
-    as success -- stopping an already-stopped process is idempotent.
+    Primary path: one ``kubectl exec`` runs
+    ``standalone_launcher.py stop --pidfile {remote_dir}/{process_name}.pid``
+    which sends SIGTERM, polls for exit inside the pod (0.2s interval, same
+    /proc semantics as dscli's ``wait_exit``), escalates to SIGKILL after
+    ``grace`` seconds, and waits another 10s. The whole wait/escalate loop
+    runs in-pod so the deploy side issues a single round-trip regardless of
+    how long the graceful shutdown takes.
+
+    Exit-code contract (from the launcher): 0 = exited (including "was
+    already gone" -- idempotent), 1 = alive after SIGKILL (FAILED),
+    3 = pidfile missing (process was started by an older deploy or via the
+    nohup path) -> fall back to the legacy pkill + pgrep-poll path below.
+
+    Returns True if the process is gone, False only if it refused to die
+    even after SIGKILL.
     """
     name = pod['name']
     pod_ip = pod.get('ip', '')
+    if remote_dir:
+        # upload_launcher uploads to {remote_dir}/standalone_launcher.py (same
+        # directory as the binary), so stop looks for it there too. pidfile
+        # is also under {remote_dir}.
+        launcher_remote = f'{remote_dir}/standalone_launcher.py'
+        pidfile = f'{remote_dir}/{process_name}.pid'
+        cmd = (f'python3 {shlex.quote(launcher_remote)} stop '
+               f'--pidfile {shlex.quote(pidfile)} '
+               f'--binary {shlex.quote(process_name)} --grace {grace}')
+        try:
+            r = kubectl_exec(name, namespace, cmd, check=False,
+                             timeout=grace + 10 + 60)
+        except subprocess.TimeoutExpired:
+            log_info(f'  {name} ({pod_ip}) -> FAILED: launcher stop timed out')
+            return False
+        except Exception as e:
+            log_info(f'  {name} ({pod_ip}) -> launcher stop error: {e}; '
+                     f'falling back to pkill')
+            r = None
+        if r is not None:
+            if r.returncode == 0:
+                elapsed = _launcher_elapsed(r.stdout)
+                detail = f' (elapsed={elapsed:.2f}s)' if elapsed is not None else ''
+                log_info(f'  {name} ({pod_ip}) -> stopped{detail}')
+                return True
+            if r.returncode == 1:
+                elapsed = _launcher_elapsed(r.stdout)
+                detail = f' (elapsed={elapsed:.2f}s)' if elapsed is not None else ''
+                log_info(f'  {name} ({pod_ip}) -> FAILED: still running after '
+                         f'TERM+KILL{detail}')
+                return False
+            # rc == 3 (no pidfile) or any unexpected code: legacy fallback.
+        # fall through
+    return _stop_service_standalone_legacy(pod, namespace, process_name, grace)
+
+
+def _launcher_elapsed(stdout):
+    """Parse ``stopped {elapsed}`` / ``alive {elapsed}`` from launcher stop
+    stdout. Returns the float or None."""
+    if not stdout:
+        return None
+    parts = stdout.strip().splitlines()[-1].split()
+    if len(parts) >= 2:
+        try:
+            return float(parts[1])
+        except ValueError:
+            return None
+    return None
+
+
+def _pgrep_alive(name, namespace, process_name, timeout=10):
+    """True if pgrep -f finds the process in the pod."""
+    out = kubectl_exec_raw({'name': name}, namespace,
+                           f'pgrep -f {process_name}', timeout=timeout)
+    return bool(out and out.strip())
+
+
+def _stop_service_standalone_legacy(pod, namespace, process_name, grace):
+    """Pre-pidfile stop path: pkill + deploy-side pgrep polling with the
+    same TERM -> KILL escalation contract as the launcher stop. Kept for
+    processes started before pidfiles existed (or nohup starts)."""
+    name = pod['name']
+    pod_ip = pod.get('ip', '')
+    try:
+        subprocess.run(['kubectl', 'exec', '-n', namespace, name, '--', 'bash', '-c',
+                        f'pkill -TERM -f {process_name} 2>/dev/null'],
+                       capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        pass
+    # Poll for exit every 2s (kubectl exec per poll is the floor cost; the
+    # launcher path avoids this entirely). Same grace as the launcher path.
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline:
+        if not _pgrep_alive(name, namespace, process_name):
+            log_info(f'  {name} ({pod_ip}) -> stopped')
+            return True
+        time.sleep(2)
     subprocess.run(['kubectl', 'exec', '-n', namespace, name, '--', 'bash', '-c',
-                    f'pkill -TERM -f {process_name} 2>/dev/null'],
-                   capture_output=True, text=True, timeout=timeout)
-    time.sleep(3)
-    verify = kubectl_exec_raw({'name': name}, namespace,
-                              f'pgrep -f {process_name}', timeout=10)
-    if verify and verify.strip():
-        log_info(f'  {name} ({pod_ip}) -> FAILED: still running after SIGTERM')
-        return False
-    log_info(f'  {name} ({pod_ip}) -> stopped')
-    return True
+                    f'pkill -9 -f {process_name} 2>/dev/null'],
+                   capture_output=True, text=True, timeout=30)
+    time.sleep(2)
+    if not _pgrep_alive(name, namespace, process_name):
+        log_info(f'  {name} ({pod_ip}) -> stopped (after SIGKILL)')
+        return True
+    log_info(f'  {name} ({pod_ip}) -> FAILED: still running after TERM+KILL')
+    return False
 
 
 # ============================================================================
@@ -1695,9 +1817,12 @@ def cmd_install_shared(args, pods, process_name_standalone, label,
 def cmd_stop_shared(args, pods, process_name_standalone, label,
                     service_type='worker', with_timings=False,
                     timeout=DEFAULT_TIMEOUT):
-    """Stop service gracefully. Standalone mode uses SIGTERM + do_for_all_pods;
-    non-standalone uses dscli stop."""
+    """Stop service gracefully. Standalone mode delegates to the launcher's
+    stop subcommand (pidfile + in-pod TERM/wait/KILL escalation, grace from
+    --stop-timeout, default 180s); non-standalone uses dscli stop."""
     if getattr(args, 'standalone', False):
+        remote_dir = getattr(args, 'remote_dir', None)
+        grace = getattr(args, 'stop_timeout', 180)
         timings = []
 
         def do_op(pod):
@@ -1706,7 +1831,9 @@ def cmd_stop_shared(args, pods, process_name_standalone, label,
             ok = False
             try:
                 ok = stop_service_standalone(pod, args.namespace,
-                                             process_name_standalone, timeout)
+                                             process_name_standalone,
+                                             remote_dir=remote_dir,
+                                             grace=grace, timeout=timeout)
                 return ok
             finally:
                 elapsed = _time.monotonic() - t0

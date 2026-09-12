@@ -41,7 +41,6 @@ from deploy_common import (
     kill_process,
     parse_config_override,
     read_remote_log_dir,
-    resolve_procmon_dir,
     start_procmon,
     start_service,
     start_service_standalone,
@@ -88,34 +87,6 @@ class TestParseConfigOverride(unittest.TestCase):
     def test_whitespace_is_stripped(self):
         self.assertEqual(parse_config_override('  hello  '), 'hello')
         self.assertEqual(parse_config_override('  42  '), 42)
-
-
-class TestResolveProcmonDir(unittest.TestCase):
-    """Test resolve_procmon_dir: log_dir dict/string, fallback to config dir."""
-
-    def test_from_log_dir_dict(self):
-        cfg = {'log_dir': {'value': '/var/log/datasystem'}}
-        self.assertEqual(resolve_procmon_dir(cfg, '/tmp/worker.config'),
-                         '/var/log/datasystem')
-
-    def test_from_log_dir_string(self):
-        cfg = {'log_dir': '/data/logs'}
-        self.assertEqual(resolve_procmon_dir(cfg, '/tmp/worker.config'),
-                         '/data/logs')
-
-    def test_fallback_to_remote_config_dir(self):
-        cfg = {}
-        self.assertEqual(resolve_procmon_dir(cfg, '/data/workers/worker.config'),
-                         '/data/workers')
-
-    def test_empty_log_dir_falls_back(self):
-        cfg = {'log_dir': ''}
-        self.assertEqual(resolve_procmon_dir(cfg, '/opt/worker.config'),
-                         '/opt')
-
-    def test_log_dir_dict_empty_value(self):
-        cfg = {'log_dir': {'value': ''}}
-        self.assertEqual(resolve_procmon_dir(cfg, '/tmp/worker.config'), '/tmp')
 
 
 class TestDoForAllPods(unittest.TestCase):
@@ -509,8 +480,12 @@ class TestStopServiceStandalone(unittest.TestCase):
     @patch('deploy_common.kubectl_exec_raw')
     @patch('deploy_common.subprocess.run')
     @patch('deploy_common.time.sleep')
-    def test_process_exits_after_sigterm(self, mock_sleep, mock_run, mock_raw):
+    @patch('deploy_common.time.monotonic', side_effect=[0.0, 1000.0, 2000.0])
+    def test_process_exits_after_sigterm(self, mock_mono, mock_sleep, mock_run,
+                                         mock_raw):
         # pkill sends SIGTERM; pgrep confirms process is gone -> stopped.
+        # monotonic side_effect: deadline=0+grace, while-check=1000>grace
+        # (skip poll), post-KILL check=2000. pgrep returns '' -> stopped.
         mock_raw.return_value = ''
         ok = stop_service_standalone(self._pod(), 'default', 'worker_test',
                                      timeout=10)
@@ -519,7 +494,9 @@ class TestStopServiceStandalone(unittest.TestCase):
     @patch('deploy_common.kubectl_exec_raw')
     @patch('deploy_common.subprocess.run')
     @patch('deploy_common.time.sleep')
-    def test_process_already_absent(self, mock_sleep, mock_run, mock_raw):
+    @patch('deploy_common.time.monotonic', side_effect=[0.0, 1000.0, 2000.0])
+    def test_process_already_absent(self, mock_mono, mock_sleep, mock_run,
+                                    mock_raw):
         # pkill finds no process (rc=1) but pgrep also finds nothing ->
         # idempotent stop, returns True (not a failure to stop something
         # that is already stopped).
@@ -531,8 +508,10 @@ class TestStopServiceStandalone(unittest.TestCase):
     @patch('deploy_common.kubectl_exec_raw')
     @patch('deploy_common.subprocess.run')
     @patch('deploy_common.time.sleep')
-    def test_process_refuses_to_exit(self, mock_sleep, mock_run, mock_raw):
-        # SIGTERM sent but process still alive after 3s grace period ->
+    @patch('deploy_common.time.monotonic', side_effect=[0.0, 1000.0, 2000.0])
+    def test_process_refuses_to_exit(self, mock_mono, mock_sleep, mock_run,
+                                     mock_raw):
+        # SIGTERM sent but process still alive after grace period ->
         # FAILED, return False. This is the regression guard: the old code
         # unconditionally returned True here.
         mock_raw.return_value = '1234\n'
@@ -543,7 +522,9 @@ class TestStopServiceStandalone(unittest.TestCase):
     @patch('deploy_common.kubectl_exec_raw')
     @patch('deploy_common.subprocess.run')
     @patch('deploy_common.time.sleep')
-    def test_no_or_true_in_pkill_command(self, mock_sleep, mock_run, mock_raw):
+    @patch('deploy_common.time.monotonic', side_effect=[0.0, 1000.0, 2000.0])
+    def test_no_or_true_in_pkill_command(self, mock_mono, mock_sleep, mock_run,
+                                         mock_raw):
         # The old code used `pkill ... || true` which masked the pkill rc.
         # The new code must NOT have `|| true` so pkill's rc is visible
         # (though we rely on pgrep, not pkill rc, for the final verdict).
@@ -1126,6 +1107,11 @@ def _kubectl_exec_responder(log_dir_files, remote_dir_exists,
       * `ls -d {log_dir}`           -> returncode 0 (log_dir always exists
                                        in these tests)
       * `ls {log_dir}/*.log ...`    -> returncode 0, stdout = log_dir_files
+      * `ls -d <candidate files>`   -> multi-path existence check: echoes
+                                       back the candidates that exist per
+                                       the scenario (stdout.log present iff
+                                       stdout_log_content set; csv present
+                                       iff procmon_log_content set)
       * `base64 <path>`             -> returncode 0, stdout = base64 bytes
                                        of the matching file's content; raises
                                        CalledProcessError if path unknown
@@ -1140,12 +1126,28 @@ def _kubectl_exec_responder(log_dir_files, remote_dir_exists,
     def _resp(*args, **kwargs):
         cmd = args[2]
         if cmd.startswith('ls -d '):
-            target = cmd.split('ls -d ', 1)[1].split(' 2>/dev/null', 1)[0]
-            if target in ('/var/log/ds', '/tmp/ds_worker', '/tmp/ds_coordinator'):
-                if target == '/var/log/ds':
-                    return MagicMock(returncode=0)
-                return MagicMock(returncode=0 if remote_dir_exists else 1)
-            return MagicMock(returncode=0)
+            targets = cmd.split('ls -d ', 1)[1].split(' 2>/dev/null', 1)[0].split()
+            # Single-target dir check (log_dir / remote_dir gate).
+            if len(targets) == 1:
+                target = targets[0]
+                if target in ('/var/log/ds', '/tmp/ds_worker', '/tmp/ds_coordinator'):
+                    if target == '/var/log/ds':
+                        return MagicMock(returncode=0)
+                    return MagicMock(returncode=0 if remote_dir_exists else 1)
+                return MagicMock(returncode=0)
+            # Multi-path candidate existence check: echo back paths that
+            # exist per the scenario so collect filters its tar list.
+            existing = []
+            for t in targets:
+                if t.endswith('/stdout.log'):
+                    if stdout_log_content is not None:
+                        existing.append(t)
+                elif t.endswith('/resource_monitor.csv'):
+                    if procmon_log_content is not None:
+                        existing.append(t)
+                else:
+                    existing.append(t)
+            return MagicMock(returncode=0, stdout='\n'.join(existing))
         if cmd.startswith('ls '):
             return MagicMock(returncode=0, stdout='\n'.join(log_dir_files))
         if cmd.startswith('base64 '):

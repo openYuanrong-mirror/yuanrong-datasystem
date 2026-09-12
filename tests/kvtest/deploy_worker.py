@@ -33,7 +33,6 @@ from deploy_common import (
     kubectl_exec,
     log_error,
     log_info,
-    resolve_procmon_dir,
     setup_logging,
     start_service,
     start_service_standalone,
@@ -49,7 +48,7 @@ ADDRESS_KEY = 'worker_address'
 
 
 def start_worker(pod, namespace, config, worker_port, remote_config,
-                 enable_procmon=True, procmon_remote_dir='/tmp',
+                  enable_procmon=True,
                  numactl_opts=None, jemalloc_prof_conf=None,
                  timeout=DEFAULT_TIMEOUT):
     """Start a worker in a single pod.
@@ -62,7 +61,7 @@ def start_worker(pod, namespace, config, worker_port, remote_config,
     if jemalloc_prof_conf is not None:
         kwargs['jemalloc_prof_conf'] = jemalloc_prof_conf
     return start_service(pod, namespace, config, remote_config, worker_port,
-                         PROCESS_NAME, enable_procmon, procmon_remote_dir,
+                          PROCESS_NAME, enable_procmon,
                          **kwargs)
 
 
@@ -73,11 +72,6 @@ def cmd_start(args, pods):
 
     with open(args.config) as f:
         config_template = json.load(f)
-
-    # Default procmon dir to log_dir from worker config, fallback to
-    # --remote-config dir.
-    if args.procmon_dir is None:
-        args.procmon_dir = resolve_procmon_dir(config_template, args.remote_config)
 
     if args.set:
         apply_config_overrides(config_template, args.set)
@@ -99,7 +93,6 @@ def cmd_start(args, pods):
             ok = start_worker(pod, args.namespace, cfg, args.port,
                               args.remote_config,
                               enable_procmon=args.enable_procmon,
-                              procmon_remote_dir=args.procmon_dir,
                               numactl_opts=numactl_opts,
                               jemalloc_prof_conf=getattr(
                                   args, 'jemalloc_prof_options', None),
@@ -167,11 +160,11 @@ def cmd_start_standalone(args, pods):
                 args.remote_config, args.jf, args.service, '',
                 config=cfg,
                 enable_procmon=args.enable_procmon,
-                procmon_remote_dir=args.procmon_dir or '/tmp',
                 port=args.port,
                 process_name=PROCESS_NAME_STANDALONE,
                 timeout=args.timeout,
-                jemalloc_prof_conf=getattr(args, 'jemalloc_prof_options', None))
+                jemalloc_prof_conf=getattr(args, 'jemalloc_prof_options', None),
+                start_timeout=getattr(args, 'start_timeout', 90))
             return ok
         finally:
             # start_service_standalone records only the actual launch
@@ -362,8 +355,6 @@ def main():
     parser_start.add_argument('--no-procmon', action='store_false',
                               dest='enable_procmon',
                               help='Disable procmon.py monitoring (default)')
-    parser_start.add_argument('--procmon-dir', default=None,
-                              help='Remote directory for procmon files (default: same as --remote-config dir)')
     parser_start.add_argument('-N', '--numa-nodes', default=None,
                               help='NUMA node(s) to bind worker to, passed to dscli start -N (e.g. "0" or "0,1")')
     parser_start.add_argument('-C', '--cpu-bind', default=None,
@@ -381,13 +372,29 @@ def main():
                               help='JF service name (standalone mode, default: kvcache_coordinator)')
     parser_start.add_argument('--remote-dir', default='/tmp/ds_worker',
                               help='Remote directory with standalone binary (must match install --remote-dir)')
+    parser_start.add_argument('--start-timeout', type=int, default=90,
+                              help='Max seconds to wait for a worker to become '
+                                   'ready after launch (default: 90, matches '
+                                   'dscli start). Standalone mode only.')
 
     # Stop subcommand
     parser_stop = subparsers.add_parser('stop', parents=[parent_parser],
                                         help='Stop workers gracefully')
     parser_stop.add_argument('--remote-config', default='/tmp/worker.config',
                              help='Worker config file path (default: /tmp/worker.config)')
-    parser_stop.add_argument('-S', '--standalone', action='store_true', default=False)
+    parser_stop.add_argument('-S', '--standalone', action='store_true', default=False,
+                             help='Stop worker_test via the launcher stop subcommand '
+                                  '(pidfile + in-pod TERM/KILL escalation). '
+                                  'Must match install --remote-dir.')
+    parser_stop.add_argument('--remote-dir', default='/tmp/ds_worker',
+                             help='Remote directory holding the standalone binary '
+                                  'and pidfile (default: /tmp/ds_worker, must match '
+                                  'install)')
+    parser_stop.add_argument('--stop-timeout', type=int, default=180,
+                             help='Max seconds to wait after SIGTERM before '
+                                  'escalating to SIGKILL (default: 180, '
+                                  'matches dscli stop base_timeout). '
+                                  'Standalone mode only.')
 
     # Kill subcommand (force kill using kill -9)
     parser_kill = subparsers.add_parser('kill', parents=[parent_parser],
@@ -511,8 +518,10 @@ def main():
     parser_deploy.add_argument('--no-procmon', action='store_false',
                                dest='enable_procmon',
                                help='Disable procmon.py monitoring (default)')
-    parser_deploy.add_argument('--procmon-dir', default=None,
-                               help='Remote directory for procmon files')
+    parser_deploy.add_argument('--start-timeout', type=int, default=90,
+                               help='Max seconds to wait for a worker to become '
+                                    'ready after launch (default: 90, matches '
+                                    'dscli start). Standalone mode only.')
 
     args = parser.parse_args()
 

@@ -29,8 +29,9 @@ test budget, those scenarios belong in the manual/perf bucket.
 import os
 import socket
 import sys
+import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 # Make standalone_launcher importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'tools'))
@@ -495,6 +496,256 @@ class TestMainClearsStaleReadyFile(unittest.TestCase):
                     os.unlink(log_path)
                 except OSError:
                     pass
+
+
+class TestPidfileHelpers(unittest.TestCase):
+    """read_pid / write_pid / remove_pidfile: pidfile is the persistent state
+    shared between start and stop; a missing or invalid pidfile must yield
+    None so stop reports rc=3 (deploy falls back to its pgrep path)."""
+
+    def test_write_then_read_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pidfile = os.path.join(tmpdir, 'worker_test.pid')
+            self.assertTrue(launcher.write_pid(pidfile, 4321))
+            self.assertEqual(launcher.read_pid(pidfile), 4321)
+            self.assertTrue(launcher.remove_pidfile(pidfile))
+            self.assertIsNone(launcher.read_pid(pidfile))
+
+    def test_read_missing_pidfile_returns_none(self):
+        self.assertIsNone(launcher.read_pid('/tmp/no_such_pidfile_xyz'))
+
+    def test_read_garbage_content_returns_none(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pidfile = os.path.join(tmpdir, 'bad.pid')
+            with open(pidfile, 'w') as f:
+                f.write('not-a-pid')
+            self.assertIsNone(launcher.read_pid(pidfile))
+
+
+class TestParseStatState(unittest.TestCase):
+    """parse_stat_state: state is the token after the LAST ')' because comm
+    may contain spaces/parens. Z (zombie) must be distinguishable from R/S."""
+
+    def test_simple_comm(self):
+        self.assertEqual(launcher.parse_stat_state(
+            '1234 (kvtest) R 1 2 3'), 'R')
+
+    def test_comm_with_spaces_and_parens(self):
+        # comm may contain spaces/parens: state follows the LAST ')'.
+        self.assertEqual(launcher.parse_stat_state(
+            '1234 (weird (name) here) S 1 2 3'), 'S')
+
+    def test_zombie_state(self):
+        self.assertEqual(launcher.parse_stat_state(
+            '1234 (kvtest) Z 1 2 3'), 'Z')
+
+    def test_malformed_returns_empty(self):
+        self.assertEqual(launcher.parse_stat_state('no parens here'), '')
+
+
+class TestCmdlineMatches(unittest.TestCase):
+    """cmdline_matches: basename comparison over NUL-separated argv guards
+    the stop path against signaling a recycled PID owned by another binary."""
+
+    def test_exact_basename_match(self):
+        raw = b'/tmp/ds_worker/worker_test\x00--config\x00cfg.json'
+        self.assertTrue(launcher.cmdline_matches(raw, 'worker_test'))
+
+    def test_different_basename_no_match(self):
+        raw = b'/usr/bin/python3\x00script.py'
+        self.assertFalse(launcher.cmdline_matches(raw, 'worker_test'))
+
+    def test_empty_cmdline_no_match(self):
+        self.assertFalse(launcher.cmdline_matches(b'', 'kvtest'))
+
+    def test_match_on_any_arg(self):
+        raw = b'/usr/bin/env\x00worker_test'
+        self.assertTrue(launcher.cmdline_matches(raw, 'worker_test'))
+
+
+class TestStopSubcommand(unittest.TestCase):
+    """main_stop: SIGTERM -> poll exit (grace) -> SIGKILL -> wait kill-wait.
+    Exit codes: 0 = exited (incl. already gone / stale pidfile), 1 = alive
+    after SIGKILL, 3 = pidfile missing. stdout last line protocol:
+    'stopped {elapsed}' / 'alive {elapsed}' (no rounds)."""
+
+    def _args(self, pidfile, grace=1.0, kill_wait=1.0):
+        return ['--pidfile', pidfile, '--binary', 'worker_test',
+                '--grace', str(grace), '--kill-wait', str(kill_wait)]
+
+    @patch('standalone_launcher.os.kill')
+    @patch('standalone_launcher.time.sleep')
+    @patch('standalone_launcher.time.monotonic', side_effect=lambda: 0.0)
+    def test_missing_pidfile_returns_3(self, mock_mono, mock_sleep, mock_kill):
+        with patch('standalone_launcher.read_pid', return_value=None):
+            rc = launcher.main_stop(self._args('/tmp/absent.pid'))
+        self.assertEqual(rc, 3)
+        mock_kill.assert_not_called()
+
+    @patch('standalone_launcher.remove_pidfile')
+    @patch('standalone_launcher.os.kill')
+    @patch('standalone_launcher.time.sleep')
+    @patch('standalone_launcher.time.monotonic', side_effect=lambda: 0.0)
+    def test_already_gone_is_idempotent_success(self, mock_mono, mock_sleep,
+                                                mock_kill, mock_remove):
+        # pidfile points to a dead PID: no signal may be sent, rc=0.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pidfile = os.path.join(tmpdir, 'w.pid')
+            launcher.write_pid(pidfile, 1234)
+            with patch('standalone_launcher.pid_alive', return_value=False):
+                rc = launcher.main_stop(self._args(pidfile))
+        self.assertEqual(rc, 0)
+        mock_kill.assert_not_called()
+
+    @patch('standalone_launcher.remove_pidfile')
+    @patch('standalone_launcher.os.kill')
+    @patch('standalone_launcher.time.sleep')
+    @patch('standalone_launcher.time.monotonic', side_effect=lambda: 0.0)
+    def test_recycled_pid_not_signaled(self, mock_mono, mock_sleep,
+                                       mock_kill, mock_remove):
+        # Pidfile PID now belongs to a different binary (kernel recycled it):
+        # stop must NOT signal it; idempotent success instead.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pidfile = os.path.join(tmpdir, 'w.pid')
+            launcher.write_pid(pidfile, 1234)
+            with patch('standalone_launcher.pid_alive', return_value=True), \
+                 patch('standalone_launcher.pid_matches_binary',
+                       return_value=False):
+                rc = launcher.main_stop(self._args(pidfile))
+        self.assertEqual(rc, 0)
+        mock_kill.assert_not_called()
+
+    @patch('standalone_launcher.remove_pidfile')
+    @patch('standalone_launcher.os.kill')
+    @patch('standalone_launcher.time.sleep')
+    @patch('standalone_launcher.time.monotonic', side_effect=lambda: 0.0)
+    def test_sigterm_graceful_exit(self, mock_mono, mock_sleep, mock_kill,
+                                   mock_remove):
+        # TERM sent, process exits during grace poll -> rc=0, exactly one
+        # signal (SIGTERM=15) issued, no SIGKILL.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pidfile = os.path.join(tmpdir, 'w.pid')
+            launcher.write_pid(pidfile, 1234)
+            with patch('standalone_launcher.pid_alive', return_value=True), \
+                 patch('standalone_launcher.pid_matches_binary',
+                       return_value=True), \
+                 patch('standalone_launcher.wait_exit', return_value=True):
+                rc = launcher.main_stop(self._args(pidfile))
+        self.assertEqual(rc, 0)
+        self.assertEqual(mock_kill.call_count, 1)
+        self.assertEqual(mock_kill.call_args[0][1], 15)
+
+    @patch('standalone_launcher.remove_pidfile')
+    @patch('standalone_launcher.os.kill')
+    @patch('standalone_launcher.time.sleep')
+    @patch('standalone_launcher.time.monotonic', side_effect=lambda: 0.0)
+    def test_sigkill_escalation_then_exit(self, mock_mono, mock_sleep,
+                                          mock_kill, mock_remove):
+        # TERM waits full grace (alive), KILL escalates, process exits during
+        # kill-wait -> rc=0. Signal sequence must be TERM(15) then KILL(9).
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pidfile = os.path.join(tmpdir, 'w.pid')
+            launcher.write_pid(pidfile, 1234)
+            with patch('standalone_launcher.pid_alive', return_value=True), \
+                 patch('standalone_launcher.pid_matches_binary',
+                       return_value=True), \
+                 patch('standalone_launcher.wait_exit',
+                       side_effect=[False, True]):
+                rc = launcher.main_stop(self._args(pidfile))
+        self.assertEqual(rc, 0)
+        self.assertEqual([c[0][1] for c in mock_kill.call_args_list], [15, 9])
+
+    @patch('standalone_launcher.time.monotonic', side_effect=lambda: 0.0)
+    def test_still_alive_after_kill_returns_1(self, mock_mono):
+        # TERM grace expires, KILL sent, kill-wait expires, still alive ->
+        # rc=1 (deploy reports FAILED), stdout reports 'alive'.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pidfile = os.path.join(tmpdir, 'w.pid')
+            launcher.write_pid(pidfile, 1234)
+            with patch('standalone_launcher.pid_alive', return_value=True), \
+                 patch('standalone_launcher.pid_matches_binary',
+                       return_value=True), \
+                 patch('standalone_launcher.wait_exit', return_value=False), \
+                 patch('standalone_launcher.os.kill'), \
+                 patch('standalone_launcher.time.sleep'):
+                rc = launcher.main_stop(self._args(pidfile))
+        self.assertEqual(rc, 1)
+
+
+class TestStopDispatch(unittest.TestCase):
+    """main() dispatch: leading 'stop' word routes to the stop subcommand;
+    no subcommand (legacy callers) still routes to start."""
+
+    @patch('standalone_launcher.main_stop', return_value=0)
+    def test_stop_word_routes_to_stop(self, mock_stop):
+        rc = launcher.main(['stop', '--pidfile', '/tmp/p.pid',
+                            '--binary', 'kvtest'])
+        self.assertEqual(rc, 0)
+        mock_stop.assert_called_once_with(['--pidfile', '/tmp/p.pid',
+                                           '--binary', 'kvtest'])
+
+    @patch('standalone_launcher.main_start', return_value=0)
+    def test_no_subcommand_routes_to_start(self, mock_start):
+        # Legacy callers invoke the launcher without any subcommand word.
+        rc = launcher.main(['--binary', '/bin/sleep', '--log', '/tmp/l.log'])
+        self.assertEqual(rc, 0)
+        mock_start.assert_called_once_with(
+            ['--binary', '/bin/sleep', '--log', '/tmp/l.log'])
+
+    @patch('standalone_launcher.main_start', return_value=0)
+    def test_start_word_routes_to_start(self, mock_start):
+        rc = launcher.main(['start', '--binary', '/bin/sleep',
+                            '--log', '/tmp/l.log'])
+        self.assertEqual(rc, 0)
+        mock_start.assert_called_once_with(
+            ['--binary', '/bin/sleep', '--log', '/tmp/l.log'])
+
+
+class TestStartWritesPidfile(unittest.TestCase):
+    """main_start: pidfile written after successful Popen (before readiness)
+    so stop can address the process even when readiness is slow; removed on
+    the early-exit failure path."""
+
+    @patch('standalone_launcher.remove_pidfile')
+    @patch('standalone_launcher.subprocess.Popen')
+    def test_pidfile_written_and_removed_on_early_exit(
+            self, mock_popen, mock_remove):
+        # Binary exits immediately (proc.poll returns 1): pidfile written
+        # after Popen must be removed on the failure path.
+        proc = MagicMock()
+        proc.pid = 4321
+        proc.poll.return_value = 1
+        mock_popen.return_value = proc
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pidfile = os.path.join(tmpdir, 'w.pid')
+            with patch('standalone_launcher.time.monotonic',
+                       side_effect=[0.0, 0.0, 0.1, 0.1]), \
+                 patch('standalone_launcher.time.sleep'):
+                rc = launcher.main([
+                    '--binary', '/bin/false', '--log',
+                    os.path.join(tmpdir, 'out.log'), '--pidfile', pidfile])
+            self.assertEqual(rc, 1)
+            mock_remove.assert_called_once_with(pidfile)
+
+    @patch('standalone_launcher.subprocess.Popen')
+    def test_pidfile_survives_no_signal_success(self, mock_popen):
+        # No-signal grace success: pidfile must remain for the stop path.
+        proc = MagicMock()
+        proc.pid = 4321
+        proc.poll.return_value = None
+        mock_popen.return_value = proc
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pidfile = os.path.join(tmpdir, 'w.pid')
+            with patch('standalone_launcher.time.monotonic',
+                       side_effect=[0.0, 0.0, 0.5, 0.5]), \
+                 patch('standalone_launcher.time.sleep'):
+                rc = launcher.main([
+                    '--binary', '/bin/sleep', '--log',
+                    os.path.join(tmpdir, 'out.log'), '--pidfile', pidfile,
+                    '--no-signal-grace', '0.5'])
+            # Assert while tmpdir still exists (it is deleted on with-exit).
+            self.assertEqual(rc, 0)
+            self.assertEqual(launcher.read_pid(pidfile), 4321)
 
 
 if __name__ == '__main__':

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Standalone binary launcher for kubectl-exec-safe background start.
+"""Standalone binary launcher for kubectl-exec-safe background start + stop.
 
 Mirrors the pattern in ``cli/start.py`` (``subprocess.Popen`` with
 ``start_new_session=True``): launch the binary in a new session so it does
@@ -18,6 +18,20 @@ shell pattern:
    uses Python's ``subprocess.Popen(start_new_session=True)`` which calls
    ``setsid(2)`` directly, no external binary required.
 
+Subcommands:
+
+* ``start`` (default; also the behavior when invoked with no subcommand,
+  for backward compatibility with callers that predate the split): launch
+  the binary detached, poll for readiness, print ``{pid} {elapsed}``, and
+  record the PID in ``--pidfile`` so ``stop`` can address the exact process.
+
+* ``stop --pidfile P --binary B [--grace S] [--kill-wait S]``: graceful
+  stop of the recorded process. SIGTERM first, poll for exit (``/proc``
+  state, same semantics as ``dscli stop``'s ``wait_exit``), SIGKILL after
+  ``--grace`` seconds, wait ``--kill-wait`` more. Keeps the whole
+  signal/wait/escalate loop inside the pod so the deploy script issues a
+  single ``kubectl exec`` instead of polling from outside.
+
 Readiness polling matches ``dscli start`` (``cli/start.py``):
 
 * If ``--ready-file`` is given, poll for that file's existence until it
@@ -26,15 +40,13 @@ Readiness polling matches ``dscli start`` (``cli/start.py``):
   ``WaitForServiceReady()`` + ``WaitForTopologyReady()`` complete, so this
   is the authoritative readiness signal.
 * If ``--port`` is given (and no ``--ready-file``), poll TCP connect to
-  ``--host:--port`` until it succeeds. Used by coordinator standalones.
+  ``--host:--port`` until it succeeds. Used by coordinator standalones
+  and kvtest clients (HTTP control port).
 * If neither is given, poll ``proc.poll()`` for ``--no-signal-grace``
   seconds (default 2) to catch early exits (bad gflags, missing .so,
-  config errors), then print the PID. Used by client-style binaries that
-  do not expose a readiness signal; the grace window catches the common
-  failure mode where the binary parses gflags and exits before the caller
-  can verify via ``pgrep``.
+  config errors), then print the PID.
 
-Failure detection:
+Failure detection (start):
 
 * If the binary exits before becoming ready (or before the no-signal grace
   period elapses), the launcher prints an error to stderr and returns 1
@@ -48,14 +60,24 @@ Failure detection:
 
 Output format:
 
-* On success: prints ``{pid} {elapsed}`` to stdout, where ``elapsed`` is
-  the actual binary startup time measured inside the launcher (Popen →
-  ready signal), excluding ``kubectl exec`` / ``python3`` startup overhead.
-* On failure: prints nothing to stdout; error details on stderr.
+* ``start`` success: prints ``{pid} {elapsed}`` to stdout, where
+  ``elapsed`` is the actual binary startup time measured inside the
+  launcher (Popen → ready signal), excluding ``kubectl exec`` /
+  ``python3`` startup overhead.
+* ``start`` failure: prints nothing to stdout; error details on stderr.
+* ``stop`` success: prints ``stopped {elapsed}`` to stdout, where elapsed
+  is the total wall-clock from SIGTERM (including the SIGKILL wait when
+  escalation was needed). Failure: ``alive {elapsed}``.
+* ``stop`` exit codes: 0 = process exited (including "was already gone"
+  -- stopping a stopped process is idempotent); 1 = still alive after
+  SIGKILL + kill-wait (caller reports FAILED); 3 = pidfile missing or
+  unreadable (caller falls back to its legacy pgrep path).
 
-The caller should parse stdout's last line, split on whitespace: first
-field is the PID (digit string), second field (if present) is the elapsed
-time in seconds (float).
+PID identity: before signaling, ``stop`` validates ``/proc/{pid}/cmdline``
+against ``--binary`` (basename match). A stale pidfile whose PID was
+recycled by an unrelated process is treated as "binary already gone"
+(idempotent success, pidfile removed) instead of signaling an innocent
+process.
 """
 
 import argparse
@@ -64,6 +86,9 @@ import socket
 import subprocess
 import sys
 import time
+
+
+_POLL_INTERVAL = 0.2
 
 
 def is_port_ready(host, port, timeout=0.5):
@@ -131,6 +156,108 @@ def build_env(extra_lib_path=None):
     return env
 
 
+# --- pidfile helpers -------------------------------------------------------
+
+
+def read_pid(pidfile):
+    """Return the PID recorded in pidfile, or None if missing/invalid."""
+    try:
+        with open(pidfile) as f:
+            content = f.read().strip()
+    except OSError:
+        return None
+    if not content.isdigit():
+        return None
+    return int(content)
+
+
+def write_pid(pidfile, pid):
+    """Record pid in pidfile. Best effort: a write failure only disables
+    the pidfile-based stop path (caller falls back to pgrep); start itself
+    must not fail because of it."""
+    try:
+        with open(pidfile, 'w') as f:
+            f.write(f'{pid}\n')
+        return True
+    except OSError as e:
+        print(f'standalone_launcher: WARNING: cannot write pidfile '
+              f'{pidfile}: {e}', file=sys.stderr, flush=True)
+        return False
+
+
+def remove_pidfile(pidfile):
+    """Best-effort pidfile removal."""
+    try:
+        os.unlink(pidfile)
+        return True
+    except OSError:
+        return False
+
+
+def parse_stat_state(content):
+    """Extract the process state letter from /proc/{pid}/stat content.
+
+    The stat format is ``pid (comm) state ...`` where comm may contain
+    spaces and parentheses, so state is the token after the LAST ')'.
+    """
+    idx = content.rfind(')')
+    if idx < 0 or idx + 2 > len(content):
+        return ''
+    return content[idx + 2:].split(' ', 1)[0] if content[idx + 1:] else ''
+
+
+def pid_state(pid):
+    """Return the process state letter, or None if /proc entry is gone."""
+    try:
+        with open(f'/proc/{pid}/stat') as f:
+            return parse_stat_state(f.read())
+    except (OSError, ValueError):
+        return None
+
+
+def pid_alive(pid):
+    """True if the process exists and is not a zombie (Z = exited, awaiting
+    reaping -- treated as exited, matching dscli's wait_exit semantics)."""
+    state = pid_state(pid)
+    return state is not None and state != 'Z'
+
+
+def cmdline_matches(raw_cmdline, binary):
+    """True if any argv entry's basename equals binary's basename.
+
+    raw_cmdline is the NUL-separated /proc/{pid}/cmdline content.
+    """
+    args = [a.decode('utf-8', errors='ignore')
+            for a in raw_cmdline.split(b'\x00') if a]
+    if not args:
+        return False
+    base = os.path.basename(binary)
+    return any(os.path.basename(a) == base for a in args)
+
+
+def pid_matches_binary(pid, binary):
+    """Validate that pid still refers to the expected binary (guards against
+    a stale pidfile whose PID the kernel recycled for another process)."""
+    try:
+        with open(f'/proc/{pid}/cmdline', 'rb') as f:
+            return cmdline_matches(f.read(), binary)
+    except OSError:
+        return False
+
+
+def wait_exit(pid, timeout, interval=_POLL_INTERVAL):
+    """Poll until the process exits. Returns True if gone within timeout."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not pid_alive(pid):
+            return True
+        time.sleep(interval)
+    return not pid_alive(pid)
+
+
+# --- start subcommand -------------------------------------------------------
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description='Launch a binary detached from the caller session.')
@@ -142,8 +269,11 @@ def parse_args(argv=None):
                         help='File to redirect binary stdout+stderr (append)')
     parser.add_argument('--lib-path',
                         help='Path to prepend to LD_LIBRARY_PATH for the binary')
+    parser.add_argument('--pidfile',
+                        help='File to record the launched PID so the stop '
+                             'subcommand can address the exact process')
     parser.add_argument('--ready-file',
-                        help='If set, poll for this file\'s existence until '
+                        help="If set, poll for this file's existence until "
                              'ready (authoritative readiness signal, e.g. '
                              'worker ready_check_path). Relative paths are '
                              'resolved against --cwd.')
@@ -167,7 +297,7 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
-def main(argv=None):
+def main_start(argv=None):
     args = parse_args(argv)
 
     binary_argv = list(args.argv)
@@ -216,6 +346,12 @@ def main(argv=None):
         except OSError:
             pass
 
+    # Record the PID for the stop subcommand. Written before readiness so
+    # stop can address the process even if readiness is slow; removed again
+    # on the early-exit failure path below.
+    if args.pidfile:
+        write_pid(args.pidfile, proc.pid)
+
     # Readiness polling priority: --ready-file (authoritative, e.g. worker
     # ready_check_path) > --port (TCP connect, e.g. coordinator) > none
     # (grace-poll proc.poll() to catch early exits). This mirrors dscli's
@@ -237,6 +373,8 @@ def main(argv=None):
         rc = proc.poll()
         if rc is not None:
             elapsed = time.monotonic() - t_launch
+            if args.pidfile:
+                remove_pidfile(args.pidfile)
             print(f'standalone_launcher: binary exited early with code {rc} '
                   f'after {elapsed:.3f}s',
                   file=sys.stderr, flush=True)
@@ -262,6 +400,8 @@ def main(argv=None):
     rc = proc.poll()
     if rc is not None:
         elapsed = time.monotonic() - t_launch
+        if args.pidfile:
+            remove_pidfile(args.pidfile)
         print(f'standalone_launcher: binary exited with code {rc} '
               f'after {elapsed:.3f}s',
               file=sys.stderr, flush=True)
@@ -281,6 +421,92 @@ def main(argv=None):
           f'printed PID for caller verify',
           file=sys.stderr, flush=True)
     return 0
+
+
+# --- stop subcommand -------------------------------------------------------
+
+
+def parse_stop_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description='Gracefully stop a process recorded by the start '
+                    'subcommand (SIGTERM -> wait -> SIGKILL escalation).')
+    parser.add_argument('--pidfile', required=True,
+                        help='Pidfile written by the start subcommand')
+    parser.add_argument('--binary', required=True,
+                        help='Binary basename used to validate the recorded '
+                             'PID still refers to the expected process')
+    parser.add_argument('--grace', type=float, default=180.0,
+                        help='Max seconds to wait after SIGTERM before '
+                             'escalating to SIGKILL (default: 180)')
+    parser.add_argument('--kill-wait', type=float, default=10.0,
+                        help='Max seconds to wait after SIGKILL (default: 10)')
+    parser.add_argument('--interval', type=float, default=_POLL_INTERVAL,
+                        help='Exit-polling interval in seconds '
+                             '(default: 0.2)')
+    return parser.parse_args(argv)
+
+
+def main_stop(argv=None):
+    args = parse_stop_args(argv)
+
+    pid = read_pid(args.pidfile)
+    if pid is None:
+        print('no-pidfile', file=sys.stderr, flush=True)
+        return 3
+
+    t0 = time.monotonic()
+
+    # Stale/recycled PID: if the recorded process is gone, or exists but is
+    # not our binary, the launched process is already gone -- idempotent
+    # success (never signal an unrelated process).
+    if not pid_alive(pid) or not pid_matches_binary(pid, args.binary):
+        remove_pidfile(args.pidfile)
+        print('stopped 0.00', flush=True)
+        return 0
+
+    try:
+        os.kill(pid, 15)  # SIGTERM
+    except ProcessLookupError:
+        remove_pidfile(args.pidfile)
+        print('stopped 0.00', flush=True)
+        return 0
+
+    if wait_exit(pid, args.grace, args.interval):
+        remove_pidfile(args.pidfile)
+        print(f'stopped {time.monotonic() - t0:.2f}', flush=True)
+        return 0
+
+    print(f'standalone_launcher: process {pid} still alive after SIGTERM '
+          f'grace {args.grace}s, escalating to SIGKILL',
+          file=sys.stderr, flush=True)
+    try:
+        os.kill(pid, 9)  # SIGKILL
+    except ProcessLookupError:
+        remove_pidfile(args.pidfile)
+        print(f'stopped {time.monotonic() - t0:.2f}', flush=True)
+        return 0
+
+    if wait_exit(pid, args.kill_wait, args.interval):
+        remove_pidfile(args.pidfile)
+        print(f'stopped {time.monotonic() - t0:.2f}', flush=True)
+        return 0
+
+    print(f'alive {time.monotonic() - t0:.2f}', flush=True)
+    return 1
+
+
+def main(argv=None):
+    """Dispatch: 'stop' -> stop subcommand, everything else -> start.
+
+    The start path accepts an optional leading 'start' word (and tolerates
+    its absence so callers that predate the subcommand split keep working).
+    """
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == 'stop':
+        return main_stop(argv[1:])
+    if argv and argv[0] == 'start':
+        argv = argv[1:]
+    return main_start(argv)
 
 
 if __name__ == '__main__':

@@ -508,6 +508,37 @@ Backed by `tests/kvtest/deploy_coordinator.py`, `deploy_worker.py`, `deploy_comm
   its introduction (`83e794791`). Covered by `test_deploy_common.py` (`TestStopServiceStandalone`:
   process-exits / already-absent / refuses-to-exit / no-or-true-in-pkill; `TestStartServiceStandaloneCrashDetect`:
   crash-detected / started-when-survives; `TestStartService::test_start_fails_when_process_crashes_immediately`).
+- standalone_launcher.py start/stop subcommands + pidfile: the launcher was upgraded from a single-action start
+  script to a two-subcommand tool (start + stop), mirroring dscli's start/stop structure. The stop loop
+  (SIGTERM → 0.2s /proc poll → SIGKILL → kill-wait) runs in-pod via one ``kubectl exec``, eliminating the
+  deploy-side external polling that caused 960+ kubectl round-trips on a 32-node client stop and the 3s
+  single-shot pgrep on worker stop. Pidfile (``{remote_dir}/{binary_name}.pid``) is the persistent state
+  shared between start (writes after Popen) and stop (reads for exact-PID signaling + ``/proc/{pid}/cmdline``
+  identity check to guard against PID recycling). Exit codes: 0=exited (incl. idempotent "already gone"),
+  1=alive after SIGKILL, 3=no pidfile (deploy falls back to legacy pkill + pgrep polling). Covered by
+  ``test_standalone_launcher.py`` (TestPidfileHelpers / TestParseStatState / TestCmdlineMatches /
+  TestStopSubcommand: missing-pidfile / already-gone / recycled-pid / sigterm-exit / sigkill-escalation /
+  still-alive / TestStopDispatch / TestStartWritesPidfile).
+- kvtest binary TERM == /stop alignment (``main.cpp``): ``SignalHandler`` now sets ``gStopRequested`` (atomic)
+  in addition to ``gRunning``. The main loop sleeps in 200ms chunks (was 3s) so a TERM is observed promptly.
+  On shutdown, if ``gStopRequested`` is set, the main thread calls ``server.StopNow()`` + ``worker->RequestStop()``
+  + ``cacheReader->RequestStop()`` — the same immediate stops the /stop handler applies — before the pre-drain
+  sleep. This makes SIGTERM and HTTP /stop equivalent (both trigger ``WriteSummary`` via ``metrics.Stop()``
+  in teardown). ``HttpServer::StopNow()`` and ``BrpcControlServer::StopNow()`` added as public wrappers around
+  ``dispatcher_.StopNow()``. The handler itself only touches atomics (StopNow takes a mutex → not
+  async-signal-safe); the mutex-holding calls run on the main thread.
+- ``--start-timeout`` / ``--stop-timeout`` CLI parameters: worker/coordinator default 90s start / 180s stop
+  (matching dscli); client default 5s / 5s. ``start_service_standalone`` accepts ``start_timeout`` (was
+  ``min(timeout, 60)`` hardcoded); ``stop_service_standalone`` accepts ``grace`` (was fixed ``sleep(3)``);
+  ``cmd_stop_shared`` standalone branch reads ``args.stop_timeout`` + ``args.remote_dir``. ``deploy_client``
+  ``do_stop`` accepts ``stop_timeout``; ``start_node`` passes ``--port {listen_port}`` + ``--pidfile`` +
+  ``--ready-timeout {start_timeout}`` to the launcher (was no-signal grace-poll → misleading "not ready
+  within 2.0s" on every client). Worker/coordinator ``stop`` subparser gained ``--remote-dir`` (was missing).
+- collect tar-stream fix: ``collect_logs_from_pod`` now does a merged ``ls -d`` existence check on optional
+  extras (``resource_monitor.csv`` legacy path + ``stdout.log``) before building the tar list, filtering out
+  missing files so ``tar`` does not abort with rc≠0. ``_collect_via_tar_stream`` attempts partial extraction
+  even when tar rc≠0 but stdout is non-empty. Fixes the 100% "tar stream failed" observed on worker pods where
+  ``/tmp/resource_monitor.csv`` did not exist (procmon writes to ``log_dir``, not ``/tmp``).
 - `deploy_jf.py` is the JF mock pod lifecycle CLI (deploy/start/stop/check/clean/collect). It is
   self-contained (uses its own `_kubectl_exec`, not the shared `deploy_common` primitives) because the JF
   mock is a single Python script (`mock_jf_server.py`) with no whl, no dscli, and no per-pod config file.

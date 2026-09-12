@@ -667,9 +667,21 @@ class Deployer:
                         '--binary', shlex.quote(f'{self.remote_work_dir}/kvtest'),
                         '--cwd', shlex.quote(self.remote_work_dir),
                         '--log', shlex.quote(f'{self.remote_work_dir}/run.log'),
+                        '--pidfile', shlex.quote(f'{self.remote_work_dir}/kvtest.pid'),
                     ]
                     if ld_path:
                         launcher_parts.extend(['--lib-path', shlex.quote(ld_path)])
+                    # kvtest client listens on listen_port (HTTP /stop /summary
+                    # gateway). Pass --port so the launcher polls TCP connect
+                    # instead of falling back to the 2s no-signal grace path
+                    # (which prints a misleading "not ready within 2.0s" on
+                    # every client that takes >2s to bind).
+                    port = node.get('port', self.listen_port)
+                    if port:
+                        launcher_parts.extend(['--port', str(port),
+                                               '--host', '127.0.0.1',
+                                               '--ready-timeout',
+                                               str(getattr(self, 'start_timeout', 5))])
                     launcher_parts.extend(['--', f'config_{instance_id}.json'])
                     start_cmd = ' '.join(launcher_parts)
                     result = self.run_on(node, start_cmd, check=False,
@@ -864,7 +876,25 @@ class Deployer:
         log_info('\n--- install done, starting ---')
         return self.do_start()
 
-    def do_stop(self):
+    def do_stop(self, stop_timeout=5):
+        """Stop all kvtest instances.
+
+        Single-phase: each node issues one ``standalone_launcher.py stop``
+        which sends SIGTERM, polls for exit (up to ``stop_timeout`` seconds),
+        and escalates to SIGKILL if needed. Since the kvtest binary's SIGTERM
+        handler now mirrors the HTTP /stop RPC (StopNow + RequestStop on the
+        main thread), TERM and /stop are equivalent -- no need for the prior
+        4-phase HTTP /stop + external pgrep polling + TERM + KILL cascade.
+
+        Falls back to the legacy HTTP /stop + external pgrep polling path
+        when no pidfile exists (process started by an older deploy or the
+        nohup fallback path).
+
+        ``stop_timeout`` (default 5s, overridable via --stop-timeout) is the
+        grace period before SIGKILL escalation; the kvtest binary's teardown
+        has a fixed ~5s sleep (pre-drain 3s + post 2s) so 5s is the minimum
+        that avoids killing mid-summary-write.
+        """
         if not self.nodes:
             log_info('No nodes in deploy config')
             return
@@ -872,132 +902,118 @@ class Deployer:
         log_info(f'Stopping {len(self.nodes)} instances...')
         timings = []
 
-        def http_stop(node):
-            """Stop one instance via the brpc HTTP gateway (path preserved as
-            /stop, mapped to KvtestControl::Stop via brpc restful mapping)."""
-            port = node.get('port', self.listen_port)
-            url = f'http://localhost:{port}/stop'
-            # Try curl first (most common in containers)
-            r = self.run_on(node, f'curl -sf -X POST {url} --max-time 3', check=False, timeout=5)
-            if r.returncode == 0:
-                return True
-            # Try wget
-            r = self.run_on(node, f'wget -qO- --post-data="" --timeout=3 {url}', check=False, timeout=5)
-            if r.returncode == 0:
-                return True
-            # Try python3
-            r = self.run_on(node,
-                            f'python3 -c "'
-                            f'from urllib.request import urlopen,Request;'
-                            f'r=Request(\'http://localhost:{port}/stop\',data=b\'\',method=\'POST\');'
-                            f'urlopen(r,timeout=3);print(\'ok\')"',
-                            check=False, timeout=5)
-            if r.returncode == 0 and 'ok' in (r.stdout or ''):
-                return True
-            return False
-
         def stop_one(node):
             target = self._exec_target(node)
-            # Check if kvtest process exists before trying HTTP stop.
-            # kubectl exec can be slow under load; treat timeout as
-            # "process may exist" so we still attempt HTTP stop.
-            try:
-                r = self.run_on(node, 'pgrep -x kvtest', check=False, timeout=10)
-            except subprocess.TimeoutExpired:
-                log_info(f'  {target} -> pgrep timed out, assuming process alive')
-                r = None
-            if r is not None and (r.returncode != 0 or not r.stdout.strip()):
-                log_info(f'  {target} -> no kvtest process, skipped')
-                return (target, None)
+            transport = self._transport(node)
+            pidfile = f'{self.remote_work_dir}/kvtest.pid'
             t0 = time.monotonic()
-            ok = http_stop(node)
-            elapsed = time.monotonic() - t0
-            timings.append((target, elapsed, bool(ok)))
-            return (target, ok)
 
-        # Phase 1: graceful HTTP stop
-        ok = 0
+            # Check if pidfile exists (launcher start wrote it). kubectl exec
+            # / ssh to test -f; localhost uses os.path.exists.
+            if transport == 'localhost':
+                has_pidfile = os.path.exists(pidfile)
+            else:
+                r = self.run_on(node, f'test -f {pidfile}', check=False, timeout=5)
+                has_pidfile = r.returncode == 0
+
+            if has_pidfile:
+                # Primary path: launcher stop (in-pod TERM → poll → KILL).
+                # One round-trip replaces the prior 4-phase cascade.
+                launcher = f'{self.remote_work_dir}/standalone_launcher.py'
+                cmd = (f'python3 {shlex.quote(launcher)} stop '
+                       f'--pidfile {shlex.quote(pidfile)} '
+                       f'--binary kvtest --grace {stop_timeout}')
+                r = self.run_on(node, cmd, check=False,
+                                timeout=stop_timeout + 10 + 30)
+                elapsed = time.monotonic() - t0
+                ok = r.returncode == 0
+                # Parse launcher stdout last line for elapsed detail.
+                detail = ''
+                if r.stdout:
+                    last = r.stdout.strip().splitlines()[-1].strip()
+                    parts = last.split()
+                    if len(parts) >= 2:
+                        try:
+                            detail = f' (elapsed={float(parts[1]):.2f}s)'
+                        except ValueError:
+                            pass
+                if ok:
+                    log_info(f'  {target} -> stopped{detail}')
+                else:
+                    log_info(f'  {target} -> FAILED: still running after '
+                             f'TERM+KILL{detail}')
+                timings.append((target, elapsed, ok))
+                return ok
+
+            # Fallback: no pidfile (old version or nohup start). Use the
+            # legacy HTTP /stop + external pgrep polling path.
+            return self._stop_one_legacy(node, target, t0, timings)
+
         with ThreadPoolExecutor(max_workers=len(self.nodes) or 1) as pool:
             futures = [pool.submit(stop_one, n) for n in self.nodes]
             for future in as_completed(futures):
-                try:
-                    target, result = future.result()
-                except Exception as e:
-                    log_info(f'  ERROR during stop: {e}')
-                    continue
-                if result is None:
-                    pass
-                elif result is True:
-                    ok += 1
-                    log_info(f'  {target} -> OK (graceful)')
-                else:
-                    log_info(f'  {target} -> HTTP stop failed')
+                future.result()
 
-        # Phase 2: poll for graceful shutdown instead of blind sleep.
-        # HTTP stop (Phase 1) sets running_=false; the process then
-        # flushes logs, writes summary, closes connections. Polling
-        # check_alive detects actual exit so we proceed to SIGTERM only
-        # when still needed, without wasting wall-clock on processes
-        # that already exited (and without force-killing too early when
-        # the process needs more time to finish writing).
-        def check_alive(node):
-            r = self.run_on(node,
-                            'pgrep -x kvtest 2>/dev/null',
-                            check=False)
-            return r.returncode == 0
+        ok = sum(1 for _, _, ok in timings if ok)
+        _print_timings('stop', timings)
 
-        log_info(f'Waiting for graceful shutdown (up to {_GRACEFUL_STOP_TIMEOUT}s)...')
+    def _stop_one_legacy(self, node, target, t0, timings):
+        """Legacy stop path for nodes without a pidfile: HTTP /stop + external
+        pgrep polling + SIGTERM/SIGKILL escalation. Kept for backward compat
+        with processes started before the pidfile feature or via nohup."""
+        port = node.get('port', self.listen_port)
+        url = f'http://localhost:{port}/stop'
+        r = self.run_on(node, f'curl -sf -X POST {url} --max-time 3',
+                        check=False, timeout=5)
+        if r.returncode != 0:
+            r = self.run_on(node, f'wget -qO- --post-data="" --timeout=3 {url}',
+                            check=False, timeout=5)
+        http_ok = r.returncode == 0
+
+        # Poll for graceful exit (external, since no pidfile for in-pod wait).
         deadline = time.monotonic() + _GRACEFUL_STOP_TIMEOUT
-        alive = list(self.nodes)
-        while alive and time.monotonic() < deadline:
-            alive = []
-            with ThreadPoolExecutor(max_workers=len(self.nodes) or 1) as pool:
-                check_futures = {pool.submit(check_alive, n): n for n in self.nodes}
-                for f in as_completed(check_futures):
-                    if f.result():
-                        alive.append(check_futures[f])
-            if alive:
-                time.sleep(_POLL_INTERVAL)
-        if alive:
-            log_info(f'  {len(alive)} nodes still running after {_GRACEFUL_STOP_TIMEOUT}s')
-        else:
-            log_info('  All processes exited gracefully')
+        while time.monotonic() < deadline:
+            r = self.run_on(node, 'pgrep -x kvtest 2>/dev/null', check=False)
+            if r.returncode != 0:
+                break
+            time.sleep(_POLL_INTERVAL)
 
-        # Phase 3: SIGTERM remaining processes
-        def kill_remaining(node, sig=''):
-            return self.run_on(
-                node,
-                f"for p in $(pgrep -x kvtest 2>/dev/null); do "
-                f"kill {sig} $p 2>/dev/null; done; "
-                f"for p in $(pgrep -x procmon.py 2>/dev/null); do "
-                f"kill {sig} $p 2>/dev/null; done",
-                check=False, timeout=10)
+        elapsed = time.monotonic() - t0
+        r = self.run_on(node, 'pgrep -x kvtest 2>/dev/null', check=False)
+        if r.returncode != 0:
+            log_info(f'  {target} -> stopped (legacy, HTTP ok={http_ok})')
+            timings.append((target, elapsed, True))
+            return True
 
-        with ThreadPoolExecutor(max_workers=len(self.nodes) or 1) as pool:
-            kill_futures = [pool.submit(kill_remaining, n) for n in self.nodes]
-            for f in as_completed(kill_futures):
-                pass
-
+        # SIGTERM remaining
+        self.run_on(node,
+                    f"for p in $(pgrep -x kvtest 2>/dev/null); do "
+                    f"kill $p 2>/dev/null; done; "
+                    f"for p in $(pgrep -x procmon.py 2>/dev/null); do "
+                    f"kill $p 2>/dev/null; done",
+                    check=False, timeout=10)
         time.sleep(2)
 
-        # Phase 4: SIGKILL only nodes still alive
-        alive = []
-        with ThreadPoolExecutor(max_workers=len(self.nodes) or 1) as pool:
-            check_futures = {pool.submit(check_alive, n): n for n in self.nodes}
-            for f in as_completed(check_futures):
-                if f.result():
-                    alive.append(check_futures[f])
+        # SIGKILL if still alive
+        r = self.run_on(node, 'pgrep -x kvtest 2>/dev/null', check=False)
+        if r.returncode == 0:
+            self.run_on(node,
+                        f"for p in $(pgrep -x kvtest 2>/dev/null); do "
+                        f"kill -9 $p 2>/dev/null; done; "
+                        f"for p in $(pgrep -x procmon.py 2>/dev/null); do "
+                        f"kill -9 $p 2>/dev/null; done",
+                        check=False, timeout=10)
+            time.sleep(1)
 
-        if alive:
-            log_info(f'Force killing {len(alive)} remaining processes...')
-            with ThreadPoolExecutor(max_workers=len(alive)) as pool:
-                kill9_futures = [pool.submit(kill_remaining, n, '-9') for n in alive]
-                for f in as_completed(kill9_futures):
-                    pass
-
-        log_info(f'Stop result: {ok}/{len(self.nodes)} graceful, '
-                 f'{len(alive)} force killed')
-        _print_timings('stop', timings)
+        r = self.run_on(node, 'pgrep -x kvtest 2>/dev/null', check=False)
+        ok = r.returncode != 0
+        elapsed = time.monotonic() - t0
+        if ok:
+            log_info(f'  {target} -> stopped (legacy, after KILL)')
+        else:
+            log_info(f'  {target} -> FAILED: still running after KILL')
+        timings.append((target, elapsed, ok))
+        return ok
 
     def do_clean(self):
         results = []
@@ -1246,7 +1262,7 @@ class Deployer:
 
         elapsed = int(time.time() - start)
         log_info(f'\n--- Run finished ({elapsed}s elapsed) ---')
-        self.do_stop()
+        self.do_stop(stop_timeout=getattr(self, 'stop_timeout', 5))
         self.do_collect(summary_timeout=5)
 
 
@@ -1737,6 +1753,10 @@ def main():
                        parents=[shared])
     p.add_argument('--jemalloc_prof_conf',
                    help='Jemalloc MALLOC_CONF; default prof_prefix is <output_dir>/jemalloc/kvtest_<instance_id>')
+    p.add_argument('--start-timeout', type=int, default=5,
+                   help='Max seconds to wait for a kvtest client to become '
+                        'ready after launch (default: 5). The launcher polls '
+                        'TCP connect on the HTTP control port.')
     p.add_argument('deploy_json', help='Path to deploy.json')
     p.add_argument('config_template', nargs='?', default='config/config.json.example',
                    help='Config template (default: config/config.json.example)')
@@ -1750,11 +1770,20 @@ def main():
     p.add_argument('--jemalloc_prof_conf',
                    help='Jemalloc MALLOC_CONF for a kvtest built with -b bazel -x on; '
                         'default prof_prefix is <output_dir>/jemalloc/kvtest_<instance_id>')
+    p.add_argument('--start-timeout', type=int, default=5,
+                   help='Max seconds to wait for a kvtest client to become '
+                        'ready after launch (default: 5). The launcher polls '
+                        'TCP connect on the HTTP control port.')
 
     # stop
-    p = sub.add_parser('stop', help='Stop all instances (HTTP POST /stop -> KvtestControl::Stop)', parents=[shared])
+    p = sub.add_parser('stop', help='Stop all instances (launcher stop: SIGTERM -> SIGKILL)',
+                       parents=[shared])
     p.add_argument('deploy_json')
     p.add_argument('config_template', nargs='?', default='config/config.json.example')
+    p.add_argument('--stop-timeout', type=int, default=5,
+                   help='Max seconds to wait after SIGTERM before '
+                        'escalating to SIGKILL (default: 5). The kvtest '
+                        'binary teardown has a fixed ~5s sleep.')
 
     # collect
     p = sub.add_parser('collect', help='Collect output files and SDK logs', parents=[shared])
@@ -1823,6 +1852,7 @@ def main():
 
     if args.command in ('start', 'deploy'):
         deployer.jemalloc_prof_conf = args.jemalloc_prof_conf
+        deployer.start_timeout = getattr(args, 'start_timeout', 5)
         if args.jemalloc_prof_conf is not None:
             try:
                 normalize_jemalloc_prof_conf(args.jemalloc_prof_conf, 'logs', 0)
@@ -1841,7 +1871,7 @@ def main():
         if duration > 0:
             deployer.do_run(duration)
     elif args.command == 'stop':
-        deployer.do_stop()
+        deployer.do_stop(stop_timeout=getattr(args, 'stop_timeout', 5))
     elif args.command == 'collect':
         node_slice = None
         if getattr(args, 'count', None) is not None or getattr(args, 'offset', 0) > 0:

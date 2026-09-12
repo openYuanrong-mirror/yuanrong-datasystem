@@ -24,6 +24,13 @@ public:
     void Start();
     void Stop();
 
+    // Drop queued notify work + stop the cache reader without joining, same
+    // as the /stop handler does. Called from main's shutdown path when the
+    // process was stopped via SIGTERM so the TERM path mirrors /stop (the
+    // calls must run on the main thread: StopNow takes a mutex and is not
+    // async-signal-safe, so the signal handler only flips an atomic).
+    void StopNow() { dispatcher_.StopNow(); }
+
     size_t NotifyQueueSize() { return dispatcher_.QueueSize(); }
 
     void SetCacheReader(CacheReader *reader) { dispatcher_.SetCacheReader(reader); }

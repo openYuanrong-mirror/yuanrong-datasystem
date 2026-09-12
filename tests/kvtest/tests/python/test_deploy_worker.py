@@ -77,19 +77,19 @@ class TestStartWorker(unittest.TestCase):
         pod = {'name': 'p1', 'ip': '10.0.0.1'}
         cfg = {'worker_address': {'value': 'old'}}
         ok = start_worker(pod, 'default', cfg, 31501, '/tmp/worker.config',
-                          enable_procmon=True, procmon_remote_dir='/tmp',
+                          enable_procmon=True,
                           numactl_opts='-N 0', timeout=10)
         self.assertTrue(ok)
         mock_start.assert_called_once_with(
             pod, 'default', cfg, '/tmp/worker.config', 31501,
-            PROCESS_NAME, True, '/tmp',
+            PROCESS_NAME, True,
             numactl_opts='-N 0', timeout=10)
 
     @patch('deploy_worker.start_service', return_value=True)
     def test_no_numactl_by_default(self, mock_start):
         pod = {'name': 'p1', 'ip': '10.0.0.1'}
         start_worker(pod, 'default', {}, 31501, '/tmp/worker.config',
-                     enable_procmon=False, procmon_remote_dir='/tmp',
+                     enable_procmon=False,
                      numactl_opts=None, timeout=10)
         self.assertIsNone(_kw(mock_start.call_args)['numactl_opts'])
 
@@ -109,7 +109,7 @@ class TestCmdStart(unittest.TestCase):
     def _args(self, **overrides):
         defaults = dict(namespace='default', port=31501,
                         remote_config='/tmp/worker.config',
-                        set=[], enable_procmon=True, procmon_dir=None,
+                        set=[], enable_procmon=True,
                         numa_nodes=None, cpu_bind=None, timeout=10,
                         jemalloc_prof_options=None, standalone=False,
                         config=None)
@@ -136,8 +136,6 @@ class TestCmdStart(unittest.TestCase):
                              '10.0.0.1:31501')
             self.assertEqual(_pos(c1)[2][ADDRESS_KEY]['value'],
                              '10.0.0.2:31501')
-            # procmon_dir resolved from log_dir in the config
-            self.assertEqual(_kw(c0)['procmon_remote_dir'], '/var/log/ds')
             # each pod gets a distinct deep-copied config
             self.assertIsNot(_pos(c0)[2], _pos(c1)[2])
         finally:
@@ -186,19 +184,6 @@ class TestCmdStart(unittest.TestCase):
             cmd_start(args, [{'name': 'p1', 'ip': '10.0.0.1'}])
             cfg = _pos(mock_start.call_args)[2]
             self.assertEqual(cfg['rpc_thread_num']['value'], 128)
-        finally:
-            os.unlink(cfg_path)
-
-    @patch('deploy_worker.start_worker', return_value=True)
-    def test_procmon_dir_falls_back_to_remote_config_dir(self, mock_start):
-        # No log_dir in config -> procmon_dir defaults to the remote-config
-        # directory (dirname of /tmp/worker.config == /tmp).
-        cfg_path = _write_config({'worker_address': {'value': '0.0.0.0:0'}})
-        try:
-            args = self._args(config=cfg_path)
-            cmd_start(args, [{'name': 'p1', 'ip': '10.0.0.1'}])
-            self.assertEqual(_kw(mock_start.call_args)['procmon_remote_dir'],
-                             '/tmp')
         finally:
             os.unlink(cfg_path)
 
