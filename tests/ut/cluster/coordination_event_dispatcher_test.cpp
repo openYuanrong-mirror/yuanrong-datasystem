@@ -101,6 +101,22 @@ TEST(TopologyRoleWatchPlanTest, BuildsOnlyRoleRequiredExactAndPrefixWatches)
     EXPECT_TRUE(watches[1].key.empty());
 }
 
+TEST(TopologyRoleWatchPlanTest, WorkerWatchPlansExcludeUbHealth)
+{
+    for (const std::string clusterName : { "", "watch" }) {
+        std::unique_ptr<TopologyKeyHelper> keys;
+        DS_ASSERT_OK(TopologyKeyHelper::Create(clusterName, keys));
+        for (const auto role : { TopologyRuntimeRole::WORKER, TopologyRuntimeRole::UNIFIED_ETCD }) {
+            std::vector<WatchKey> watches;
+            DS_ASSERT_OK(BuildTopologyRoleWatchPlan(role, "127.0.0.1:1", *keys, WATCH_FROM_NOW, watches));
+            ASSERT_FALSE(watches.empty());
+            EXPECT_TRUE(std::none_of(watches.begin(), watches.end(), [&](const WatchKey &watch) {
+                return watch.tableName == keys->UbHealthTable();
+            }));
+        }
+    }
+}
+
 TEST(TopologyRoleWatchPlanTest, PropagatesAuthorityRevisionToAllCurrentUnifiedEtcdTargets)
 {
     constexpr int64_t authorityRevision = 9;

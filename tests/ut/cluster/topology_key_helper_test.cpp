@@ -150,6 +150,20 @@ TEST(TopologyKeyHelperTest, EnforcesClusterNameContractWithoutNormalization)
     }
 }
 
+TEST(TopologyKeyHelperTest, UbHealthKeyValidatesAddressesWithoutChangingOutputOnFailure)
+{
+    std::string key;
+    for (const std::string address : { "127.0.0.1:7001", "[::1]:7001" }) {
+        DS_ASSERT_OK(TopologyKeyHelper::UbHealthKey(address, key));
+        EXPECT_EQ(key, address);
+    }
+    for (const std::string address : { "", "127.0.0.1", "bad/address:7001", "127.0.0.1:07001" }) {
+        key = "unchanged";
+        EXPECT_EQ(TopologyKeyHelper::UbHealthKey(address, key).GetCode(), K_INVALID);
+        EXPECT_EQ(key, "unchanged");
+    }
+}
+
 TEST(TopologyKeyHelperTest, RejectsPrefixUseOnExactCollections)
 {
     std::string key = "unchanged";

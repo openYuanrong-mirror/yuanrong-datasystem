@@ -287,6 +287,13 @@ Status TopologyKeyHelper::MembershipKey(const std::string &address, std::string 
     return Status::OK();
 }
 
+Status TopologyKeyHelper::UbHealthKey(const std::string &address, std::string &key)
+{
+    RETURN_IF_NOT_OK(ValidateAddress(address));
+    key = address;
+    return Status::OK();
+}
+
 Status TopologyKeyHelper::ScaleInMetadataDoneKey(uint64_t batchEpoch, const std::string &sourceId,
                                                  const std::string &taskId, std::string &key)
 {

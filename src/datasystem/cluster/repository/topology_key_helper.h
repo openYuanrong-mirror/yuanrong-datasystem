@@ -170,6 +170,14 @@ public:
     static Status MembershipKey(const std::string &address, std::string &key);
 
     /**
+     * @brief Validate a canonical Worker address and build its exact UB health key.
+     * @param[in] address Canonical Worker address.
+     * @param[out] key Exact relative key; unchanged on failure.
+     * @return K_OK on success; K_INVALID for an invalid address.
+     */
+    static Status UbHealthKey(const std::string &address, std::string &key);
+
+    /**
      * @brief Validate a ScaleIn metadata-done marker identity and build its exact relative key.
      * @param[in] batchEpoch Active ScaleIn batch epoch.
      * @param[in] sourceId Stable source member ID.

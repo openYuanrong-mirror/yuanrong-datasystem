@@ -1075,6 +1075,38 @@ private:
     bool originalEnableUrma_ = false;
 };
 
+#ifdef USE_URMA
+TEST_F(CoordinatorBackendFaultIsolationTest, HealthyWorkersPublishAndConsumeUbHealthSnapshots)
+{
+    DS_ASSERT_OK(GetCoordinatorProxy());
+    std::unique_ptr<cluster::TopologyKeyHelper> keys;
+    DS_ASSERT_OK(cluster::TopologyKeyHelper::Create(GetTestClusterName(), keys));
+    DS_ASSERT_OK(cluster_->WaitForExpectedResult([&] {
+        for (uint32_t workerIndex = 0; workerIndex < 3; ++workerIndex) {
+            HostPort worker;
+            RETURN_IF_NOT_OK(cluster_->GetWorkerAddr(workerIndex, worker));
+            std::vector<KeyValueEntry> kvs;
+            int64_t revision = 0;
+            RETURN_IF_NOT_OK(coordinatorProxy_->Range(
+                keys->UbHealthTable() + "/" + worker.ToString(), "", kvs, revision));
+            CHECK_FAIL_RETURN_STATUS(kvs.size() == 1 && !kvs.front().value.empty(), K_TRY_AGAIN, "Waiting for UB health");
+        }
+        return Status::OK();
+    }, WAIT_TOPOLOGY_TIMEOUT_SEC, K_OK));
+    constexpr char consumeInject[] = "PeerUbAdmission.ReplaceGlobalSummaries.afterCommit";
+    for (uint32_t workerIndex = 0; workerIndex < 3; ++workerIndex) {
+        DS_ASSERT_OK(cluster_->SetInjectAction(WORKER, workerIndex, consumeInject, "call()"));
+    }
+    DS_ASSERT_OK(cluster_->WaitForExpectedResult([&] {
+        for (uint32_t workerIndex = 0; workerIndex < 3; ++workerIndex) {
+            uint64_t count = 0;
+            RETURN_IF_NOT_OK(cluster_->GetInjectActionExecuteCount(WORKER, workerIndex, consumeInject, count));
+            CHECK_FAIL_RETURN_STATUS(count > 0, K_TRY_AGAIN, "Waiting for UB health consumption");
+        }
+        return Status::OK();
+    }, WAIT_TOPOLOGY_TIMEOUT_SEC, K_OK));
+}
+#endif
 class StaleTopologyBootstrapTest : public CoordinatorBackendClusterTest,
                                    public testing::WithParamInterface<CoordinationBackendType> {
 public:
