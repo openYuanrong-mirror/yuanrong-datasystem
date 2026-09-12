@@ -161,7 +161,7 @@ Status ValidateRelativeKey(TopologyCoordinationKeyKind kind, const std::string &
     } else if (kind == TopologyCoordinationKeyKind::MEMBERSHIP && !relative.empty()) {
         RETURN_IF_NOT_OK(cluster::TopologyKeyHelper::MembershipKey(relative, canonical));
     } else if (kind == TopologyCoordinationKeyKind::UB_HEALTH && !relative.empty()) {
-        RETURN_IF_NOT_OK(cluster::TopologyKeyHelper::MembershipKey(relative, canonical));
+        RETURN_IF_NOT_OK(cluster::TopologyKeyHelper::UbHealthKey(relative, canonical));
     } else if (kind == TopologyCoordinationKeyKind::SCALE_IN_METADATA_DONE && !relative.empty()) {
         RETURN_IF_NOT_OK(ValidateScaleInMetadataDoneKey(relative));
     } else if (kind == TopologyCoordinationKeyKind::EVICTION_POLICY_ROLLOUT) {

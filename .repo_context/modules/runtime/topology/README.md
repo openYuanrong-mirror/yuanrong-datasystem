@@ -406,6 +406,8 @@
   O(N) snapshot into `PeerUbAdmission`. Coordinator validates canonical addresses, allows same-table ranges, rejects
   collection-root mutations and cross-table ranges, and applies ordinary per-cluster recovery admission. Workers with
   URMA disabled do not start the lease-sidecar sync loop.
+  `UbHealthKey` validates addresses independently of membership key semantics. Workers use Range polling for UB health;
+  their Coordinator and unified-ETCD watch plans do not include the UB health table.
   Missing leased records clear global quarantine, malformed live records preserve the last accepted quarantine, and
   neither path erases process-local failure evidence. Topology membership and Failure
   planning remain the only authoritative ownership inputs.

@@ -346,6 +346,7 @@ ds_cc_test(
     deps = OC_CLIENT_COMMON_DEPS + [
         "//src/datasystem/client/object_cache:object_client_impl",
         "//src/datasystem/client/object_cache/client_worker_api:iclient_worker_api",
+        "//src/datasystem/cluster:cluster_topology_keyspace",
         "//src/datasystem/common/immutable_string:immutable_string",
         "//src/datasystem/common/util:uuid_generator",
         "@securec",
