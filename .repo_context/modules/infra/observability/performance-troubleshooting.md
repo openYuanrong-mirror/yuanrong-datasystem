@@ -8,12 +8,15 @@
   - behavior note | troubleshooting reference
 - Primary code paths:
   - `src/datasystem/worker/worker_main.cpp`
+  - `src/datasystem/worker/object_cache/service/worker_query_and_get_impl.cpp`
+  - `src/datasystem/common/rdma/urma_manager.cpp`
+  - `src/datasystem/common/rdma/urma_resource.cpp`
   - `src/datasystem/common/log/*`
   - `src/datasystem/common/metrics/*`
   - `tests/perf`
   - `tests/st`
 - Last verified against source:
-  - `2026-04-13`
+  - `2026-09-12`
 - Related design docs:
   - `.repo_context/modules/infra/observability/diagnosis-and-operations.md`
   - `.repo_context/modules/infra/logging/design.md`
@@ -66,6 +69,14 @@
 
 ## URMA Request Wait Slowdown
 
+- Send-lane admission diagnostics:
+  - `[URMA_SEND_LANE_PHASE] phase=acquirePeerSlot` isolates per-peer admission. `waitedForCapacity=1` with
+    `peerInflightAtEntry` at `peerInflightLimit` means the request queued behind that peer's occupied lanes;
+    `waitedForCapacity=0` routes investigation toward mutex contention or scheduling instead.
+  - `[URMA_SEND_LANE_PHASE] phase=acquireJetty` isolates local send-Jetty pool access, while
+    `phase=createAndRegisterLane` isolates lane object creation and active-lane registration.
+  - `[URMA_WRITE_PHASE] prepareAndPostUs` includes send-lane preparation and WR submission. Use the narrower
+    send-lane phase logs to attribute that aggregate rather than interpreting it as provider post latency.
 - Verified timing surface:
   - `src/datasystem/common/rdma/urma_manager.cpp` logs `[URMA_ELAPSED_TOTAL]` when a request exceeds 1 ms from just
     before `urma_post_jetty_send_wr` submission to write completion confirmation. The timestamp is captured when the
@@ -85,6 +96,15 @@
   - `src/datasystem/common/rdma/urma_manager.cpp` tags failed `urma_post_jetty_send_wr` logs with `[URMA_WRITE]` and
     failed `urma_poll_jfc` return or completion-record errors with `[URMA_POLL_JFC]`; these logs include the URMA
     return/status code and route to URMA further analysis.
+
+## QueryAndGet Phase Diagnostics
+
+- `[QUERY_AND_GET_PHASE]` uses the Worker process slow-log threshold and reports only a slow request or object phase at
+  default verbosity. `scope=request` identifies request-wide validation; `objectIndex` identifies an object in a batch.
+- Phase names ending in `Total` include their nested work. In particular, `encodeLocalHitTotal` includes
+  `urmaWritePayloadTotal`; use the narrowest matching phase as the owner and do not add nested durations together.
+- Correlate these phase logs with `QueryAndGet done` by trace ID. The latter remains the request summary for
+  preprocess, local read, metadata, delivery, transport, hit/miss count and final status.
 
 ## Current Signal Limits For `set/get`
 
