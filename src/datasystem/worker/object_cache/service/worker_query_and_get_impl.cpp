@@ -50,6 +50,17 @@ uint64_t GetSteadyTimeUs()
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now).count());
 }
 
+/** @brief Log one object-level QueryAndGet phase using the configured Worker slow-log threshold. */
+void LogQueryAndGetObjectPhase(const char *phase, size_t objectIndex, uint64_t dataSize, uint64_t elapsedUs,
+                               const Status &status)
+{
+    const auto config = GetServerLatencyTraceConfig();
+    SLOW_LOG_IF_OR_VLOG(
+        INFO, config.processSlowerThanUs > 0 && elapsedUs >= config.processSlowerThanUs, 1,
+        "[QUERY_AND_GET_PHASE] phase=" << phase << ", objectIndex=" << objectIndex << ", dataSize=" << dataSize
+                                       << ", costUs=" << elapsedUs << ", status=" << status.ToString());
+}
+
 void FillLocation(const master::ObjectLocationInfoPb &source, QueryAndGetLocationInfoPb &target)
 {
     target.set_object_key(source.object_key());
@@ -294,7 +305,15 @@ Status WorkerQueryAndGetImpl::ValidateRequest(const QueryAndGetReqPb &request) c
     // again would build a string that CheckUrmaConnectionStable's `fallbackAddress != hostAddress` guard
     // discards. This is the per-request hot path, so skip the extra allocation.
     const std::string fallbackAddress = hasClientId ? remoteAddressStr : std::string();
-    RETURN_IF_NOT_OK(CheckTransportConnectionStable(connectionId, ub.urma_instance_id(), fallbackAddress));
+    const auto connectionStartUs = GetSteadyTimeUs();
+    auto rc = CheckTransportConnectionStable(connectionId, ub.urma_instance_id(), fallbackAddress);
+    const auto connectionUs = GetSteadyTimeUs() - connectionStartUs;
+    const auto config = GetServerLatencyTraceConfig();
+    SLOW_LOG_IF_OR_VLOG(
+        INFO, config.processSlowerThanUs > 0 && connectionUs >= config.processSlowerThanUs, 1,
+        "[QUERY_AND_GET_PHASE] phase=checkTransportConnection, scope=request, bufferSize="
+            << ub.buffer_size() << ", costUs=" << connectionUs << ", status=" << rc.ToString());
+    RETURN_IF_NOT_OK(rc);
     return Status::OK();
 }
 
@@ -309,7 +328,11 @@ Status WorkerQueryAndGetImpl::EncodeLocalHits(RequestState &state)
             continue;
         }
         std::unique_ptr<GetObjEntryParams> params;
-        RETURN_IF_NOT_OK(getProc_->TryAcquireLocalObject(objectKey, params));
+        const auto acquireStartUs = GetSteadyTimeUs();
+        auto rc = getProc_->TryAcquireLocalObject(objectKey, params);
+        LogQueryAndGetObjectPhase("acquireLocalObject", static_cast<size_t>(i),
+                                  params == nullptr ? 0 : params->dataSize, GetSteadyTimeUs() - acquireStartUs, rc);
+        RETURN_IF_NOT_OK(rc);
         if (params == nullptr) {
             state.misses.emplace_back(objectKey);
             continue;
@@ -317,7 +340,10 @@ Status WorkerQueryAndGetImpl::EncodeLocalHits(RequestState &state)
         const size_t payloadCount = state.payloads.size();
         const uint64_t tcpPayloadSize = state.tcpPayloadSize;
         bool encoded = false;
-        Status rc = EncodeLocalHit(state, static_cast<size_t>(i), *params, encoded, shmBytes);
+        const auto encodeStartUs = GetSteadyTimeUs();
+        rc = EncodeLocalHit(state, static_cast<size_t>(i), *params, encoded, shmBytes);
+        LogQueryAndGetObjectPhase("encodeLocalHitTotal", static_cast<size_t>(i), params->dataSize,
+                                  GetSteadyTimeUs() - encodeStartUs, rc);
         if (rc.IsError() || !encoded) {
             state.payloads.resize(payloadCount);
             state.tcpPayloadSize = tcpPayloadSize;
@@ -402,7 +428,10 @@ Status WorkerQueryAndGetImpl::EncodeUb(const QueryAndGetUbDataReqPb &request, si
     const auto &remote = request.buffer_infos(static_cast<int>(index));
     ShmGuard shmGuard(params.shmUnit, params.dataSize, params.metaSize);
     if (WorkerOcServiceCrudCommonApi::ShmEnable()) {
-        RETURN_IF_NOT_OK(shmGuard.TryRLatch());
+        const auto latchStartUs = GetSteadyTimeUs();
+        auto latchRc = shmGuard.TryRLatch();
+        LogQueryAndGetObjectPhase("shmReadLatch", index, params.dataSize, GetSteadyTimeUs() - latchStartUs, latchRc);
+        RETURN_IF_NOT_OK(latchRc);
     }
     const uint64_t base = reinterpret_cast<uint64_t>(params.shmUnit->GetPointer());
     uint64_t segmentAddress = 0;
@@ -418,9 +447,11 @@ Status WorkerQueryAndGetImpl::EncodeUb(const QueryAndGetUbDataReqPb &request, si
             : ubAdmission_->BuildLateCompletionContext(UbOperationKind::CLIENT_GET_WRITEBACK);
     auto &readBwTracker = scheduling::WorkerReadBandwidthTracker::Instance();
     auto readBwToken = readBwTracker.BeginRead();
+    const auto writeStartUs = GetSteadyTimeUs();
     Status rc = UrmaWritePayload(remote, segmentAddress, segmentSize, base, 0, params.dataSize, params.metaSize,
                                  srcChipId, dstChipId, true, eventKeys, nullptr, &failure,
                                  std::move(lateCompletionContext));
+    LogQueryAndGetObjectPhase("urmaWritePayloadTotal", index, params.dataSize, GetSteadyTimeUs() - writeStartUs, rc);
     readBwTracker.CompleteRead(readBwToken, params.dataSize, rc.IsOk());
     if (rc.IsError()) {
         const auto &address = remote.request_address();

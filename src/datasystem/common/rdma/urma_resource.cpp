@@ -35,6 +35,7 @@
 #endif
 
 #include "datasystem/common/inject/inject_point.h"
+#include "datasystem/common/log/latency_phase.h"
 #include "datasystem/common/log/log.h"
 #include "datasystem/common/log/trace.h"
 #include "datasystem/common/metrics/kv_metrics.h"
@@ -56,6 +57,24 @@ namespace datasystem {
 namespace {
 constexpr uint32_t K_URMA_WARNING_LOG_EVERY_N = 100;
 constexpr const char *URMA_ERROR_SUGGEST = "check URMA";
+
+/** @brief Log peer slot acquisition details using the configured slow-log threshold. */
+void LogInflightSlotAcquire(const UrmaJfrInfo &jfrInfo, std::chrono::steady_clock::time_point start,
+                            uint32_t inflightAtEntry, uint32_t inflightAtExit, uint32_t limit,
+                            bool waitedForCapacity, const Status &status)
+{
+    const auto costUs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                  std::chrono::steady_clock::now() - start)
+                                                  .count());
+    const auto config = GetServerLatencyTraceConfig();
+    SLOW_LOG_IF_OR_VLOG(
+        INFO, config.processSlowerThanUs > 0 && costUs >= config.processSlowerThanUs, 1,
+        "[URMA_SEND_LANE_PHASE] phase=acquirePeerSlot, costUs="
+            << costUs << ", waitedForCapacity=" << waitedForCapacity << ", peerInflightAtEntry=" << inflightAtEntry
+            << ", peerInflightAtExit=" << inflightAtExit << ", peerInflightLimit=" << limit
+            << ", target=" << jfrInfo.localAddress.ToString() << ", remoteInstanceId=" << jfrInfo.uniqueInstanceId
+            << ", status=" << status.ToString());
+}
 
 // A quarantined/pending Jetty cannot be destroyed safely when the provider's modify/flush
 // contract did not converge. Keep the complete wrapper (including its JFR dependency) alive
@@ -750,23 +769,37 @@ Status UrmaConnection::AcquireInflightSlot(int64_t remainingUs)
             OnJettyRetired();
         }
     });
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(remainingUs);
+    const auto start = std::chrono::steady_clock::now();
+    const auto deadline = start + std::chrono::microseconds(remainingUs);
     std::unique_lock<bthread::Mutex> lock(peerState_->mutex);
+    const uint32_t inflightAtEntry = peerState_->inflight;
+    bool waitedForCapacity = false;
+    auto finish = [&](const Status &status, uint32_t limit) {
+        const uint32_t inflightAtExit = peerState_->inflight;
+        lock.unlock();
+        LogInflightSlotAcquire(urmaJfrInfo_, start, inflightAtEntry, inflightAtExit, limit, waitedForCapacity, status);
+        return status;
+    };
     for (;;) {
-        CHECK_FAIL_RETURN_STATUS(!IsCircuitBroken(), K_URMA_TRY_AGAIN,
-                                 "Peer circuit-broken; reconnect after cooldown before sending a recovery probe");
         const bool halfOpen = peerState_->phase.load(std::memory_order_acquire) == BreakerPhase::HALF_OPEN;
         const auto limit = halfOpen ? 1U : MAX_INFLIGHT_JETTIES;
+        if (IsCircuitBroken()) {
+            return finish(Status(K_URMA_TRY_AGAIN,
+                                 "Peer circuit-broken; reconnect after cooldown before sending a recovery probe"),
+                          limit);
+        }
         if (peerState_->inflight < limit) {
             ++peerState_->inflight;
-            return Status::OK();
+            return finish(Status::OK(), limit);
         }
-        CHECK_FAIL_RETURN_STATUS(!halfOpen, K_URMA_TRY_AGAIN, "Peer circuit-breaker recovery probe is in flight");
+        if (halfOpen) {
+            return finish(Status(K_URMA_TRY_AGAIN, "Peer circuit-breaker recovery probe is in flight"), limit);
+        }
+        waitedForCapacity = true;
         const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
             deadline - std::chrono::steady_clock::now()).count();
-        CHECK_FAIL_RETURN_STATUS(remaining > 0, K_URMA_TRY_AGAIN, "Peer in-flight jetty cap wait timed out");
-        if (peerState_->cv.wait_for(lock, static_cast<long>(remaining)) == ETIMEDOUT) {
-            RETURN_STATUS(K_URMA_TRY_AGAIN, "Peer in-flight jetty cap wait timed out");
+        if (remaining <= 0 || peerState_->cv.wait_for(lock, static_cast<long>(remaining)) == ETIMEDOUT) {
+            return finish(Status(K_URMA_TRY_AGAIN, "Peer in-flight jetty cap wait timed out"), limit);
         }
     }
 }

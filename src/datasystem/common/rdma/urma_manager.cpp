@@ -1840,7 +1840,16 @@ Status UrmaManager::AcquireSendLaneFromConnection(const std::shared_ptr<UrmaConn
     // in cqe9 does not block callers indefinitely.
     const int64_t remainingUs = ApiDeadline::Instance().ApiRemainingUs();
     RETURN_IF_NOT_OK(connection->AcquireInflightSlot(remainingUs));
+    const auto acquireJettyStartUs = static_cast<uint64_t>(GetSteadyClockTimeStampUs());
     auto rc = urmaResource_->AcquireJetty(jetty);
+    const auto acquireJettyUs = static_cast<uint64_t>(GetSteadyClockTimeStampUs()) - acquireJettyStartUs;
+    const auto config = GetServerLatencyTraceConfig();
+    SLOW_LOG_IF_OR_VLOG(
+        INFO, config.processSlowerThanUs > 0 && acquireJettyUs >= config.processSlowerThanUs, 1,
+        "[URMA_SEND_LANE_PHASE] phase=acquireJetty, costUs="
+            << acquireJettyUs << ", target=" << connection->GetUrmaJfrInfo().localAddress.ToString()
+            << ", remoteInstanceId=" << connection->GetUrmaJfrInfo().uniqueInstanceId
+            << ", status=" << rc.ToString());
     if (rc.IsError()) {
         connection->OnTransferFinished(false);
         connection->ReleaseInflightSlot();
@@ -2435,9 +2444,17 @@ Status UrmaManager::UrmaWriteImpl(const UrmaWriteArgs &args, std::vector<uint64_
     auto laneLease = externalLaneLease;
     if (ownsLaneLease) {
         RETURN_IF_NOT_OK(AcquireSendLaneFromConnection(args.connection, jetty, targetJetty));
+        const auto registerLaneStartUs = static_cast<uint64_t>(GetSteadyClockTimeStampUs());
         laneLease =
             std::make_shared<UrmaSendLaneLease>(jetty, requestId_.load(std::memory_order_relaxed), args.connection);
         auto registerRc = urmaResource_->RegisterActiveSendLane(laneLease);
+        const auto registerLaneUs = static_cast<uint64_t>(GetSteadyClockTimeStampUs()) - registerLaneStartUs;
+        const auto config = GetServerLatencyTraceConfig();
+        SLOW_LOG_IF_OR_VLOG(
+            INFO, config.processSlowerThanUs > 0 && registerLaneUs >= config.processSlowerThanUs, 1,
+            "[URMA_SEND_LANE_PHASE] phase=createAndRegisterLane, costUs="
+                << registerLaneUs << ", dataSize=" << args.size << ", target=" << args.remoteAddress
+                << ", status=" << registerRc.ToString());
         if (registerRc.IsError()) {
             LOG_IF_ERROR(urmaResource_->RetireJetty(jetty),
                          "Failed to retire URMA send Jetty after lane registration failure");
@@ -2666,6 +2683,7 @@ Status UrmaManager::UrmaWritePayloadImpl(const UrmaRemoteAddrPb &urmaInfo, const
                                          std::optional<UrmaLateCompletionContext> lateCompletionContext)
 {
     eventKeys.clear();
+    const auto startUs = static_cast<uint64_t>(GetSteadyClockTimeStampUs());
     PerfPoint point(PerfKey::URMA_WRITE_TOTAL);
     const uint64_t segVa = urmaInfo.seg_va();
     const HostPort requestAddress(urmaInfo.request_address().host(), urmaInfo.request_address().port());
@@ -2688,15 +2706,18 @@ Status UrmaManager::UrmaWritePayloadImpl(const UrmaRemoteAddrPb &urmaInfo, const
         connection = externalLaneLease->GetConnection();
     }
     CHECK_FAIL_RETURN_STATUS_PRINT_ERROR(connection != nullptr, K_RUNTIME_ERROR, "Urma connection is null");
+    const auto findConnectionEndUs = static_cast<uint64_t>(GetSteadyClockTimeStampUs());
 
     point.RecordAndReset(PerfKey::URMA_WRITE_FIND_REMOTE_SEGMENT);
     UrmaRemoteSegmentMap::const_accessor remoteSegAccessor;
     RETURN_IF_NOT_OK(connection->GetRemoteSeg(segVa, remoteSegAccessor));
+    const auto findRemoteSegmentEndUs = static_cast<uint64_t>(GetSteadyClockTimeStampUs());
 
     point.RecordAndReset(PerfKey::URMA_WRITE_REGISTER_LOCAL_SEGMENT);
     UrmaLocalSegmentMap::const_accessor localSegAccessor;
     RETURN_IF_NOT_OK(GetOrRegisterSegment(localSegAddress, localSegSize, localSegAccessor));
     CHECK_FAIL_RETURN_STATUS_PRINT_ERROR(localSegAccessor->second != nullptr, K_RUNTIME_ERROR, "Local segment is null");
+    const auto registerLocalSegmentEndUs = static_cast<uint64_t>(GetSteadyClockTimeStampUs());
 
     point.RecordAndReset(PerfKey::URMA_WRITE_LOOP);
 
@@ -2782,16 +2803,37 @@ Status UrmaManager::UrmaWritePayloadImpl(const UrmaRemoteAddrPb &urmaInfo, const
     writeLoopArgs.srcChipId = srcChipId;
     writeLoopArgs.dstChipId = dstChipId;
     writeLoopArgs.lateCompletionContext = std::move(lateCompletionContext);
-    RETURN_IF_NOT_OK(UrmaWriteImpl(writeLoopArgs, eventKeys, externalLaneLease, failure));
+    auto writeRc = UrmaWriteImpl(writeLoopArgs, eventKeys, externalLaneLease, failure);
+    const auto postEndUs = static_cast<uint64_t>(GetSteadyClockTimeStampUs());
     point.Record();
     // If it is blocking wait, we will wait for the write to finish here.
-    if (blocking) {
+    if (blocking && writeRc.IsOk()) {
         auto remainingTime = []() { return GetRequestContext()->reqTimeoutDuration.CalcRemainingTime(); };
         auto errorHandler = [](Status &status) { return status; };
-        RETURN_IF_NOT_OK(WaitFastTransportEventWithFailure(eventKeys, remainingTime, errorHandler, failure));
-        eventKeys.clear();
+        writeRc = WaitFastTransportEventWithFailure(eventKeys, remainingTime, errorHandler, failure);
+        if (writeRc.IsOk()) {
+            eventKeys.clear();
+        }
     }
-    return Status::OK();
+    const auto endUs = static_cast<uint64_t>(GetSteadyClockTimeStampUs());
+    const auto findConnectionUs = findConnectionEndUs - startUs;
+    const auto findRemoteSegmentUs = findRemoteSegmentEndUs - findConnectionEndUs;
+    const auto registerLocalSegmentUs = registerLocalSegmentEndUs - findRemoteSegmentEndUs;
+    const auto prepareAndPostUs = postEndUs - registerLocalSegmentEndUs;
+    const auto waitUs = endUs - postEndUs;
+    const auto totalUs = endUs - startUs;
+    const auto config = GetServerLatencyTraceConfig();
+    const auto thresholdUs = config.processSlowerThanUs;
+    const bool isSlow = thresholdUs > 0 && totalUs >= thresholdUs;
+    SLOW_LOG_IF_OR_VLOG(
+        INFO, isSlow, 1,
+        "[URMA_WRITE_PHASE] totalUs=" << totalUs << ", findConnectionUs=" << findConnectionUs
+                                      << ", findRemoteSegmentUs=" << findRemoteSegmentUs
+                                      << ", registerLocalSegmentUs=" << registerLocalSegmentUs
+                                      << ", prepareAndPostUs=" << prepareAndPostUs << ", waitUs=" << waitUs
+                                      << ", dataSize=" << readSize << ", blocking=" << blocking
+                                      << ", status=" << writeRc.ToString());
+    return writeRc;
 }
 
 Status UrmaManager::UrmaRead(const UrmaRemoteAddrPb &urmaInfo, const uint64_t &localSegAddress,
